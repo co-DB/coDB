@@ -12,6 +12,7 @@ coDB is a relational database built from scratch.
     - [Prerequisites](#prerequisites)
     - [Running binaries](#running-binaries)
     - [Running tests](#running-tests)
+    - [Generating docs](#generating-docs)
 
 ## Project structure
 
@@ -85,3 +86,11 @@ Run tests for a specific crate:
         ```shell
         cargo test --lib <CRATE_NAME>
         ```
+
+### Generating docs
+
+To generate docs run:
+
+```shell
+cargo doc --document-private-items --open
+```
