@@ -3,3 +3,7 @@ resolver = "3"
 members = [
     "client", "engine", "server",
 ]
+
+[workspace.dependencies]
+tokio = { version = "1.46.0", features = ["full"] }
+thiserror = "2"
