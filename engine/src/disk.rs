@@ -72,10 +72,8 @@ impl FileManager {
         todo!()
     }
 
-    /// Defragments the file - remove unused allocated pages, move used allocated pages so that the file is truncated to the
-    /// minimum number of pages required for it to hold whole data. This function heavily uses the disk and shouldn't be called too often.
-    /// Can fail if io error occurs.
-    pub async fn defragment(&mut self) -> Result<(), FileManagerError> {
+    /// Truncates the file - remove unused allocated pages from the end of the file. Can fail if io error occurs.
+    pub async fn truncate(&mut self) -> Result<(), FileManagerError> {
         todo!()
     }
 
