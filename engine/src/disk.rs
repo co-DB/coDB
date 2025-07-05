@@ -1,12 +1,23 @@
 //! Disk module — abstraction layer for managing on-disk files and page operations.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    io::{Cursor, ErrorKind, Read},
+    path::Path,
+};
 
+use byteorder::{BigEndian, ReadBytesExt};
 use thiserror::Error;
-use tokio::fs;
+use tokio::{
+    fs,
+    io::{self, AsyncReadExt},
+};
 
 /// Type representing page id, should be used instead of using bare `u64`.
 type PageId = u64;
+
+/// Metadata page id - page with this id should only be used internally by [`FileManager`].
+const MetadataPageId: PageId = 0;
 
 /// Size of each page in [`FileManager`].
 const PAGE_SIZE: usize = 4096; // 4 kB
@@ -31,7 +42,21 @@ pub struct FileManager {
 /// Error for [`FileManager`] related operations.
 #[derive(Error, Debug)]
 pub enum FileManagerError {
-    // TODO: populate when implementing `FileManager`
+    /// Provided page id was invalid, e.g. tried to read [`MetadataPageId`]
+    #[error("invalid page id: {0}")]
+    InvalidPageId(PageId),
+    /// File used for loading [`FileManager`] has invalid format
+    #[error("file has invalid format: {0}")]
+    InvalidFileFormat(&'static str),
+    /// Underlying IO module returned error
+    #[error("io error occured: {0}")]
+    IoError(#[source] io::Error),
+}
+
+impl From<io::Error> for FileManagerError {
+    fn from(err: io::Error) -> Self {
+        FileManagerError::IoError(err)
+    }
 }
 
 impl FileManager {
@@ -41,7 +66,17 @@ impl FileManager {
     where
         P: AsRef<Path>,
     {
-        todo!()
+        // It returns error if existance of the file at `file_path` cannot be checked, e.g.
+        // if we don't have permission to read that file. I don't think there is anything we can do about it,
+        // so just return underlying error in that case.
+        let exists = fs::try_exists(&file_path).await?;
+        match exists {
+            true => {
+                let file = fs::File::open(&file_path).await?;
+                Self::from_file(file).await
+            }
+            false => todo!(),
+        }
     }
 
     /// Reads page with id equal to `page_id` from underlying file. Can fail if io error occurs or `page_id` is not valid.
@@ -86,6 +121,27 @@ impl FileManager {
     pub fn set_root_page_id(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
         todo!()
     }
+
+    /// Try to loads existing [`FileManager`] from `file`. Can fail if io error occurrs or if underlying file
+    /// has invalid format.
+    async fn from_file(mut file: fs::File) -> Result<Self, FileManagerError> {
+        let mut metadata_buffer = [0u8; PAGE_SIZE];
+        if let Err(e) = file.read_exact(&mut metadata_buffer).await {
+            match e.kind() {
+                ErrorKind::UnexpectedEof => {
+                    return Err(FileManagerError::InvalidFileFormat(
+                        "file shorter than one page",
+                    ));
+                }
+                _ => return Err(FileManagerError::IoError(e)),
+            }
+        }
+        let file_metadata = FileMetadata::try_from(metadata_buffer)?;
+        Ok(FileManager {
+            handle: file,
+            metadata: file_metadata,
+        })
+    }
 }
 
 /// Magic number - used for checking if file is (has high chances to be) codb file.
@@ -109,4 +165,172 @@ struct FileMetadata {
     next_page_id: PageId,
     /// set of free pages (already allocated, but not used)
     free_pages: HashSet<PageId>,
+}
+
+/// Should be used to deserialize [`FileMetadata`] from [`Page`].
+impl TryFrom<Page> for FileMetadata {
+    type Error = FileManagerError;
+
+    fn try_from(value: Page) -> Result<Self, Self::Error> {
+        let mut cursor = Cursor::new(value);
+        let mut magic_number = [0u8; 4];
+        Read::read_exact(&mut cursor, &mut magic_number)?;
+        if magic_number != CODB_MAGIC_NUMBER {
+            return Err(FileManagerError::InvalidFileFormat("invalid magic number"));
+        }
+        let root_page_value = ReadBytesExt::read_u64::<BigEndian>(&mut cursor)?;
+        let root_page_id = match root_page_value {
+            0 => None,
+            _ => Some(root_page_value),
+        };
+        let next_page_id = ReadBytesExt::read_u64::<BigEndian>(&mut cursor)?;
+        let free_pages_length = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)? as _;
+        let mut free_pages = HashSet::with_capacity(free_pages_length);
+        for _ in 0..free_pages_length {
+            let free_page_id = ReadBytesExt::read_u64::<BigEndian>(&mut cursor)?;
+            free_pages.insert(free_page_id);
+        }
+        Ok(FileMetadata {
+            root_page_id,
+            next_page_id,
+            free_pages,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byteorder::{BigEndian, WriteBytesExt};
+    use std::collections::HashSet;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use tokio::fs;
+
+    fn create_metadata_page(
+        root_page_id: Option<u64>,
+        next_page_id: u64,
+        free_pages: &[u64],
+    ) -> Page {
+        let mut buffer = Vec::with_capacity(PAGE_SIZE);
+        buffer.extend_from_slice(&CODB_MAGIC_NUMBER);
+        buffer
+            .write_u64::<BigEndian>(root_page_id.unwrap_or(0))
+            .unwrap();
+        buffer.write_u64::<BigEndian>(next_page_id).unwrap();
+        buffer
+            .write_u32::<BigEndian>(free_pages.len() as u32)
+            .unwrap();
+        for id in free_pages {
+            buffer.write_u64::<BigEndian>(*id).unwrap();
+        }
+        buffer.resize(PAGE_SIZE, 0);
+        buffer.try_into().unwrap()
+    }
+
+    async fn write_temp_file_with_content(contents: &[u8]) -> NamedTempFile {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        std::fs::write(&path, contents).unwrap();
+        temp_file.flush().unwrap();
+        temp_file
+    }
+
+    #[tokio::test]
+    async fn file_manager_from_file_file_too_small() {
+        // given file with size < `PAGE_SIZE`
+        let temp_file = write_temp_file_with_content(&[1, 2, 3]).await;
+
+        // when try to load `FileManager` from it
+        let result = FileManager::new(temp_file.path()).await;
+
+        // then error is returned
+        assert!(matches!(
+            result.err().unwrap(),
+            FileManagerError::InvalidFileFormat(msg)
+                if msg == "file shorter than one page"
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_manager_from_file_invalid_magic_number() {
+        // given page with invalid magic number
+        let mut bad_page = [0u8; PAGE_SIZE];
+        bad_page[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let temp_file = write_temp_file_with_content(&bad_page).await;
+
+        // when try to load `FileManager` from it
+        let result = FileManager::new(temp_file.path()).await;
+
+        // then error is returned
+        assert!(matches!(
+            result.err().unwrap(),
+            FileManagerError::InvalidFileFormat(msg)
+                if msg == "invalid magic number"
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_manager_from_file_valid_metadata_cases() {
+        struct TestCase {
+            name: &'static str,
+            root: Option<u64>,
+            next: u64,
+            free: Vec<u64>,
+        }
+
+        let test_cases = [
+            TestCase {
+                name: "empty root, empty free",
+                root: None,
+                next: 1,
+                free: vec![],
+            },
+            TestCase {
+                name: "some root, empty free",
+                root: Some(42),
+                next: 2,
+                free: vec![],
+            },
+            TestCase {
+                name: "empty root, some free",
+                root: None,
+                next: 3,
+                free: vec![10, 20, 30],
+            },
+            TestCase {
+                name: "some root, some free",
+                root: Some(111),
+                next: 4,
+                free: vec![40, 50, 60],
+            },
+        ];
+
+        for case in test_cases {
+            // given valid metadata page
+            let page = create_metadata_page(case.root, case.next, &case.free);
+            let temp_file = write_temp_file_with_content(&page).await;
+
+            // when try to load `FileManager` from it
+            let manager = FileManager::new(temp_file.path()).await.unwrap();
+
+            // then `FileManager` instance is returned
+            assert_eq!(
+                manager.metadata.root_page_id, case.root,
+                "root_page_id failed for case '{}'",
+                case.name
+            );
+            assert_eq!(
+                manager.metadata.next_page_id, case.next,
+                "next_page_id failed for case '{}'",
+                case.name
+            );
+            assert_eq!(
+                manager.metadata.free_pages,
+                case.free.iter().cloned().collect::<HashSet<_>>(),
+                "free_pages failed for case '{}'",
+                case.name
+            );
+        }
+    }
 }
