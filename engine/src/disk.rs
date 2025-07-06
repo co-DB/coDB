@@ -2,22 +2,19 @@
 
 use std::{
     collections::HashSet,
-    io::{Cursor, ErrorKind, Read},
+    fs,
+    io::{self, Cursor, ErrorKind, Read},
     path::Path,
 };
 
 use byteorder::{BigEndian, ReadBytesExt};
 use thiserror::Error;
-use tokio::{
-    fs,
-    io::{self, AsyncReadExt},
-};
 
 /// Type representing page id, should be used instead of using bare `u64`.
 type PageId = u64;
 
 /// Metadata page id - page with this id should only be used internally by [`FileManager`].
-const MetadataPageId: PageId = 0;
+const METADATA_PAGE_ID: PageId = 0;
 
 /// Size of each page in [`FileManager`].
 const PAGE_SIZE: usize = 4096; // 4 kB
@@ -42,7 +39,7 @@ pub struct FileManager {
 /// Error for [`FileManager`] related operations.
 #[derive(Error, Debug)]
 pub enum FileManagerError {
-    /// Provided page id was invalid, e.g. tried to read [`MetadataPageId`]
+    /// Provided page id was invalid, e.g. tried to read [`METADATA_PAGE_ID`]
     #[error("invalid page id: {0}")]
     InvalidPageId(PageId),
     /// File used for loading [`FileManager`] has invalid format
@@ -62,53 +59,49 @@ impl From<io::Error> for FileManagerError {
 impl FileManager {
     /// Creates a new instance of [`FileManager`]. When `file_path` points to existing file it
     /// tries to load it from there, otherwise it creates new file at `file_path`.
-    pub async fn new<P>(file_path: P) -> Result<FileManager, FileManagerError>
+    pub fn new<P>(file_path: P) -> Result<FileManager, FileManagerError>
     where
         P: AsRef<Path>,
     {
         // It returns error if existance of the file at `file_path` cannot be checked, e.g.
         // if we don't have permission to read that file. I don't think there is anything we can do about it,
         // so just return underlying error in that case.
-        let exists = fs::try_exists(&file_path).await?;
+        let exists = file_path.as_ref().try_exists()?;
         match exists {
             true => {
-                let file = fs::File::open(&file_path).await?;
-                Self::from_file(file).await
+                let file = fs::File::open(&file_path)?;
+                FileManager::try_from(file)
             }
             false => todo!(),
         }
     }
 
     /// Reads page with id equal to `page_id` from underlying file. Can fail if io error occurs or `page_id` is not valid.
-    pub async fn read_page(&self, page_id: PageId) -> Result<Page, FileManagerError> {
+    pub fn read_page(&self, page_id: PageId) -> Result<Page, FileManagerError> {
         todo!()
     }
 
     /// Writes new `page` to page with id `page_id`. It flushes the newly written page to disk, so be careful as it might be bottleneck if used incorrectly.
     /// Page with id `page_id` must be allocated before writing to it. Can fail if io error occurs or `page_id` is not valid.
-    pub async fn write_page(
-        &mut self,
-        page_id: PageId,
-        page: Page,
-    ) -> Result<(), FileManagerError> {
+    pub fn write_page(&mut self, page_id: PageId, page: Page) -> Result<(), FileManagerError> {
         todo!()
     }
 
     /// Allocates new page and returns its `PageId`. If there is a free page in [`FileMetadata`]'s `free_pages` it uses it,
     /// otherwise creates new page. Returned page id is guaranteed to point to page that is not used.
     /// Can fail if io error occurs.
-    pub async fn allocate_page(&mut self) -> Result<PageId, FileManagerError> {
+    pub fn allocate_page(&mut self) -> Result<PageId, FileManagerError> {
         todo!()
     }
 
     /// Frees page with `page_id` so that it can be reused later.
     /// It doesn't erase the page content, but adds its `page_id` to [`FileMetadata`]'s `free_pages`.
-    pub async fn free_page(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
+    pub fn free_page(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
         todo!()
     }
 
     /// Truncates the file - remove unused allocated pages from the end of the file. Can fail if io error occurs.
-    pub async fn truncate(&mut self) -> Result<(), FileManagerError> {
+    pub fn truncate(&mut self) -> Result<(), FileManagerError> {
         todo!()
     }
 
@@ -121,12 +114,16 @@ impl FileManager {
     pub fn set_root_page_id(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
         todo!()
     }
+}
 
-    /// Try to loads existing [`FileManager`] from `file`. Can fail if io error occurrs or if underlying file
-    /// has invalid format.
-    async fn from_file(mut file: fs::File) -> Result<Self, FileManagerError> {
+/// Try to deserialize existing [`FileManager`] from file. Can fail if io error occurrs or if underlying file
+/// has invalid format.
+impl TryFrom<fs::File> for FileManager {
+    type Error = FileManagerError;
+
+    fn try_from(mut value: fs::File) -> Result<Self, Self::Error> {
         let mut metadata_buffer = [0u8; PAGE_SIZE];
-        if let Err(e) = file.read_exact(&mut metadata_buffer).await {
+        if let Err(e) = value.read_exact(&mut metadata_buffer) {
             match e.kind() {
                 ErrorKind::UnexpectedEof => {
                     return Err(FileManagerError::InvalidFileFormat(
@@ -138,7 +135,7 @@ impl FileManager {
         }
         let file_metadata = FileMetadata::try_from(metadata_buffer)?;
         Ok(FileManager {
-            handle: file,
+            handle: value,
             metadata: file_metadata,
         })
     }
@@ -174,20 +171,20 @@ impl TryFrom<Page> for FileMetadata {
     fn try_from(value: Page) -> Result<Self, Self::Error> {
         let mut cursor = Cursor::new(value);
         let mut magic_number = [0u8; 4];
-        Read::read_exact(&mut cursor, &mut magic_number)?;
+        cursor.read_exact(&mut magic_number)?;
         if magic_number != CODB_MAGIC_NUMBER {
             return Err(FileManagerError::InvalidFileFormat("invalid magic number"));
         }
-        let root_page_value = ReadBytesExt::read_u64::<BigEndian>(&mut cursor)?;
+        let root_page_value = cursor.read_u64::<BigEndian>()?;
         let root_page_id = match root_page_value {
             0 => None,
             _ => Some(root_page_value),
         };
-        let next_page_id = ReadBytesExt::read_u64::<BigEndian>(&mut cursor)?;
-        let free_pages_length = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)? as _;
+        let next_page_id = cursor.read_u64::<BigEndian>()?;
+        let free_pages_length = cursor.read_u32::<BigEndian>()? as _;
         let mut free_pages = HashSet::with_capacity(free_pages_length);
         for _ in 0..free_pages_length {
-            let free_page_id = ReadBytesExt::read_u64::<BigEndian>(&mut cursor)?;
+            let free_page_id = cursor.read_u64::<BigEndian>()?;
             free_pages.insert(free_page_id);
         }
         Ok(FileMetadata {
@@ -205,7 +202,6 @@ mod tests {
     use std::collections::HashSet;
     use std::io::Write;
     use tempfile::NamedTempFile;
-    use tokio::fs;
 
     fn create_metadata_page(
         root_page_id: Option<u64>,
@@ -228,7 +224,7 @@ mod tests {
         buffer.try_into().unwrap()
     }
 
-    async fn write_temp_file_with_content(contents: &[u8]) -> NamedTempFile {
+    fn write_temp_file_with_content(contents: &[u8]) -> NamedTempFile {
         let mut temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
         std::fs::write(&path, contents).unwrap();
@@ -236,13 +232,13 @@ mod tests {
         temp_file
     }
 
-    #[tokio::test]
-    async fn file_manager_from_file_file_too_small() {
+    #[test]
+    fn file_manager_from_file_file_too_small() {
         // given file with size < `PAGE_SIZE`
-        let temp_file = write_temp_file_with_content(&[1, 2, 3]).await;
+        let temp_file = write_temp_file_with_content(&[1, 2, 3]);
 
         // when try to load `FileManager` from it
-        let result = FileManager::new(temp_file.path()).await;
+        let result = FileManager::new(temp_file.path());
 
         // then error is returned
         assert!(matches!(
@@ -252,15 +248,15 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn file_manager_from_file_invalid_magic_number() {
+    #[test]
+    fn file_manager_from_file_invalid_magic_number() {
         // given page with invalid magic number
         let mut bad_page = [0u8; PAGE_SIZE];
         bad_page[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let temp_file = write_temp_file_with_content(&bad_page).await;
+        let temp_file = write_temp_file_with_content(&bad_page);
 
         // when try to load `FileManager` from it
-        let result = FileManager::new(temp_file.path()).await;
+        let result = FileManager::new(temp_file.path());
 
         // then error is returned
         assert!(matches!(
@@ -270,8 +266,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn file_manager_from_file_valid_metadata_cases() {
+    #[test]
+    fn file_manager_from_file_valid_metadata_cases() {
         struct TestCase {
             name: &'static str,
             root: Option<u64>,
@@ -309,10 +305,10 @@ mod tests {
         for case in test_cases {
             // given valid metadata page
             let page = create_metadata_page(case.root, case.next, &case.free);
-            let temp_file = write_temp_file_with_content(&page).await;
+            let temp_file = write_temp_file_with_content(&page);
 
             // when try to load `FileManager` from it
-            let manager = FileManager::new(temp_file.path()).await.unwrap();
+            let manager = FileManager::new(temp_file.path()).unwrap();
 
             // then `FileManager` instance is returned
             assert_eq!(
