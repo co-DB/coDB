@@ -30,8 +30,8 @@ CoSQL includes a set of essential data types suitable for building production-gr
 
 ### Conventions
 - Keywords are case-insensitive ("Select" is the same as "SELECT" is the same as "select")
-- Statements end with semicolons ("SELECT 1 FROM Users;")
-- Number of spaces between tokens doesn't matter (E.g "Select     1;" works just fine)
+- Statements end with semicolons ("SELECT * FROM Users;")
+- Number of spaces between tokens doesn't matter (E.g "Select    * FROM Users;" works just fine)
 - Strings are enclosed by a single quotation mark ('Text')
 - Identifiers must start with a letter and can use only letters, digits and underscores ('_')
 
@@ -45,7 +45,7 @@ SELECT, FROM, WHERE, INSERT, INTO, VALUES, UPDATE, SET, DELETE, TRUE, FALSE
 
 ```
  <identifier> :: <letter> (<letter> | <digit> | '_')*
- <letter> :: 'A'-'Z' | 'a'-'z'
+ <letter> :: 'A'..'Z' | 'a'..'z'
  <digit> :: '0'..'9'
 ```
 
@@ -95,7 +95,7 @@ Precedence goes as follows (from highest to lowest):
 ```
  <column_name> :: <identifier>
  <table_name> :: <identifier>
- <value> :: <literal>
+ <value> :: <literal> | <expression>
 ```
 
 #### Start
@@ -107,19 +107,19 @@ Precedence goes as follows (from highest to lowest):
 
 #### Where clause
 ```
- <where_clause> :: WHERE <condition_expr>
+ <where_clause> :: WHERE <expression> | ε
 ```
 #### Select
 ```
  <select_stmt> :: SELECT <column_list> FROM <table_name> <where_clause>
- <column_list> :: <column_name>(,<column_name>)* | *
+ <column_list_select> :: <column_name>(,<column_name>)* | *
 ```
 
 #### Insert
 
 ```
- <insert_stmt> :: INSERT INTO <table_name> <column_list> VALUES (<value_list>)
- <column_list> :: (<identifier>(,<column_name>)*) | ε
+ <insert_stmt> :: INSERT INTO <table_name> <column_list> VALUES (<values_list>)
+ <column_list_insert> :: (<column_name>(,<column_name>)*) | ε
  <values_list> :: (<value>(,<value>)*)
 ```
 
