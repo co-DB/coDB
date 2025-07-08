@@ -111,14 +111,14 @@ Precedence goes as follows (from highest to lowest):
 ```
 #### Select
 ```
- <select_stmt> :: SELECT <column_list> FROM <table_name> <where_clause>
+ <select_stmt> :: SELECT <column_list_select> FROM <table_name> <where_clause>
  <column_list_select> :: <column_name>(,<column_name>)* | *
 ```
 
 #### Insert
 
 ```
- <insert_stmt> :: INSERT INTO <table_name> <column_list> VALUES (<values_list>)
+ <insert_stmt> :: INSERT INTO <table_name> <column_list_insert> VALUES (<values_list>)
  <column_list_insert> :: (<column_name>(,<column_name>)*) | ε
  <values_list> :: (<value>(,<value>)*)
 ```
