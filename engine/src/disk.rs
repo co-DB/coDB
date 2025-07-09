@@ -139,12 +139,16 @@ impl FileManager {
 
     /// Returns id of root page. Can be `None` if `root_page_id` was not set yet (it's not set automatically when new file is created).
     pub fn root_page_id(&self) -> Option<PageId> {
-        todo!()
+        self.metadata.root_page_id
     }
 
     /// Sets new root page id. `page_id` must be already pointing to allocated page. Can fail if `page_id` is not valid.
     pub fn set_root_page_id(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
-        todo!()
+        if self.is_invalid_page_id(page_id) {
+            return Err(FileManagerError::InvalidPageId(page_id));
+        }
+        self.metadata.root_page_id = Some(page_id);
+        self.sync_metadata()
     }
 
     /// Seeks underlying file handle to the start of the page with `page_id`.
@@ -651,5 +655,83 @@ mod tests {
         let disk_metadata = read_metadata_from_disk(temp_file.path());
         assert_eq!(disk_metadata.next_page_id, 4);
         assert!(disk_metadata.free_pages.is_empty());
+    }
+
+    #[test]
+    fn file_manager_set_root_page_id_metadata_page() {
+        // given a file with a valid metadata page and one data page
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let page1 = [1u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and setting root page id to 0 (metadata)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.set_root_page_id(0);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(0))));
+    }
+
+    #[test]
+    fn file_manager_set_root_page_id_free_page() {
+        // given a file with a valid metadata page and page 2 marked as free
+        let metadata_page = create_metadata_page(None, 3, &[2]);
+        let page1 = [1u8; PAGE_SIZE];
+        let page2 = [2u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        file_content.extend_from_slice(&page2);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and setting root page id to 2 (free)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.set_root_page_id(2);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+    }
+
+    #[test]
+    fn file_manager_set_root_page_id_unallocated_page() {
+        // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let page1 = [1u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and setting root page id to 2 (unallocated)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.set_root_page_id(2);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+    }
+
+    #[test]
+    fn file_manager_set_root_page_id_valid() {
+        // given a file with a valid metadata page and one data page
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let page1 = [1u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and setting root page id to 1
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        manager.set_root_page_id(1).unwrap();
+
+        // then root_page_id is updated in memory
+        assert_eq!(manager.root_page_id(), Some(1));
+
+        // and metadata on disk is updated
+        let disk_metadata = read_metadata_from_disk(temp_file.path());
+        assert_eq!(disk_metadata.root_page_id, Some(1));
     }
 }
