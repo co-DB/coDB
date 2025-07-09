@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fs,
-    io::{self, Cursor, ErrorKind, Read, Seek},
+    io::{self, Cursor, ErrorKind, Read, Seek, Write},
     path::Path,
 };
 
@@ -69,7 +69,10 @@ impl FileManager {
         let exists = file_path.as_ref().try_exists()?;
         match exists {
             true => {
-                let file = fs::File::open(&file_path)?;
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&file_path)?;
                 FileManager::try_from(file)
             }
             false => todo!(),
@@ -78,17 +81,11 @@ impl FileManager {
 
     /// Reads page with id equal to `page_id` from underlying file. Can fail if io error occurs or `page_id` is not valid.
     pub fn read_page(&mut self, page_id: PageId) -> Result<Page, FileManagerError> {
-        let is_metadata = page_id == METADATA_PAGE_ID;
-        let is_free = self.metadata.free_pages.contains(&page_id);
-        let is_unallocated = page_id >= self.metadata.next_page_id;
-
-        if is_metadata || is_free || is_unallocated {
+        if self.is_invalid_page_id(page_id) {
             return Err(FileManagerError::InvalidPageId(page_id));
         }
 
-        let start = PAGE_SIZE as u64 * page_id;
-        self.handle.seek(io::SeekFrom::Start(start))?;
-
+        self.seek_page(page_id)?;
         let mut buffer = [0u8; PAGE_SIZE];
         self.handle.read_exact(&mut buffer)?;
 
@@ -98,7 +95,15 @@ impl FileManager {
     /// Writes new `page` to page with id `page_id`. It flushes the newly written page to disk, so be careful as it might be bottleneck if used incorrectly.
     /// Page with id `page_id` must be allocated before writing to it. Can fail if io error occurs or `page_id` is not valid.
     pub fn write_page(&mut self, page_id: PageId, page: Page) -> Result<(), FileManagerError> {
-        todo!()
+        if self.is_invalid_page_id(page_id) {
+            return Err(FileManagerError::InvalidPageId(page_id));
+        }
+
+        self.seek_page(page_id)?;
+        self.handle.write_all(&page)?;
+        self.handle.flush()?;
+
+        Ok(())
     }
 
     /// Allocates new page and returns its `PageId`. If there is a free page in [`FileMetadata`]'s `free_pages` it uses it,
@@ -127,6 +132,21 @@ impl FileManager {
     /// Sets new root page id. `page_id` must be already pointing to allocated page. Can fail if `page_id` is not valid.
     pub fn set_root_page_id(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
         todo!()
+    }
+
+    /// Seeks underlying file handle to the start of the page with `page_id`.
+    fn seek_page(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
+        let start = PAGE_SIZE as u64 * page_id;
+        self.handle.seek(io::SeekFrom::Start(start))?;
+        Ok(())
+    }
+
+    /// Helper to check if page with `page_id` can be read from/write to.
+    fn is_invalid_page_id(&self, page_id: PageId) -> bool {
+        let is_metadata = page_id == METADATA_PAGE_ID;
+        let is_free = self.metadata.free_pages.contains(&page_id);
+        let is_unallocated = page_id >= self.metadata.next_page_id;
+        is_metadata || is_free || is_unallocated
     }
 }
 
@@ -345,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_read_page_metadata_page_should_fail() {
+    fn file_manager_read_page_metadata_page() {
         // given a file with a valid metadata page and one data page
         let metadata_page = create_metadata_page(None, 2, &[]);
         let page_data = [1u8; PAGE_SIZE];
@@ -363,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_read_page_free_page_should_fail() {
+    fn file_manager_read_page_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
         let metadata_page = create_metadata_page(None, 3, &[2]);
         let page1 = [1u8; PAGE_SIZE];
@@ -383,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_read_page_unallocated_page_should_fail() {
+    fn file_manager_read_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
         let metadata_page = create_metadata_page(None, 2, &[]);
         let page1 = [1u8; PAGE_SIZE];
@@ -416,5 +436,86 @@ mod tests {
 
         // then the page data is correct
         assert_eq!(read, page_data);
+    }
+
+    #[test]
+    fn file_manager_write_page_metadata_page() {
+        // given a file with a valid metadata page and one data page
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let page_data = [1u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page_data);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and writing to page 0 (metadata)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let new_page = [42u8; PAGE_SIZE];
+        let result = manager.write_page(0, new_page);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(0))));
+    }
+
+    #[test]
+    fn file_manager_write_page_free_page() {
+        // given a file with a valid metadata page and page 2 marked as free
+        let metadata_page = create_metadata_page(None, 3, &[2]);
+        let page1 = [1u8; PAGE_SIZE];
+        let page2 = [2u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        file_content.extend_from_slice(&page2);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and writing to page 2 (free)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let new_page = [42u8; PAGE_SIZE];
+        let result = manager.write_page(2, new_page);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+    }
+
+    #[test]
+    fn file_manager_write_page_unallocated_page() {
+        // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let page1 = [1u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and writing to page 2 (unallocated)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let new_page = [42u8; PAGE_SIZE];
+        let result = manager.write_page(2, new_page);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+    }
+
+    #[test]
+    fn file_manager_write_page_valid_page() {
+        // given a file with a valid metadata page and one data page
+        let orig_page = [1u8; PAGE_SIZE];
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&orig_page);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and writing new data to page 1
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let new_page = [42u8; PAGE_SIZE];
+        manager.write_page(1, new_page).unwrap();
+
+        // then the file contains the new data at page 1
+        let mut file = std::fs::File::open(temp_file.path()).unwrap();
+        let mut buf = vec![0u8; PAGE_SIZE * 2];
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[PAGE_SIZE..], &new_page);
     }
 }
