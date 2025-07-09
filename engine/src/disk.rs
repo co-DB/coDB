@@ -319,6 +319,27 @@ mod tests {
         FileMetadata::try_from(buf).unwrap()
     }
 
+    fn setup_file_with_metadata_and_n_pages(
+        root_page_id: Option<u64>,
+        next_page_id: u64,
+        free_pages: &[u64],
+        page_patterns: &[u8],
+    ) -> (tempfile::NamedTempFile, Vec<[u8; PAGE_SIZE]>) {
+        let metadata_page = create_metadata_page(root_page_id, next_page_id, free_pages);
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+
+        let mut pages = Vec::new();
+        for &pattern in page_patterns {
+            let page = [pattern; PAGE_SIZE];
+            file_content.extend_from_slice(&page);
+            pages.push(page);
+        }
+
+        let temp_file = write_temp_file_with_content(&file_content);
+        (temp_file, pages)
+    }
+
     #[test]
     fn file_manager_from_file_file_too_small() {
         // given file with size < `PAGE_SIZE`
@@ -420,12 +441,7 @@ mod tests {
     #[test]
     fn file_manager_read_page_metadata_page() {
         // given a file with a valid metadata page and one data page
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let page_data = [1u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page_data);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and reading page 0 (metadata)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -438,14 +454,7 @@ mod tests {
     #[test]
     fn file_manager_read_page_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
-        let metadata_page = create_metadata_page(None, 3, &[2]);
-        let page1 = [1u8; PAGE_SIZE];
-        let page2 = [2u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        file_content.extend_from_slice(&page2);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
         // when loading FileManager and reading page 2 (free)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -458,12 +467,7 @@ mod tests {
     #[test]
     fn file_manager_read_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let page1 = [1u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and reading page 2 (unallocated)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -476,30 +480,20 @@ mod tests {
     #[test]
     fn file_manager_read_page_valid_page() {
         // given a file with a valid metadata page and one data page
-        let page_data = [42u8; PAGE_SIZE];
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page_data);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, pages) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[42]);
 
         // when loading FileManager and reading page 1
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         let read = manager.read_page(1).unwrap();
 
         // then the page data is correct
-        assert_eq!(read, page_data);
+        assert_eq!(read, pages[0]);
     }
 
     #[test]
     fn file_manager_write_page_metadata_page() {
         // given a file with a valid metadata page and one data page
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let page_data = [1u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page_data);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and writing to page 0 (metadata)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -513,14 +507,7 @@ mod tests {
     #[test]
     fn file_manager_write_page_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
-        let metadata_page = create_metadata_page(None, 3, &[2]);
-        let page1 = [1u8; PAGE_SIZE];
-        let page2 = [2u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        file_content.extend_from_slice(&page2);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
         // when loading FileManager and writing to page 2 (free)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -534,12 +521,7 @@ mod tests {
     #[test]
     fn file_manager_write_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let page1 = [1u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and writing to page 2 (unallocated)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -553,12 +535,7 @@ mod tests {
     #[test]
     fn file_manager_write_page_valid_page() {
         // given a file with a valid metadata page and one data page
-        let orig_page = [1u8; PAGE_SIZE];
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&orig_page);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and writing new data to page 1
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -575,12 +552,7 @@ mod tests {
     #[test]
     fn file_manager_allocate_page_new_page() {
         // given a file with a valid metadata page and one data page, no free pages
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let page1 = [1u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and allocating a new page
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -601,14 +573,7 @@ mod tests {
     #[test]
     fn file_manager_allocate_page_from_free_list() {
         // given a file with a valid metadata page and page 2 marked as free
-        let metadata_page = create_metadata_page(None, 3, &[2]);
-        let page1 = [1u8; PAGE_SIZE];
-        let page2 = [2u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        file_content.extend_from_slice(&page2);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
         // when loading FileManager and allocating a page
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -630,16 +595,7 @@ mod tests {
     #[test]
     fn file_manager_allocate_page_multiple() {
         // given a file with a valid metadata page and two free pages
-        let metadata_page = create_metadata_page(None, 4, &[2, 3]);
-        let page1 = [1u8; PAGE_SIZE];
-        let page2 = [2u8; PAGE_SIZE];
-        let page3 = [3u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        file_content.extend_from_slice(&page2);
-        file_content.extend_from_slice(&page3);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 4, &[2, 3], &[1, 2, 3]);
 
         // when loading FileManager and allocating two pages
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -660,12 +616,7 @@ mod tests {
     #[test]
     fn file_manager_set_root_page_id_metadata_page() {
         // given a file with a valid metadata page and one data page
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let page1 = [1u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and setting root page id to 0 (metadata)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -678,14 +629,7 @@ mod tests {
     #[test]
     fn file_manager_set_root_page_id_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
-        let metadata_page = create_metadata_page(None, 3, &[2]);
-        let page1 = [1u8; PAGE_SIZE];
-        let page2 = [2u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        file_content.extend_from_slice(&page2);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
         // when loading FileManager and setting root page id to 2 (free)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -698,12 +642,7 @@ mod tests {
     #[test]
     fn file_manager_set_root_page_id_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let page1 = [1u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and setting root page id to 2 (unallocated)
         let mut manager = FileManager::new(temp_file.path()).unwrap();
@@ -716,12 +655,7 @@ mod tests {
     #[test]
     fn file_manager_set_root_page_id_valid() {
         // given a file with a valid metadata page and one data page
-        let metadata_page = create_metadata_page(None, 2, &[]);
-        let page1 = [1u8; PAGE_SIZE];
-        let mut file_content = Vec::new();
-        file_content.extend_from_slice(&metadata_page);
-        file_content.extend_from_slice(&page1);
-        let temp_file = write_temp_file_with_content(&file_content);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
         // when loading FileManager and setting root page id to 1
         let mut manager = FileManager::new(temp_file.path()).unwrap();
