@@ -129,7 +129,11 @@ impl FileManager {
     /// Frees page with `page_id` so that it can be reused later.
     /// It doesn't erase the page content, but adds its `page_id` to [`FileMetadata`]'s `free_pages`.
     pub fn free_page(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
-        todo!()
+        if self.is_invalid_page_id(page_id) {
+            return Err(FileManagerError::InvalidPageId(page_id));
+        }
+        self.metadata.free_pages.insert(page_id);
+        self.sync_metadata()
     }
 
     /// Truncates the file - remove unused allocated pages from the end of the file. Can fail if io error occurs.
@@ -667,5 +671,61 @@ mod tests {
         // and metadata on disk is updated
         let disk_metadata = read_metadata_from_disk(temp_file.path());
         assert_eq!(disk_metadata.root_page_id, Some(1));
+    }
+
+    #[test]
+    fn file_manager_free_page_metadata_page() {
+        // given a file with a valid metadata page and one data page
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+
+        // when loading FileManager and freeing page 0 (metadata)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.free_page(0);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(0))));
+    }
+
+    #[test]
+    fn file_manager_free_page_free_page() {
+        // given a file with a valid metadata page and page 2 already free
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
+
+        // when loading FileManager and freeing page 2 again
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.free_page(2);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+    }
+
+    #[test]
+    fn file_manager_free_page_unallocated_page() {
+        // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+
+        // when loading FileManager and freeing page 2 (unallocated)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.free_page(2);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+    }
+
+    #[test]
+    fn file_manager_free_page_valid() {
+        // given a file with a valid metadata page and two data pages
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[], &[1, 2]);
+
+        // when loading FileManager and freeing page 2
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        manager.free_page(2).unwrap();
+
+        // then page 2 is in free_pages in memory
+        assert!(manager.metadata.free_pages.contains(&2));
+
+        // and metadata on disk is updated
+        let disk_metadata = read_metadata_from_disk(temp_file.path());
+        assert!(disk_metadata.free_pages.contains(&2));
     }
 }
