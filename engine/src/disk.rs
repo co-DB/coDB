@@ -152,7 +152,17 @@ impl FileManager {
 
     /// Truncates the file - remove unused allocated pages from the end of the file. Can fail if io error occurs.
     pub fn truncate(&mut self) -> Result<(), FileManagerError> {
-        todo!()
+        while self
+            .metadata
+            .free_pages
+            .contains(&(self.metadata.next_page_id - 1))
+        {
+            self.metadata.next_page_id -= 1;
+            self.metadata.free_pages.remove(&self.metadata.next_page_id);
+        }
+        self.update_size()?;
+        self.sync_metadata()?;
+        Ok(())
     }
 
     /// Returns id of root page. Can be `None` if `root_page_id` was not set yet (it's not set automatically when new file is created).
@@ -810,5 +820,72 @@ mod tests {
         // and metadata on disk is updated
         let disk_metadata = read_metadata_from_disk(temp_file.path());
         assert!(disk_metadata.free_pages.contains(&2));
+    }
+
+    #[test]
+    fn file_manager_truncate_removes_free_pages_at_end() {
+        // given a file with 4 pages, pages 3 and 4 are free
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 5, &[3, 4], &[1, 2, 3, 4]);
+
+        // when loading FileManager and truncating
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        manager.truncate().unwrap();
+
+        // then next_page_id is 3 (pages 3 and 4 removed)
+        assert_eq!(manager.metadata.next_page_id, 3);
+
+        // and file size is 3 pages (metadata + 2 data)
+        let metadata = std::fs::metadata(temp_file.path()).unwrap();
+        assert_eq!(metadata.len(), PAGE_SIZE as u64 * 3);
+
+        // and metadata on disk is updated
+        let disk_metadata = read_metadata_from_disk(temp_file.path());
+        assert_eq!(disk_metadata.next_page_id, 3);
+        assert!(!disk_metadata.free_pages.contains(&3));
+        assert!(!disk_metadata.free_pages.contains(&4));
+    }
+
+    #[test]
+    fn file_manager_truncate_no_free_pages_at_end() {
+        // given a file with 4 pages, only page 2 is free (not at the end)
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 5, &[2], &[1, 2, 3, 4]);
+
+        // when loading FileManager and truncating
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        manager.truncate().unwrap();
+
+        // then next_page_id is unchanged
+        assert_eq!(manager.metadata.next_page_id, 5);
+
+        // and file size is unchanged
+        let metadata = std::fs::metadata(temp_file.path()).unwrap();
+        assert_eq!(metadata.len(), PAGE_SIZE as u64 * 5);
+
+        // and metadata on disk is updated
+        let disk_metadata = read_metadata_from_disk(temp_file.path());
+        assert_eq!(disk_metadata.next_page_id, 5);
+        assert!(disk_metadata.free_pages.contains(&2));
+    }
+
+    #[test]
+    fn file_manager_truncate_all_pages_free() {
+        // given a file with 3 pages, all data pages are free
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[1, 2], &[1, 2]);
+
+        // when loading FileManager and truncating
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        manager.truncate().unwrap();
+
+        // then next_page_id is 1 (only metadata page remains)
+        assert_eq!(manager.metadata.next_page_id, 1);
+
+        // and file size is 1 page (metadata only)
+        let metadata = std::fs::metadata(temp_file.path()).unwrap();
+        assert_eq!(metadata.len(), PAGE_SIZE as u64 * 1);
+
+        // and metadata on disk is updated
+        let disk_metadata = read_metadata_from_disk(temp_file.path());
+        assert_eq!(disk_metadata.next_page_id, 1);
+        assert!(disk_metadata.free_pages.is_empty());
     }
 }
