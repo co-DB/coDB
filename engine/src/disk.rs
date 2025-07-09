@@ -13,9 +13,6 @@ use thiserror::Error;
 /// Type representing page id, should be used instead of using bare `u64`.
 type PageId = u64;
 
-/// Metadata page id - page with this id should only be used internally by [`FileManager`].
-const METADATA_PAGE_ID: PageId = 0;
-
 /// Size of each page in [`FileManager`].
 const PAGE_SIZE: usize = 4096; // 4 kB
 
@@ -57,6 +54,9 @@ impl From<io::Error> for FileManagerError {
 }
 
 impl FileManager {
+    /// Metadata page id - page with this id should only be used internally by [`FileManager`].
+    const METADATA_PAGE_ID: PageId = 0;
+
     /// Creates a new instance of [`FileManager`]. When `file_path` points to existing file it
     /// tries to load it from there, otherwise it creates new file at `file_path`.
     pub fn new<P>(file_path: P) -> Result<FileManager, FileManagerError>
@@ -75,7 +75,22 @@ impl FileManager {
                     .open(&file_path)?;
                 FileManager::try_from(file)
             }
-            false => todo!(),
+            false => {
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&file_path)?;
+                let metadata = FileMetadata::default();
+                let mut fm = FileManager {
+                    handle: file,
+                    metadata,
+                };
+                fm.update_size()?;
+                fm.sync_metadata()?;
+                Ok(fm)
+            }
         }
     }
 
@@ -113,8 +128,7 @@ impl FileManager {
         let page_id = if self.metadata.free_pages.is_empty() {
             let page_id = self.metadata.next_page_id;
             self.metadata.next_page_id += 1;
-            let new_size = self.metadata.next_page_id * PAGE_SIZE as u64;
-            self.handle.set_len(new_size)?;
+            self.update_size()?;
             page_id
         } else {
             // We can unwrap here as we check if `free_pages` is empty
@@ -164,7 +178,7 @@ impl FileManager {
 
     /// Helper to check if page with `page_id` can be read from/write to.
     fn is_invalid_page_id(&self, page_id: PageId) -> bool {
-        let is_metadata = page_id == METADATA_PAGE_ID;
+        let is_metadata = page_id == Self::METADATA_PAGE_ID;
         let is_free = self.metadata.free_pages.contains(&page_id);
         let is_unallocated = page_id >= self.metadata.next_page_id;
         is_metadata || is_free || is_unallocated
@@ -173,9 +187,16 @@ impl FileManager {
     /// Syncs in-memory metadata with data stored in [`METADATA_PAGE_ID`] page.
     fn sync_metadata(&mut self) -> Result<(), FileManagerError> {
         let metadata_page = Page::try_from(&self.metadata)?;
-        self.seek_page(METADATA_PAGE_ID)?;
+        self.seek_page(Self::METADATA_PAGE_ID)?;
         self.handle.write_all(&metadata_page)?;
         self.handle.flush()?;
+        Ok(())
+    }
+
+    /// Updates size of underlying file to hold `next_page_id * PAGE_SIZE` bytes
+    fn update_size(&mut self) -> Result<(), FileManagerError> {
+        let new_size = self.metadata.next_page_id * PAGE_SIZE as u64;
+        self.handle.set_len(new_size)?;
         Ok(())
     }
 }
@@ -205,9 +226,6 @@ impl TryFrom<fs::File> for FileManager {
     }
 }
 
-/// Magic number - used for checking if file is (has high chances to be) codb file.
-const CODB_MAGIC_NUMBER: [u8; 4] = [0xC, 0x0, 0xD, 0xB];
-
 /// Storage for file metadata.
 ///
 /// [`FileMetadata`] is always stored in first page of the file. It contains metadata information used by [`FileManager`] -
@@ -228,6 +246,15 @@ struct FileMetadata {
     free_pages: HashSet<PageId>,
 }
 
+impl FileMetadata {
+    /// Magic number - used for checking if file is (has high chances to be) codb file.
+    const CODB_MAGIC_NUMBER: [u8; 4] = [0xC, 0x0, 0xD, 0xB];
+
+    /// Default next page id set when creating new [`FileMetadata`] instance.
+    // TODO: after some tests we can adjust this value
+    const DEFAULT_NEXT_PAGE_ID: u64 = 4;
+}
+
 /// Should be used to deserialize [`FileMetadata`] from [`Page`].
 impl TryFrom<Page> for FileMetadata {
     type Error = FileManagerError;
@@ -236,7 +263,7 @@ impl TryFrom<Page> for FileMetadata {
         let mut cursor = Cursor::new(value);
         let mut magic_number = [0u8; 4];
         cursor.read_exact(&mut magic_number)?;
-        if magic_number != CODB_MAGIC_NUMBER {
+        if magic_number != Self::CODB_MAGIC_NUMBER {
             return Err(FileManagerError::InvalidFileFormat("invalid magic number"));
         }
         let root_page_value = cursor.read_u64::<BigEndian>()?;
@@ -265,7 +292,7 @@ impl TryFrom<&FileMetadata> for Page {
 
     fn try_from(value: &FileMetadata) -> Result<Self, Self::Error> {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
-        buffer.extend_from_slice(&CODB_MAGIC_NUMBER);
+        buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
         let root_page_id = value.root_page_id.unwrap_or(0);
         buffer.write_u64::<BigEndian>(root_page_id)?;
         buffer.write_u64::<BigEndian>(value.next_page_id)?;
@@ -276,6 +303,22 @@ impl TryFrom<&FileMetadata> for Page {
         buffer.resize(PAGE_SIZE, 0);
         // We can unwrap here as we are sure that buffer size is `PAGE_SIZE`.
         Ok(buffer.try_into().unwrap())
+    }
+}
+
+/// Should be used when creating new [`FileManager`]
+impl Default for FileMetadata {
+    fn default() -> Self {
+        let next_page_id = Self::DEFAULT_NEXT_PAGE_ID;
+        let mut free_pages = HashSet::new();
+        for i in 1..next_page_id {
+            free_pages.insert(i);
+        }
+        Self {
+            root_page_id: None,
+            next_page_id,
+            free_pages,
+        }
     }
 }
 
@@ -293,7 +336,7 @@ mod tests {
         free_pages: &[u64],
     ) -> Page {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
-        buffer.extend_from_slice(&CODB_MAGIC_NUMBER);
+        buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
         buffer
             .write_u64::<BigEndian>(root_page_id.unwrap_or(0))
             .unwrap();
@@ -342,6 +385,46 @@ mod tests {
 
         let temp_file = write_temp_file_with_content(&file_content);
         (temp_file, pages)
+    }
+
+    #[test]
+    fn file_manager_new_creates_file_and_metadata() {
+        // given a path to a non-existent file
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("new_db_file.codb");
+        assert!(!file_path.exists());
+
+        // when creating FileManager
+        let manager = FileManager::new(&file_path).unwrap();
+
+        // then file is created
+        assert!(file_path.exists());
+
+        // and metadata is initialized as expected
+        assert_eq!(manager.root_page_id(), None);
+        assert_eq!(
+            manager.metadata.next_page_id,
+            FileMetadata::DEFAULT_NEXT_PAGE_ID
+        );
+        let expected_free: std::collections::HashSet<_> =
+            (1..FileMetadata::DEFAULT_NEXT_PAGE_ID).collect();
+        assert_eq!(manager.metadata.free_pages, expected_free);
+
+        // and file size is correct
+        let metadata = std::fs::metadata(&file_path).unwrap();
+        assert_eq!(
+            metadata.len(),
+            FileMetadata::DEFAULT_NEXT_PAGE_ID * PAGE_SIZE as u64
+        );
+
+        // and the metadata on disk matches
+        let disk_metadata = read_metadata_from_disk(&file_path);
+        assert_eq!(disk_metadata.root_page_id, None);
+        assert_eq!(
+            disk_metadata.next_page_id,
+            FileMetadata::DEFAULT_NEXT_PAGE_ID
+        );
+        assert_eq!(disk_metadata.free_pages, expected_free);
     }
 
     #[test]
