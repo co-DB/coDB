@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
 
 /// Type representing page id, should be used instead of using bare `u64`.
@@ -110,7 +110,20 @@ impl FileManager {
     /// otherwise creates new page. Returned page id is guaranteed to point to page that is not used.
     /// Can fail if io error occurs.
     pub fn allocate_page(&mut self) -> Result<PageId, FileManagerError> {
-        todo!()
+        let page_id = if self.metadata.free_pages.is_empty() {
+            let page_id = self.metadata.next_page_id;
+            self.metadata.next_page_id += 1;
+            let new_size = self.metadata.next_page_id * PAGE_SIZE as u64;
+            self.handle.set_len(new_size)?;
+            page_id
+        } else {
+            // We can unwrap here as we check if `free_pages` is empty
+            let page_id = self.metadata.free_pages.iter().next().copied().unwrap();
+            self.metadata.free_pages.remove(&page_id);
+            page_id
+        };
+        self.sync_metadata()?;
+        Ok(page_id)
     }
 
     /// Frees page with `page_id` so that it can be reused later.
@@ -147,6 +160,15 @@ impl FileManager {
         let is_free = self.metadata.free_pages.contains(&page_id);
         let is_unallocated = page_id >= self.metadata.next_page_id;
         is_metadata || is_free || is_unallocated
+    }
+
+    /// Syncs in-memory metadata with data stored in [`METADATA_PAGE_ID`] page.
+    fn sync_metadata(&mut self) -> Result<(), FileManagerError> {
+        let metadata_page = Page::try_from(&self.metadata)?;
+        self.seek_page(METADATA_PAGE_ID)?;
+        self.handle.write_all(&metadata_page)?;
+        self.handle.flush()?;
+        Ok(())
     }
 }
 
@@ -229,6 +251,26 @@ impl TryFrom<Page> for FileMetadata {
     }
 }
 
+/// Should be used to serialize [`FileMetadata`] into [`Page`]
+impl TryFrom<&FileMetadata> for Page {
+    type Error = FileManagerError;
+
+    fn try_from(value: &FileMetadata) -> Result<Self, Self::Error> {
+        let mut buffer = Vec::with_capacity(PAGE_SIZE);
+        buffer.extend_from_slice(&CODB_MAGIC_NUMBER);
+        let root_page_id = value.root_page_id.unwrap_or(0);
+        buffer.write_u64::<BigEndian>(root_page_id)?;
+        buffer.write_u64::<BigEndian>(value.next_page_id)?;
+        buffer.write_u32::<BigEndian>(value.free_pages.len() as _)?;
+        for free_page_id in &value.free_pages {
+            buffer.write_u64::<BigEndian>(*free_page_id)?;
+        }
+        buffer.resize(PAGE_SIZE, 0);
+        // We can unwrap here as we are sure that buffer size is `PAGE_SIZE`.
+        Ok(buffer.try_into().unwrap())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +306,13 @@ mod tests {
         std::fs::write(&path, contents).unwrap();
         temp_file.flush().unwrap();
         temp_file
+    }
+
+    fn read_metadata_from_disk(path: &std::path::Path) -> FileMetadata {
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        file.read_exact(&mut buf).unwrap();
+        FileMetadata::try_from(buf).unwrap()
     }
 
     #[test]
@@ -517,5 +566,90 @@ mod tests {
         let mut buf = vec![0u8; PAGE_SIZE * 2];
         file.read_exact(&mut buf).unwrap();
         assert_eq!(&buf[PAGE_SIZE..], &new_page);
+    }
+
+    #[test]
+    fn file_manager_allocate_page_new_page() {
+        // given a file with a valid metadata page and one data page, no free pages
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let page1 = [1u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and allocating a new page
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let allocated = manager.allocate_page().unwrap();
+
+        // then the new page id is 2 (next_page_id before allocation)
+        assert_eq!(allocated, 2);
+
+        // and file size increased by one page
+        let metadata = std::fs::metadata(temp_file.path()).unwrap();
+        assert_eq!(metadata.len(), PAGE_SIZE as u64 * 3);
+
+        // and metadata on disk is updated
+        let disk_metadata = read_metadata_from_disk(temp_file.path());
+        assert_eq!(disk_metadata.next_page_id, 3);
+    }
+
+    #[test]
+    fn file_manager_allocate_page_from_free_list() {
+        // given a file with a valid metadata page and page 2 marked as free
+        let metadata_page = create_metadata_page(None, 3, &[2]);
+        let page1 = [1u8; PAGE_SIZE];
+        let page2 = [2u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        file_content.extend_from_slice(&page2);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and allocating a page
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let allocated = manager.allocate_page().unwrap();
+
+        // then the allocated page is 2 (from free list)
+        assert_eq!(allocated, 2);
+
+        // and file size is unchanged
+        let metadata = std::fs::metadata(temp_file.path()).unwrap();
+        assert_eq!(metadata.len(), PAGE_SIZE as u64 * 3);
+
+        // and metadata on disk is updated (free_pages is now empty)
+        let disk_metadata = read_metadata_from_disk(temp_file.path());
+        assert_eq!(disk_metadata.next_page_id, 3);
+        assert!(disk_metadata.free_pages.is_empty());
+    }
+
+    #[test]
+    fn file_manager_allocate_page_multiple() {
+        // given a file with a valid metadata page and two free pages
+        let metadata_page = create_metadata_page(None, 4, &[2, 3]);
+        let page1 = [1u8; PAGE_SIZE];
+        let page2 = [2u8; PAGE_SIZE];
+        let page3 = [3u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        file_content.extend_from_slice(&page2);
+        file_content.extend_from_slice(&page3);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and allocating two pages
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let first = manager.allocate_page().unwrap();
+        let second = manager.allocate_page().unwrap();
+
+        // then both pages come from the free list (order not guaranteed)
+        assert!(first == 2 || first == 3);
+        assert!(second == 2 || second == 3);
+        assert_ne!(first, second);
+
+        // and metadata on disk is updated (free_pages is now empty)
+        let disk_metadata = read_metadata_from_disk(temp_file.path());
+        assert_eq!(disk_metadata.next_page_id, 4);
+        assert!(disk_metadata.free_pages.is_empty());
     }
 }
