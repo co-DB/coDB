@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fs,
-    io::{self, Cursor, ErrorKind, Read},
+    io::{self, Cursor, ErrorKind, Read, Seek},
     path::Path,
 };
 
@@ -77,8 +77,22 @@ impl FileManager {
     }
 
     /// Reads page with id equal to `page_id` from underlying file. Can fail if io error occurs or `page_id` is not valid.
-    pub fn read_page(&self, page_id: PageId) -> Result<Page, FileManagerError> {
-        todo!()
+    pub fn read_page(&mut self, page_id: PageId) -> Result<Page, FileManagerError> {
+        let is_metadata = page_id == METADATA_PAGE_ID;
+        let is_free = self.metadata.free_pages.contains(&page_id);
+        let is_unallocated = page_id >= self.metadata.next_page_id;
+
+        if is_metadata || is_free || is_unallocated {
+            return Err(FileManagerError::InvalidPageId(page_id));
+        }
+
+        let start = PAGE_SIZE as u64 * page_id;
+        self.handle.seek(io::SeekFrom::Start(start))?;
+
+        let mut buffer = [0u8; PAGE_SIZE];
+        self.handle.read_exact(&mut buffer)?;
+
+        Ok(buffer)
     }
 
     /// Writes new `page` to page with id `page_id`. It flushes the newly written page to disk, so be careful as it might be bottleneck if used incorrectly.
@@ -328,5 +342,79 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn file_manager_read_page_metadata_page_should_fail() {
+        // given a file with a valid metadata page and one data page
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let page_data = [1u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page_data);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and reading page 0 (metadata)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.read_page(0);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(0))));
+    }
+
+    #[test]
+    fn file_manager_read_page_free_page_should_fail() {
+        // given a file with a valid metadata page and page 2 marked as free
+        let metadata_page = create_metadata_page(None, 3, &[2]);
+        let page1 = [1u8; PAGE_SIZE];
+        let page2 = [2u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        file_content.extend_from_slice(&page2);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and reading page 2 (free)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.read_page(2);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+    }
+
+    #[test]
+    fn file_manager_read_page_unallocated_page_should_fail() {
+        // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let page1 = [1u8; PAGE_SIZE];
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page1);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and reading page 2 (unallocated)
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let result = manager.read_page(2);
+
+        // then error is returned
+        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+    }
+
+    #[test]
+    fn file_manager_read_page_valid_page() {
+        // given a file with a valid metadata page and one data page
+        let page_data = [42u8; PAGE_SIZE];
+        let metadata_page = create_metadata_page(None, 2, &[]);
+        let mut file_content = Vec::new();
+        file_content.extend_from_slice(&metadata_page);
+        file_content.extend_from_slice(&page_data);
+        let temp_file = write_temp_file_with_content(&file_content);
+
+        // when loading FileManager and reading page 1
+        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        let read = manager.read_page(1).unwrap();
+
+        // then the page data is correct
+        assert_eq!(read, page_data);
     }
 }
