@@ -63,7 +63,7 @@ impl FileManager {
     where
         P: AsRef<Path>,
     {
-        // It returns error if existance of the file at `file_path` cannot be checked, e.g.
+        // It returns error if existence of the file at `file_path` cannot be checked, e.g.
         // if we don't have permission to read that file. I don't think there is anything we can do about it,
         // so just return underlying error in that case.
         let exists = file_path.as_ref().try_exists()?;
@@ -107,7 +107,7 @@ impl FileManager {
         Ok(buffer)
     }
 
-    /// Writes new `page` to page with id `page_id`. It flushes the newly written page to disk, so be careful as it might be bottleneck if used incorrectly.
+    /// Writes new `page` to page with id `page_id`. It does not flush newly written page to disk. For this check [`FileManager::flush`].
     /// Page with id `page_id` must be allocated before writing to it. Can fail if io error occurs or `page_id` is not valid.
     pub fn write_page(&mut self, page_id: PageId, page: Page) -> Result<(), FileManagerError> {
         if self.is_invalid_page_id(page_id) {
@@ -116,7 +116,6 @@ impl FileManager {
 
         self.seek_page(page_id)?;
         self.handle.write_all(&page)?;
-        self.handle.flush()?;
 
         Ok(())
     }
@@ -165,6 +164,12 @@ impl FileManager {
         Ok(())
     }
 
+    /// Flushes file content to disk ensuring it's synced with in-memory state. Can fail if io error occurs.
+    pub fn flush(&mut self) -> Result<(), FileManagerError> {
+        self.handle.sync_all()?;
+        Ok(())
+    }
+
     /// Returns id of root page. Can be `None` if `root_page_id` was not set yet (it's not set automatically when new file is created).
     pub fn root_page_id(&self) -> Option<PageId> {
         self.metadata.root_page_id
@@ -199,7 +204,6 @@ impl FileManager {
         let metadata_page = Page::try_from(&self.metadata)?;
         self.seek_page(Self::METADATA_PAGE_ID)?;
         self.handle.write_all(&metadata_page)?;
-        self.handle.flush()?;
         Ok(())
     }
 
@@ -219,20 +223,27 @@ impl TryFrom<fs::File> for FileManager {
     fn try_from(mut value: fs::File) -> Result<Self, Self::Error> {
         let mut metadata_buffer = [0u8; PAGE_SIZE];
         if let Err(e) = value.read_exact(&mut metadata_buffer) {
-            match e.kind() {
-                ErrorKind::UnexpectedEof => {
-                    return Err(FileManagerError::InvalidFileFormat(
-                        "file shorter than one page",
-                    ));
-                }
-                _ => return Err(FileManagerError::IoError(e)),
-            }
+            return match e.kind() {
+                ErrorKind::UnexpectedEof => Err(FileManagerError::InvalidFileFormat(
+                    "file shorter than one page",
+                )),
+                _ => Err(FileManagerError::IoError(e)),
+            };
         }
         let file_metadata = FileMetadata::try_from(metadata_buffer)?;
         Ok(FileManager {
             handle: value,
             metadata: file_metadata,
         })
+    }
+}
+
+/// Make sure that all in-memory changes have been flushed to disk before dropping [`FileManager`].
+impl Drop for FileManager {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush() {
+            log::error!("failed to flush file content while dropping FileManager: {e}");
+        }
     }
 }
 
@@ -337,7 +348,6 @@ mod tests {
     use super::*;
     use byteorder::{BigEndian, WriteBytesExt};
     use std::collections::HashSet;
-    use std::io::Write;
     use tempfile::NamedTempFile;
 
     fn create_metadata_page(
@@ -362,10 +372,9 @@ mod tests {
     }
 
     fn write_temp_file_with_content(contents: &[u8]) -> NamedTempFile {
-        let mut temp_file = NamedTempFile::new().unwrap();
+        let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
         std::fs::write(&path, contents).unwrap();
-        temp_file.flush().unwrap();
         temp_file
     }
 
@@ -638,6 +647,7 @@ mod tests {
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         let new_page = [42u8; PAGE_SIZE];
         manager.write_page(1, new_page).unwrap();
+        manager.flush().unwrap();
 
         // then the file contains the new data at page 1
         let mut file = std::fs::File::open(temp_file.path()).unwrap();
@@ -654,6 +664,7 @@ mod tests {
         // when loading FileManager and allocating a new page
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         let allocated = manager.allocate_page().unwrap();
+        manager.flush().unwrap();
 
         // then the new page id is 2 (next_page_id before allocation)
         assert_eq!(allocated, 2);
@@ -675,6 +686,7 @@ mod tests {
         // when loading FileManager and allocating a page
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         let allocated = manager.allocate_page().unwrap();
+        manager.flush().unwrap();
 
         // then the allocated page is 2 (from free list)
         assert_eq!(allocated, 2);
@@ -698,6 +710,7 @@ mod tests {
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         let first = manager.allocate_page().unwrap();
         let second = manager.allocate_page().unwrap();
+        manager.flush().unwrap();
 
         // then both pages come from the free list (order not guaranteed)
         assert!(first == 2 || first == 3);
@@ -757,6 +770,7 @@ mod tests {
         // when loading FileManager and setting root page id to 1
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         manager.set_root_page_id(1).unwrap();
+        manager.flush().unwrap();
 
         // then root_page_id is updated in memory
         assert_eq!(manager.root_page_id(), Some(1));
@@ -813,6 +827,7 @@ mod tests {
         // when loading FileManager and freeing page 2
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         manager.free_page(2).unwrap();
+        manager.flush().unwrap();
 
         // then page 2 is in free_pages in memory
         assert!(manager.metadata.free_pages.contains(&2));
@@ -830,6 +845,7 @@ mod tests {
         // when loading FileManager and truncating
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         manager.truncate().unwrap();
+        manager.flush().unwrap();
 
         // then next_page_id is 3 (pages 3 and 4 removed)
         assert_eq!(manager.metadata.next_page_id, 3);
@@ -853,6 +869,7 @@ mod tests {
         // when loading FileManager and truncating
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         manager.truncate().unwrap();
+        manager.flush().unwrap();
 
         // then next_page_id is unchanged
         assert_eq!(manager.metadata.next_page_id, 5);
@@ -875,6 +892,7 @@ mod tests {
         // when loading FileManager and truncating
         let mut manager = FileManager::new(temp_file.path()).unwrap();
         manager.truncate().unwrap();
+        manager.flush().unwrap();
 
         // then next_page_id is 1 (only metadata page remains)
         assert_eq!(manager.metadata.next_page_id, 1);
