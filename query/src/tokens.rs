@@ -1,12 +1,12 @@
 ﻿#[derive(Debug, PartialEq, Clone)]
-pub enum Token {
+pub enum TokenType {
     Ident(String),
     Int(i64),
     Float(f64),
     String(String),
     LParen,
     RParen,
-    Illegal(usize, String),
+    Illegal(String),
     EOF,
     Comma,
     NotEqual,
@@ -33,4 +33,20 @@ pub enum Token {
     Star, // This is used for both select statements and multiplication - needs to be handled correctly in parser
     And,
     Or
+}
+
+pub struct Token {
+    pub token_type: TokenType,
+    pub column: usize,
+    pub line: usize,
+}
+
+impl Token {
+    pub fn new(token_type: TokenType, column: usize, line: usize) -> Token {
+        Token{
+            token_type,
+            column,
+            line
+        }
+    }
 }
