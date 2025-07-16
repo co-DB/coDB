@@ -50,11 +50,17 @@ SELECT, FROM, WHERE, INSERT, INTO, VALUES, UPDATE, SET, DELETE, TRUE, FALSE
 ```
 
 #### Literals
+String can contain the following escape sequences:
 
+- `\\` — Backslash
+- `\'` — Single quote
+- `\n` — Newline
+- `\r` — Carriage return
+- `\t` — Horizontal tab
 ```
  <literal> :: <string> | <float> | <int> | <bool>
  <string> ::  "'"character*"'"
- <float> :: <digit>*.<digit><digit>*
+ <float> :: <digit>*.<digit><digit>* | <digit><digit>*.<digit>*
  <int> :: <digit><digit>*
  <bool> :: 'TRUE' | 'FALSE'
 ```
