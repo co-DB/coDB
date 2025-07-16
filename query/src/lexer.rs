@@ -257,7 +257,7 @@ impl Lexer {
                 if self.ch.is_alphabetic() {
                     let ident = self.read_identifier();
                     return self.match_multichar_keywords(ident);
-                } else if self.ch.is_numeric() {
+                } else if self.ch.is_ascii_digit() {
                     return self.read_numeric()
                 } else {
                     self.create_token(TokenType::Illegal(format!("unrecognized character: '{}'", self.ch)))
@@ -494,7 +494,7 @@ mod tests {
 
         assert_works(&mut lexer, &expected_tokens);
     }
-    
+
     #[test]
     fn test_valid_escape_sequences() {
         let input = "select 'Tab:\\t' from users where desc = 'Quote:\\' and slash:\\\\ \\x';";
@@ -516,7 +516,7 @@ mod tests {
 
         assert_works(&mut lexer, &expected_tokens);
     }
-    
+
     #[test]
     fn test_numbers_edge_cases() {
         let input = "select 123 456.789 999. .123 . from users;";
