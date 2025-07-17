@@ -32,31 +32,21 @@ impl Ast {
         &self.statements
     }
 
-    /// Returns node with `node_id`. Can fail if `node_id` is invalid. Note that every element in ast is guaranteed to have valid `node_id`.
-    pub fn node(&self, node_id: usize) -> Result<&Expression, AstError> {
-        match self.is_valid_node_id(node_id) {
-            true => Ok(&self.nodes[node_id]),
-            false => Err(AstError::InvalidNodeId(node_id)),
-        }
+    /// Returns node with `node_id`.
+    pub fn node(&self, node_id: NodeId) -> &Expression {
+        &self.nodes[node_id.0]
     }
 
-    /// Adds node to [`Ast`] and returns its `node_id`. Can fail if [`AstElementValidator::validate`] implementation for node returns error.
-    pub(crate) fn add_node(&mut self, node: Expression) -> Result<usize, AstError> {
-        node.validate(self)?;
+    /// Adds node to [`Ast`] and returns its id.
+    pub(crate) fn add_node(&mut self, node: Expression) -> NodeId {
         self.nodes.push(node);
-        Ok(self.nodes.len() - 1)
+        NodeId::new(self.nodes.len() - 1)
     }
 
-    /// Adds statement to [`Ast`] and returns its `statement_id`. Can fail if [`AstElementValidator::validate`] implementation for statement returns error.
-    pub(crate) fn add_statement(&mut self, statement: Statement) -> Result<usize, AstError> {
-        statement.validate(self)?;
+    /// Adds statement to [`Ast`] and returns its id.
+    pub(crate) fn add_statement(&mut self, statement: Statement) -> NodeId {
         self.statements.push(statement);
-        Ok(self.statements.len() - 1)
-    }
-
-    /// Helper for testing if `node_id` is valid for given [`Ast`].
-    fn is_valid_node_id(&self, node_id: usize) -> bool {
-        node_id < self.nodes.len()
+        NodeId::new(self.statements.len() - 1)
     }
 }
 
@@ -66,33 +56,15 @@ impl Default for Ast {
     }
 }
 
-/// A common trait for validating if element can be added to [`Ast`]
-trait AstElementValidator {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError>;
-}
+/// [`NodeId`] is used for indexing nodes inside of [`Ast`].
+///
+/// It's a wrapper around `usize`, but thanks to it being our custom type, fact that it can only be created inside `ast` ([`NodeId::new`] is private) and a fact that we don't allow to remove nodes once added to [`Ast`] we can assume that each [`NodeId`] is correct and don't need to validate it each time we want to add new node.
+#[derive(Clone, Copy)]
+pub struct NodeId(usize);
 
-fn validate_id(ast: &Ast, id: usize) -> Result<(), AstError> {
-    match ast.is_valid_node_id(id) {
-        true => Ok(()),
-        false => Err(AstError::InvalidNodeId(id)),
-    }
-}
-
-fn validate_optional_id(ast: &Ast, id: &Option<usize>) -> Result<(), AstError> {
-    match id {
-        Some(id) => validate_id(ast, *id),
-        None => Ok(()),
-    }
-}
-
-fn validate_ids(ast: &Ast, ids: &[usize]) -> Result<(), AstError> {
-    ids.iter().try_for_each(|&id| validate_id(ast, id))
-}
-
-fn validate_optional_ids(ast: &Ast, ids: &Option<Vec<usize>>) -> Result<(), AstError> {
-    match ids {
-        Some(ids) => validate_ids(ast, ids),
-        None => Ok(()),
+impl NodeId {
+    fn new(id: usize) -> Self {
+        NodeId(id)
     }
 }
 
@@ -103,79 +75,27 @@ pub enum Statement {
     Delete(DeleteStatement),
 }
 
-impl AstElementValidator for Statement {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        match self {
-            Statement::Select(statement) => statement.validate(ast),
-            Statement::Insert(statement) => statement.validate(ast),
-            Statement::Update(statement) => statement.validate(ast),
-            Statement::Delete(statement) => statement.validate(ast),
-        }
-    }
-}
-
 pub struct SelectStatement {
-    pub column_ids: Option<Vec<usize>>,
-    pub table_name_id: usize,
-    pub where_clause_id: Option<usize>,
-}
-
-impl AstElementValidator for SelectStatement {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        validate_optional_ids(ast, &self.column_ids)?;
-        validate_id(ast, self.table_name_id)?;
-        validate_optional_id(ast, &self.where_clause_id)?;
-        Ok(())
-    }
+    pub column_ids: Option<Vec<NodeId>>,
+    pub table_name_id: NodeId,
+    pub where_clause_id: Option<NodeId>,
 }
 
 pub struct InsertStatement {
-    pub table_name_id: usize,
-    pub column_ids: Option<Vec<usize>>,
-    pub value_ids: Vec<usize>,
-}
-
-impl AstElementValidator for InsertStatement {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        validate_id(ast, self.table_name_id)?;
-        validate_optional_ids(ast, &self.column_ids)?;
-        validate_ids(ast, &self.value_ids)?;
-        Ok(())
-    }
+    pub table_name_id: NodeId,
+    pub column_ids: Option<Vec<NodeId>>,
+    pub value_ids: Vec<NodeId>,
 }
 
 pub struct UpdateStatement {
-    pub table_name_id: usize,
-    pub column_setters: Vec<(usize, usize)>,
-    pub where_clause_id: Option<usize>,
-}
-
-impl AstElementValidator for UpdateStatement {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        validate_id(ast, self.table_name_id)?;
-        let column_setter_ids: Vec<_> = self
-            .column_setters
-            .iter()
-            .copied()
-            .flat_map(|(lhs, rhs)| [lhs, rhs])
-            .collect();
-        validate_ids(ast, &column_setter_ids)?;
-        validate_optional_id(ast, &self.where_clause_id)?;
-        Ok(())
-    }
+    pub table_name_id: NodeId,
+    pub column_setters: Vec<(NodeId, NodeId)>,
+    pub where_clause_id: Option<NodeId>,
 }
 
 pub struct DeleteStatement {
-    pub table_name_id: usize,
-    pub where_clause_id: Option<usize>,
-}
-
-impl AstElementValidator for DeleteStatement {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        validate_id(ast, self.table_name_id)?;
-        validate_optional_id(ast, &self.where_clause_id)?;
-        Ok(())
-    }
+    pub table_name_id: NodeId,
+    pub where_clause_id: Option<NodeId>,
 }
 
 pub enum Type {
@@ -205,37 +125,16 @@ pub enum Expression {
     Identifier(IdentifierNode),
 }
 
-impl AstElementValidator for Expression {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        match self {
-            Expression::Logical(node) => node.validate(ast),
-            Expression::Binary(node) => node.validate(ast),
-            Expression::Unary(node) => node.validate(ast),
-            Expression::FunctionCall(node) => node.validate(ast),
-            Expression::Literal(node) => node.validate(ast),
-            Expression::Identifier(node) => node.validate(ast),
-        }
-    }
-}
-
 pub enum LogicalOperator {
     And,
     Or,
 }
 
 pub struct LogicalExpressionNode {
-    pub left_id: usize,
-    pub right_id: usize,
+    pub left_id: NodeId,
+    pub right_id: NodeId,
     pub op: LogicalOperator,
     pub ty: Type,
-}
-
-impl AstElementValidator for LogicalExpressionNode {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        validate_id(ast, self.left_id)?;
-        validate_id(ast, self.right_id)?;
-        Ok(())
-    }
 }
 
 pub enum BinaryOperator {
@@ -253,18 +152,10 @@ pub enum BinaryOperator {
 }
 
 pub struct BinaryExpressionNode {
-    pub left_id: usize,
-    pub right_id: usize,
+    pub left_id: NodeId,
+    pub right_id: NodeId,
     pub op: BinaryOperator,
     pub ty: Type,
-}
-
-impl AstElementValidator for BinaryExpressionNode {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        validate_id(ast, self.left_id)?;
-        validate_id(ast, self.right_id)?;
-        Ok(())
-    }
 }
 
 pub enum UnaryOperator {
@@ -273,30 +164,15 @@ pub enum UnaryOperator {
 }
 
 pub struct UnaryExpressionNode {
-    pub expression_id: usize,
+    pub expression_id: NodeId,
     pub op: UnaryOperator,
     pub ty: Type,
 }
 
-impl AstElementValidator for UnaryExpressionNode {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        validate_id(ast, self.expression_id)?;
-        Ok(())
-    }
-}
-
 pub struct FunctionCallNode {
-    pub identifier_id: usize,
-    pub argument_ids: Vec<usize>,
+    pub identifier_id: NodeId,
+    pub argument_ids: Vec<NodeId>,
     pub ty: Type,
-}
-
-impl AstElementValidator for FunctionCallNode {
-    fn validate(&self, ast: &Ast) -> Result<(), AstError> {
-        validate_id(ast, self.identifier_id)?;
-        validate_ids(ast, &self.argument_ids)?;
-        Ok(())
-    }
 }
 
 pub struct LiteralNode {
@@ -304,21 +180,9 @@ pub struct LiteralNode {
     pub ty: Type,
 }
 
-impl AstElementValidator for LiteralNode {
-    fn validate(&self, _ast: &Ast) -> Result<(), AstError> {
-        Ok(())
-    }
-}
-
 pub struct IdentifierNode {
     pub value: String,
     pub ty: Type,
-}
-
-impl AstElementValidator for IdentifierNode {
-    fn validate(&self, _ast: &Ast) -> Result<(), AstError> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -326,18 +190,16 @@ mod tests {
     use super::*;
 
     // Helper to create a simple identifier node and return its id
-    fn add_identifier(ast: &mut Ast, name: &str, ty: Type) -> usize {
+    fn add_identifier(ast: &mut Ast, name: &str, ty: Type) -> NodeId {
         ast.add_node(Expression::Identifier(IdentifierNode {
             value: name.to_string(),
             ty,
         }))
-        .unwrap()
     }
 
     // Helper to create a literal node and return its id
-    fn add_literal(ast: &mut Ast, lit: Literal, ty: Type) -> usize {
+    fn add_literal(ast: &mut Ast, lit: Literal, ty: Type) -> NodeId {
         ast.add_node(Expression::Literal(LiteralNode { value: lit, ty }))
-            .unwrap()
     }
 
     #[test]
@@ -347,12 +209,65 @@ mod tests {
         let id = add_identifier(&mut ast, "foo", Type::I32);
 
         // when retrieving the node by id
-        let expr = ast.node(id).unwrap();
+        let expr = ast.node(id);
 
         // then it is the expected identifier node
         match expr {
             Expression::Identifier(node) => assert_eq!(node.value, "foo"),
             _ => panic!("Expected IdentifierNode"),
+        }
+    }
+
+    #[test]
+    fn ast_add_binary_expression() {
+        // given a new AST and two literal nodes
+        let mut ast = Ast::new();
+        let left = add_literal(&mut ast, Literal::I32(1), Type::I32);
+        let right = add_literal(&mut ast, Literal::I32(2), Type::I32);
+
+        // when adding a binary expression
+        let expr_id = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: left,
+            right_id: right,
+            op: BinaryOperator::Plus,
+            ty: Type::I32,
+        }));
+
+        // then the node is present and correct
+        let expr = ast.node(expr_id);
+        match expr {
+            Expression::Binary(node) => {
+                assert_eq!(node.left_id.0, left.0);
+                assert_eq!(node.right_id.0, right.0);
+            }
+            _ => panic!("Expected BinaryExpressionNode"),
+        }
+    }
+
+    #[test]
+    fn ast_add_function_call() {
+        // given a new AST, a function identifier, and two argument literals
+        let mut ast = Ast::new();
+        let func_id = add_identifier(&mut ast, "SUM", Type::I32);
+        let arg1 = add_literal(&mut ast, Literal::I32(10), Type::I32);
+        let arg2 = add_literal(&mut ast, Literal::I32(20), Type::I32);
+
+        // when adding a function call node with those arguments
+        let call_id = ast.add_node(Expression::FunctionCall(FunctionCallNode {
+            identifier_id: func_id,
+            argument_ids: vec![arg1, arg2],
+            ty: Type::I32,
+        }));
+
+        // then the node is present and has the correct arguments
+        let expr = ast.node(call_id);
+        match expr {
+            Expression::FunctionCall(node) => {
+                assert_eq!(node.argument_ids.len(), 2);
+                assert_eq!(node.argument_ids[0].0, arg1.0);
+                assert_eq!(node.argument_ids[1].0, arg2.0);
+            }
+            _ => panic!("Expected FunctionCallNode"),
         }
     }
 
@@ -370,69 +285,69 @@ mod tests {
             where_clause_id: None,
         });
 
-        // then it succeeds
-        assert!(ast.add_statement(stmt).is_ok());
+        // then it is added to the AST
+        ast.add_statement(stmt);
+        assert_eq!(ast.statements().len(), 1);
     }
 
     #[test]
-    fn ast_add_select_statement_with_invalid_column_id() {
-        // given a new AST and a valid table node
+    fn ast_add_insert_statement() {
+        // given a new AST, a table node, column nodes, and value nodes
         let mut ast = Ast::new();
-        let table_id = add_identifier(&mut ast, "table", Type::String);
+        let table_id = add_identifier(&mut ast, "users", Type::String);
+        let col_id1 = add_identifier(&mut ast, "id", Type::I32);
+        let col_id2 = add_identifier(&mut ast, "name", Type::String);
+        let val_id1 = add_literal(&mut ast, Literal::I32(1), Type::I32);
+        let val_id2 = add_literal(&mut ast, Literal::String("Alice".to_string()), Type::String);
 
-        // when adding a select statement with an invalid column id
-        let stmt = Statement::Select(SelectStatement {
-            column_ids: Some(vec![999]),
+        // when adding an insert statement
+        let stmt = Statement::Insert(InsertStatement {
             table_name_id: table_id,
-            where_clause_id: None,
+            column_ids: Some(vec![col_id1, col_id2]),
+            value_ids: vec![val_id1, val_id2],
         });
 
-        // then it fails
-        assert!(ast.add_statement(stmt).is_err());
+        // then it is added to the AST
+        ast.add_statement(stmt);
+        assert_eq!(ast.statements().len(), 1);
     }
 
     #[test]
-    fn ast_add_binary_expression_with_invalid_id() {
-        // given a new AST and a valid left literal node
+    fn ast_add_update_statement() {
+        // given a new AST, a table node, column/value nodes, and a where clause
         let mut ast = Ast::new();
-        let left = add_literal(&mut ast, Literal::I32(1), Type::I32);
+        let table_id = add_identifier(&mut ast, "users", Type::String);
+        let col_id = add_identifier(&mut ast, "name", Type::String);
+        let val_id = add_literal(&mut ast, Literal::String("Bob".to_string()), Type::String);
+        let where_id = add_literal(&mut ast, Literal::I32(1), Type::I32);
 
-        // when adding a binary expression with an invalid right id
-        let expr = Expression::Binary(BinaryExpressionNode {
-            left_id: left,
-            right_id: 1234,
-            op: BinaryOperator::Plus,
-            ty: Type::I32,
+        // when adding an update statement
+        let stmt = Statement::Update(UpdateStatement {
+            table_name_id: table_id,
+            column_setters: vec![(col_id, val_id)],
+            where_clause_id: Some(where_id),
         });
 
-        // then it fails
-        assert!(ast.add_node(expr).is_err());
+        // then it is added to the AST
+        ast.add_statement(stmt);
+        assert_eq!(ast.statements().len(), 1);
     }
 
     #[test]
-    fn ast_add_function_call() {
-        // given a new AST, a function identifier, and two argument literals
+    fn ast_add_delete_statement() {
+        // given a new AST, a table node, and a where clause
         let mut ast = Ast::new();
-        let func_id = add_identifier(&mut ast, "SUM", Type::I32);
-        let arg1 = add_literal(&mut ast, Literal::I32(10), Type::I32);
-        let arg2 = add_literal(&mut ast, Literal::I32(20), Type::I32);
+        let table_id = add_identifier(&mut ast, "users", Type::String);
+        let where_id = add_literal(&mut ast, Literal::I32(1), Type::I32);
 
-        // when adding a function call node with those arguments
-        let call_id = ast
-            .add_node(Expression::FunctionCall(FunctionCallNode {
-                identifier_id: func_id,
-                argument_ids: vec![arg1, arg2],
-                ty: Type::I32,
-            }))
-            .unwrap();
+        // when adding a delete statement
+        let stmt = Statement::Delete(DeleteStatement {
+            table_name_id: table_id,
+            where_clause_id: Some(where_id),
+        });
 
-        // then the node is present and has the correct arguments
-        let expr = ast.node(call_id).unwrap();
-        match expr {
-            Expression::FunctionCall(node) => {
-                assert_eq!(node.argument_ids.len(), 2);
-            }
-            _ => panic!("Expected FunctionCallNode"),
-        }
+        // then it is added to the AST
+        ast.add_statement(stmt);
+        assert_eq!(ast.statements().len(), 1);
     }
 }
