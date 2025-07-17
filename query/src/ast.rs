@@ -105,6 +105,8 @@ pub enum Type {
     I32,
     I64,
     Bool,
+    Column,
+    Table,
 }
 
 pub enum Literal {
