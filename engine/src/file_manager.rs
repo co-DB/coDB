@@ -21,7 +21,7 @@ type Page = [u8; PAGE_SIZE];
 
 /// Responsible for managing a single on-disk file.
 /// Only this structure should be responsible for directly communicating with disk.
-///   
+///
 /// File managed by [`FileManager`] is divided into fixed-size pages.
 ///
 /// Page 0 (first page) is a special page that should be used by [`FileManager`] for storing metadata ([`FileMetadata`]). It means that each file will be at least one page long, even when they have no other content, but this is a trade-off for better pages alignment. For more details about structure of the first page look at [`FileMetadata`].
