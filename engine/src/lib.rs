@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod disk;
 
 pub fn add(left: u64, right: u64) -> u64 {
