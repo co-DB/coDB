@@ -44,7 +44,7 @@ impl FileKey {
 ///
 /// As a singleton it allows the ['FileManager']s to persist beyond a single query and thus
 /// eliminates the time needed to instantiate them each time.
-struct DiscManager {
+struct DiskManager {
     open_files: HashMap<FileKey, FileManager>,
     base_path: PathBuf,
 }
@@ -58,7 +58,7 @@ pub enum DiscManagerError{
     FileManagerError(#[from] FileManagerError),
 }
 
-impl DiscManager {
+impl DiskManager {
     /// Creates a new DiscManager that handles files for a single database, whose name is passed to 
     /// this function as an argument 
     /// 
@@ -69,7 +69,7 @@ impl DiscManager {
             None => Err(DiscManagerError::DirectoryNotFound),
             Some(project_dir) => {
                 let base_path = project_dir.data_local_dir().to_path_buf().join(database_name);
-                Ok(DiscManager{
+                Ok(DiskManager {
                     open_files: HashMap::new(),
                     base_path,
                 })
@@ -91,13 +91,5 @@ impl DiscManager {
     /// a table is deleted or renamed.
     pub fn close_file(&mut self, key: &FileKey) {
         self.open_files.remove(key);
-    }
-
-    #[cfg(test)]
-    fn with_base_path(base_path: PathBuf) -> Self {
-        Self {
-            open_files: HashMap::new(),
-            base_path,
-        }
     }
 }
