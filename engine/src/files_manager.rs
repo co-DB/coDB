@@ -1,10 +1,12 @@
-﻿use crate::paged_file::{PagedFile, PagedFileError};
+﻿//! FilesManager module — manages and distributes paged files in a single database.
+
+use crate::paged_file::{PagedFile, PagedFileError};
 use directories::ProjectDirs;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Represents possible file types inside a table directory (refer to file_structure.md for more
+/// Represents possible file types inside a table directory (refer to `docs/file_structure.md` for more
 /// details)
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 enum FileType {
@@ -44,35 +46,35 @@ impl FileKey {
 ///
 /// As a singleton it allows the [`PagedFile`]s to persist beyond a single query and thus
 /// eliminates the time needed to instantiate them each time.
-pub struct DiskManager {
+pub struct FilesManager {
     open_files: HashMap<FileKey, PagedFile>,
     base_path: PathBuf,
 }
 
-/// Error for [`DiskManager`] related operations
+/// Error for [`FilesManager`] related operations
 #[derive(Error, Debug)]
-pub enum DiscManagerError {
+pub enum FilesManagerError {
     #[error("couldn't find the data directory")]
     DirectoryNotFound,
     #[error("paged file error: {0}")]
     PagedFileError(#[from] PagedFileError),
 }
 
-impl DiskManager {
-    /// Creates a new [`DiskManager`] that handles files for a single database, whose name is passed to
+impl FilesManager {
+    /// Creates a new [`FilesManager`] that handles files for a single database, whose name is passed to
     /// this function as an argument
     ///
-    /// Can fail if the directory in which we want to store the data (refer to file_structure.md for
+    /// Can fail if the directory in which we want to store the data (refer to `docs/file_structure.md` for
     /// OS-specific details) doesn't exist.
-    pub fn new(database_name: &str) -> Result<Self, DiscManagerError> {
+    pub fn new(database_name: &str) -> Result<Self, FilesManagerError> {
         match ProjectDirs::from("", "", "CoDB") {
-            None => Err(DiscManagerError::DirectoryNotFound),
+            None => Err(FilesManagerError::DirectoryNotFound),
             Some(project_dir) => {
                 let base_path = project_dir
                     .data_local_dir()
                     .to_path_buf()
                     .join(database_name);
-                Ok(DiskManager {
+                Ok(FilesManager {
                     open_files: HashMap::new(),
                     base_path,
                 })
@@ -88,7 +90,7 @@ impl DiskManager {
     pub fn get_or_open_new_file(
         &mut self,
         key: FileKey,
-    ) -> Result<&mut PagedFile, DiscManagerError> {
+    ) -> Result<&mut PagedFile, FilesManagerError> {
         let file_path = self.base_path.join(&key.table_name);
         Ok(self
             .open_files
