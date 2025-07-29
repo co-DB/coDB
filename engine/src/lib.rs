@@ -1,6 +1,6 @@
 pub mod catalog;
-pub mod file_manager;
 pub mod disk_manager;
+pub mod paged_file;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right

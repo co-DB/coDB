@@ -13,7 +13,7 @@ use thiserror::Error;
 /// Type representing page id, should be used instead of using bare `u64`.
 type PageId = u64;
 
-/// Size of each page in [`FileManager`].
+/// Size of each page in [`PagedFile`].
 const PAGE_SIZE: usize = 4096; // 4 kB
 
 /// Type representing page, should be used instead of bare array of bytes.
@@ -22,24 +22,24 @@ type Page = [u8; PAGE_SIZE];
 /// Responsible for managing a single on-disk file.
 /// Only this structure should be responsible for directly communicating with disk.
 ///
-/// File managed by [`FileManager`] is divided into fixed-size pages.
+/// File managed by [`PagedFile`] is divided into fixed-size pages.
 ///
-/// Page 0 (first page) is a special page that should be used by [`FileManager`] for storing metadata ([`FileMetadata`]). It means that each file will be at least one page long, even when they have no other content, but this is a trade-off for better pages alignment. For more details about structure of the first page look at [`FileMetadata`].
-/// Pages from 1 to N have no defined format from [FileManager]'s perspective - its sole responsibility is to allow reading, writing and allocating pages.
-pub struct FileManager {
+/// Page 0 (first page) is a special page that should be used by [`PagedFile`] for storing metadata ([`FileMetadata`]). It means that each file will be at least one page long, even when they have no other content, but this is a trade-off for better pages alignment. For more details about structure of the first page look at [`FileMetadata`].
+/// Pages from 1 to N have no defined format from [PagedFile]'s perspective - its sole responsibility is to allow reading, writing and allocating pages.
+pub struct PagedFile {
     /// handle to underlying file
     handle: fs::File,
     /// file's metadata
     metadata: FileMetadata,
 }
 
-/// Error for [`FileManager`] related operations.
+/// Error for [`PagedFile`] related operations.
 #[derive(Error, Debug)]
-pub enum FileManagerError {
+pub enum PagedFileError {
     /// Provided page id was invalid, e.g. tried to read [`METADATA_PAGE_ID`]
     #[error("invalid page id: {0}")]
     InvalidPageId(PageId),
-    /// File used for loading [`FileManager`] has invalid format
+    /// File used for loading [`PagedFile`] has invalid format
     #[error("file has invalid format: {0}")]
     InvalidFileFormat(&'static str),
     /// Underlying IO module returned error
@@ -47,19 +47,19 @@ pub enum FileManagerError {
     IoError(#[source] io::Error),
 }
 
-impl From<io::Error> for FileManagerError {
+impl From<io::Error> for PagedFileError {
     fn from(err: io::Error) -> Self {
-        FileManagerError::IoError(err)
+        PagedFileError::IoError(err)
     }
 }
 
-impl FileManager {
-    /// Metadata page id - page with this id should only be used internally by [`FileManager`].
+impl PagedFile {
+    /// Metadata page id - page with this id should only be used internally by [`PagedFile`].
     const METADATA_PAGE_ID: PageId = 0;
 
-    /// Creates a new instance of [`FileManager`]. When `file_path` points to existing file it
+    /// Creates a new instance of [`PagedFile`]. When `file_path` points to existing file it
     /// tries to load it from there, otherwise it creates new file at `file_path`.
-    pub fn new<P>(file_path: P) -> Result<FileManager, FileManagerError>
+    pub fn new<P>(file_path: P) -> Result<PagedFile, PagedFileError>
     where
         P: AsRef<Path>,
     {
@@ -73,7 +73,7 @@ impl FileManager {
                     .read(true)
                     .write(true)
                     .open(&file_path)?;
-                FileManager::try_from(file)
+                PagedFile::try_from(file)
             }
             false => {
                 let file = fs::OpenOptions::new()
@@ -83,21 +83,21 @@ impl FileManager {
                     .truncate(true)
                     .open(&file_path)?;
                 let metadata = FileMetadata::default();
-                let mut fm = FileManager {
+                let mut pf = PagedFile {
                     handle: file,
                     metadata,
                 };
-                fm.update_size()?;
-                fm.sync_metadata()?;
-                Ok(fm)
+                pf.update_size()?;
+                pf.sync_metadata()?;
+                Ok(pf)
             }
         }
     }
 
     /// Reads page with id equal to `page_id` from underlying file. Can fail if io error occurs or `page_id` is not valid.
-    pub fn read_page(&mut self, page_id: PageId) -> Result<Page, FileManagerError> {
+    pub fn read_page(&mut self, page_id: PageId) -> Result<Page, PagedFileError> {
         if self.is_invalid_page_id(page_id) {
-            return Err(FileManagerError::InvalidPageId(page_id));
+            return Err(PagedFileError::InvalidPageId(page_id));
         }
 
         self.seek_page(page_id)?;
@@ -107,11 +107,11 @@ impl FileManager {
         Ok(buffer)
     }
 
-    /// Writes new `page` to page with id `page_id`. It does not flush newly written page to disk. For this check [`FileManager::flush`].
+    /// Writes new `page` to page with id `page_id`. It does not flush newly written page to disk. For this check [`PagedFile::flush`].
     /// Page with id `page_id` must be allocated before writing to it. Can fail if io error occurs or `page_id` is not valid.
-    pub fn write_page(&mut self, page_id: PageId, page: Page) -> Result<(), FileManagerError> {
+    pub fn write_page(&mut self, page_id: PageId, page: Page) -> Result<(), PagedFileError> {
         if self.is_invalid_page_id(page_id) {
-            return Err(FileManagerError::InvalidPageId(page_id));
+            return Err(PagedFileError::InvalidPageId(page_id));
         }
 
         self.seek_page(page_id)?;
@@ -123,7 +123,7 @@ impl FileManager {
     /// Allocates new page and returns its `PageId`. If there is a free page in [`FileMetadata`]'s `free_pages` it uses it,
     /// otherwise creates new page. Returned page id is guaranteed to point to page that is not used.
     /// Can fail if io error occurs.
-    pub fn allocate_page(&mut self) -> Result<PageId, FileManagerError> {
+    pub fn allocate_page(&mut self) -> Result<PageId, PagedFileError> {
         let page_id = if self.metadata.free_pages.is_empty() {
             let page_id = self.metadata.next_page_id;
             self.metadata.next_page_id += 1;
@@ -141,16 +141,16 @@ impl FileManager {
 
     /// Frees page with `page_id` so that it can be reused later.
     /// It doesn't erase the page content, but adds its `page_id` to [`FileMetadata`]'s `free_pages`.
-    pub fn free_page(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
+    pub fn free_page(&mut self, page_id: PageId) -> Result<(), PagedFileError> {
         if self.is_invalid_page_id(page_id) {
-            return Err(FileManagerError::InvalidPageId(page_id));
+            return Err(PagedFileError::InvalidPageId(page_id));
         }
         self.metadata.free_pages.insert(page_id);
         self.sync_metadata()
     }
 
     /// Truncates the file - remove unused allocated pages from the end of the file. Can fail if io error occurs.
-    pub fn truncate(&mut self) -> Result<(), FileManagerError> {
+    pub fn truncate(&mut self) -> Result<(), PagedFileError> {
         while self
             .metadata
             .free_pages
@@ -165,7 +165,7 @@ impl FileManager {
     }
 
     /// Flushes file content to disk ensuring it's synced with in-memory state. Can fail if io error occurs.
-    pub fn flush(&mut self) -> Result<(), FileManagerError> {
+    pub fn flush(&mut self) -> Result<(), PagedFileError> {
         self.handle.sync_all()?;
         Ok(())
     }
@@ -176,16 +176,16 @@ impl FileManager {
     }
 
     /// Sets new root page id. `page_id` must be already pointing to allocated page. Can fail if `page_id` is not valid.
-    pub fn set_root_page_id(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
+    pub fn set_root_page_id(&mut self, page_id: PageId) -> Result<(), PagedFileError> {
         if self.is_invalid_page_id(page_id) {
-            return Err(FileManagerError::InvalidPageId(page_id));
+            return Err(PagedFileError::InvalidPageId(page_id));
         }
         self.metadata.root_page_id = Some(page_id);
         self.sync_metadata()
     }
 
     /// Seeks underlying file handle to the start of the page with `page_id`.
-    fn seek_page(&mut self, page_id: PageId) -> Result<(), FileManagerError> {
+    fn seek_page(&mut self, page_id: PageId) -> Result<(), PagedFileError> {
         let start = PAGE_SIZE as u64 * page_id;
         self.handle.seek(io::SeekFrom::Start(start))?;
         Ok(())
@@ -200,7 +200,7 @@ impl FileManager {
     }
 
     /// Syncs in-memory metadata with data stored in [`METADATA_PAGE_ID`] page.
-    fn sync_metadata(&mut self) -> Result<(), FileManagerError> {
+    fn sync_metadata(&mut self) -> Result<(), PagedFileError> {
         let metadata_page = Page::try_from(&self.metadata)?;
         self.seek_page(Self::METADATA_PAGE_ID)?;
         self.handle.write_all(&metadata_page)?;
@@ -208,48 +208,48 @@ impl FileManager {
     }
 
     /// Updates size of underlying file to hold `next_page_id * PAGE_SIZE` bytes
-    fn update_size(&mut self) -> Result<(), FileManagerError> {
+    fn update_size(&mut self) -> Result<(), PagedFileError> {
         let new_size = self.metadata.next_page_id * PAGE_SIZE as u64;
         self.handle.set_len(new_size)?;
         Ok(())
     }
 }
 
-/// Try to deserialize existing [`FileManager`] from file. Can fail if io error occurrs or if underlying file
+/// Try to deserialize existing [`PagedFile`] from file. Can fail if io error occurrs or if underlying file
 /// has invalid format.
-impl TryFrom<fs::File> for FileManager {
-    type Error = FileManagerError;
+impl TryFrom<fs::File> for PagedFile {
+    type Error = PagedFileError;
 
     fn try_from(mut value: fs::File) -> Result<Self, Self::Error> {
         let mut metadata_buffer = [0u8; PAGE_SIZE];
         if let Err(e) = value.read_exact(&mut metadata_buffer) {
             return match e.kind() {
-                ErrorKind::UnexpectedEof => Err(FileManagerError::InvalidFileFormat(
+                ErrorKind::UnexpectedEof => Err(PagedFileError::InvalidFileFormat(
                     "file shorter than one page",
                 )),
-                _ => Err(FileManagerError::IoError(e)),
+                _ => Err(PagedFileError::IoError(e)),
             };
         }
         let file_metadata = FileMetadata::try_from(metadata_buffer)?;
-        Ok(FileManager {
+        Ok(PagedFile {
             handle: value,
             metadata: file_metadata,
         })
     }
 }
 
-/// Make sure that all in-memory changes have been flushed to disk before dropping [`FileManager`].
-impl Drop for FileManager {
+/// Make sure that all in-memory changes have been flushed to disk before dropping [`PagedFile`].
+impl Drop for PagedFile {
     fn drop(&mut self) {
         if let Err(e) = self.flush() {
-            log::error!("failed to flush file content while dropping FileManager: {e}");
+            log::error!("failed to flush file content while dropping PagedFile: {e}");
         }
     }
 }
 
 /// Storage for file metadata.
 ///
-/// [`FileMetadata`] is always stored in first page of the file. It contains metadata information used by [`FileManager`] -
+/// [`FileMetadata`] is always stored in first page of the file. It contains metadata information used by [`PagedFile`] -
 /// no other struct should directly use it (it should not be exported outside this module).
 ///
 /// Format of the first page in the file is as follows:
@@ -278,14 +278,14 @@ impl FileMetadata {
 
 /// Should be used to deserialize [`FileMetadata`] from [`Page`].
 impl TryFrom<Page> for FileMetadata {
-    type Error = FileManagerError;
+    type Error = PagedFileError;
 
     fn try_from(value: Page) -> Result<Self, Self::Error> {
         let mut cursor = Cursor::new(value);
         let mut magic_number = [0u8; 4];
         cursor.read_exact(&mut magic_number)?;
         if magic_number != Self::CODB_MAGIC_NUMBER {
-            return Err(FileManagerError::InvalidFileFormat("invalid magic number"));
+            return Err(PagedFileError::InvalidFileFormat("invalid magic number"));
         }
         let root_page_value = cursor.read_u64::<BigEndian>()?;
         let root_page_id = match root_page_value {
@@ -309,7 +309,7 @@ impl TryFrom<Page> for FileMetadata {
 
 /// Should be used to serialize [`FileMetadata`] into [`Page`]
 impl TryFrom<&FileMetadata> for Page {
-    type Error = FileManagerError;
+    type Error = PagedFileError;
 
     fn try_from(value: &FileMetadata) -> Result<Self, Self::Error> {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
@@ -327,7 +327,7 @@ impl TryFrom<&FileMetadata> for Page {
     }
 }
 
-/// Should be used when creating new [`FileManager`]
+/// Should be used when creating new [`PagedFile`]
 impl Default for FileMetadata {
     fn default() -> Self {
         let next_page_id = Self::DEFAULT_NEXT_PAGE_ID;
@@ -407,27 +407,27 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_new_creates_file_and_metadata() {
+    fn paged_file_new_creates_file_and_metadata() {
         // given a path to a non-existent file
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("new_db_file.codb");
         assert!(!file_path.exists());
 
-        // when creating FileManager
-        let manager = FileManager::new(&file_path).unwrap();
+        // when creating PagedFile
+        let paged_file = PagedFile::new(&file_path).unwrap();
 
         // then file is created
         assert!(file_path.exists());
 
         // and metadata is initialized as expected
-        assert_eq!(manager.root_page_id(), None);
+        assert_eq!(paged_file.root_page_id(), None);
         assert_eq!(
-            manager.metadata.next_page_id,
+            paged_file.metadata.next_page_id,
             FileMetadata::DEFAULT_NEXT_PAGE_ID
         );
         let expected_free: std::collections::HashSet<_> =
             (1..FileMetadata::DEFAULT_NEXT_PAGE_ID).collect();
-        assert_eq!(manager.metadata.free_pages, expected_free);
+        assert_eq!(paged_file.metadata.free_pages, expected_free);
 
         // and file size is correct
         let metadata = std::fs::metadata(&file_path).unwrap();
@@ -447,41 +447,41 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_from_file_file_too_small() {
+    fn paged_file_from_file_file_too_small() {
         // given file with size < `PAGE_SIZE`
         let temp_file = write_temp_file_with_content(&[1, 2, 3]);
 
-        // when try to load `FileManager` from it
-        let result = FileManager::new(temp_file.path());
+        // when try to load `PagedFile` from it
+        let result = PagedFile::new(temp_file.path());
 
         // then error is returned
         assert!(matches!(
             result.err().unwrap(),
-            FileManagerError::InvalidFileFormat(msg)
+            PagedFileError::InvalidFileFormat(msg)
                 if msg == "file shorter than one page"
         ));
     }
 
     #[test]
-    fn file_manager_from_file_invalid_magic_number() {
+    fn paged_file_from_file_invalid_magic_number() {
         // given page with invalid magic number
         let mut bad_page = [0u8; PAGE_SIZE];
         bad_page[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         let temp_file = write_temp_file_with_content(&bad_page);
 
-        // when try to load `FileManager` from it
-        let result = FileManager::new(temp_file.path());
+        // when try to load `PagedFile` from it
+        let result = PagedFile::new(temp_file.path());
 
         // then error is returned
         assert!(matches!(
             result.err().unwrap(),
-            FileManagerError::InvalidFileFormat(msg)
+            PagedFileError::InvalidFileFormat(msg)
                 if msg == "invalid magic number"
         ));
     }
 
     #[test]
-    fn file_manager_from_file_valid_metadata_cases() {
+    fn paged_file_from_file_valid_metadata_cases() {
         struct TestCase {
             name: &'static str,
             root: Option<u64>,
@@ -521,22 +521,22 @@ mod tests {
             let page = create_metadata_page(case.root, case.next, &case.free);
             let temp_file = write_temp_file_with_content(&page);
 
-            // when try to load `FileManager` from it
-            let manager = FileManager::new(temp_file.path()).unwrap();
+            // when try to load `PagedFile` from it
+            let paged_file = PagedFile::new(temp_file.path()).unwrap();
 
-            // then `FileManager` instance is returned
+            // then `PagedFile` instance is returned
             assert_eq!(
-                manager.metadata.root_page_id, case.root,
+                paged_file.metadata.root_page_id, case.root,
                 "root_page_id failed for case '{}'",
                 case.name
             );
             assert_eq!(
-                manager.metadata.next_page_id, case.next,
+                paged_file.metadata.next_page_id, case.next,
                 "next_page_id failed for case '{}'",
                 case.name
             );
             assert_eq!(
-                manager.metadata.free_pages,
+                paged_file.metadata.free_pages,
                 case.free.iter().cloned().collect::<HashSet<_>>(),
                 "free_pages failed for case '{}'",
                 case.name
@@ -545,109 +545,109 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_read_page_metadata_page() {
+    fn paged_file_read_page_metadata_page() {
         // given a file with a valid metadata page and one data page
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and reading page 0 (metadata)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.read_page(0);
+        // when loading PagedFile and reading page 0 (metadata)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.read_page(0);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(0))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(0))));
     }
 
     #[test]
-    fn file_manager_read_page_free_page() {
+    fn paged_file_read_page_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
-        // when loading FileManager and reading page 2 (free)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.read_page(2);
+        // when loading PagedFile and reading page 2 (free)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.read_page(2);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
     }
 
     #[test]
-    fn file_manager_read_page_unallocated_page() {
+    fn paged_file_read_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and reading page 2 (unallocated)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.read_page(2);
+        // when loading PagedFile and reading page 2 (unallocated)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.read_page(2);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
     }
 
     #[test]
-    fn file_manager_read_page_valid_page() {
+    fn paged_file_read_page_valid_page() {
         // given a file with a valid metadata page and one data page
         let (temp_file, pages) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[42]);
 
-        // when loading FileManager and reading page 1
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let read = manager.read_page(1).unwrap();
+        // when loading PagedFile and reading page 1
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let read = paged_file.read_page(1).unwrap();
 
         // then the page data is correct
         assert_eq!(read, pages[0]);
     }
 
     #[test]
-    fn file_manager_write_page_metadata_page() {
+    fn paged_file_write_page_metadata_page() {
         // given a file with a valid metadata page and one data page
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and writing to page 0 (metadata)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        // when loading PagedFile and writing to page 0 (metadata)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
         let new_page = [42u8; PAGE_SIZE];
-        let result = manager.write_page(0, new_page);
+        let result = paged_file.write_page(0, new_page);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(0))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(0))));
     }
 
     #[test]
-    fn file_manager_write_page_free_page() {
+    fn paged_file_write_page_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
-        // when loading FileManager and writing to page 2 (free)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        // when loading PagedFile and writing to page 2 (free)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
         let new_page = [42u8; PAGE_SIZE];
-        let result = manager.write_page(2, new_page);
+        let result = paged_file.write_page(2, new_page);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
     }
 
     #[test]
-    fn file_manager_write_page_unallocated_page() {
+    fn paged_file_write_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and writing to page 2 (unallocated)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        // when loading PagedFile and writing to page 2 (unallocated)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
         let new_page = [42u8; PAGE_SIZE];
-        let result = manager.write_page(2, new_page);
+        let result = paged_file.write_page(2, new_page);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
     }
 
     #[test]
-    fn file_manager_write_page_valid_page() {
+    fn paged_file_write_page_valid_page() {
         // given a file with a valid metadata page and one data page
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and writing new data to page 1
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
+        // when loading PagedFile and writing new data to page 1
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
         let new_page = [42u8; PAGE_SIZE];
-        manager.write_page(1, new_page).unwrap();
-        manager.flush().unwrap();
+        paged_file.write_page(1, new_page).unwrap();
+        paged_file.flush().unwrap();
 
         // then the file contains the new data at page 1
         let mut file = std::fs::File::open(temp_file.path()).unwrap();
@@ -657,14 +657,14 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_allocate_page_new_page() {
+    fn paged_file_allocate_page_new_page() {
         // given a file with a valid metadata page and one data page, no free pages
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and allocating a new page
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let allocated = manager.allocate_page().unwrap();
-        manager.flush().unwrap();
+        // when loading PagedFile and allocating a new page
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let allocated = paged_file.allocate_page().unwrap();
+        paged_file.flush().unwrap();
 
         // then the new page id is 2 (next_page_id before allocation)
         assert_eq!(allocated, 2);
@@ -679,14 +679,14 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_allocate_page_from_free_list() {
+    fn paged_file_allocate_page_from_free_list() {
         // given a file with a valid metadata page and page 2 marked as free
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
-        // when loading FileManager and allocating a page
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let allocated = manager.allocate_page().unwrap();
-        manager.flush().unwrap();
+        // when loading PagedFile and allocating a page
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let allocated = paged_file.allocate_page().unwrap();
+        paged_file.flush().unwrap();
 
         // then the allocated page is 2 (from free list)
         assert_eq!(allocated, 2);
@@ -702,15 +702,15 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_allocate_page_multiple() {
+    fn paged_file_allocate_page_multiple() {
         // given a file with a valid metadata page and two free pages
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 4, &[2, 3], &[1, 2, 3]);
 
-        // when loading FileManager and allocating two pages
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let first = manager.allocate_page().unwrap();
-        let second = manager.allocate_page().unwrap();
-        manager.flush().unwrap();
+        // when loading PagedFile and allocating two pages
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let first = paged_file.allocate_page().unwrap();
+        let second = paged_file.allocate_page().unwrap();
+        paged_file.flush().unwrap();
 
         // then both pages come from the free list (order not guaranteed)
         assert!(first == 2 || first == 3);
@@ -724,56 +724,56 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_set_root_page_id_metadata_page() {
+    fn paged_file_set_root_page_id_metadata_page() {
         // given a file with a valid metadata page and one data page
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and setting root page id to 0 (metadata)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.set_root_page_id(0);
+        // when loading PagedFile and setting root page id to 0 (metadata)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.set_root_page_id(0);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(0))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(0))));
     }
 
     #[test]
-    fn file_manager_set_root_page_id_free_page() {
+    fn paged_file_set_root_page_id_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
-        // when loading FileManager and setting root page id to 2 (free)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.set_root_page_id(2);
+        // when loading PagedFile and setting root page id to 2 (free)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.set_root_page_id(2);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
     }
 
     #[test]
-    fn file_manager_set_root_page_id_unallocated_page() {
+    fn paged_file_set_root_page_id_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and setting root page id to 2 (unallocated)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.set_root_page_id(2);
+        // when loading PagedFile and setting root page id to 2 (unallocated)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.set_root_page_id(2);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
     }
 
     #[test]
-    fn file_manager_set_root_page_id_valid() {
+    fn paged_file_set_root_page_id_valid() {
         // given a file with a valid metadata page and one data page
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and setting root page id to 1
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        manager.set_root_page_id(1).unwrap();
-        manager.flush().unwrap();
+        // when loading PagedFile and setting root page id to 1
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        paged_file.set_root_page_id(1).unwrap();
+        paged_file.flush().unwrap();
 
         // then root_page_id is updated in memory
-        assert_eq!(manager.root_page_id(), Some(1));
+        assert_eq!(paged_file.root_page_id(), Some(1));
 
         // and metadata on disk is updated
         let disk_metadata = read_metadata_from_disk(temp_file.path());
@@ -781,56 +781,56 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_free_page_metadata_page() {
+    fn paged_file_free_page_metadata_page() {
         // given a file with a valid metadata page and one data page
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and freeing page 0 (metadata)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.free_page(0);
+        // when loading PagedFile and freeing page 0 (metadata)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.free_page(0);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(0))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(0))));
     }
 
     #[test]
-    fn file_manager_free_page_free_page() {
+    fn paged_file_free_page_free_page() {
         // given a file with a valid metadata page and page 2 already free
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
 
-        // when loading FileManager and freeing page 2 again
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.free_page(2);
+        // when loading PagedFile and freeing page 2 again
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.free_page(2);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
     }
 
     #[test]
-    fn file_manager_free_page_unallocated_page() {
+    fn paged_file_free_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
 
-        // when loading FileManager and freeing page 2 (unallocated)
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        let result = manager.free_page(2);
+        // when loading PagedFile and freeing page 2 (unallocated)
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        let result = paged_file.free_page(2);
 
         // then error is returned
-        assert!(matches!(result, Err(FileManagerError::InvalidPageId(2))));
+        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
     }
 
     #[test]
-    fn file_manager_free_page_valid() {
+    fn paged_file_free_page_valid() {
         // given a file with a valid metadata page and two data pages
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[], &[1, 2]);
 
-        // when loading FileManager and freeing page 2
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        manager.free_page(2).unwrap();
-        manager.flush().unwrap();
+        // when loading PagedFile and freeing page 2
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        paged_file.free_page(2).unwrap();
+        paged_file.flush().unwrap();
 
         // then page 2 is in free_pages in memory
-        assert!(manager.metadata.free_pages.contains(&2));
+        assert!(paged_file.metadata.free_pages.contains(&2));
 
         // and metadata on disk is updated
         let disk_metadata = read_metadata_from_disk(temp_file.path());
@@ -838,17 +838,17 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_truncate_removes_free_pages_at_end() {
+    fn paged_file_truncate_removes_free_pages_at_end() {
         // given a file with 4 pages, pages 3 and 4 are free
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 5, &[3, 4], &[1, 2, 3, 4]);
 
-        // when loading FileManager and truncating
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        manager.truncate().unwrap();
-        manager.flush().unwrap();
+        // when loading PagedFile and truncating
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        paged_file.truncate().unwrap();
+        paged_file.flush().unwrap();
 
         // then next_page_id is 3 (pages 3 and 4 removed)
-        assert_eq!(manager.metadata.next_page_id, 3);
+        assert_eq!(paged_file.metadata.next_page_id, 3);
 
         // and file size is 3 pages (metadata + 2 data)
         let metadata = std::fs::metadata(temp_file.path()).unwrap();
@@ -862,17 +862,17 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_truncate_no_free_pages_at_end() {
+    fn paged_file_truncate_no_free_pages_at_end() {
         // given a file with 4 pages, only page 2 is free (not at the end)
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 5, &[2], &[1, 2, 3, 4]);
 
-        // when loading FileManager and truncating
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        manager.truncate().unwrap();
-        manager.flush().unwrap();
+        // when loading PagedFile and truncating
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        paged_file.truncate().unwrap();
+        paged_file.flush().unwrap();
 
         // then next_page_id is unchanged
-        assert_eq!(manager.metadata.next_page_id, 5);
+        assert_eq!(paged_file.metadata.next_page_id, 5);
 
         // and file size is unchanged
         let metadata = std::fs::metadata(temp_file.path()).unwrap();
@@ -885,17 +885,17 @@ mod tests {
     }
 
     #[test]
-    fn file_manager_truncate_all_pages_free() {
+    fn paged_file_truncate_all_pages_free() {
         // given a file with 3 pages, all data pages are free
         let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[1, 2], &[1, 2]);
 
-        // when loading FileManager and truncating
-        let mut manager = FileManager::new(temp_file.path()).unwrap();
-        manager.truncate().unwrap();
-        manager.flush().unwrap();
+        // when loading PagedFile and truncating
+        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
+        paged_file.truncate().unwrap();
+        paged_file.flush().unwrap();
 
         // then next_page_id is 1 (only metadata page remains)
-        assert_eq!(manager.metadata.next_page_id, 1);
+        assert_eq!(paged_file.metadata.next_page_id, 1);
 
         // and file size is 1 page (metadata only)
         let metadata = std::fs::metadata(temp_file.path()).unwrap();
