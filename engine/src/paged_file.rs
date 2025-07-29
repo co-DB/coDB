@@ -1,4 +1,4 @@
-//! Disk module — abstraction layer for managing on-disk files and page operations.
+//! PagedFile module — abstraction layer for managing on-disk paged-files and page operations.
 
 use std::{
     collections::HashSet,
