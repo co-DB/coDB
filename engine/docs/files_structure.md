@@ -1,16 +1,15 @@
 ## coDB files structure
 
-All coDB files are stored in a special directory named `.coDB`.  
-- On Linux, this is located at `~/.coDB`.
-- On Windows, it is located at `%APPDATA%\.coDB`.
+All coDB files are stored in a special directory:  
+- On Linux, this is located at `$HOME/.local/share/codb`.
+- On Windows, it is located at `C:\Users\$USER\AppData\Roaming\CoDB\data`.
 
 
 ### Structure
 
-At the top level inside the `.coDB` directory are subdirectories for each database. For example, `database-A` contains data for the database named "database-A":
+At the top level inside the directory there are subdirectories for each database. For example, `database-A` contains data for the database named "database-A":
 
 ```text
-.coDB
     /database-A
     /database-B
     /database-C
@@ -19,7 +18,6 @@ At the top level inside the `.coDB` directory are subdirectories for each databa
 Inside each database directory, there is a metadata file (`metadata.coDB`) and directories for each table:
 
 ```text
-.coDB
     /database-A
         metadata.coDB
         /table-A
@@ -32,7 +30,6 @@ Each table directory contains two files:
 - `table_name.tbl`: Stores table rows using slotted pages.
 
 ```text
-.coDB
     /database-A
         metadata.coDB
         /table-A
@@ -42,4 +39,4 @@ Each table directory contains two files:
 
 ### Assumptions
 
-Files used in coDB must match the exact layout described in this documentation. Any deviation can result in unexpected behaviour. Currently, changing the location of the `.coDB` directory is not supported, but this may change in the future.
+Files used in coDB must match the exact layout described in this documentation. Any deviation can result in unexpected behaviour. Currently, changing the location of the main coDB directory is not supported, but this may change in the future.
