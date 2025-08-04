@@ -32,7 +32,7 @@ pub enum TokenType {
     Set,
     Star, // This is used for both select statements and multiplication - needs to be handled correctly in parser
     And,
-    Or
+    Or,
 }
 
 pub struct Token {
@@ -43,10 +43,10 @@ pub struct Token {
 
 impl Token {
     pub fn new(token_type: TokenType, column: usize, line: usize) -> Token {
-        Token{
+        Token {
             token_type,
             column,
-            line
+            line,
         }
     }
 }
