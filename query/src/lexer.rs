@@ -1,6 +1,5 @@
 ﻿use super::tokens::{Token, TokenType};
 
-
 /// Responsible for transforming an input CoSQL string into a stream of [`Token`]s.
 ///
 /// The [`Lexer`] processes the input character-by-character, keeping track of current position,
@@ -44,7 +43,7 @@ impl Lexer {
     /// Creates tokens from the token type that automatically includes column and line from
     /// ['Lexer'] internal state.
     fn create_token(&self, token_type: TokenType) -> Token {
-        Token::new(token_type,self.column,self.line)
+        Token::new(token_type, self.column, self.line)
     }
 
     /// Reads the next char and updates ['Lexer'] internal state, while accounting for EOFs and
@@ -63,7 +62,6 @@ impl Lexer {
         self.read_pos += 1;
         self.column += 1;
     }
-
 
     /// Checks if current position is at the end of input.
     fn is_at_end(&self) -> bool {
@@ -127,13 +125,17 @@ impl Lexer {
             let float: String = self.input[pos..self.pos].iter().collect();
             match float.parse::<f64>() {
                 Ok(float) => self.create_token(TokenType::Float(float)),
-                Err(_) => self.create_token(TokenType::Illegal(format!("invalid float literal: '{float}'"))),
+                Err(_) => self.create_token(TokenType::Illegal(format!(
+                    "invalid float literal: '{float}'"
+                ))),
             }
         } else {
             let integer: String = self.input[pos..self.pos].iter().collect();
             match integer.parse::<i64>() {
                 Ok(integer) => self.create_token(TokenType::Int(integer)),
-                Err(_) => self.create_token(TokenType::Illegal(format!("Invalid integer literal: '{integer}'"))),
+                Err(_) => self.create_token(TokenType::Illegal(format!(
+                    "Invalid integer literal: '{integer}'"
+                ))),
             }
         }
     }
@@ -205,39 +207,36 @@ impl Lexer {
     pub fn next_token(&mut self) -> Token {
         self.skip_whitespace();
         let token = match self.ch {
-            '!' => {
-                match self.peek_char() {
-                    '=' => {
-                        self.read_char();
-                        self.create_token(TokenType::NotEqual)
-                    }
-                    _ => self.create_token(TokenType::Illegal(String::from("invalid character literal"))),
+            '!' => match self.peek_char() {
+                '=' => {
+                    self.read_char();
+                    self.create_token(TokenType::NotEqual)
                 }
-            }
-            '>' => {
-                match self.peek_char() {
-                    '=' => {
-                        self.read_char();
-                        self.create_token(TokenType::GreaterEqual)
-                    }
-                    _ => self.create_token(TokenType::Greater),
+                _ => self.create_token(TokenType::Illegal(String::from(
+                    "invalid character literal",
+                ))),
+            },
+            '>' => match self.peek_char() {
+                '=' => {
+                    self.read_char();
+                    self.create_token(TokenType::GreaterEqual)
                 }
-            }
-            '<' => {
-                match self.peek_char() {
-                    '=' => {
-                        self.read_char();
-                        self.create_token(TokenType::LessEqual)
-                    }
-                    _ => self.create_token(TokenType::Less),
+                _ => self.create_token(TokenType::Greater),
+            },
+            '<' => match self.peek_char() {
+                '=' => {
+                    self.read_char();
+                    self.create_token(TokenType::LessEqual)
                 }
-            }
-            '.' => {
-                match self.peek_char() {
-                    peak_ch if peak_ch.is_ascii_digit() => self.read_numeric(),
-                    _ => self.create_token(TokenType::Illegal(format!("unrecognized character: '{}'", self.ch))),
-                }
-            }
+                _ => self.create_token(TokenType::Less),
+            },
+            '.' => match self.peek_char() {
+                peak_ch if peak_ch.is_ascii_digit() => self.read_numeric(),
+                _ => self.create_token(TokenType::Illegal(format!(
+                    "unrecognized character: '{}'",
+                    self.ch
+                ))),
+            },
             '+' => self.create_token(TokenType::Plus),
             '-' => self.create_token(TokenType::Minus),
             '/' => self.create_token(TokenType::Divide),
@@ -258,9 +257,12 @@ impl Lexer {
                     let ident = self.read_identifier();
                     return self.match_multichar_keywords(ident);
                 } else if self.ch.is_ascii_digit() {
-                    return self.read_numeric()
+                    return self.read_numeric();
                 } else {
-                    self.create_token(TokenType::Illegal(format!("unrecognized character: '{}'", self.ch)))
+                    self.create_token(TokenType::Illegal(format!(
+                        "unrecognized character: '{}'",
+                        self.ch
+                    )))
                 }
             }
         };
@@ -277,8 +279,11 @@ mod tests {
     fn assert_works(lexer: &mut Lexer, expected_tokens: &[TokenType]) {
         for token in expected_tokens {
             let actual_token = lexer.next_token();
-            assert_eq!(token, &actual_token.token_type,
-                       "Token {token:?} doesn't match actual token {:?}", &actual_token.token_type);
+            assert_eq!(
+                token, &actual_token.token_type,
+                "Token {token:?} doesn't match actual token {:?}",
+                &actual_token.token_type
+            );
         }
     }
 
@@ -303,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_upper_lower_case(){
+    fn test_upper_lower_case() {
         let input = "select Select SELECT sElEcT insert INSERT WHERE wHerE";
 
         let mut lexer = Lexer::new(input);
@@ -538,5 +543,4 @@ mod tests {
 
         assert_works(&mut lexer, &expected_tokens);
     }
-
 }
