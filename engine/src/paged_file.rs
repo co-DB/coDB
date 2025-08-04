@@ -899,7 +899,7 @@ mod tests {
 
         // and file size is 1 page (metadata only)
         let metadata = std::fs::metadata(temp_file.path()).unwrap();
-        assert_eq!(metadata.len(), PAGE_SIZE as u64 * 1);
+        assert_eq!(metadata.len(), PAGE_SIZE as u64);
 
         // and metadata on disk is updated
         let disk_metadata = read_metadata_from_disk(temp_file.path());
