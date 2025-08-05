@@ -1,6 +1,6 @@
 //! Catalog module - manages tables metadata.
 
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap, fs, path::Path};
 
 use thiserror::Error;
 
@@ -20,34 +20,55 @@ pub struct Catalog {
 /// Error for [`Catalog`] related operations
 #[derive(Error, Debug)]
 pub enum CatalogError {
-    // TODO: fill when implementing catalog
+    /// Table with provided name does not exist in `tables`
+    #[error("table '{0}' not found")]
+    TableNotFound(String),
+    /// Table with provided name already exists in `tables`
+    #[error("table '{0}' already exists")]
+    TableAlreadyExists(String),
 }
 
 impl Catalog {
     /// Creates new instance of [`Catalog`] for database `database_name`.
     /// Can fail if database does not exist or io error occurs.
-    pub fn new(database_name: &str) -> Result<Self, CatalogError> {
+    pub fn new<P>(main_dir_path: P, database_name: &str) -> Result<Self, CatalogError>
+    where
+        P: AsRef<Path>,
+    {
+        let path = main_dir_path.as_ref().join(database_name);
         todo!()
     }
 
     /// Returns table with `table_name` name.
-    /// Can fail if table with `table_name` name does not exist.
+    /// Returns `None` if table with `table_name` name does not exist.
     pub fn table(&self, table_name: &str) -> Result<&TableMetadata, CatalogError> {
-        todo!()
+        self.tables
+            .get(table_name)
+            .ok_or(CatalogError::TableNotFound(table_name.into()))
     }
 
     /// Adds `table` to list of tables in the catalog.
     /// IMPORTANT NOTE: this function is purely for changing contents of `metadata.coDB` file. It is NOT responsible for managing table related files (e.g. creating new b-tree).
     /// Can fail if table with same name already exists.
     pub fn add_table(&mut self, table: TableMetadata) -> Result<(), CatalogError> {
-        todo!()
+        let already_exists = self.tables.contains_key(&table.name);
+        match already_exists {
+            true => Err(CatalogError::TableAlreadyExists(table.name)),
+            false => {
+                self.tables.insert(table.name.clone(), table);
+                Ok(())
+            }
+        }
     }
 
     /// Removes table with `table_name` name from list of tables in the catalog.
     /// IMPORTANT NOTE: this function is purely for changing contents of `metadata.coDB` file. It is NOT responsible for managing table related files (e.g. removing folder `.{PATH_TO_CODB}/{DATABASE_NAME}/{TABLE_NAME}` and its files).
     /// Can fail if table with `table_name` does not exist.
     pub fn remove_table(&mut self, table_name: &str) -> Result<(), CatalogError> {
-        todo!()
+        self.tables
+            .remove(table_name)
+            .ok_or(CatalogError::TableNotFound(table_name.into()))
+            .map(|_| ())
     }
 
     /// Syncs in-memory [`Catalog`] instance with underlying file.
@@ -71,24 +92,63 @@ pub struct TableMetadata {
 /// Error for [`TableMetadata`] related operations
 #[derive(Error, Debug)]
 pub enum TableMetadataError {
-    // TODO: fill when implementing TableMetadata
+    /// While creating [`TableMetadata`] there were more than one column with the same name in `columns`
+    #[error("column '{0}' was defined more than once")]
+    DuplicatedColumn(String),
+    /// While creating [`TableMetadata`] `primary_key_column_name` was set to column which names does not appear in `columns`
+    #[error("unknown primary key column: {0}")]
+    UnknownPrimaryKeyColumn(String),
+    /// Column with provided name does not exist in `columns`
+    #[error("column '{0}' not found")]
+    ColumnNotFound(String),
+    /// Column with provided names already exists in `columns`
+    #[error("column '{0}' already exists")]
+    ColumnAlreadyExists(String),
+    /// Invalid columns was used for operation, e.g. tried to remove primary key column
+    #[error("column '{0}' cannot be used in that context")]
+    InvalidColumnUsed(String),
 }
 
 impl TableMetadata {
     /// Creates new [`TableMetadata`].
     /// Can fail if columns slice contains more than one column with the same name or `primary_key_column_name` is not in `columns`.
     pub fn new(
-        name: &str,
+        name: impl Into<String>,
         columns: &[ColumnMetadata],
-        primary_key_column_name: String,
+        primary_key_column_name: impl Into<String>,
     ) -> Result<Self, TableMetadataError> {
-        todo!()
+        let mut table_columns = Vec::with_capacity(columns.len());
+        let mut table_columns_by_name = HashMap::with_capacity(columns.len());
+        for (idx, column) in columns.iter().enumerate() {
+            if table_columns_by_name.contains_key(&column.name) {
+                return Err(TableMetadataError::DuplicatedColumn(column.name.clone()));
+            }
+            table_columns.push(column.clone());
+            table_columns_by_name.insert(column.name.clone(), idx);
+        }
+
+        let primary_key_column_name = primary_key_column_name.into();
+        if !table_columns_by_name.contains_key(&primary_key_column_name) {
+            return Err(TableMetadataError::UnknownPrimaryKeyColumn(
+                primary_key_column_name,
+            ));
+        }
+
+        Ok(TableMetadata {
+            name: name.into(),
+            columns: table_columns,
+            columns_by_name: table_columns_by_name,
+            primary_key_column_name,
+        })
     }
 
     /// Returns column metadata for column with `column_name`.
     /// Can fail if column with `column_name` does not exist.
     pub fn column(&self, column_name: &str) -> Result<&ColumnMetadata, TableMetadataError> {
-        todo!()
+        self.columns_by_name
+            .get(column_name)
+            .map(|&idx| &self.columns[idx])
+            .ok_or(TableMetadataError::ColumnNotFound(column_name.into()))
     }
 
     /// Returns metadata of each column stored in table sorted by columns position in disk layout.
@@ -100,14 +160,40 @@ impl TableMetadata {
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with same name already exists.
     pub fn add_column(&mut self, column: ColumnMetadata) -> Result<(), TableMetadataError> {
-        todo!()
+        let already_exists = self.columns_by_name.contains_key(&column.name);
+        match already_exists {
+            true => Err(TableMetadataError::ColumnAlreadyExists(column.name)),
+            false => {
+                self.columns_by_name
+                    .insert(column.name.clone(), self.columns.len());
+                self.columns.push(column);
+                Ok(())
+            }
+        }
     }
 
     /// Removes column from the table.
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with provided name does not exist or the column is primary key.
     pub fn remove_column(&mut self, column_name: &str) -> Result<(), TableMetadataError> {
-        todo!()
+        if column_name == self.primary_key_column_name() {
+            return Err(TableMetadataError::InvalidColumnUsed(column_name.into()));
+        }
+        let idx = self.columns_by_name.remove(column_name);
+        match idx {
+            Some(idx) => {
+                self.columns.swap_remove(idx);
+                // Removed last element - don't need to update any index
+                if idx == self.columns.len() {
+                    return Ok(());
+                }
+                // Update index of the element that was moved
+                let swapped_name = &self.columns[idx].name;
+                self.columns_by_name.insert(swapped_name.clone(), idx);
+                Ok(())
+            }
+            None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
+        }
     }
 
     /// Returns name of the table's primary key column
@@ -117,6 +203,7 @@ impl TableMetadata {
 }
 
 /// [`ColumnMetadata`] stores the metadata for a single column.
+#[derive(Clone)]
 pub struct ColumnMetadata {
     name: String,
     ty: ColumnType,
@@ -147,7 +234,8 @@ pub struct ColumnMetadata {
 /// Error for [`ColumnMetadata`] related operations
 #[derive(Error, Debug)]
 pub enum ColumnMetadataError {
-    // TODO: fill when implementing ColumnMetadata
+    #[error("base_offset_pos ({0}) greater than pos ({1})")]
+    InvalidBaseOffsetPosition(u16, u16),
 }
 
 impl ColumnMetadata {
@@ -160,10 +248,39 @@ impl ColumnMetadata {
         base_offset: usize,
         base_offset_pos: u16,
     ) -> Result<Self, ColumnMetadataError> {
-        todo!()
+        if base_offset_pos > pos {
+            return Err(ColumnMetadataError::InvalidBaseOffsetPosition(
+                base_offset_pos,
+                pos,
+            ));
+        }
+        Ok(ColumnMetadata {
+            name,
+            ty,
+            pos,
+            base_offset,
+            base_offset_pos,
+        })
+    }
+
+    pub fn ty(&self) -> ColumnType {
+        self.ty
+    }
+
+    pub fn pos(&self) -> u16 {
+        self.pos
+    }
+
+    pub fn base_offset(&self) -> usize {
+        self.base_offset
+    }
+
+    pub fn base_offset_pos(&self) -> u16 {
+        self.base_offset_pos
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum ColumnType {
     String,
     F32,
