@@ -61,7 +61,7 @@ impl Catalog {
     }
 
     /// Returns table with `table_name` name.
-    /// Returns `None` if table with `table_name` name does not exist.
+    /// Can fail if table with `table_name` name does not exist.
     pub fn table(&self, table_name: &str) -> Result<&TableMetadata, CatalogError> {
         self.tables
             .get(table_name)
@@ -414,4 +414,10 @@ impl From<ColumnJson> for ColumnMetadata {
             base_offset_pos: value.base_offset_pos,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
 }
