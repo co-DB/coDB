@@ -1,7 +1,13 @@
 //! Catalog module - manages tables metadata.
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// [`Catalog`] is an in-memory structure that holds information about a database's tables.
@@ -26,6 +32,12 @@ pub enum CatalogError {
     /// Table with provided name already exists in `tables`
     #[error("table '{0}' already exists")]
     TableAlreadyExists(String),
+    /// Underlying IO module returned error
+    #[error("io error occured: {0}")]
+    IoError(#[from] io::Error),
+    /// File contains invalid json
+    #[error("json error occured: {0}")]
+    JsonError(#[from] serde_json::Error),
 }
 
 impl Catalog {
@@ -36,7 +48,16 @@ impl Catalog {
         P: AsRef<Path>,
     {
         let path = main_dir_path.as_ref().join(database_name);
-        todo!()
+        let mut handle = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+        let mut content = String::new();
+        handle.read_to_string(&mut content)?;
+        let catalog_json: CatalogJson = serde_json::from_str(&content)?;
+        let tables = catalog_json
+            .tables
+            .into_iter()
+            .map(|t| (t.name.clone(), TableMetadata::from(t)))
+            .collect();
+        Ok(Catalog { handle, tables })
     }
 
     /// Returns table with `table_name` name.
@@ -74,7 +95,17 @@ impl Catalog {
     /// Syncs in-memory [`Catalog`] instance with underlying file.
     /// Can fail if io error occurs.
     pub fn sync_to_disk(&mut self) -> Result<(), CatalogError> {
-        todo!()
+        // Performance note: it's much easier to write whole json all at once instead of updating only the diff.
+        // I'm aware that for a large number of tables and columns it might be quite slow,
+        // though we assume this operation to be called quite rarely (we will mostly load the catalog
+        // but making upadates to it will be (at least we expect it to be) quite rare).
+        let catalog_json = CatalogJson::from(&*self);
+        let content = serde_json::to_string_pretty(&catalog_json)?;
+        self.handle.set_len(0)?;
+        self.handle.seek(SeekFrom::Start(0))?;
+        self.handle.write_all(content.as_bytes())?;
+        self.handle.sync_data()?;
+        Ok(())
     }
 }
 
@@ -280,7 +311,7 @@ impl ColumnMetadata {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum ColumnType {
     String,
     F32,
@@ -303,6 +334,84 @@ impl ColumnType {
             ColumnType::Bool => true,
             ColumnType::Date => true,
             ColumnType::Datetime => true,
+        }
+    }
+}
+
+/// [`CatalogJson`] is a representation of [`Catalog`] on disk. Used only for serializing to/deserializing from JSON file.
+#[derive(Serialize, Deserialize)]
+struct CatalogJson {
+    tables: Vec<TableJson>,
+}
+
+impl From<&Catalog> for CatalogJson {
+    fn from(value: &Catalog) -> Self {
+        CatalogJson {
+            tables: value.tables.values().map(TableJson::from).collect(),
+        }
+    }
+}
+
+/// [`TableJson`] is a representation of [`TableMetadata`] on disk. Used only for serializing to/deserializing from JSON file.
+#[derive(Serialize, Deserialize)]
+struct TableJson {
+    name: String,
+    columns: Vec<ColumnJson>,
+    primary_key_columns_name: String,
+}
+
+impl From<&TableMetadata> for TableJson {
+    fn from(value: &TableMetadata) -> Self {
+        TableJson {
+            name: value.name.clone(),
+            columns: value.columns.iter().map(ColumnJson::from).collect(),
+            primary_key_columns_name: value.primary_key_column_name.clone(),
+        }
+    }
+}
+
+impl From<TableJson> for TableMetadata {
+    fn from(value: TableJson) -> Self {
+        let columns: Vec<_> = value
+            .columns
+            .into_iter()
+            .map(ColumnMetadata::from)
+            .collect();
+        // We can unwrap here as we our sure that table saved to file is well-defined table.
+        TableMetadata::new(value.name, &columns, value.primary_key_columns_name).unwrap()
+    }
+}
+
+/// [`ColumnJson`] is a representation of [`ColumnMetadata`] on disk. Used only for serializing to/deserializing from JSON file.
+#[derive(Serialize, Deserialize)]
+struct ColumnJson {
+    name: String,
+    ty: ColumnType,
+    pos: u16,
+    base_offset: usize,
+    base_offset_pos: u16,
+}
+
+impl From<&ColumnMetadata> for ColumnJson {
+    fn from(value: &ColumnMetadata) -> Self {
+        ColumnJson {
+            name: value.name.clone(),
+            ty: value.ty,
+            pos: value.pos,
+            base_offset: value.base_offset,
+            base_offset_pos: value.base_offset_pos,
+        }
+    }
+}
+
+impl From<ColumnJson> for ColumnMetadata {
+    fn from(value: ColumnJson) -> Self {
+        ColumnMetadata {
+            name: value.name,
+            ty: value.ty,
+            pos: value.pos,
+            base_offset: value.base_offset,
+            base_offset_pos: value.base_offset_pos,
         }
     }
 }
