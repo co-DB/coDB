@@ -44,13 +44,7 @@ pub enum PagedFileError {
     InvalidFileFormat(&'static str),
     /// Underlying IO module returned error
     #[error("io error occured: {0}")]
-    IoError(#[source] io::Error),
-}
-
-impl From<io::Error> for PagedFileError {
-    fn from(err: io::Error) -> Self {
-        PagedFileError::IoError(err)
-    }
+    IoError(#[from] io::Error),
 }
 
 impl PagedFile {
