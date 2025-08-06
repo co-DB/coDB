@@ -16,6 +16,7 @@ use thiserror::Error;
 ///
 /// [`Catalog`] is created once at database startup. It is assumed that the number of tables and columns
 /// is small enough that [`Catalog`] can be used as an in-memory data structure.
+#[derive(Debug)]
 pub struct Catalog {
     /// Handle to underlying file
     handle: fs::File,
@@ -110,6 +111,7 @@ impl Catalog {
 }
 
 /// [`TableMetadata`] stores the metadata for a single table.
+#[derive(Debug, Clone)]
 pub struct TableMetadata {
     name: String,
     /// All table's columns sorted by their position in the disk layout.
@@ -234,7 +236,7 @@ impl TableMetadata {
 }
 
 /// [`ColumnMetadata`] stores the metadata for a single column.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ColumnMetadata {
     name: String,
     ty: ColumnType,
@@ -311,7 +313,7 @@ impl ColumnMetadata {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnType {
     String,
     F32,
@@ -419,5 +421,344 @@ impl From<ColumnJson> for ColumnMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::Error;
     use tempfile::NamedTempFile;
+
+    // Helper to create a dummy column
+    fn dummy_column(name: &str, ty: ColumnType, pos: u16) -> ColumnMetadata {
+        ColumnMetadata::new(name.to_string(), ty, pos, pos as usize * 4, pos).unwrap()
+    }
+
+    // Helper to check if column is as expected
+    fn assert_column(expected: &ColumnMetadata, actual: &ColumnMetadata) {
+        assert_eq!(expected.name, actual.name, "Column names differ");
+        assert_eq!(expected.ty, actual.ty, "Column types differ");
+        assert_eq!(expected.pos, actual.pos, "Column positions differ");
+        assert_eq!(
+            expected.base_offset, actual.base_offset,
+            "Column base_offsets differ"
+        );
+        assert_eq!(
+            expected.base_offset_pos, actual.base_offset_pos,
+            "Column base_offset_pos differ"
+        );
+    }
+
+    // Helper to create a dummy table
+    fn dummy_table(name: &str, columns: &[ColumnMetadata], pk: &str) -> TableMetadata {
+        TableMetadata::new(name, columns, pk).unwrap()
+    }
+
+    // Helper to create example users table
+    fn users_table() -> TableMetadata {
+        let columns = vec![
+            dummy_column("id", ColumnType::I32, 0),
+            dummy_column("name", ColumnType::String, 1),
+        ];
+        dummy_table("users", &columns, "id")
+    }
+
+    // Helper to check if table is as expected
+    fn assert_table(expected: &TableMetadata, actual: &TableMetadata) {
+        assert_eq!(expected.name, actual.name, "Table names differ");
+        assert_eq!(
+            expected.primary_key_column_name(),
+            actual.primary_key_column_name(),
+            "Primary key column names differ"
+        );
+        assert_eq!(
+            expected.columns.len(),
+            actual.columns.len(),
+            "Number of columns differ"
+        );
+        for (ec, ac) in expected.columns.iter().zip(actual.columns.iter()) {
+            assert_column(ec, ac);
+        }
+    }
+
+    // Helper to create [`Catalog`] that will be used only in-memory
+    fn in_memory_catalog(tables: HashMap<String, TableMetadata>) -> Catalog {
+        let file = NamedTempFile::new().unwrap().into_file();
+        Catalog {
+            handle: file,
+            tables,
+        }
+    }
+
+    // Helper to create [`Catalog`] that will be used for on-disk operations
+    fn file_backed_catalog<P: AsRef<Path>>(
+        path: P,
+        tables: HashMap<String, TableMetadata>,
+    ) -> Catalog {
+        let catalog_json = CatalogJson {
+            tables: tables.values().map(TableJson::from).collect(),
+        };
+        let content = serde_json::to_string_pretty(&catalog_json).unwrap();
+        std::fs::write(&path, content).unwrap();
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        Catalog {
+            handle: file,
+            tables,
+        }
+    }
+
+    // Helper to check if error variant is as expected
+    fn assert_catalog_error_variant(actual: &CatalogError, expected: &CatalogError) {
+        assert_eq!(
+            std::mem::discriminant(actual),
+            std::mem::discriminant(expected),
+            "CatalogError variant does not match"
+        );
+    }
+
+    #[test]
+    fn catalog_new_returns_error_when_path_does_not_exist() {
+        // given non-existent path
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        // when creating catalog
+        let result = Catalog::new(&tmp_dir, "nonexistent_db");
+
+        // then Err(CatalogError::IoError) is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::IoError(io::Error::new(io::ErrorKind::NotFound, "")),
+        );
+    }
+
+    #[test]
+    fn catalog_new_returns_error_when_file_is_not_json() {
+        // given file with invalid json
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("db");
+        std::fs::write(&db_path, b"not a json").unwrap();
+
+        // when creating catalog
+        let result = Catalog::new(&tmp_dir, "db");
+
+        // then Err(CatalogError::JsonError) is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::JsonError(serde_json::Error::custom("")),
+        );
+    }
+
+    #[test]
+    fn catalog_new_returns_error_when_file_is_json_but_not_catalog_json() {
+        // given file with valid json but not CatalogJson
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("db");
+        std::fs::write(&db_path, b"{\"foo\": 123}").unwrap();
+
+        // when creating catalog
+        let result = Catalog::new(&tmp_dir, "db");
+
+        // then Err(CatalogError::JsonError) is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::JsonError(serde_json::Error::custom("")),
+        );
+    }
+
+    #[test]
+    fn catalog_new_loads_proper_catalog_json() {
+        // given file with valid CatalogJson
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("db");
+
+        let json = r#"
+    {
+        "tables": [
+            {
+                "name": "users",
+                "columns": [
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
+                    { "name": "name", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
+                ],
+                "primary_key_columns_name": "id"
+            },
+            {
+                "name": "posts",
+                "columns": [
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
+                    { "name": "title", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
+                ],
+                "primary_key_columns_name": "id"
+            },
+            {
+                "name": "comments",
+                "columns": [
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
+                    { "name": "body", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
+                ],
+                "primary_key_columns_name": "id"
+            }
+        ]
+    }
+    "#;
+
+        std::fs::write(&db_path, json).unwrap();
+
+        // when creating catalog
+        let result = Catalog::new(&tmp_dir, "db");
+
+        // then Catalog is returned and tables are loaded
+        assert!(result.is_ok());
+        let catalog = result.unwrap();
+        assert_eq!(catalog.tables.len(), 3);
+        assert!(catalog.tables.contains_key("users"));
+        assert!(catalog.tables.contains_key("posts"));
+        assert!(catalog.tables.contains_key("comments"));
+    }
+
+    #[test]
+    fn catalog_table_returns_existing_table() {
+        // given catalog with table `users`
+        let users = users_table();
+        let mut tables = HashMap::new();
+        tables.insert(users.name.clone(), users.clone());
+
+        let c = in_memory_catalog(tables);
+
+        // when getting table with name `users`
+        let result = c.table("users");
+
+        // then table `users` is returned
+        assert!(result.is_ok());
+        assert_table(&users, &result.unwrap());
+    }
+
+    #[test]
+    fn catalog_table_returns_error_when_missing_table() {
+        // given empty catalog
+        let tables = HashMap::new();
+        let c = in_memory_catalog(tables);
+
+        // when getting non existing table
+        let result = c.table("missing");
+
+        // then Err(CatalogError::TableNotFound) is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &&&CatalogError::TableNotFound("missing".into()),
+        );
+    }
+
+    #[test]
+    fn catalog_add_table_adds_new_table() {
+        // given empty catalog and a new table
+        let tables = HashMap::new();
+        let mut c = in_memory_catalog(tables);
+        let users = users_table();
+
+        // when adding table
+        let result = c.add_table(users.clone());
+
+        // then table is present
+        assert!(result.is_ok());
+        assert_table(&users, c.tables.get("users").unwrap());
+    }
+
+    #[test]
+    fn catalog_add_table_returns_error_when_table_exists() {
+        // given catalog with table `users`
+        let users = users_table();
+        let mut tables = HashMap::new();
+        tables.insert(users.name.clone(), users.clone());
+        let mut c = in_memory_catalog(tables);
+
+        // when adding table with same name
+        let result = c.add_table(users.clone());
+
+        // then Err(CatalogError::TableAlreadyExists) is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::TableAlreadyExists("users".into()),
+        );
+    }
+
+    #[test]
+    fn catalog_remove_table_removes_existing_table() {
+        // given catalog with table `users`
+        let users = users_table();
+        let mut tables = HashMap::new();
+        tables.insert(users.name.clone(), users);
+        let mut c = in_memory_catalog(tables);
+
+        // when removing table with name `users`
+        let result = c.remove_table("users");
+
+        // then Ok(()) is returned and table is removed
+        assert!(result.is_ok());
+        assert!(c.tables.get("users").is_none());
+    }
+
+    #[test]
+    fn catalog_sync_to_disk_saves_to_file() {
+        // given a catalog with one table
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("db");
+
+        let users = users_table();
+        let mut tables = HashMap::new();
+        tables.insert(users.name.clone(), users.clone());
+
+        let mut catalog = file_backed_catalog(&db_path, tables);
+
+        // when syncing to disk
+        catalog.sync_to_disk().unwrap();
+
+        // then file contains expected JSON
+        let content = std::fs::read_to_string(&db_path).unwrap();
+        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.tables.len(), 1);
+        assert_eq!(loaded.tables[0].name, "users");
+        assert_eq!(loaded.tables[0].columns.len(), 2);
+        assert_eq!(loaded.tables[0].primary_key_columns_name, "id");
+    }
+
+    #[test]
+    fn catalog_sync_to_disk_after_adding_table() {
+        // given a catalog with one table
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("db");
+
+        let users = users_table();
+        let mut tables = HashMap::new();
+        tables.insert(users.name.clone(), users.clone());
+
+        let mut catalog = file_backed_catalog(&db_path, tables);
+
+        // sync initial state
+        catalog.sync_to_disk().unwrap();
+
+        // add another table
+        let columns = vec![
+            dummy_column("id", ColumnType::I32, 0),
+            dummy_column("title", ColumnType::String, 1),
+        ];
+        let posts = dummy_table("posts", &columns, "id");
+        catalog.add_table(posts.clone()).unwrap();
+
+        // sync again
+        catalog.sync_to_disk().unwrap();
+
+        // then file contains both tables
+        let content = std::fs::read_to_string(&db_path).unwrap();
+        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.tables.len(), 2);
+        assert!(loaded.tables.iter().any(|t| t.name == "users"));
+        assert!(loaded.tables.iter().any(|t| t.name == "posts"));
+    }
 }
