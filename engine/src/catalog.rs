@@ -761,4 +761,212 @@ mod tests {
         assert!(loaded.tables.iter().any(|t| t.name == "users"));
         assert!(loaded.tables.iter().any(|t| t.name == "posts"));
     }
+
+    // Helper to check if error variant is as expected
+    fn assert_table_metadata_error_variant(
+        actual: &TableMetadataError,
+        expected: &TableMetadataError,
+    ) {
+        assert_eq!(
+            std::mem::discriminant(actual),
+            std::mem::discriminant(expected),
+            "TableMetadataError variant does not match"
+        );
+    }
+
+    #[test]
+    fn table_metadata_new_returns_error_on_duplicate_column_names() {
+        // given two columns with the same name
+        let columns = vec![
+            dummy_column("id", ColumnType::I32, 0),
+            dummy_column("id", ColumnType::String, 1),
+        ];
+        // when creating new [`TableMetadata`]
+        let result = TableMetadata::new("users", &columns, "id");
+        // error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::DuplicatedColumn(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_new_returns_error_on_invalid_primary_key_column() {
+        // given two columns
+        let columns = vec![
+            dummy_column("id", ColumnType::I32, 0),
+            dummy_column("name", ColumnType::String, 1),
+        ];
+        // when creating [`TableMetadata`] with unknown primary key column name
+        let result = TableMetadata::new("users", &columns, "not_a_column");
+        // error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::UnknownPrimaryKeyColumn(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_new_returns_self_on_valid_input() {
+        // given valid columns and primary key
+        let columns = vec![
+            dummy_column("id", ColumnType::I32, 0),
+            dummy_column("name", ColumnType::String, 1),
+        ];
+        // when creating new [`TableMetadata`]
+        let result = TableMetadata::new("users", &columns, "id");
+        // [`TableMetadata`] is returned
+        assert!(result.is_ok());
+        let table = result.unwrap();
+        assert_eq!(table.name, "users");
+        assert_eq!(table.primary_key_column_name(), "id");
+        assert_eq!(table.columns.len(), 2);
+        assert_eq!(table.columns[0].name, "id");
+        assert_eq!(table.columns[1].name, "name");
+    }
+
+    #[test]
+    fn table_metadata_column_returns_existing_column() {
+        // given table with columns "id" and "name"
+        let columns = vec![
+            dummy_column("id", ColumnType::I32, 0),
+            dummy_column("name", ColumnType::String, 1),
+        ];
+        let table = TableMetadata::new("users", &columns, "id").unwrap();
+
+        // when getting column "name"
+        let result = table.column("name");
+
+        // then column is returned
+        assert!(result.is_ok());
+        assert_column(&columns[1], result.unwrap());
+    }
+
+    #[test]
+    fn table_metadata_column_returns_error_when_missing() {
+        // given table with columns "id" and "name"
+        let users = users_table();
+
+        // when getting non-existing column
+        let result = users.column("missing");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::ColumnNotFound(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_add_column_adds_new_column() {
+        // given table with one column "id"
+        let id_col = dummy_column("id", ColumnType::I32, 0);
+        let columns = vec![id_col.clone()];
+        let mut table = TableMetadata::new("users", &columns, "id").unwrap();
+
+        // when adding a new column "name"
+        let new_col = dummy_column("name", ColumnType::String, 1);
+        let result = table.add_column(new_col.clone());
+
+        // then column "name" is present
+        assert!(result.is_ok());
+        let col = table.column("name").unwrap();
+        assert_column(&new_col, col);
+        // and column "id" still exists
+        let col = table.column("id").unwrap();
+        assert_column(&id_col, col)
+    }
+
+    #[test]
+    fn table_metadata_add_column_returns_error_when_column_exists() {
+        // given table with column "id"
+        let columns = vec![dummy_column("id", ColumnType::I32, 0)];
+        let mut table = TableMetadata::new("users", &columns, "id").unwrap();
+
+        // when adding column with same name
+        let duplicate_col = dummy_column("id", ColumnType::I32, 1);
+        let result = table.add_column(duplicate_col);
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::ColumnAlreadyExists(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_last_column() {
+        // given table with two columns
+        let mut table = users_table();
+
+        // when removing last column ("name")
+        let result = table.remove_column("name");
+
+        // then only "id" remains
+        assert!(result.is_ok());
+        assert!(table.column("name").is_err());
+        assert!(table.column("id").is_ok());
+        assert_eq!(table.columns.len(), 1);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_middle_column() {
+        // given table with three columns
+        let columns = vec![
+            dummy_column("id", ColumnType::I32, 0),
+            dummy_column("middle", ColumnType::String, 1),
+            dummy_column("last", ColumnType::Bool, 2),
+        ];
+        let mut table = TableMetadata::new("users", &columns, "id").unwrap();
+
+        // when removing the "middle" column
+        let result = table.remove_column("middle");
+
+        // then "middle" is gone, "id" and "last" remain
+        assert!(result.is_ok());
+        assert!(table.column("middle").is_err());
+        assert!(table.column("id").is_ok());
+        assert!(table.column("last").is_ok());
+        assert_eq!(table.columns.len(), 2);
+
+        // and "last" is still accessible and correct
+        let last_col = table.column("last").unwrap();
+        assert_eq!(last_col.name, "last");
+    }
+
+    #[test]
+    fn table_metadata_remove_column_returns_error_when_removing_primary_key() {
+        // given table with primary key "id"
+        let mut table = users_table();
+
+        // when trying to remove primary key column
+        let result = table.remove_column("id");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::InvalidColumnUsed(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_remove_column_returns_error_when_column_not_found() {
+        // given table with two columns
+        let mut table = users_table();
+
+        // when trying to remove non-existing column
+        let result = table.remove_column("not_found");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::ColumnNotFound(String::new()),
+        );
+    }
 }
