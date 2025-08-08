@@ -966,7 +966,7 @@ mod tests {
 
         // then table `users` is returned
         assert!(result.is_ok());
-        assert_table(&users, &result.unwrap());
+        assert_table(&users, result.unwrap());
     }
 
     #[test]
@@ -982,7 +982,7 @@ mod tests {
         assert!(result.is_err());
         assert_catalog_error_variant(
             &result.unwrap_err(),
-            &&&CatalogError::TableNotFound("missing".into()),
+            &CatalogError::TableNotFound("missing".into()),
         );
     }
 
@@ -1033,7 +1033,7 @@ mod tests {
 
         // then Ok(()) is returned and table is removed
         assert!(result.is_ok());
-        assert!(c.tables.get("users").is_none());
+        assert!(!c.tables.contains_key("users"));
     }
 
     #[test]
