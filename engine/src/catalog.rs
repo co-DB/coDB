@@ -19,7 +19,7 @@ use thiserror::Error;
 /// is small enough that [`Catalog`] can be used as an in-memory data structure.
 #[derive(Debug)]
 pub struct Catalog {
-    /// Path to underlyng file
+    /// Path to underlying file
     file_path: PathBuf,
     /// Maps each table name to its metadata. Stores all tables from database.
     tables: HashMap<String, TableMetadata>,
@@ -97,11 +97,11 @@ impl Catalog {
         // Performance note: it's much easier to write whole json all at once instead of updating only the diff.
         // I'm aware that for a large number of tables and columns it might be quite slow,
         // though we assume this operation to be called quite rarely (we will mostly load the catalog
-        // but making upadates to it will be (at least we expect it to be) quite rare).
+        // but making updates to it will be (at least we expect it to be) quite rare).
         let catalog_json = CatalogJson::from(&*self);
         let content = serde_json::to_string_pretty(&catalog_json)?;
 
-        // We can unwrap here, because we know `UNIX_EPOCH` was before `SystemTimen::now`
+        // We can unwrap here, because we know `UNIX_EPOCH` was before `SystemTime::now`
         let epoch = time::SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
             .unwrap()
