@@ -49,18 +49,14 @@ impl Catalog {
     where
         P: AsRef<Path>,
     {
-        let path = main_dir_path.as_ref().join(database_name);
-        let content = fs::read_to_string(&path)?;
-        let catalog_json: CatalogJson = serde_json::from_str(&content)?;
+        let catalog_json = Self::latest_catalog_json(&main_dir_path, database_name)?;
         let tables = catalog_json
             .tables
             .into_iter()
             .map(|t| (t.name.clone(), TableMetadata::from(t)))
             .collect();
-        Ok(Catalog {
-            file_path: path,
-            tables,
-        })
+        let file_path = main_dir_path.as_ref().join(database_name);
+        Ok(Catalog { file_path, tables })
     }
 
     /// Returns table with `table_name` name.
@@ -109,7 +105,7 @@ impl Catalog {
         let epoch = time::SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
             .unwrap()
-            .as_secs();
+            .as_millis();
         let tmp_path = self.file_path.with_extension(format!("tmp-{epoch}"));
 
         // We firstly store content in temporary file, only when all content is successfuly saved to file
@@ -125,6 +121,86 @@ impl Catalog {
         fs::rename(&tmp_path, &self.file_path)?;
 
         Ok(())
+    }
+
+    /// Return the latest version of [`CatalogJson`] saved on disk.
+    /// Most of the time it will just return content of `main_dir_path/database_name`,
+    /// but in cases when there was a problem during [`Catalog::sync_to_disk`] and new content was only saved to temprorary file it will return the content from newest temporary file.
+    /// Can fail if io error occurs or file was not properly formatted (JSON).
+    fn latest_catalog_json<P>(
+        main_dir_path: P,
+        database_name: &str,
+    ) -> Result<CatalogJson, CatalogError>
+    where
+        P: AsRef<Path>,
+    {
+        let main_file = main_dir_path.as_ref().join(database_name);
+
+        // List of all database tmp files with their creating time (epoch).
+        let mut tmp_files = fs::read_dir(main_dir_path)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let file_name = path.file_name()?.to_string_lossy();
+                let prefix = format!("{database_name}.tmp-");
+                if file_name.starts_with(&prefix) {
+                    if let Ok(epoch) = file_name[prefix.len()..].parse::<u128>() {
+                        return Some((epoch, path));
+                    }
+                }
+                None
+            })
+            .collect::<Vec<(u128, std::path::PathBuf)>>();
+
+        tmp_files.sort_by_key(|(epoch, _)| *epoch);
+
+        let main_mtime = Self::file_last_modified_time(&main_file);
+
+        let mut catalog_json = None;
+
+        while let Some((_, tmp_path)) = tmp_files.pop() {
+            let tmp_mtime = Self::file_last_modified_time(&tmp_path);
+            let tmp_is_latest = tmp_mtime > main_mtime;
+            match tmp_is_latest {
+                true => {
+                    let tmp_catalog_json = CatalogJson::read_from_file(&tmp_path);
+                    // In this case it means we have successfuly deserialize proper [`CatalogJson`] structure from the file.
+                    // We will assume that this is the most recent version that should be used.
+                    if let Ok(cj) = tmp_catalog_json {
+                        fs::rename(&tmp_path, &main_file)?;
+                        catalog_json = Some(cj);
+                        break;
+                    }
+                    // In this case we tried to read from file but it didn't contait proper json structure.
+                    // We can remove the file as it will no longer be needed.
+                    fs::remove_file(&tmp_path)?;
+                }
+                false => {
+                    // If main file has latest modification time than we no longer need tmp file and can remove it.
+                    fs::remove_file(&tmp_path)?;
+                    catalog_json = Some(CatalogJson::read_from_file(&main_file)?);
+                    break;
+                }
+            };
+        }
+        // Remove any remaining tmp file (we know that we already found the latest file)
+        for (_, tmp_path) in tmp_files {
+            fs::remove_file(tmp_path)?;
+        }
+
+        // Note: it can be `None` in case that each entry in `tmp_files` has greater modification time,
+        // but at the same time none of them is proper json file - edge case that we handle with this default value.
+        let catalog_json = catalog_json.unwrap_or(CatalogJson::read_from_file(&main_file)?);
+        Ok(catalog_json)
+    }
+
+    /// Returns time of last file modification. For convenience in case of error just returns EPOCH.
+    fn file_last_modified_time<P>(path: P) -> time::SystemTime
+    where
+        P: AsRef<Path>,
+    {
+        let meta = fs::metadata(path);
+        meta.and_then(|m| m.modified()).unwrap_or(time::UNIX_EPOCH)
     }
 }
 
@@ -364,6 +440,17 @@ struct CatalogJson {
     tables: Vec<TableJson>,
 }
 
+impl CatalogJson {
+    pub fn read_from_file<P>(path: P) -> Result<Self, CatalogError>
+    where
+        P: AsRef<Path>,
+    {
+        let content = fs::read_to_string(path)?;
+        let catalog_json = serde_json::from_str(&content)?;
+        Ok(catalog_json)
+    }
+}
+
 impl From<&Catalog> for CatalogJson {
     fn from(value: &Catalog) -> Self {
         CatalogJson {
@@ -517,6 +604,38 @@ mod tests {
         }
     }
 
+    // Helper to write json to path
+    fn write_json<P: AsRef<std::path::Path>>(path: P, json: &str) {
+        std::fs::write(path, json).unwrap();
+    }
+
+    // Helper to create path for tmp file
+    fn tmp_path(dir: &std::path::Path, db: &str, epoch: u64) -> std::path::PathBuf {
+        dir.join(format!("{db}.tmp-{epoch}"))
+    }
+
+    // Helper to check if file contains expected json
+    fn assert_file_json_eq<P: AsRef<std::path::Path>>(path: P, expected_json: &str) {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).unwrap(),
+            serde_json::from_str::<serde_json::Value>(expected_json).unwrap()
+        );
+    }
+
+    // Helper to check if no tmp files are in the directory
+    fn assert_no_tmp_files(dir: &std::path::Path, db: &str) {
+        let prefix = format!("{db}.tmp-");
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(&prefix),
+                "tmp file {name} was not deleted"
+            );
+        }
+    }
+
     // Helper to check if error variant is as expected
     fn assert_catalog_error_variant(actual: &CatalogError, expected: &CatalogError) {
         assert_eq!(
@@ -615,7 +734,7 @@ mod tests {
     }
     "#;
 
-        std::fs::write(&db_path, json).unwrap();
+        write_json(&db_path, json);
 
         // when creating catalog
         let result = Catalog::new(&tmp_dir, "db");
@@ -627,6 +746,210 @@ mod tests {
         assert!(catalog.tables.contains_key("users"));
         assert!(catalog.tables.contains_key("posts"));
         assert!(catalog.tables.contains_key("comments"));
+    }
+
+    #[test]
+    fn catalog_new_picks_latest_tmp_over_main_file() {
+        // given one tmp file with mtime > main and valid json
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db = "db";
+        let db_path = tmp_dir.path().join(db);
+
+        let main_json = r#"{
+    "tables":[
+        {
+            "name":"main",
+            "columns":[
+                { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+            ],
+            "primary_key_column_name":"id"
+        }
+    ]
+}"#;
+        write_json(&db_path, main_json);
+
+        let tmp_json = r#"{
+    "tables":[
+        {
+            "name":"tmp",
+            "columns":[
+                { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+            ],
+            "primary_key_column_name":"id"
+        }
+    ]
+}"#;
+        let tmp_epoch = 12345;
+        let tmp_path = tmp_path(tmp_dir.path(), db, tmp_epoch);
+        // ensure mtime is newer
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_json(&tmp_path, tmp_json);
+
+        // when loading `Catalog`
+        let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
+
+        // tmp file should be loaded
+        assert!(catalog.tables.contains_key("tmp"));
+        assert!(!catalog.tables.contains_key("main"));
+        assert_no_tmp_files(tmp_dir.path(), db);
+
+        // main file should now contain the newest tmp json
+        assert_file_json_eq(&db_path, tmp_json);
+    }
+
+    #[test]
+    fn catalog_new_picks_newest_of_multiple_tmp_files() {
+        // given multiple tmp files with valid json
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db = "db";
+        let db_path = tmp_dir.path().join(db);
+
+        let main_json = r#"{
+        "tables":[
+            {
+                "name":"main",
+                "columns":[
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+                ],
+                "primary_key_column_name":"id"
+            }
+        ]
+    }"#;
+        write_json(&db_path, main_json);
+
+        let tmp_json1 = r#"{
+        "tables":[
+            {
+                "name":"tmp1",
+                "columns":[
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+                ],
+                "primary_key_column_name":"id"
+            }
+        ]
+    }"#;
+        let tmp_json2 = r#"{
+        "tables":[
+            {
+                "name":"tmp2",
+                "columns":[
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+                ],
+                "primary_key_column_name":"id"
+            }
+        ]
+    }"#;
+
+        let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
+        let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_json(&tmp_path1, tmp_json1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_json(&tmp_path2, tmp_json2);
+
+        // when loading `Catalog`
+        let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
+
+        // newest tmp file should be loaded and renamed
+        assert!(catalog.tables.contains_key("tmp2"));
+        assert!(!catalog.tables.contains_key("main"));
+        assert!(!catalog.tables.contains_key("tmp1"));
+        assert_no_tmp_files(tmp_dir.path(), db);
+
+        // main file should now contain the newest tmp json
+        assert_file_json_eq(&db_path, tmp_json2);
+    }
+
+    #[test]
+    fn catalog_new_picks_latest_valid_json_among_tmp_files() {
+        // given multiple tmp files with only one in the middle with valid json
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db = "db";
+        let db_path = tmp_dir.path().join(db);
+
+        let main_json = r#"{
+        "tables":[
+            {
+                "name":"main",
+                "columns":[
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+                ],
+                "primary_key_column_name":"id"
+            }
+        ]
+    }"#;
+        write_json(&db_path, main_json);
+
+        let tmp_json_valid = r#"{
+        "tables":[
+            {
+                "name":"valid",
+                "columns":[
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+                ],
+                "primary_key_column_name":"id"
+            }
+        ]
+    }"#;
+
+        let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
+        let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
+        let tmp_path3 = tmp_path(tmp_dir.path(), db, 300);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_json(&tmp_path1, "not json");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_json(&tmp_path2, tmp_json_valid);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_json(&tmp_path3, "not json");
+
+        // when loading `Catalog`
+        let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
+
+        // valid tmp file should be loaded and renamed
+        assert!(catalog.tables.contains_key("valid"));
+        assert!(!catalog.tables.contains_key("main"));
+        assert_no_tmp_files(tmp_dir.path(), db);
+
+        // main file should now contain the valid tmp json
+        assert_file_json_eq(&db_path, tmp_json_valid);
+    }
+
+    #[test]
+    fn catalog_new_falls_back_to_main_file_if_no_valid_tmp() {
+        // given multiple tmp files, none of them with valid json
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db = "db";
+        let db_path = tmp_dir.path().join(db);
+
+        let main_json = r#"{
+        "tables":[
+            {
+                "name":"main",
+                "columns":[
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+                ],
+                "primary_key_column_name":"id"
+            }
+        ]
+    }"#;
+        write_json(&db_path, main_json);
+
+        let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
+        let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_json(&tmp_path1, "not json");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_json(&tmp_path2, "not json");
+
+        // when loading `Catalog`
+        let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
+
+        // main file should be loaded
+        assert!(catalog.tables.contains_key("main"));
+        assert_no_tmp_files(tmp_dir.path(), db);
+
+        // main file should still contain the original json
+        assert_file_json_eq(&db_path, main_json);
     }
 
     #[test]
