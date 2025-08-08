@@ -2,9 +2,10 @@
 
 use std::{
     collections::HashMap,
-    fs,
-    io::{self, Read, Seek, SeekFrom, Write},
-    path::Path,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time,
 };
 
 use serde::{Deserialize, Serialize};
@@ -18,8 +19,8 @@ use thiserror::Error;
 /// is small enough that [`Catalog`] can be used as an in-memory data structure.
 #[derive(Debug)]
 pub struct Catalog {
-    /// Handle to underlying file
-    handle: fs::File,
+    /// Path to underlyng file
+    file_path: PathBuf,
     /// Maps each table name to its metadata. Stores all tables from database.
     tables: HashMap<String, TableMetadata>,
 }
@@ -49,16 +50,17 @@ impl Catalog {
         P: AsRef<Path>,
     {
         let path = main_dir_path.as_ref().join(database_name);
-        let mut handle = fs::OpenOptions::new().read(true).write(true).open(&path)?;
-        let mut content = String::new();
-        handle.read_to_string(&mut content)?;
+        let content = fs::read_to_string(&path)?;
         let catalog_json: CatalogJson = serde_json::from_str(&content)?;
         let tables = catalog_json
             .tables
             .into_iter()
             .map(|t| (t.name.clone(), TableMetadata::from(t)))
             .collect();
-        Ok(Catalog { handle, tables })
+        Ok(Catalog {
+            file_path: path,
+            tables,
+        })
     }
 
     /// Returns table with `table_name` name.
@@ -102,10 +104,26 @@ impl Catalog {
         // but making upadates to it will be (at least we expect it to be) quite rare).
         let catalog_json = CatalogJson::from(&*self);
         let content = serde_json::to_string_pretty(&catalog_json)?;
-        self.handle.set_len(0)?;
-        self.handle.seek(SeekFrom::Start(0))?;
-        self.handle.write_all(content.as_bytes())?;
-        self.handle.sync_data()?;
+
+        // We can unwrap here, because we know `UNIX_EPOCH` was before `SystemTimen::now`
+        let epoch = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tmp_path = self.file_path.with_extension(format!("tmp-{epoch}"));
+
+        // We firstly store content in temporary file, only when all content is successfuly saved to file
+        // we swap it with previous file content.
+        let mut tmp_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        tmp_file.write_all(content.as_bytes())?;
+        tmp_file.sync_data()?;
+
+        fs::rename(&tmp_path, &self.file_path)?;
+
         Ok(())
     }
 }
@@ -478,32 +496,23 @@ mod tests {
 
     // Helper to create [`Catalog`] that will be used only in-memory
     fn in_memory_catalog(tables: HashMap<String, TableMetadata>) -> Catalog {
-        let file = NamedTempFile::new().unwrap().into_file();
+        let file = NamedTempFile::new().unwrap();
         Catalog {
-            handle: file,
+            file_path: file.into_temp_path().to_path_buf(),
             tables,
         }
     }
 
     // Helper to create [`Catalog`] that will be used for on-disk operations
-    fn file_backed_catalog<P: AsRef<Path>>(
-        path: P,
-        tables: HashMap<String, TableMetadata>,
-    ) -> Catalog {
+    fn file_backed_catalog(path: PathBuf, tables: HashMap<String, TableMetadata>) -> Catalog {
         let catalog_json = CatalogJson {
             tables: tables.values().map(TableJson::from).collect(),
         };
         let content = serde_json::to_string_pretty(&catalog_json).unwrap();
         std::fs::write(&path, content).unwrap();
 
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-
         Catalog {
-            handle: file,
+            file_path: path,
             tables,
         }
     }
@@ -714,7 +723,7 @@ mod tests {
         let mut tables = HashMap::new();
         tables.insert(users.name.clone(), users.clone());
 
-        let mut catalog = file_backed_catalog(&db_path, tables);
+        let mut catalog = file_backed_catalog(db_path.clone(), tables);
 
         // when syncing to disk
         catalog.sync_to_disk().unwrap();
@@ -738,7 +747,7 @@ mod tests {
         let mut tables = HashMap::new();
         tables.insert(users.name.clone(), users.clone());
 
-        let mut catalog = file_backed_catalog(&db_path, tables);
+        let mut catalog = file_backed_catalog(db_path.clone(), tables);
 
         // sync initial state
         catalog.sync_to_disk().unwrap();
