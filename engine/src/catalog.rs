@@ -359,7 +359,7 @@ impl From<&Catalog> for CatalogJson {
 struct TableJson {
     name: String,
     columns: Vec<ColumnJson>,
-    primary_key_columns_name: String,
+    primary_key_column_name: String,
 }
 
 impl From<&TableMetadata> for TableJson {
@@ -367,7 +367,7 @@ impl From<&TableMetadata> for TableJson {
         TableJson {
             name: value.name.clone(),
             columns: value.columns.iter().map(ColumnJson::from).collect(),
-            primary_key_columns_name: value.primary_key_column_name.clone(),
+            primary_key_column_name: value.primary_key_column_name.clone(),
         }
     }
 }
@@ -380,7 +380,7 @@ impl From<TableJson> for TableMetadata {
             .map(ColumnMetadata::from)
             .collect();
         // We can unwrap here as we our sure that table saved to file is well-defined table.
-        TableMetadata::new(value.name, &columns, value.primary_key_columns_name).unwrap()
+        TableMetadata::new(value.name, &columns, value.primary_key_column_name).unwrap()
     }
 }
 
@@ -584,7 +584,7 @@ mod tests {
                     { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
                     { "name": "name", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
                 ],
-                "primary_key_columns_name": "id"
+                "primary_key_column_name": "id"
             },
             {
                 "name": "posts",
@@ -592,7 +592,7 @@ mod tests {
                     { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
                     { "name": "title", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
                 ],
-                "primary_key_columns_name": "id"
+                "primary_key_column_name": "id"
             },
             {
                 "name": "comments",
@@ -600,7 +600,7 @@ mod tests {
                     { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
                     { "name": "body", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
                 ],
-                "primary_key_columns_name": "id"
+                "primary_key_column_name": "id"
             }
         ]
     }
@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(loaded.tables.len(), 1);
         assert_eq!(loaded.tables[0].name, "users");
         assert_eq!(loaded.tables[0].columns.len(), 2);
-        assert_eq!(loaded.tables[0].primary_key_columns_name, "id");
+        assert_eq!(loaded.tables[0].primary_key_column_name, "id");
     }
 
     #[test]
