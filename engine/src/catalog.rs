@@ -129,7 +129,7 @@ impl Catalog {
         Ok(())
     }
 
-    /// Return the latest version of [`CatalogJson`] saved on disk.
+    /// Returns the latest version of [`CatalogJson`] saved on disk.
     /// Most of the time it will just return content of `main_dir_path/database_name`,
     /// but in cases when there was a problem during [`Catalog::sync_to_disk`] and new content was only saved to temporary file it will return the content from newest temporary file.
     /// Can fail if io error occurs or file was not properly formatted (JSON).
