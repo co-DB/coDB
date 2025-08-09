@@ -28,12 +28,54 @@ pub enum ParserError {
 struct Parser {
     lexer: Lexer,
     ast: Ast,
-    errors: Vec<String>,
+    errors: Vec<ParserError>,
     curr_token: Token,
     peek_token: Token,
 }
 
 impl Parser {
+    pub fn parse_program(mut self) -> Result<Ast, Vec<ParserError>> {
+        while self.peek_token.token_type != TokenType::EOF {
+            let stmt = self.parse_statement();
+            match stmt {
+                Err(err) => {
+                    self.errors.push(err);
+                    self.recover_to_semicolon();
+                }
+                Ok(stmt) => {
+                    if self.peek_token.token_type == TokenType::Semicolon {
+                        self.ast.add_statement(stmt);
+                    } else {
+                        self.errors.push(ParserError::UnexpectedToken {
+                            expected: TokenType::Semicolon.to_string(),
+                            found: self.peek_token.token_type.to_string(),
+                            line: self.peek_token.line,
+                            column: self.peek_token.column,
+                        });
+                        self.recover_to_semicolon();
+                    }
+                }
+            }
+            if self.peek_token.token_type == TokenType::Semicolon {
+                let _ = self.read_token();
+            };
+        }
+        if !self.errors.is_empty() {
+            return Err(self.errors);
+        }
+        Ok(self.ast)
+    }
+
+    fn recover_to_semicolon(&mut self) {
+        while self.peek_token.token_type != TokenType::Semicolon
+            && self.peek_token.token_type != TokenType::EOF
+        {
+            if let Err(err) = self.read_token() {
+                self.errors.push(err);
+            }
+        }
+    }
+
     fn parse_expression(&mut self) -> Result<NodeId, ParserError> {
         Ok(self.ast.add_node(Expression::Literal(LiteralNode {
             value: Literal::String("String".to_string()),
@@ -158,7 +200,7 @@ impl Parser {
     }
 
     fn parse_where_clause(&mut self) -> Result<Option<NodeId>, ParserError> {
-        if self.peek_token.token_type != TokenType::Where{
+        if self.peek_token.token_type != TokenType::Where {
             return Ok(None);
         }
         self.expect_token(TokenType::Where)?;
