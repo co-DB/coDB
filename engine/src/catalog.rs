@@ -141,8 +141,34 @@ impl Catalog {
         P: AsRef<Path>,
     {
         let main_file = main_dir_path.as_ref().join(database_name);
+        let mut tmp_files = Self::list_catalog_tmp_files(main_dir_path, database_name)?;
 
-        // List of all database tmp files with their creating time (epoch).
+        let catalog_json_tmp = Self::find_latest_valid_tmp_catalog(&main_file, &mut tmp_files)?;
+
+        Self::remove_tmp_files(&mut tmp_files)?;
+
+        let catalog_json = catalog_json_tmp.unwrap_or(CatalogJson::read_from_file(&main_file)?);
+        Ok(catalog_json)
+    }
+
+    /// Returns time of last file modification. For convenience in case of error just returns EPOCH.
+    fn file_last_modified_time<P>(path: P) -> time::SystemTime
+    where
+        P: AsRef<Path>,
+    {
+        let meta = fs::metadata(path);
+        meta.and_then(|m| m.modified()).unwrap_or(time::UNIX_EPOCH)
+    }
+
+    /// Returns a list of all catalog tmp files (each file whose name matches `{CATALOG_FILE_NAME}.tmp-{TIME}`), sorted by their `created_at` time (the latest is the last).
+    /// Can fail if io error occurs.
+    fn list_catalog_tmp_files<P>(
+        main_dir_path: P,
+        database_name: &str,
+    ) -> Result<Vec<PathBuf>, CatalogError>
+    where
+        P: AsRef<Path>,
+    {
         let mut tmp_files = fs::read_dir(main_dir_path)?
             .filter_map(|entry| {
                 let entry = entry.ok()?;
@@ -160,11 +186,32 @@ impl Catalog {
 
         tmp_files.sort_by_key(|(epoch, _)| *epoch);
 
+        Ok(tmp_files.into_iter().map(|(_, p)| p).collect())
+    }
+
+    /// Iterates over elements in `tmp_files` and tries to find one that has:
+    ///    
+    /// - modification time > main file modification time
+    /// - valid [`CatalogJson`] as its content
+    ///
+    /// If successfully found tmp file that matches requirements returns `Some(CatalogJson)` - [`CatalogJson`] loaded from tmp file.
+    /// If no such tmp file was found then `None` is returned, meaning that [`CatalogJson`] should be loaded from the main file.
+    ///
+    /// Each element consumed from `tmp_files` is guaranteed to be removed from the file system.
+    ///
+    /// Can fail if io error occurs.
+    fn find_latest_valid_tmp_catalog<P>(
+        main_file: P,
+        tmp_files: &mut Vec<PathBuf>,
+    ) -> Result<Option<CatalogJson>, CatalogError>
+    where
+        P: AsRef<Path>,
+    {
         let main_mtime = Self::file_last_modified_time(&main_file);
 
         let mut catalog_json = None;
 
-        while let Some((_, tmp_path)) = tmp_files.pop() {
+        while let Some(tmp_path) = tmp_files.pop() {
             let tmp_mtime = Self::file_last_modified_time(&tmp_path);
             let tmp_is_latest = tmp_mtime > main_mtime;
             match tmp_is_latest {
@@ -184,29 +231,21 @@ impl Catalog {
                 false => {
                     // If main file has latest modification time then we no longer need tmp file and can remove it.
                     fs::remove_file(&tmp_path)?;
-                    catalog_json = Some(CatalogJson::read_from_file(&main_file)?);
                     break;
                 }
             };
         }
-        // Remove any remaining tmp file (we know that we already found the latest file)
-        for (_, tmp_path) in tmp_files {
-            fs::remove_file(tmp_path)?;
-        }
 
-        // Note: it can be `None` in case that each entry in `tmp_files` has greater modification time,
-        // but at the same time none of them is proper json file - edge case that we handle with this default value.
-        let catalog_json = catalog_json.unwrap_or(CatalogJson::read_from_file(&main_file)?);
         Ok(catalog_json)
     }
 
-    /// Returns time of last file modification. For convenience in case of error just returns EPOCH.
-    fn file_last_modified_time<P>(path: P) -> time::SystemTime
-    where
-        P: AsRef<Path>,
-    {
-        let meta = fs::metadata(path);
-        meta.and_then(|m| m.modified()).unwrap_or(time::UNIX_EPOCH)
+    /// Removes all `tmp_files` from file system.
+    /// Can fail if io error occurs.
+    fn remove_tmp_files(tmp_files: &mut Vec<PathBuf>) -> Result<(), CatalogError> {
+        for tmp_path in tmp_files {
+            fs::remove_file(tmp_path)?;
+        }
+        Ok(())
     }
 }
 
