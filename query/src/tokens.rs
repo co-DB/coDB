@@ -1,4 +1,6 @@
-﻿#[derive(Debug, PartialEq, Clone)]
+use std::fmt;
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum TokenType {
     Ident(String),
     Int(i64),
@@ -31,10 +33,52 @@ pub enum TokenType {
     Into,
     Set,
     Star, // This is used for both select statements and multiplication - needs to be handled correctly in parser
+    Values,
     And,
     Or,
 }
+impl fmt::Display for TokenType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenType::Ident(s) => write!(f, "identifier `{s}`"),
+            TokenType::Int(i) => write!(f, "integer `{i}`"),
+            TokenType::Float(fl) => write!(f, "float `{fl}`"),
+            TokenType::String(s) => write!(f, "string \"{s}\""),
+            TokenType::Illegal(e) => write!(f, "illegal token `{e}`"),
+            TokenType::LParen => write!(f, "("),
+            TokenType::RParen => write!(f, ")"),
+            TokenType::EOF => write!(f, "end of file"),
+            TokenType::Comma => write!(f, ","),
+            TokenType::NotEqual => write!(f, "!="),
+            TokenType::Equal => write!(f, "="),
+            TokenType::Greater => write!(f, ">"),
+            TokenType::GreaterEqual => write!(f, ">="),
+            TokenType::Less => write!(f, "<"),
+            TokenType::LessEqual => write!(f, "<="),
+            TokenType::Semicolon => write!(f, ";"),
+            TokenType::Plus => write!(f, "+"),
+            TokenType::Minus => write!(f, "-"),
+            TokenType::Divide => write!(f, "/"),
+            TokenType::Mod => write!(f, "%"),
+            TokenType::True => write!(f, "TRUE"),
+            TokenType::False => write!(f, "FALSE"),
+            TokenType::Select => write!(f, "SELECT"),
+            TokenType::Insert => write!(f, "INSERT"),
+            TokenType::Delete => write!(f, "DELETE"),
+            TokenType::Update => write!(f, "UPDATE"),
+            TokenType::Where => write!(f, "WHERE"),
+            TokenType::From => write!(f, "FROM"),
+            TokenType::Into => write!(f, "INTO"),
+            TokenType::Set => write!(f, "SET"),
+            TokenType::Star => write!(f, "*"),
+            TokenType::Values => write!(f, "VALUES"),
+            TokenType::And => write!(f, "AND"),
+            TokenType::Or => write!(f, "OR"),
+        }
+    }
+}
 
+#[derive(Clone)]
 pub struct Token {
     pub token_type: TokenType,
     pub column: usize,

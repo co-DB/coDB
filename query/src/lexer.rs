@@ -1,4 +1,4 @@
-﻿use super::tokens::{Token, TokenType};
+use super::tokens::{Token, TokenType};
 
 /// Responsible for transforming an input CoSQL string into a stream of [`Token`]s.
 ///
@@ -64,7 +64,7 @@ impl Lexer {
     }
 
     /// Checks if current position is at the end of input.
-    fn is_at_end(&self) -> bool {
+    pub fn is_at_end(&self) -> bool {
         self.read_pos >= self.input.len()
     }
 

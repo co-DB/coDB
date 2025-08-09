@@ -56,9 +56,10 @@ impl Default for Ast {
     }
 }
 
-/// [`NodeId`] is used for indexing nodes inside of [`Ast`].
+/// [`NodeId`] is used for indexing nodes inside [`Ast`].
 ///
-/// It's a wrapper around `usize`, but thanks to it being our custom type, fact that it can only be created inside `ast` ([`NodeId::new`] is private) and a fact that we don't allow to remove nodes once added to [`Ast`] we can assume that each [`NodeId`] is correct and don't need to validate it each time we want to add new node.
+/// It's a wrapper around `usize`, but thanks to it being our custom type, fact that it can only be created inside `ast` ([`NodeId::new`] is private)
+/// and a fact that we don't allow to remove nodes once added to [`Ast`] we can assume that each [`NodeId`] is correct and don't need to validate it each time we want to add new node.
 #[derive(Clone, Copy)]
 pub struct NodeId(usize);
 
@@ -98,17 +99,6 @@ pub struct DeleteStatement {
     pub where_clause_id: Option<NodeId>,
 }
 
-pub enum Type {
-    String,
-    F32,
-    F64,
-    I32,
-    I64,
-    Bool,
-    Column,
-    Table,
-}
-
 pub enum Literal {
     String(String),
     F32(f32),
@@ -136,7 +126,6 @@ pub struct LogicalExpressionNode {
     pub left_id: NodeId,
     pub right_id: NodeId,
     pub op: LogicalOperator,
-    pub ty: Type,
 }
 
 pub enum BinaryOperator {
@@ -157,7 +146,6 @@ pub struct BinaryExpressionNode {
     pub left_id: NodeId,
     pub right_id: NodeId,
     pub op: BinaryOperator,
-    pub ty: Type,
 }
 
 pub enum UnaryOperator {
@@ -168,23 +156,19 @@ pub enum UnaryOperator {
 pub struct UnaryExpressionNode {
     pub expression_id: NodeId,
     pub op: UnaryOperator,
-    pub ty: Type,
 }
 
 pub struct FunctionCallNode {
     pub identifier_id: NodeId,
     pub argument_ids: Vec<NodeId>,
-    pub ty: Type,
 }
 
 pub struct LiteralNode {
     pub value: Literal,
-    pub ty: Type,
 }
 
 pub struct IdentifierNode {
     pub value: String,
-    pub ty: Type,
 }
 
 #[cfg(test)]
@@ -192,23 +176,22 @@ mod tests {
     use super::*;
 
     // Helper to create a simple identifier node and return its id
-    fn add_identifier(ast: &mut Ast, name: &str, ty: Type) -> NodeId {
+    fn add_identifier(ast: &mut Ast, name: &str) -> NodeId {
         ast.add_node(Expression::Identifier(IdentifierNode {
             value: name.to_string(),
-            ty,
         }))
     }
 
     // Helper to create a literal node and return its id
-    fn add_literal(ast: &mut Ast, lit: Literal, ty: Type) -> NodeId {
-        ast.add_node(Expression::Literal(LiteralNode { value: lit, ty }))
+    fn add_literal(ast: &mut Ast, lit: Literal) -> NodeId {
+        ast.add_node(Expression::Literal(LiteralNode { value: lit }))
     }
 
     #[test]
     fn ast_add_identifier_node() {
         // given a new AST and an identifier node
         let mut ast = Ast::new();
-        let id = add_identifier(&mut ast, "foo", Type::I32);
+        let id = add_identifier(&mut ast, "foo");
 
         // when retrieving the node by id
         let expr = ast.node(id);
@@ -224,15 +207,14 @@ mod tests {
     fn ast_add_binary_expression() {
         // given a new AST and two literal nodes
         let mut ast = Ast::new();
-        let left = add_literal(&mut ast, Literal::I32(1), Type::I32);
-        let right = add_literal(&mut ast, Literal::I32(2), Type::I32);
+        let left = add_literal(&mut ast, Literal::I32(1));
+        let right = add_literal(&mut ast, Literal::I32(2));
 
         // when adding a binary expression
         let expr_id = ast.add_node(Expression::Binary(BinaryExpressionNode {
             left_id: left,
             right_id: right,
             op: BinaryOperator::Plus,
-            ty: Type::I32,
         }));
 
         // then the node is present and correct
@@ -250,15 +232,14 @@ mod tests {
     fn ast_add_function_call() {
         // given a new AST, a function identifier, and two argument literals
         let mut ast = Ast::new();
-        let func_id = add_identifier(&mut ast, "SUM", Type::I32);
-        let arg1 = add_literal(&mut ast, Literal::I32(10), Type::I32);
-        let arg2 = add_literal(&mut ast, Literal::I32(20), Type::I32);
+        let func_id = add_identifier(&mut ast, "SUM");
+        let arg1 = add_literal(&mut ast, Literal::I32(10));
+        let arg2 = add_literal(&mut ast, Literal::I32(20));
 
         // when adding a function call node with those arguments
         let call_id = ast.add_node(Expression::FunctionCall(FunctionCallNode {
             identifier_id: func_id,
             argument_ids: vec![arg1, arg2],
-            ty: Type::I32,
         }));
 
         // then the node is present and has the correct arguments
@@ -277,8 +258,8 @@ mod tests {
     fn ast_add_select_statement() {
         // given a new AST and valid column/table nodes
         let mut ast = Ast::new();
-        let col_id = add_identifier(&mut ast, "col", Type::I32);
-        let table_id = add_identifier(&mut ast, "table", Type::String);
+        let col_id = add_identifier(&mut ast, "col");
+        let table_id = add_identifier(&mut ast, "table");
 
         // when adding a valid select statement
         let stmt = Statement::Select(SelectStatement {
@@ -296,11 +277,11 @@ mod tests {
     fn ast_add_insert_statement() {
         // given a new AST, a table node, column nodes, and value nodes
         let mut ast = Ast::new();
-        let table_id = add_identifier(&mut ast, "users", Type::String);
-        let col_id1 = add_identifier(&mut ast, "id", Type::I32);
-        let col_id2 = add_identifier(&mut ast, "name", Type::String);
-        let val_id1 = add_literal(&mut ast, Literal::I32(1), Type::I32);
-        let val_id2 = add_literal(&mut ast, Literal::String("Alice".to_string()), Type::String);
+        let table_id = add_identifier(&mut ast, "users");
+        let col_id1 = add_identifier(&mut ast, "id");
+        let col_id2 = add_identifier(&mut ast, "name");
+        let val_id1 = add_literal(&mut ast, Literal::I32(1));
+        let val_id2 = add_literal(&mut ast, Literal::String("Alice".to_string()));
 
         // when adding an insert statement
         let stmt = Statement::Insert(InsertStatement {
@@ -318,10 +299,10 @@ mod tests {
     fn ast_add_update_statement() {
         // given a new AST, a table node, column/value nodes, and a where clause
         let mut ast = Ast::new();
-        let table_id = add_identifier(&mut ast, "users", Type::String);
-        let col_id = add_identifier(&mut ast, "name", Type::String);
-        let val_id = add_literal(&mut ast, Literal::String("Bob".to_string()), Type::String);
-        let where_id = add_literal(&mut ast, Literal::I32(1), Type::I32);
+        let table_id = add_identifier(&mut ast, "users");
+        let col_id = add_identifier(&mut ast, "name");
+        let val_id = add_literal(&mut ast, Literal::String("Bob".to_string()));
+        let where_id = add_literal(&mut ast, Literal::I32(1));
 
         // when adding an update statement
         let stmt = Statement::Update(UpdateStatement {
@@ -339,8 +320,8 @@ mod tests {
     fn ast_add_delete_statement() {
         // given a new AST, a table node, and a where clause
         let mut ast = Ast::new();
-        let table_id = add_identifier(&mut ast, "users", Type::String);
-        let where_id = add_literal(&mut ast, Literal::I32(1), Type::I32);
+        let table_id = add_identifier(&mut ast, "users");
+        let where_id = add_literal(&mut ast, Literal::I32(1));
 
         // when adding a delete statement
         let stmt = Statement::Delete(DeleteStatement {
