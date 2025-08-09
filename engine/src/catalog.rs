@@ -35,10 +35,10 @@ pub enum CatalogError {
     #[error("table '{0}' already exists")]
     TableAlreadyExists(String),
     /// Underlying IO module returned error
-    #[error("io error occured: {0}")]
+    #[error("io error occurred: {0}")]
     IoError(#[from] io::Error),
     /// File contains invalid json
-    #[error("json error occured: {0}")]
+    #[error("json error occurred: {0}")]
     JsonError(#[from] serde_json::Error),
 }
 
@@ -108,7 +108,7 @@ impl Catalog {
             .as_millis();
         let tmp_path = self.file_path.with_extension(format!("tmp-{epoch}"));
 
-        // We firstly store content in temporary file, only when all content is successfuly saved to file
+        // We firstly store content in temporary file, only when all content is successfully saved to file
         // we swap it with previous file content.
         let mut tmp_file = OpenOptions::new()
             .write(true)
@@ -125,7 +125,7 @@ impl Catalog {
 
     /// Return the latest version of [`CatalogJson`] saved on disk.
     /// Most of the time it will just return content of `main_dir_path/database_name`,
-    /// but in cases when there was a problem during [`Catalog::sync_to_disk`] and new content was only saved to temprorary file it will return the content from newest temporary file.
+    /// but in cases when there was a problem during [`Catalog::sync_to_disk`] and new content was only saved to temporary file it will return the content from newest temporary file.
     /// Can fail if io error occurs or file was not properly formatted (JSON).
     fn latest_catalog_json<P>(
         main_dir_path: P,
@@ -164,19 +164,19 @@ impl Catalog {
             match tmp_is_latest {
                 true => {
                     let tmp_catalog_json = CatalogJson::read_from_file(&tmp_path);
-                    // In this case it means we have successfuly deserialize proper [`CatalogJson`] structure from the file.
+                    // In this case it means we have successfully deserialize proper [`CatalogJson`] structure from the file.
                     // We will assume that this is the most recent version that should be used.
                     if let Ok(cj) = tmp_catalog_json {
                         fs::rename(&tmp_path, &main_file)?;
                         catalog_json = Some(cj);
                         break;
                     }
-                    // In this case we tried to read from file but it didn't contait proper json structure.
+                    // In this case we tried to read from file but it didn't contain proper json structure.
                     // We can remove the file as it will no longer be needed.
                     fs::remove_file(&tmp_path)?;
                 }
                 false => {
-                    // If main file has latest modification time than we no longer need tmp file and can remove it.
+                    // If main file has latest modification time then we no longer need tmp file and can remove it.
                     fs::remove_file(&tmp_path)?;
                     catalog_json = Some(CatalogJson::read_from_file(&main_file)?);
                     break;
@@ -222,7 +222,7 @@ pub enum TableMetadataError {
     /// While creating [`TableMetadata`] there were more than one column with the same name in `columns`
     #[error("column '{0}' was defined more than once")]
     DuplicatedColumn(String),
-    /// While creating [`TableMetadata`] `primary_key_column_name` was set to column which names does not appear in `columns`
+    /// While creating [`TableMetadata`] `primary_key_column_name` was set to column which name does not appear in `columns`
     #[error("unknown primary key column: {0}")]
     UnknownPrimaryKeyColumn(String),
     /// Column with provided name does not exist in `columns`
@@ -231,14 +231,14 @@ pub enum TableMetadataError {
     /// Column with provided names already exists in `columns`
     #[error("column '{0}' already exists")]
     ColumnAlreadyExists(String),
-    /// Invalid columns was used for operation, e.g. tried to remove primary key column
+    /// Invalid column was used for operation, e.g. tried to remove primary key column
     #[error("column '{0}' cannot be used in that context")]
     InvalidColumnUsed(String),
 }
 
 impl TableMetadata {
     /// Creates new [`TableMetadata`].
-    /// Can fail if columns slice contains more than one column with the same name or `primary_key_column_name` is not in `columns`.
+    /// Can fail if the columns slice contains more than one column with the same name, or if `primary_key_column_name` is not in `columns`.
     pub fn new(
         name: impl Into<String>,
         columns: &[ColumnMetadata],
@@ -310,7 +310,7 @@ impl TableMetadata {
         match idx {
             Some(idx) => {
                 self.columns.swap_remove(idx);
-                // Removed last element - don't need to update any index
+                // Removed last element - no need to update any index
                 if idx == self.columns.len() {
                     return Ok(());
                 }
@@ -484,7 +484,7 @@ impl From<TableJson> for TableMetadata {
             .into_iter()
             .map(ColumnMetadata::from)
             .collect();
-        // We can unwrap here as we our sure that table saved to file is well-defined table.
+        // We can unwrap here as we are sure that table saved to file is well-defined.
         TableMetadata::new(value.name, &columns, value.primary_key_column_name).unwrap()
     }
 }
