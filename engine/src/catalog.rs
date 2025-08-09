@@ -40,6 +40,9 @@ pub enum CatalogError {
     /// File contains invalid json
     #[error("json error occurred: {0}")]
     JsonError(#[from] serde_json::Error),
+    /// While creating new [`Catalog`] table returned error
+    #[error("table returned error: {0}")]
+    TableError(#[from] TableMetadataError),
 }
 
 impl Catalog {
@@ -53,8 +56,11 @@ impl Catalog {
         let tables = catalog_json
             .tables
             .into_iter()
-            .map(|t| (t.name.clone(), TableMetadata::from(t)))
-            .collect();
+            .map(|t| {
+                let name = t.name.clone();
+                TableMetadata::try_from(t).map(|tm| (name, tm))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
         let file_path = main_dir_path.as_ref().join(database_name);
         Ok(Catalog { file_path, tables })
     }
@@ -234,6 +240,9 @@ pub enum TableMetadataError {
     /// Invalid column was used for operation, e.g. tried to remove primary key column
     #[error("column '{0}' cannot be used in that context")]
     InvalidColumnUsed(String),
+    /// While creating new [`TableMetadata`] column returned error
+    #[error("column returned error: {0}")]
+    ColumnError(#[from] ColumnMetadataError),
 }
 
 impl TableMetadata {
@@ -477,15 +486,17 @@ impl From<&TableMetadata> for TableJson {
     }
 }
 
-impl From<TableJson> for TableMetadata {
-    fn from(value: TableJson) -> Self {
+impl TryFrom<TableJson> for TableMetadata {
+    type Error = TableMetadataError;
+
+    fn try_from(value: TableJson) -> Result<Self, Self::Error> {
         let columns: Vec<_> = value
             .columns
             .into_iter()
-            .map(ColumnMetadata::from)
-            .collect();
-        // We can unwrap here as we are sure that table saved to file is well-defined.
-        TableMetadata::new(value.name, &columns, value.primary_key_column_name).unwrap()
+            .map(ColumnMetadata::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let tm = TableMetadata::new(value.name, &columns, value.primary_key_column_name)?;
+        Ok(tm)
     }
 }
 
@@ -511,15 +522,17 @@ impl From<&ColumnMetadata> for ColumnJson {
     }
 }
 
-impl From<ColumnJson> for ColumnMetadata {
-    fn from(value: ColumnJson) -> Self {
-        ColumnMetadata {
-            name: value.name,
-            ty: value.ty,
-            pos: value.pos,
-            base_offset: value.base_offset,
-            base_offset_pos: value.base_offset_pos,
-        }
+impl TryFrom<ColumnJson> for ColumnMetadata {
+    type Error = ColumnMetadataError;
+
+    fn try_from(value: ColumnJson) -> Result<Self, Self::Error> {
+        ColumnMetadata::new(
+            value.name,
+            value.ty,
+            value.pos,
+            value.base_offset,
+            value.base_offset_pos,
+        )
     }
 }
 
@@ -950,6 +963,73 @@ mod tests {
 
         // main file should still contain the original json
         assert_file_json_eq(&db_path, main_json);
+    }
+
+    #[test]
+    fn catalog_new_returns_error_when_column_is_invalid() {
+        // given file with a column that has invalid base_offset_pos > pos
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("db");
+
+        let json = r#"
+    {
+        "tables": [
+            {
+                "name": "users",
+                "columns": [
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 1 }
+                ],
+                "primary_key_column_name": "id"
+            }
+        ]
+    }
+    "#;
+        write_json(&db_path, json);
+
+        // when creating catalog
+        let result = Catalog::new(&tmp_dir, "db");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::TableError(TableMetadataError::ColumnError(
+                ColumnMetadataError::InvalidBaseOffsetPosition(1, 0),
+            )),
+        );
+    }
+
+    #[test]
+    fn catalog_new_returns_error_when_table_has_duplicate_column_names() {
+        // given file with a table that has duplicate column names
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("db");
+
+        let json = r#"
+    {
+        "tables": [
+            {
+                "name": "users",
+                "columns": [
+                    { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
+                    { "name": "id", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
+                ],
+                "primary_key_column_name": "id"
+            }
+        ]
+    }
+    "#;
+        write_json(&db_path, json);
+
+        // when creating catalog
+        let result = Catalog::new(&tmp_dir, "db");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::TableError(TableMetadataError::DuplicatedColumn(String::new())),
+        );
     }
 
     #[test]
