@@ -34,6 +34,18 @@ struct Parser {
 }
 
 impl Parser {
+    pub fn new(input: &str) -> Parser {
+        let mut lexer = Lexer::new(input);
+        let first_token = lexer.next_token();
+        let second_token = lexer.next_token();
+        Self {
+            lexer,
+            ast: Ast::new(),
+            errors: Vec::new(),
+            curr_token: first_token,
+            peek_token: second_token,
+        }
+    }
     pub fn parse_program(mut self) -> Result<Ast, Vec<ParserError>> {
         while self.peek_token.token_type != TokenType::EOF {
             let stmt = self.parse_statement();
