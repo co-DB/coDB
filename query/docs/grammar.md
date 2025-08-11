@@ -82,23 +82,27 @@ String can contain the following escape sequences:
 
 ### Expressions
 
-Precedence goes as follows (from highest to lowest):
+Precedence (from lowest to highest)
 
-- primary expressions: function calls, literals, identifiers and parentheses
-- unary expressions
-- multiplicative expressions
-- additive expressions
-- comparison expressions
-- logical expressions
+- logical OR expressions (`OR`)
+- logical AND expressions (`AND`)
+- equality expressions (`=`, `!=`)
+- comparison expressions (`<`, `<=`, `>`, `>=`)
+- additive expressions (`+`, `-`)
+- multiplicative expressions (`*`, `/`, `%`)
+- unary expressions (unary `+`, unary `-`)
+- primary expressions: function calls, literals, identifiers, and parentheses
 
 ```
-<expression> :: <logical_expr>
-<logical_expr> :: <comparison_expr> (<logical_op> <comparison_expr>)*
-<comparison_expr> :: <add_expr> (<comparison_op> <add_expr>)*
-<add_expr> :: <mul_expr> (<add_op> <mul_expr>)*
-<mul_expr> :: <unary_expr> (<mul_op> <unary_expr>)*
-<unary_expr> :: <unary_op> <primary_expr> | <primary_expr>
-<primary_expr> :: <function_call> | <literal> | <identifier> | (<expression>)
+<expression>       ::= <logical_expr>
+<logical_or_expr>  ::= <logical_and_expr> ( "OR" <logical_and_expr> )*
+<logical_and_expr> ::= <equality_expr> ( "AND" <equality_expr> )*
+<equality_expr>    ::= <comparison_expr> ( <equality_op> <comparison_expr> )*
+<comparison_expr>  ::= <add_expr> ( <comparison_op> <add_expr> )*
+<add_expr>         ::= <mul_expr> ( <add_op> <mul_expr> )*
+<mul_expr>         ::= <unary_expr> ( <mul_op> <unary_expr> )*
+<unary_expr>       ::= <unary_op> <primary_expr> | <primary_expr>
+<primary_expr>     ::= <function_call> | <literal> | <identifier> | "(" <expression> ")"
 ```
 
 ### Function Calls

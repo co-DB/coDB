@@ -7,6 +7,19 @@ use crate::tokens::{Token, TokenType};
 use std::mem;
 use thiserror::Error;
 
+#[derive(PartialEq, PartialOrd)]
+enum Precedence {
+    Lowest = 0,
+    LogicalOr,      // OR
+    LogicalAnd,     // AND
+    Equality,       // =, !=, <>
+    Comparison,     // <, <=, >, >=
+    Additive,       // +, -
+    Multiplicative, // *, /, %
+    Unary,          // unary -, NOT
+    Primary,        // literals, identifiers, function calls, parentheses
+}
+
 #[derive(Error, Debug)]
 pub enum ParserError {
     #[error("Unexpected token: expected {expected}, found {found} at line {line}, column {column}")]
