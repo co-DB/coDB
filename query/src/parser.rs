@@ -60,7 +60,7 @@ impl Parser {
         }
     }
     pub fn parse_program(mut self) -> Result<Ast, Vec<ParserError>> {
-        while self.peek_token.token_type != TokenType::EOF {
+        loop {
             let stmt = self.parse_statement();
             match stmt {
                 Err(err) => {
@@ -83,7 +83,12 @@ impl Parser {
             }
             if self.peek_token.token_type == TokenType::Semicolon {
                 let _ = self.read_token();
-            };
+            } else if self.peek_token.token_type == TokenType::EOF {
+                break;
+            }
+            if let Err(err) = self.read_token() {
+                self.errors.push(err);
+            }
         }
         if !self.errors.is_empty() {
             return Err(self.errors);
