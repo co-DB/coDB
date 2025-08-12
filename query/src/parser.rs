@@ -8,11 +8,11 @@ use std::mem;
 use thiserror::Error;
 
 #[derive(PartialEq, PartialOrd)]
-enum Precedence {
+pub(crate) enum Precedence {
     Lowest = 0,
     LogicalOr,      // OR
     LogicalAnd,     // AND
-    Equality,       // =, !=, <>
+    Equality,       // =, !=
     Comparison,     // <, <=, >, >=
     Additive,       // +, -
     Multiplicative, // *, /, %
