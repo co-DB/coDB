@@ -51,12 +51,12 @@ impl Lexer {
     fn read_char(&mut self) {
         if self.is_at_end() {
             self.ch = '\0';
-            return;
-        }
-        self.ch = self.input[self.read_pos];
-        if self.ch == '\n' {
-            self.line += 1;
-            self.column = 0;
+        } else {
+            self.ch = self.input[self.read_pos];
+            if self.ch == '\n' {
+                self.line += 1;
+                self.column = 0;
+            }
         }
         self.pos = self.read_pos;
         self.read_pos += 1;
