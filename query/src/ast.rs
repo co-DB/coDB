@@ -10,14 +10,6 @@ pub struct Ast {
     statements: Vec<Statement>,
 }
 
-/// Error for [`Ast`] related operations.
-#[derive(Error, Debug)]
-pub enum AstError {
-    /// Provided node id was invalid, e.g. index was out of bound
-    #[error("invalid node id: {0}")]
-    InvalidNodeId(usize),
-}
-
 impl Ast {
     /// Create new, empty [`Ast`].
     pub fn new() -> Self {
