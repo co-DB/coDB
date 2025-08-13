@@ -83,7 +83,8 @@ impl Parser {
             }
             if self.peek_token.token_type == TokenType::Semicolon {
                 let _ = self.read_token();
-            } else if self.peek_token.token_type == TokenType::EOF {
+            }
+            if self.peek_token.token_type == TokenType::EOF {
                 break;
             }
             if let Err(err) = self.read_token() {
