@@ -1,11 +1,14 @@
-use crate::ast::{
-    Ast, DeleteStatement, Expression, IdentifierNode, InsertStatement, Literal, LiteralNode,
-    NodeId, SelectStatement, Statement, UpdateStatement,
-};
-use crate::lexer::Lexer;
-use crate::tokens::{Token, TokenType};
+#![allow(E0308)]
+
+use super::ast::*;
+use super::lexer::Lexer;
+use super::tokens::{Token, TokenType};
 use std::mem;
 use thiserror::Error;
+
+type PrefixFn = fn(&mut Parser) -> Result<NodeId, ParserError>;
+
+type InfixFn = fn(&mut Parser, NodeId) -> Result<NodeId, ParserError>;
 
 #[derive(PartialEq, PartialOrd)]
 pub(crate) enum Precedence {
@@ -16,7 +19,7 @@ pub(crate) enum Precedence {
     Comparison,     // <, <=, >, >=
     Additive,       // +, -
     Multiplicative, // *, /, %
-    Unary,          // unary -, NOT
+    Unary,          // unary -, +, !
     Primary,        // literals, identifiers, function calls, parentheses
 }
 
@@ -33,6 +36,20 @@ pub enum ParserError {
     #[error("Illegal token '{token}' at line {line}, column {column}")]
     IllegalToken {
         token: String,
+        line: usize,
+        column: usize,
+    },
+
+    #[error("Unexpected token in expression: {found} at line {line}, column {column}")]
+    NoInfixParseFn {
+        found: String,
+        line: usize,
+        column: usize,
+    },
+
+    #[error("Unexpected token in expression: {found} at line {line}, column {column}")]
+    NoPrefixParseFn {
+        found: String,
         line: usize,
         column: usize,
     },
@@ -107,10 +124,115 @@ impl Parser {
         }
     }
 
-    fn parse_expression(&mut self) -> Result<NodeId, ParserError> {
-        Ok(self.ast.add_node(Expression::Literal(LiteralNode {
-            value: Literal::String("String".to_string()),
-        })))
+    fn prefix_function(&self, token_type: &TokenType) -> Result<PrefixFn, ParserError> {
+        match token_type {
+            TokenType::Minus => Ok(Self::parse_unary_minus),
+            TokenType::Plus => Ok(Self::parse_unary_plus),
+            TokenType::Bang => Ok(Self::parse_bang),
+            TokenType::Int(_) => Ok(Self::parse_prefix_int),
+            TokenType::Float(_) => Ok(Self::parse_prefix_float),
+            TokenType::String(_) => Ok(Self::parse_prefix_string),
+            TokenType::False | TokenType::True => Ok(Self::parse_prefix_bool),
+            TokenType::LParen => Ok(Self::parse_grouped_expression),
+            _ => Err(ParserError::NoPrefixParseFn {
+                found: token_type.to_string(),
+                column: self.curr_token.column,
+                line: self.curr_token.line,
+            }),
+        }
+    }
+
+    fn parse_unary_minus(&mut self) -> Result<NodeId, ParserError> {
+        let node_id = self.parse_expression(Precedence::Unary)?;
+        let expression = Expression::Unary(UnaryExpressionNode {
+            op: UnaryOperator::Minus,
+            expression_id: node_id,
+        });
+        Ok(self.ast.add_node(expression))
+    }
+
+    fn parse_unary_plus(&mut self) -> Result<NodeId, ParserError> {
+        let node_id = self.parse_expression(Precedence::Unary)?;
+        let expression = Expression::Unary(UnaryExpressionNode {
+            op: UnaryOperator::Plus,
+            expression_id: node_id,
+        });
+        Ok(self.ast.add_node(expression))
+    }
+
+    fn parse_bang(&mut self) -> Result<NodeId, ParserError> {
+        let node_id = self.parse_expression(Precedence::Unary)?;
+        let expression = Expression::Unary(UnaryExpressionNode {
+            op: UnaryOperator::Bang,
+            expression_id: node_id,
+        });
+        Ok(self.ast.add_node(expression))
+    }
+
+    fn parse_prefix_int(&mut self) -> Result<NodeId, ParserError> {
+        if let TokenType::Int(s) = &self.curr_token.token_type {
+            return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
+                value: Literal::Int(*s),
+            })));
+        }
+        Err(Self::unexpected_token_error(self, "integer"))
+    }
+
+    fn parse_prefix_float(&mut self) -> Result<NodeId, ParserError> {
+        if let TokenType::Float(float) = &self.curr_token.token_type {
+            return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
+                value: Literal::Float(*float),
+            })));
+        }
+        Err(Self::unexpected_token_error(self, "float"))
+    }
+
+    fn parse_prefix_string(&mut self) -> Result<NodeId, ParserError> {
+        if let TokenType::String(s) = &self.curr_token.token_type {
+            return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
+                value: Literal::String(s.clone()),
+            })));
+        }
+        Err(Self::unexpected_token_error(self, "string"))
+    }
+
+    fn parse_prefix_bool(&mut self) -> Result<NodeId, ParserError> {
+        if let TokenType::False = &self.curr_token.token_type {
+            return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
+                value: Literal::Bool(false),
+            })));
+        } else if let TokenType::True = &self.curr_token.token_type {
+            return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
+                value: Literal::Bool(true),
+            })));
+        }
+        Err(Self::unexpected_token_error(self, "boolean"))
+    }
+
+    fn parse_grouped_expression(&mut self) -> Result<NodeId, ParserError> {
+        // We use the lowest precedence here, because we want to parse anything inside the parentheses
+        let expression_id = self.parse_expression(Precedence::Lowest)?;
+        self.expect_token(TokenType::RParen)?;
+        Ok(expression_id)
+    }
+    fn infix_function(token_type: &TokenType) -> InfixFn {
+        panic!("No prefix function")
+    }
+
+    fn parse_expression(&mut self, precedence: Precedence) -> Result<NodeId, ParserError> {
+        // Assume we are starting this function in position where the expression we want to parse
+        // starts from the peek token
+        self.read_token()?;
+        let prefix_function = self.prefix_function(&self.curr_token.token_type)?;
+        let mut expression_node_id = prefix_function(self)?;
+
+        while self.peek_token.token_type.precedence() > precedence {
+            self.read_token()?;
+            let infix_function = Self::infix_function(&self.curr_token.token_type);
+            expression_node_id = infix_function(self, expression_node_id)?;
+        }
+
+        Ok(expression_node_id)
     }
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         match self.curr_token.token_type {
@@ -124,7 +246,7 @@ impl Parser {
 
     fn parse_columns_common(&mut self) -> Result<Vec<NodeId>, ParserError> {
         let mut columns = Vec::new();
-        let first_col = self.expect_string()?;
+        let first_col = self.expect_ident()?;
         columns.push(
             self.ast
                 .add_node(Expression::Identifier(IdentifierNode { value: first_col })),
@@ -132,7 +254,7 @@ impl Parser {
 
         while self.peek_token.token_type == TokenType::Comma {
             self.read_token()?;
-            let column = self.expect_string()?;
+            let column = self.expect_ident()?;
             columns.push(
                 self.ast
                     .add_node(Expression::Identifier(IdentifierNode { value: column })),
@@ -174,12 +296,12 @@ impl Parser {
     }
 
     fn parse_column_setter(&mut self) -> Result<(NodeId, NodeId), ParserError> {
-        let column = self.expect_string()?;
+        let column = self.expect_ident()?;
         let column_id = self
             .ast
             .add_node(Expression::Identifier(IdentifierNode { value: column }));
         self.expect_token(TokenType::Equal)?;
-        let value_id = self.parse_expression()?;
+        let value_id = self.parse_expression(Precedence::Lowest)?;
         Ok((column_id, value_id))
     }
     fn parse_insert_statement(&mut self) -> Result<Statement, ParserError> {
@@ -198,10 +320,10 @@ impl Parser {
     fn parse_insert_values(&mut self) -> Result<Vec<NodeId>, ParserError> {
         self.expect_token(TokenType::LParen)?;
         let mut values = Vec::new();
-        values.push(self.parse_expression()?);
+        values.push(self.parse_expression(Precedence::Lowest)?);
         while self.peek_token.token_type == TokenType::Comma {
             self.read_token()?;
-            values.push(self.parse_expression()?);
+            values.push(self.parse_expression(Precedence::Lowest)?);
         }
         self.expect_token(TokenType::RParen)?;
         Ok(values)
@@ -235,10 +357,10 @@ impl Parser {
             return Ok(None);
         }
         self.expect_token(TokenType::Where)?;
-        Ok(Some(self.parse_expression()?))
+        Ok(Some(self.parse_expression(Precedence::Lowest)?))
     }
     fn parse_table_name(&mut self) -> Result<NodeId, ParserError> {
-        let table_name = self.expect_string()?;
+        let table_name = self.expect_ident()?;
         let node_id = self
             .ast
             .add_node(Expression::Identifier(IdentifierNode { value: table_name }));
@@ -274,10 +396,10 @@ impl Parser {
         }
     }
 
-    fn expect_string(&mut self) -> Result<String, ParserError> {
-        if let TokenType::String(s) = &self.peek_token.token_type {
-            let value = s.clone(); // clone first
-            self.read_token()?; // then advance
+    fn expect_ident(&mut self) -> Result<String, ParserError> {
+        if let TokenType::Ident(s) = &self.peek_token.token_type {
+            let value = s.clone();
+            self.read_token()?;
             Ok(value)
         } else {
             Err(self.unexpected_token_error("string"))
