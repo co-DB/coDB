@@ -93,10 +93,8 @@ pub struct DeleteStatement {
 
 pub enum Literal {
     String(String),
-    F32(f32),
-    F64(f64),
-    I32(i32),
-    I64(i64),
+    Float(f64),
+    Int(i64),
     Bool(bool),
 }
 
@@ -200,8 +198,8 @@ mod tests {
     fn ast_add_binary_expression() {
         // given a new AST and two literal nodes
         let mut ast = Ast::new();
-        let left = add_literal(&mut ast, Literal::I32(1));
-        let right = add_literal(&mut ast, Literal::I32(2));
+        let left = add_literal(&mut ast, Literal::Int(1));
+        let right = add_literal(&mut ast, Literal::Int(2));
 
         // when adding a binary expression
         let expr_id = ast.add_node(Expression::Binary(BinaryExpressionNode {
@@ -226,8 +224,8 @@ mod tests {
         // given a new AST, a function identifier, and two argument literals
         let mut ast = Ast::new();
         let func_id = add_identifier(&mut ast, "SUM");
-        let arg1 = add_literal(&mut ast, Literal::I32(10));
-        let arg2 = add_literal(&mut ast, Literal::I32(20));
+        let arg1 = add_literal(&mut ast, Literal::Int(10));
+        let arg2 = add_literal(&mut ast, Literal::Int(20));
 
         // when adding a function call node with those arguments
         let call_id = ast.add_node(Expression::FunctionCall(FunctionCallNode {
@@ -273,7 +271,7 @@ mod tests {
         let table_id = add_identifier(&mut ast, "users");
         let col_id1 = add_identifier(&mut ast, "id");
         let col_id2 = add_identifier(&mut ast, "name");
-        let val_id1 = add_literal(&mut ast, Literal::I32(1));
+        let val_id1 = add_literal(&mut ast, Literal::Int(1));
         let val_id2 = add_literal(&mut ast, Literal::String("Alice".to_string()));
 
         // when adding an insert statement
@@ -295,7 +293,7 @@ mod tests {
         let table_id = add_identifier(&mut ast, "users");
         let col_id = add_identifier(&mut ast, "name");
         let val_id = add_literal(&mut ast, Literal::String("Bob".to_string()));
-        let where_id = add_literal(&mut ast, Literal::I32(1));
+        let where_id = add_literal(&mut ast, Literal::Int(1));
 
         // when adding an update statement
         let stmt = Statement::Update(UpdateStatement {
@@ -314,7 +312,7 @@ mod tests {
         // given a new AST, a table node, and a where clause
         let mut ast = Ast::new();
         let table_id = add_identifier(&mut ast, "users");
-        let where_id = add_literal(&mut ast, Literal::I32(1));
+        let where_id = add_literal(&mut ast, Literal::Int(1));
 
         // when adding a delete statement
         let stmt = Statement::Delete(DeleteStatement {
