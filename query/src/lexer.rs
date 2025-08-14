@@ -213,9 +213,7 @@ impl Lexer {
                     self.read_char();
                     self.create_token(TokenType::NotEqual)
                 }
-                _ => self.create_token(TokenType::Illegal(String::from(
-                    "invalid character literal",
-                ))),
+                _ => self.create_token(TokenType::Bang),
             },
             '>' => match self.peek_char() {
                 '=' => {

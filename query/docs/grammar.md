@@ -75,7 +75,7 @@ String can contain the following escape sequences:
 ```
 <add_op> :: '+' | '-'
 <mul_op> :: '*' | '/' | '%'
-<unary_op> :: '-' | '+'
+<unary_op> :: '-' | '+' | '!'
 <comparison_op> :: '=' | '!=' | '>' | '>=' | '<' | '<='
 <logical_op> :: 'AND' | 'OR'
 ```
@@ -90,7 +90,7 @@ Precedence (from lowest to highest)
 - comparison expressions (`<`, `<=`, `>`, `>=`)
 - additive expressions (`+`, `-`)
 - multiplicative expressions (`*`, `/`, `%`)
-- unary expressions (unary `+`, unary `-`)
+- unary expressions (unary `+`, unary `-`, `!`)
 - primary expressions: function calls, literals, identifiers, and parentheses
 
 ```

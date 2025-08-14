@@ -143,6 +143,7 @@ pub struct BinaryExpressionNode {
 pub enum UnaryOperator {
     Plus,
     Minus,
+    Bang,
 }
 
 pub struct UnaryExpressionNode {
