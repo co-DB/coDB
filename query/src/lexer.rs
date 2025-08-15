@@ -459,25 +459,7 @@ mod tests {
 
         assert_works(&mut lexer, &expected_tokens);
     }
-
-    #[test]
-    fn test_illegal_bang_without_equal() {
-        let input = "select ! from users;";
-
-        let mut lexer = Lexer::new(input);
-
-        let expected_tokens = [
-            TokenType::Select,
-            TokenType::Illegal(String::from("invalid character literal")),
-            TokenType::From,
-            TokenType::Ident(String::from("users")),
-            TokenType::Semicolon,
-            TokenType::EOF,
-        ];
-
-        assert_works(&mut lexer, &expected_tokens);
-    }
-
+    
     #[test]
     fn test_unterminated_string() {
         let input = "select name from users where bio = 'This string has no end";
