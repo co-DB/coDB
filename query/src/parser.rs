@@ -1,7 +1,6 @@
 use super::ast::*;
 use super::lexer::Lexer;
 use super::tokens::{Token, TokenType};
-use crate::ast::Expression::FunctionCall;
 use std::mem;
 use thiserror::Error;
 
@@ -358,7 +357,7 @@ impl Parser {
             }
         }
         self.expect_token(TokenType::RParen)?;
-        let expression = FunctionCall(FunctionCallNode {
+        let expression = Expression::FunctionCall(FunctionCallNode {
             identifier_id: left_id,
             argument_ids: args,
         });
@@ -506,6 +505,7 @@ impl Parser {
     /// - `Some(Vec<NodeId>)` if a column list is explicitly provided.
     fn parse_insert_columns(&mut self) -> Result<Option<Vec<NodeId>>, ParserError> {
         if self.peek_token.token_type == TokenType::Values {
+            self.read_token()?;
             return Ok(None);
         }
 
@@ -558,6 +558,7 @@ impl Parser {
     /// - `Some(Vec<NodeId>)` for explicit columns.
     fn parse_select_columns(&mut self) -> Result<Option<Vec<NodeId>>, ParserError> {
         if self.peek_token.token_type == TokenType::Star {
+            self.read_token()?;
             return Ok(None);
         }
         let columns = self.parse_columns_common()?;
@@ -610,5 +611,412 @@ impl Parser {
             line: self.peek_token.line,
             column: self.peek_token.column,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_error_on_empty_input() {
+        let parser = Parser::new("");
+        let result = parser.parse_program();
+        assert!(result.is_err());
+        let errors = result.err().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors.first().unwrap(),
+            ParserError::UnexpectedToken { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_select_statement_correctly() {
+        let parser = Parser::new("Select * from table;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:#?}", ast.statements[0]);
+        };
+        assert!(select_stmt.where_clause_id.is_none());
+
+        let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name_id) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(select_stmt.table_name_id)
+            );
+        };
+        assert_eq!(table_ident.value, "table");
+    }
+
+    #[test]
+    fn parses_delete_statement_correctly() {
+        let parser = Parser::new("DELETE FROM table;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Delete(delete_stmt) = &ast.statements[0] else {
+            panic!("Expected Delete statement, got {:?}", &ast.statements[0]);
+        };
+        assert!(delete_stmt.where_clause_id.is_none());
+
+        let Expression::Identifier(ident) = ast.node(delete_stmt.table_name_id) else {
+            panic!(
+                "Expected Identifier, got {:?}",
+                ast.node(delete_stmt.table_name_id)
+            );
+        };
+        assert_eq!(ident.value, "table");
+    }
+
+    #[test]
+    fn parses_update_statement_correctly() {
+        let parser = Parser::new("UPDATE table SET col1 = 4, col2 = 6.1;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Update(update_stmt) = &ast.statements[0] else {
+            panic!("Expected Update statement, got {:#?}", ast.statements[0]);
+        };
+        assert!(update_stmt.where_clause_id.is_none());
+
+        let Expression::Identifier(table_ident) = ast.node(update_stmt.table_name_id) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(update_stmt.table_name_id)
+            );
+        };
+        assert_eq!(table_ident.value, "table");
+
+        assert_eq!(update_stmt.column_setters.len(), 2);
+
+        let (col1_id, col1_val_id) = update_stmt.column_setters[0];
+        let Expression::Identifier(col1_ident) = ast.node(col1_id) else {
+            panic!("Expected Identifier for col1, got {:#?}", ast.node(col1_id));
+        };
+        assert_eq!(col1_ident.value, "col1");
+
+        let Expression::Literal(col1_literal) = ast.node(col1_val_id) else {
+            panic!(
+                "Expected Literal for col1 value, got {:#?}",
+                ast.node(col1_val_id)
+            );
+        };
+        let Literal::Int(i) = col1_literal.value else {
+            panic!(
+                "Expected Int literal for col1, got {:#?}",
+                col1_literal.value
+            );
+        };
+        assert_eq!(i, 4);
+
+        let (col2_id, col2_val_id) = update_stmt.column_setters[1];
+        let Expression::Identifier(col2_ident) = ast.node(col2_id) else {
+            panic!("Expected Identifier for col2, got {:#?}", ast.node(col2_id));
+        };
+        assert_eq!(col2_ident.value, "col2");
+
+        let Expression::Literal(col2_literal) = ast.node(col2_val_id) else {
+            panic!(
+                "Expected Literal for col2 value, got {:#?}",
+                ast.node(col2_val_id)
+            );
+        };
+        let Literal::Float(f) = col2_literal.value else {
+            panic!(
+                "Expected Float literal for col2, got {:#?}",
+                col2_literal.value
+            );
+        };
+        assert_eq!(f, 6.1);
+    }
+
+    #[test]
+    fn parses_insert_statement_correctly() {
+        let parser = Parser::new("INSERT INTO table (col1, col2) VALUES (1, 2.5);");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Insert(insert_stmt) = &ast.statements[0] else {
+            panic!("Expected Insert statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(insert_stmt.table_name_id) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(insert_stmt.table_name_id)
+            );
+        };
+        assert_eq!(table_ident.value, "table");
+
+        let column_ids = insert_stmt.column_ids.as_ref().unwrap();
+        assert_eq!(column_ids.len(), 2);
+
+        let Expression::Identifier(col1_ident) = ast.node(column_ids[0]) else {
+            panic!(
+                "Expected Identifier for col1, got {:#?}",
+                ast.node(column_ids[0])
+            );
+        };
+        assert_eq!(col1_ident.value, "col1");
+
+        let Expression::Identifier(col2_ident) = ast.node(column_ids[1]) else {
+            panic!(
+                "Expected Identifier for col2, got {:#?}",
+                ast.node(column_ids[1])
+            );
+        };
+        assert_eq!(col2_ident.value, "col2");
+
+        let Expression::Literal(val1) = ast.node(insert_stmt.value_ids[0]) else {
+            panic!(
+                "Expected Literal for value1, got {:#?}",
+                ast.node(insert_stmt.value_ids[0])
+            );
+        };
+        let Literal::Int(i1) = val1.value else {
+            panic!("Expected Int literal for value1, got {:#?}", val1.value);
+        };
+        assert_eq!(i1, 1);
+
+        let Expression::Literal(val2) = ast.node(insert_stmt.value_ids[1]) else {
+            panic!(
+                "Expected Literal for value2, got {:#?}",
+                ast.node(insert_stmt.value_ids[1])
+            );
+        };
+        let Literal::Float(f2) = val2.value else {
+            panic!("Expected Float literal for value2, got {:#?}", val2.value);
+        };
+        assert_eq!(f2, 2.5);
+    }
+
+    #[test]
+    fn parses_select_with_complex_where_clause() {
+        let parser = Parser::new("SELECT * FROM table WHERE a + 3 * b > 10;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name_id) else {
+            panic!("Expected Identifier for table name");
+        };
+        assert_eq!(table_ident.value, "table");
+
+        let where_id = select_stmt.where_clause_id.expect("Expected WHERE clause");
+
+        let Expression::Binary(where_binary) = ast.node(where_id) else {
+            panic!("Expected Binary expression at WHERE clause root");
+        };
+        assert!(matches!(where_binary.op, BinaryOperator::Greater));
+
+        let Expression::Binary(add_expr) = ast.node(where_binary.left_id) else {
+            panic!("Expected Binary expression (Plus) on left of Greater");
+        };
+        assert!(matches!(add_expr.op, BinaryOperator::Plus));
+
+        let Expression::Identifier(a_ident) = ast.node(add_expr.left_id) else {
+            panic!("Expected Identifier on left of Plus");
+        };
+        assert_eq!(a_ident.value, "a");
+
+        let Expression::Binary(mul_expr) = ast.node(add_expr.right_id) else {
+            panic!("Expected Binary expression (Star) on right of Plus");
+        };
+        assert!(matches!(mul_expr.op, BinaryOperator::Star));
+
+        let Expression::Literal(lit_three) = ast.node(mul_expr.left_id) else {
+            panic!("Expected Literal on left of Star");
+        };
+        assert!(matches!(lit_three.value, Literal::Int(3)));
+
+        let Expression::Identifier(b_ident) = ast.node(mul_expr.right_id) else {
+            panic!("Expected Identifier on right of Star");
+        };
+        assert_eq!(b_ident.value, "b");
+
+        let Expression::Literal(lit_ten) = ast.node(where_binary.right_id) else {
+            panic!("Expected Literal on right of Greater");
+        };
+        assert!(matches!(lit_ten.value, Literal::Int(10)));
+    }
+
+    #[test]
+    fn parses_where_with_function_call_and_parentheses() {
+        let parser = Parser::new("SELECT * FROM table WHERE (LENGTH(name) + 3) * 2 > 10;");
+        let result = parser.parse_program();
+        assert!(result.is_ok(), "Parser error: {:?}", result.err());
+        let ast = result.unwrap();
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected SELECT statement, got {:?}", ast.statements[0]);
+        };
+
+        let where_id = select_stmt.where_clause_id.expect("Expected WHERE clause");
+        let root_expr = ast.node(where_id);
+        let Expression::Binary(root_bin) = root_expr else {
+            panic!("Expected Binary expression at root, got {root_expr:?}");
+        };
+        assert!(matches!(root_bin.op, BinaryOperator::Greater));
+
+        match ast.node(root_bin.right_id) {
+            Expression::Literal(lit) => match &lit.value {
+                Literal::Int(i) => assert_eq!(*i, 10),
+                other => panic!("Expected int literal, got {other:?}"),
+            },
+            other => panic!("Expected literal, got {other:?}"),
+        }
+
+        let Expression::Binary(mul_bin) = ast.node(root_bin.left_id) else {
+            panic!(
+                "Expected multiplication, got {:?}",
+                ast.node(root_bin.left_id)
+            );
+        };
+        assert!(matches!(mul_bin.op, BinaryOperator::Star));
+
+        match ast.node(mul_bin.right_id) {
+            Expression::Literal(lit) => match &lit.value {
+                Literal::Int(i) => assert_eq!(*i, 2),
+                other => panic!("Expected int literal, got {other:?}"),
+            },
+            other => panic!("Expected literal, got {other:?}"),
+        }
+
+        let Expression::Binary(add_bin) = ast.node(mul_bin.left_id) else {
+            panic!("Expected addition, got {:?}", ast.node(mul_bin.left_id));
+        };
+        assert!(matches!(add_bin.op, BinaryOperator::Plus));
+
+        match ast.node(add_bin.right_id) {
+            Expression::Literal(lit) => match &lit.value {
+                Literal::Int(i) => assert_eq!(*i, 3),
+                other => panic!("Expected int literal, got {other:?}"),
+            },
+            other => panic!("Expected literal, got {other:?}"),
+        }
+
+        let Expression::FunctionCall(func_call) = ast.node(add_bin.left_id) else {
+            panic!(
+                "Expected function call, got {:?}",
+                ast.node(add_bin.left_id)
+            );
+        };
+
+        match ast.node(func_call.identifier_id) {
+            Expression::Identifier(ident) => assert_eq!(ident.value, "LENGTH"),
+            other => panic!("Expected identifier for function name, got {other:?}"),
+        }
+
+        assert_eq!(func_call.argument_ids.len(), 1);
+        match ast.node(func_call.argument_ids[0]) {
+            Expression::Identifier(ident) => assert_eq!(ident.value, "name"),
+            other => panic!("Expected identifier for function argument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_unary_expression_correctly() {
+        let parser = Parser::new("SELECT * FROM products WHERE (-price + Length(name)) * 2 > 10;");
+        let result = parser.parse_program();
+        assert!(result.is_ok());
+        let ast = result.unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:?}", ast.statements[0]);
+        };
+        assert!(select_stmt.where_clause_id.is_some());
+
+        let where_id = select_stmt.where_clause_id.unwrap();
+        let Expression::Binary(greater_expr) = ast.node(where_id) else {
+            panic!(
+                "Expected top-level BinaryExpression (>), got {:?}",
+                ast.node(where_id)
+            );
+        };
+        assert!(matches!(greater_expr.op, BinaryOperator::Greater));
+
+        let Expression::Binary(mul_expr) = ast.node(greater_expr.left_id) else {
+            panic!(
+                "Expected BinaryExpression (*), got {:?}",
+                ast.node(greater_expr.left_id)
+            );
+        };
+        assert!(matches!(mul_expr.op, BinaryOperator::Star));
+
+        let Expression::Binary(add_expr) = ast.node(mul_expr.left_id) else {
+            panic!(
+                "Expected BinaryExpression (+), got {:?}",
+                ast.node(mul_expr.left_id)
+            );
+        };
+        assert!(matches!(add_expr.op, BinaryOperator::Plus));
+
+        let Expression::Unary(unary_expr) = ast.node(add_expr.left_id) else {
+            panic!(
+                "Expected UnaryExpression (-), got {:?}",
+                ast.node(add_expr.left_id)
+            );
+        };
+        assert!(matches!(unary_expr.op, UnaryOperator::Minus));
+
+        let Expression::Identifier(price_ident) = ast.node(unary_expr.expression_id) else {
+            panic!(
+                "Expected Identifier inside unary, got {:?}",
+                ast.node(unary_expr.expression_id)
+            );
+        };
+        assert_eq!(price_ident.value, "price");
+
+        let Expression::FunctionCall(func_node) = ast.node(add_expr.right_id) else {
+            panic!(
+                "Expected FunctionCallExpression, got {:?}",
+                ast.node(add_expr.right_id)
+            );
+        };
+        let Expression::Identifier(func_ident) = ast.node(func_node.identifier_id) else {
+            panic!(
+                "Expected Identifier for function name, got {:?}",
+                ast.node(func_node.identifier_id)
+            );
+        };
+        assert_eq!(func_ident.value, "Length");
+
+        let arg_id = func_node.argument_ids[0];
+        let Expression::Identifier(arg) = ast.node(arg_id) else {
+            panic!(
+                "Expected Identifier as function argument, got {:?}",
+                ast.node(arg_id)
+            );
+        };
+        assert_eq!(arg.value, "name");
+
+        let Expression::Literal(literal_node) = ast.node(mul_expr.right_id) else {
+            panic!(
+                "Expected LiteralExpression (2), got {:?}",
+                ast.node(mul_expr.right_id)
+            );
+        };
+        let Literal::Int(i) = literal_node.value else {
+            panic!("Expected Int literal, got {:?}", literal_node.value);
+        };
+        assert_eq!(i, 2);
+
+        let Expression::Literal(literal_node) = ast.node(greater_expr.right_id) else {
+            panic!(
+                "Expected LiteralExpression (10), got {:?}",
+                ast.node(greater_expr.right_id)
+            );
+        };
+        let Literal::Int(i) = literal_node.value else {
+            panic!("Expected Int literal, got {:?}", literal_node.value);
+        };
+        assert_eq!(i, 10);
     }
 }
