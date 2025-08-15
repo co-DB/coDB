@@ -4,8 +4,8 @@
 ///
 /// When executing, statements should be run in order of appearance.
 pub struct Ast {
-    nodes: Vec<Expression>,
-    statements: Vec<Statement>,
+    pub nodes: Vec<Expression>,
+    pub statements: Vec<Statement>,
 }
 
 impl Ast {
@@ -50,15 +50,20 @@ impl Default for Ast {
 ///
 /// It's a wrapper around `usize`, but thanks to it being our custom type, fact that it can only be created inside `ast` ([`NodeId::new`] is private)
 /// and a fact that we don't allow to remove nodes once added to [`Ast`] we can assume that each [`NodeId`] is correct and don't need to validate it each time we want to add new node.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct NodeId(usize);
 
 impl NodeId {
     fn new(id: usize) -> Self {
         NodeId(id)
     }
+
+    pub fn id(&self) -> usize {
+        self.0
+    }
 }
 
+#[derive(Debug)]
 pub enum Statement {
     Select(SelectStatement),
     Insert(InsertStatement),
@@ -66,29 +71,34 @@ pub enum Statement {
     Delete(DeleteStatement),
 }
 
+#[derive(Debug)]
 pub struct SelectStatement {
     pub column_ids: Option<Vec<NodeId>>,
     pub table_name_id: NodeId,
     pub where_clause_id: Option<NodeId>,
 }
 
+#[derive(Debug)]
 pub struct InsertStatement {
     pub table_name_id: NodeId,
     pub column_ids: Option<Vec<NodeId>>,
     pub value_ids: Vec<NodeId>,
 }
 
+#[derive(Debug)]
 pub struct UpdateStatement {
     pub table_name_id: NodeId,
     pub column_setters: Vec<(NodeId, NodeId)>,
     pub where_clause_id: Option<NodeId>,
 }
 
+#[derive(Debug)]
 pub struct DeleteStatement {
     pub table_name_id: NodeId,
     pub where_clause_id: Option<NodeId>,
 }
 
+#[derive(Debug)]
 pub enum Literal {
     String(String),
     Float(f64),
@@ -96,6 +106,7 @@ pub enum Literal {
     Bool(bool),
 }
 
+#[derive(Debug)]
 pub enum Expression {
     Logical(LogicalExpressionNode),
     Binary(BinaryExpressionNode),
@@ -105,17 +116,20 @@ pub enum Expression {
     Identifier(IdentifierNode),
 }
 
+#[derive(Debug)]
 pub enum LogicalOperator {
     And,
     Or,
 }
 
+#[derive(Debug)]
 pub struct LogicalExpressionNode {
     pub left_id: NodeId,
     pub right_id: NodeId,
     pub op: LogicalOperator,
 }
 
+#[derive(Debug)]
 pub enum BinaryOperator {
     Plus,
     Minus,
@@ -130,32 +144,38 @@ pub enum BinaryOperator {
     LessEqual,
 }
 
+#[derive(Debug)]
 pub struct BinaryExpressionNode {
     pub left_id: NodeId,
     pub right_id: NodeId,
     pub op: BinaryOperator,
 }
 
+#[derive(Debug)]
 pub enum UnaryOperator {
     Plus,
     Minus,
     Bang,
 }
 
+#[derive(Debug)]
 pub struct UnaryExpressionNode {
     pub expression_id: NodeId,
     pub op: UnaryOperator,
 }
 
+#[derive(Debug)]
 pub struct FunctionCallNode {
     pub identifier_id: NodeId,
     pub argument_ids: Vec<NodeId>,
 }
 
+#[derive(Debug)]
 pub struct LiteralNode {
     pub value: Literal,
 }
 
+#[derive(Debug)]
 pub struct IdentifierNode {
     pub value: String,
 }
