@@ -3,6 +3,7 @@
 use super::ast::*;
 use super::lexer::Lexer;
 use super::tokens::{Token, TokenType};
+use crate::ast::Expression::FunctionCall;
 use std::mem;
 use thiserror::Error;
 
@@ -126,9 +127,10 @@ impl Parser {
 
     fn prefix_function(&self, token_type: &TokenType) -> Result<PrefixFn, ParserError> {
         match token_type {
-            TokenType::Minus => Ok(Self::parse_unary_minus),
-            TokenType::Plus => Ok(Self::parse_unary_plus),
-            TokenType::Bang => Ok(Self::parse_bang),
+            TokenType::Minus => Ok(|p| p.parse_unary_op(UnaryOperator::Minus)),
+            TokenType::Plus => Ok(|p| p.parse_unary_op(UnaryOperator::Plus)),
+            TokenType::Bang => Ok(|p| p.parse_unary_op(UnaryOperator::Bang)),
+            TokenType::Ident(_) => Ok(Self::parse_prefix_ident),
             TokenType::Int(_) => Ok(Self::parse_prefix_int),
             TokenType::Float(_) => Ok(Self::parse_prefix_float),
             TokenType::String(_) => Ok(Self::parse_prefix_string),
@@ -142,31 +144,21 @@ impl Parser {
         }
     }
 
-    fn parse_unary_minus(&mut self) -> Result<NodeId, ParserError> {
+    fn parse_unary_op(&mut self, unary_op: UnaryOperator) -> Result<NodeId, ParserError> {
         let node_id = self.parse_expression(Precedence::Unary)?;
         let expression = Expression::Unary(UnaryExpressionNode {
-            op: UnaryOperator::Minus,
+            op: unary_op,
             expression_id: node_id,
         });
         Ok(self.ast.add_node(expression))
     }
-
-    fn parse_unary_plus(&mut self) -> Result<NodeId, ParserError> {
-        let node_id = self.parse_expression(Precedence::Unary)?;
-        let expression = Expression::Unary(UnaryExpressionNode {
-            op: UnaryOperator::Plus,
-            expression_id: node_id,
-        });
-        Ok(self.ast.add_node(expression))
-    }
-
-    fn parse_bang(&mut self) -> Result<NodeId, ParserError> {
-        let node_id = self.parse_expression(Precedence::Unary)?;
-        let expression = Expression::Unary(UnaryExpressionNode {
-            op: UnaryOperator::Bang,
-            expression_id: node_id,
-        });
-        Ok(self.ast.add_node(expression))
+    fn parse_prefix_ident(&mut self) -> Result<NodeId, ParserError> {
+        if let TokenType::Ident(s) = &self.curr_token.token_type {
+            return Ok(self
+                .ast
+                .add_node(Expression::Identifier(IdentifierNode { value: s.clone() })));
+        }
+        Err(Self::unexpected_token_error(self, "identifier"))
     }
 
     fn parse_prefix_int(&mut self) -> Result<NodeId, ParserError> {
@@ -215,8 +207,107 @@ impl Parser {
         self.expect_token(TokenType::RParen)?;
         Ok(expression_id)
     }
-    fn infix_function(token_type: &TokenType) -> InfixFn {
-        panic!("No prefix function")
+    fn infix_function(&self, token_type: &TokenType) -> Result<InfixFn, ParserError> {
+        match token_type {
+            TokenType::Plus => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::Plus, Precedence::Additive, left_id)
+            }),
+            TokenType::Minus => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::Minus, Precedence::Additive, left_id)
+            }),
+            TokenType::Star => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::Star, Precedence::Multiplicative, left_id)
+            }),
+            TokenType::Divide => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::Slash, Precedence::Multiplicative, left_id)
+            }),
+            TokenType::Mod => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::Modulo, Precedence::Multiplicative, left_id)
+            }),
+
+            TokenType::Equal => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::Equal, Precedence::Equality, left_id)
+            }),
+            TokenType::NotEqual => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::NotEqual, Precedence::Equality, left_id)
+            }),
+
+            TokenType::Greater => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::Greater, Precedence::Comparison, left_id)
+            }),
+            TokenType::GreaterEqual => Ok(|parser, left_id| {
+                parser.parse_binary_op(
+                    BinaryOperator::GreaterEqual,
+                    Precedence::Comparison,
+                    left_id,
+                )
+            }),
+            TokenType::Less => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::Less, Precedence::Comparison, left_id)
+            }),
+            TokenType::LessEqual => Ok(|parser, left_id| {
+                parser.parse_binary_op(BinaryOperator::LessEqual, Precedence::Comparison, left_id)
+            }),
+            TokenType::And => Ok(|parser, left_id| {
+                parser.parse_logical_op(LogicalOperator::And, Precedence::LogicalAnd, left_id)
+            }),
+            TokenType::Or => Ok(|parser, left_id| {
+                parser.parse_logical_op(LogicalOperator::Or, Precedence::LogicalOr, left_id)
+            }),
+            TokenType::LParen => Ok(Self::parse_function_call),
+            _ => Err(ParserError::NoInfixParseFn {
+                found: token_type.to_string(),
+                column: self.curr_token.column,
+                line: self.curr_token.line,
+            }),
+        }
+    }
+
+    fn parse_binary_op(
+        &mut self,
+        op: BinaryOperator,
+        precedence: Precedence,
+        left_id: NodeId,
+    ) -> Result<NodeId, ParserError> {
+        let right_id = self.parse_expression(precedence)?;
+        let exp = Expression::Binary(BinaryExpressionNode {
+            left_id,
+            right_id,
+            op,
+        });
+        Ok(self.ast.add_node(exp))
+    }
+
+    fn parse_logical_op(
+        &mut self,
+        op: LogicalOperator,
+        precedence: Precedence,
+        left_id: NodeId,
+    ) -> Result<NodeId, ParserError> {
+        let right_id = self.parse_expression(precedence)?;
+        let exp = Expression::Logical(LogicalExpressionNode {
+            left_id,
+            right_id,
+            op,
+        });
+        Ok(self.ast.add_node(exp))
+    }
+
+    fn parse_function_call(&mut self, left_id: NodeId) -> Result<NodeId, ParserError> {
+        let mut args = Vec::new();
+        if self.peek_token.token_type != TokenType::RParen {
+            args.push(self.parse_expression(Precedence::Lowest)?);
+            while self.peek_token.token_type == TokenType::Comma {
+                self.expect_token(TokenType::Comma)?;
+                args.push(self.parse_expression(Precedence::Lowest)?);
+            }
+        }
+        self.expect_token(TokenType::RParen)?;
+        let expression = FunctionCall(FunctionCallNode {
+            identifier_id: left_id,
+            argument_ids: args,
+        });
+        Ok(self.ast.add_node(expression))
     }
 
     fn parse_expression(&mut self, precedence: Precedence) -> Result<NodeId, ParserError> {
@@ -228,7 +319,7 @@ impl Parser {
 
         while self.peek_token.token_type.precedence() > precedence {
             self.read_token()?;
-            let infix_function = Self::infix_function(&self.curr_token.token_type);
+            let infix_function = self.infix_function(&self.curr_token.token_type)?;
             expression_node_id = infix_function(self, expression_node_id)?;
         }
 

@@ -121,7 +121,7 @@ pub struct LogicalExpressionNode {
 pub enum BinaryOperator {
     Plus,
     Minus,
-    Start,
+    Star,
     Slash,
     Modulo,
     Equal,

@@ -41,7 +41,7 @@ pub enum TokenType {
 }
 
 impl TokenType {
-    pub fn precedence(&self) -> Precedence {
+    pub(super) fn precedence(&self) -> Precedence {
         match self {
             TokenType::Or => Precedence::LogicalOr,
             TokenType::And => Precedence::LogicalAnd,
@@ -56,13 +56,7 @@ impl TokenType {
 
             TokenType::Star | TokenType::Divide | TokenType::Mod => Precedence::Multiplicative,
 
-            TokenType::Ident(_)
-            | TokenType::Int(_)
-            | TokenType::Float(_)
-            | TokenType::String(_)
-            | TokenType::LParen
-            | TokenType::True
-            | TokenType::False => Precedence::Primary,
+            TokenType::LParen => Precedence::Primary,
 
             // Everything else defaults to the lowest precedence
             _ => Precedence::Lowest,
