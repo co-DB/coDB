@@ -93,6 +93,7 @@ impl Lexer {
             "where" => self.create_token(TokenType::Where),
             "from" => self.create_token(TokenType::From),
             "set" => self.create_token(TokenType::Set),
+            "values" => self.create_token(TokenType::Values),
             "and" => self.create_token(TokenType::And),
             "or" => self.create_token(TokenType::Or),
             "into" => self.create_token(TokenType::Into),
