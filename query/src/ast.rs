@@ -1,7 +1,5 @@
 //! AST module - definition of coSQL syntax tree nodes and statements.
 
-use thiserror::Error;
-
 /// [`Ast`] represents query as list of statements ([`Ast::statements`]). Each statement is built using nodes defined in [`Ast::nodes`]. Every statement inserted to [`Ast`] is guaranteed to have every node id valid - user of this module does not need to assert it.
 ///
 /// When executing, statements should be run in order of appearance.

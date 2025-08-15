@@ -459,7 +459,7 @@ mod tests {
 
         assert_works(&mut lexer, &expected_tokens);
     }
-    
+
     #[test]
     fn test_unterminated_string() {
         let input = "select name from users where bio = 'This string has no end";
