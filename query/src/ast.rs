@@ -57,10 +57,6 @@ impl NodeId {
     fn new(id: usize) -> Self {
         NodeId(id)
     }
-
-    pub fn id(&self) -> usize {
-        self.0
-    }
 }
 
 #[derive(Debug)]
