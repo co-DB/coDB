@@ -41,6 +41,12 @@ pub enum TokenType {
 }
 
 impl TokenType {
+    /// Returns the operator precedence for this token type.
+    ///
+    /// Used by the parser to determine the order in which expressions
+    /// should be evaluated. Higher precedence values bind tighter in
+    /// expressions (e.g., multiplication before addition).
+    /// Non-operator tokens default to the lowest precedence.
     pub(super) fn precedence(&self) -> Precedence {
         match self {
             TokenType::Or => Precedence::LogicalOr,

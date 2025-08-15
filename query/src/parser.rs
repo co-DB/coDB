@@ -1,5 +1,3 @@
-#![allow(E0308)]
-
 use super::ast::*;
 use super::lexer::Lexer;
 use super::tokens::{Token, TokenType};
@@ -11,6 +9,9 @@ type PrefixFn = fn(&mut Parser) -> Result<NodeId, ParserError>;
 
 type InfixFn = fn(&mut Parser, NodeId) -> Result<NodeId, ParserError>;
 
+/// Operator precedence levels, ordered from lowest to highest.
+/// Used in the Pratt parsing algorithm to decide whether to
+/// continue parsing an expression or return control to the caller.
 #[derive(PartialEq, PartialOrd)]
 pub(crate) enum Precedence {
     Lowest = 0,
@@ -24,6 +25,7 @@ pub(crate) enum Precedence {
     Primary,        // literals, identifiers, function calls, parentheses
 }
 
+/// Error for [`Parser`] related operations.
 #[derive(Error, Debug)]
 pub enum ParserError {
     #[error("Unexpected token: expected {expected}, found {found} at line {line}, column {column}")]
@@ -57,14 +59,23 @@ pub enum ParserError {
 }
 
 struct Parser {
+    /// lexer to supply the tokens
     lexer: Lexer,
+    /// The ast being constructed
     ast: Ast,
+    /// list of errors, filled during parsing
     errors: Vec<ParserError>,
+    /// the token currently being processed
     curr_token: Token,
+    /// the next token to be processed
     peek_token: Token,
 }
 
+/// Responsible for transforming a stream of tokens from [`Lexer`] into an abstract syntax tree ([`Ast`]).
 impl Parser {
+    /// Creates a new parser from the given input string.
+    /// It initializes the lexer and pre-reads two tokens so that
+    /// `curr_token` and `peek_token` are always valid during parsing.
     pub fn new(input: &str) -> Parser {
         let mut lexer = Lexer::new(input);
         let first_token = lexer.next_token();
@@ -77,6 +88,16 @@ impl Parser {
             peek_token: second_token,
         }
     }
+
+    /// Main entry point for parsing a full CoSQL program.
+    ///
+    /// - Repeatedly calls `parse_statement` until EOF is reached.
+    /// - After each statement, ensures it ends with a semicolon (unless it’s the last one).
+    /// - On errors, records them and attempts to recover by skipping to the next semicolon.
+    ///
+    /// Returns:
+    /// - `Ok(Ast)` if parsing completed without errors.
+    /// - `Err(Vec<ParserError>)` if one or more errors were encountered.
     pub fn parse_program(mut self) -> Result<Ast, Vec<ParserError>> {
         loop {
             let stmt = self.parse_statement();
@@ -85,6 +106,9 @@ impl Parser {
                     self.errors.push(err);
                     self.recover_to_semicolon();
                 }
+                // Since in our definition a statement ends on a semicolon, even correctly parsed
+                // statements that are immediately followed by something other than semicolon will
+                // be treated as errors.
                 Ok(stmt) => {
                     if self.peek_token.token_type == TokenType::Semicolon {
                         self.ast.add_statement(stmt);
@@ -100,11 +124,12 @@ impl Parser {
                 }
             }
             if self.peek_token.token_type == TokenType::Semicolon {
-                let _ = self.read_token();
+                self.read_token().unwrap();
             }
             if self.peek_token.token_type == TokenType::EOF {
                 break;
             }
+            // We read a token here to move the next statement keyword into curr_token.
             if let Err(err) = self.read_token() {
                 self.errors.push(err);
             }
@@ -115,6 +140,8 @@ impl Parser {
         Ok(self.ast)
     }
 
+    /// Skips tokens until a semicolon or EOF is reached. This allows the parser to continue parsing
+    /// subsequent statements after an error instead of aborting entirely.
     fn recover_to_semicolon(&mut self) {
         while self.peek_token.token_type != TokenType::Semicolon
             && self.peek_token.token_type != TokenType::EOF
@@ -125,6 +152,9 @@ impl Parser {
         }
     }
 
+    /// Gets the correct prefix parsing function based on `token_type`.
+    ///
+    /// Can fail if there exists no prefix function for the given `token_type`
     fn prefix_function(&self, token_type: &TokenType) -> Result<PrefixFn, ParserError> {
         match token_type {
             TokenType::Minus => Ok(|p| p.parse_unary_op(UnaryOperator::Minus)),
@@ -144,6 +174,7 @@ impl Parser {
         }
     }
 
+    /// Parses a unary expression: `-x`, `+x`, or `!x` with operator `unary_op`.
     fn parse_unary_op(&mut self, unary_op: UnaryOperator) -> Result<NodeId, ParserError> {
         let node_id = self.parse_expression(Precedence::Unary)?;
         let expression = Expression::Unary(UnaryExpressionNode {
@@ -152,6 +183,8 @@ impl Parser {
         });
         Ok(self.ast.add_node(expression))
     }
+
+    /// Parses an identifier as an expression (e.g., column or table names).
     fn parse_prefix_ident(&mut self) -> Result<NodeId, ParserError> {
         if let TokenType::Ident(s) = &self.curr_token.token_type {
             return Ok(self
@@ -161,6 +194,7 @@ impl Parser {
         Err(Self::unexpected_token_error(self, "identifier"))
     }
 
+    /// Parses an integer literal as an expression.
     fn parse_prefix_int(&mut self) -> Result<NodeId, ParserError> {
         if let TokenType::Int(s) = &self.curr_token.token_type {
             return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
@@ -170,6 +204,7 @@ impl Parser {
         Err(Self::unexpected_token_error(self, "integer"))
     }
 
+    /// Parses a floating-point literal.
     fn parse_prefix_float(&mut self) -> Result<NodeId, ParserError> {
         if let TokenType::Float(float) = &self.curr_token.token_type {
             return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
@@ -179,6 +214,7 @@ impl Parser {
         Err(Self::unexpected_token_error(self, "float"))
     }
 
+    /// Parses a string literal.
     fn parse_prefix_string(&mut self) -> Result<NodeId, ParserError> {
         if let TokenType::String(s) = &self.curr_token.token_type {
             return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
@@ -188,6 +224,7 @@ impl Parser {
         Err(Self::unexpected_token_error(self, "string"))
     }
 
+    /// Parses a boolean literal (`true` or `false`).
     fn parse_prefix_bool(&mut self) -> Result<NodeId, ParserError> {
         if let TokenType::False = &self.curr_token.token_type {
             return Ok(self.ast.add_node(Expression::Literal(LiteralNode {
@@ -201,12 +238,18 @@ impl Parser {
         Err(Self::unexpected_token_error(self, "boolean"))
     }
 
+    /// Parses an expression enclosed in parentheses: `( ... )`.
+    /// This allows nested expressions and changes precedence.
     fn parse_grouped_expression(&mut self) -> Result<NodeId, ParserError> {
         // We use the lowest precedence here, because we want to parse anything inside the parentheses
         let expression_id = self.parse_expression(Precedence::Lowest)?;
         self.expect_token(TokenType::RParen)?;
         Ok(expression_id)
     }
+
+    /// Gets the correct infix parsing function based on `token_type`.
+    ///
+    /// Can fail if there exists no infix function for the given `token_type`
     fn infix_function(&self, token_type: &TokenType) -> Result<InfixFn, ParserError> {
         match token_type {
             TokenType::Plus => Ok(|parser, left_id| {
@@ -263,6 +306,11 @@ impl Parser {
         }
     }
 
+    /// Parses a binary operator expression (`left <op> right`).
+    ///
+    /// - `op` is the binary operator type (e.g., Plus, Minus, Equal).
+    /// - `precedence` is used to control how far the parser continues parsing the right-hand side.
+    /// - `left_id` is the AST node ID of the already-parsed left-hand expression.
     fn parse_binary_op(
         &mut self,
         op: BinaryOperator,
@@ -278,6 +326,9 @@ impl Parser {
         Ok(self.ast.add_node(exp))
     }
 
+    /// Parses a logical operator expression (`left AND right`, `left OR right`).
+    ///
+    /// Works similarly to `parse_binary_op`
     fn parse_logical_op(
         &mut self,
         op: LogicalOperator,
@@ -293,6 +344,10 @@ impl Parser {
         Ok(self.ast.add_node(exp))
     }
 
+    /// Parses a function call expression (`(x,y)`)
+    ///
+    /// - `left_id` is the identifier for the function name (e.g., "func").
+    /// - Parses zero or more arguments separated by commas.
     fn parse_function_call(&mut self, left_id: NodeId) -> Result<NodeId, ParserError> {
         let mut args = Vec::new();
         if self.peek_token.token_type != TokenType::RParen {
@@ -310,6 +365,13 @@ impl Parser {
         Ok(self.ast.add_node(expression))
     }
 
+    /// Parses an expression using Pratt parsing.
+    ///
+    /// Flow:
+    /// 1. Reads the next token to become `curr_token`.
+    /// 2. Finds the matching prefix function and parses the initial part of the expression.
+    /// 3. While the next token has higher precedence than the current one,
+    ///    calls the matching infix function to extend the expression.
     fn parse_expression(&mut self, precedence: Precedence) -> Result<NodeId, ParserError> {
         // Assume we are starting this function in position where the expression we want to parse
         // starts from the peek token
@@ -325,6 +387,8 @@ impl Parser {
 
         Ok(expression_node_id)
     }
+
+    /// Determines the correct statement parser based on the current token and runs it.
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         match self.curr_token.token_type {
             TokenType::Select => self.parse_select_statement(),
@@ -335,6 +399,7 @@ impl Parser {
         }
     }
 
+    /// Parses a comma-separated list of column identifiers.
     fn parse_columns_common(&mut self) -> Result<Vec<NodeId>, ParserError> {
         let mut columns = Vec::new();
         let first_col = self.expect_ident()?;
@@ -354,6 +419,9 @@ impl Parser {
         Ok(columns)
     }
 
+    /// Parses a DELETE statement:
+    ///
+    /// Syntax: `DELETE FROM <table> [WHERE <expression>]`
     fn parse_delete_statement(&mut self) -> Result<Statement, ParserError> {
         self.expect_token(TokenType::From)?;
         let table_name_id = self.parse_table_name()?;
@@ -364,6 +432,9 @@ impl Parser {
         }))
     }
 
+    /// Parses an UPDATE statement:
+    ///
+    /// Syntax: `UPDATE <table> SET col1 = val1, col2 = val2 [WHERE <expression>]`
     fn parse_update_statement(&mut self) -> Result<Statement, ParserError> {
         let table_name_id = self.parse_table_name()?;
         self.expect_token(TokenType::Set)?;
@@ -376,6 +447,7 @@ impl Parser {
         }))
     }
 
+    /// Parses a comma-separated list of `column = value` pairs for UPDATE statements.
     fn parse_column_setters(&mut self) -> Result<Vec<(NodeId, NodeId)>, ParserError> {
         let mut column_setters = Vec::new();
         column_setters.push(self.parse_column_setter()?);
@@ -386,6 +458,7 @@ impl Parser {
         Ok(column_setters)
     }
 
+    /// Parses a single column-value pair for an UPDATE statement.
     fn parse_column_setter(&mut self) -> Result<(NodeId, NodeId), ParserError> {
         let column = self.expect_ident()?;
         let column_id = self
@@ -395,6 +468,11 @@ impl Parser {
         let value_id = self.parse_expression(Precedence::Lowest)?;
         Ok((column_id, value_id))
     }
+
+    /// Parses an INSERT statement:
+    ///
+    /// Syntax:
+    /// `INSERT INTO <table> [(col1, col2, ...)] VALUES (val1, val2, ...)`
     fn parse_insert_statement(&mut self) -> Result<Statement, ParserError> {
         self.expect_token(TokenType::Into)?;
         let table_name_id = self.parse_table_name()?;
@@ -408,6 +486,7 @@ impl Parser {
         }))
     }
 
+    /// Parses the VALUES clause of an INSERT statement.
     fn parse_insert_values(&mut self) -> Result<Vec<NodeId>, ParserError> {
         self.expect_token(TokenType::LParen)?;
         let mut values = Vec::new();
@@ -419,6 +498,12 @@ impl Parser {
         self.expect_token(TokenType::RParen)?;
         Ok(values)
     }
+
+    /// Parses the optional column list in an INSERT statement.
+    ///
+    /// Returns:
+    /// - `None` if no column list is provided (implying all columns).
+    /// - `Some(Vec<NodeId>)` if a column list is explicitly provided.
     fn parse_insert_columns(&mut self) -> Result<Option<Vec<NodeId>>, ParserError> {
         if self.peek_token.token_type == TokenType::Values {
             return Ok(None);
@@ -431,6 +516,11 @@ impl Parser {
         self.expect_token(TokenType::RParen)?;
         Ok(Some(columns))
     }
+
+    /// Parses a SELECT statement:
+    ///
+    /// Syntax:
+    /// `SELECT <columns> FROM <table> [WHERE <expression>]`
     fn parse_select_statement(&mut self) -> Result<Statement, ParserError> {
         let column_ids = self.parse_select_columns()?;
         self.expect_token(TokenType::From)?;
@@ -443,6 +533,7 @@ impl Parser {
         }))
     }
 
+    /// Parses an optional WHERE clause, returning the expression node ID if present.
     fn parse_where_clause(&mut self) -> Result<Option<NodeId>, ParserError> {
         if self.peek_token.token_type != TokenType::Where {
             return Ok(None);
@@ -450,6 +541,8 @@ impl Parser {
         self.expect_token(TokenType::Where)?;
         Ok(Some(self.parse_expression(Precedence::Lowest)?))
     }
+
+    /// Parses a table name as an identifier expression.
     fn parse_table_name(&mut self) -> Result<NodeId, ParserError> {
         let table_name = self.expect_ident()?;
         let node_id = self
@@ -457,6 +550,12 @@ impl Parser {
             .add_node(Expression::Identifier(IdentifierNode { value: table_name }));
         Ok(node_id)
     }
+
+    /// Parses the column list in a SELECT statement.
+    ///
+    /// Returns:
+    /// - `None` if `*` is used (all columns).
+    /// - `Some(Vec<NodeId>)` for explicit columns.
     fn parse_select_columns(&mut self) -> Result<Option<Vec<NodeId>>, ParserError> {
         if self.peek_token.token_type == TokenType::Star {
             return Ok(None);
@@ -464,6 +563,9 @@ impl Parser {
         let columns = self.parse_columns_common()?;
         Ok(Some(columns))
     }
+
+    /// Advances the parser by one token.
+    /// Also checks for illegal tokens from the lexer and returns an error if found.
     fn read_token(&mut self) -> Result<(), ParserError> {
         self.curr_token = mem::replace(&mut self.peek_token, self.lexer.next_token());
 
@@ -478,6 +580,8 @@ impl Parser {
         Ok(())
     }
 
+    /// Consumes the next token if it matches the expected type.
+    /// Otherwise, returns an `UnexpectedToken` error.
     fn expect_token(&mut self, expected_type: TokenType) -> Result<(), ParserError> {
         if self.peek_token.token_type == expected_type {
             self.read_token()?;
@@ -487,6 +591,7 @@ impl Parser {
         }
     }
 
+    /// Consumes the next token if it’s an identifier and returns its string value.
     fn expect_ident(&mut self) -> Result<String, ParserError> {
         if let TokenType::Ident(s) = &self.peek_token.token_type {
             let value = s.clone();
@@ -497,6 +602,7 @@ impl Parser {
         }
     }
 
+    /// Helper to create a consistent `UnexpectedToken` error.
     fn unexpected_token_error(&self, expected: &str) -> ParserError {
         ParserError::UnexpectedToken {
             expected: expected.to_string(),
