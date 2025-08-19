@@ -43,14 +43,7 @@ pub enum ParserError {
     },
 
     #[error("Unexpected token in expression: {found} at line {line}, column {column}")]
-    NoInfixParseFn {
-        found: String,
-        line: usize,
-        column: usize,
-    },
-
-    #[error("Unexpected token in expression: {found} at line {line}, column {column}")]
-    NoPrefixParseFn {
+    NoParseFn {
         found: String,
         line: usize,
         column: usize,
@@ -91,7 +84,7 @@ impl Parser {
     /// Main entry point for parsing a full CoSQL program.
     ///
     /// - Repeatedly calls `parse_statement` until EOF is reached.
-    /// - After each statement, ensures it ends with a semicolon (unless it’s the last one).
+    /// - After each statement, ensures it ends with a semicolon.
     /// - On errors, records them and attempts to recover by skipping to the next semicolon.
     ///
     /// Returns:
@@ -165,7 +158,7 @@ impl Parser {
             TokenType::String(_) => Ok(Self::parse_prefix_string),
             TokenType::False | TokenType::True => Ok(Self::parse_prefix_bool),
             TokenType::LParen => Ok(Self::parse_grouped_expression),
-            _ => Err(ParserError::NoPrefixParseFn {
+            _ => Err(ParserError::NoParseFn {
                 found: token_type.to_string(),
                 column: self.curr_token.column,
                 line: self.curr_token.line,
@@ -297,7 +290,7 @@ impl Parser {
                 parser.parse_logical_op(LogicalOperator::Or, Precedence::LogicalOr, left_id)
             }),
             TokenType::LParen => Ok(Self::parse_function_call),
-            _ => Err(ParserError::NoInfixParseFn {
+            _ => Err(ParserError::NoParseFn {
                 found: token_type.to_string(),
                 column: self.curr_token.column,
                 line: self.curr_token.line,
@@ -934,6 +927,7 @@ mod tests {
         assert!(select_stmt.where_clause_id.is_some());
 
         let where_id = select_stmt.where_clause_id.unwrap();
+
         let Expression::Binary(greater_expr) = ast.node(where_id) else {
             panic!(
                 "Expected top-level BinaryExpression (>), got {:?}",
@@ -1018,5 +1012,26 @@ mod tests {
             panic!("Expected Int literal, got {:?}", literal_node.value);
         };
         assert_eq!(i, 10);
+    }
+
+    #[test]
+    fn parses_multiple_statements() {
+        let parser = Parser::new("SELECT * FROM products; Select * FROM users; DELETE FROM table;");
+        let result = parser.parse_program();
+        assert!(result.is_ok());
+        let ast = result.unwrap();
+        assert_eq!(ast.statements.len(), 3);
+        assert!(matches!(ast.statements[0], Statement::Select(_)));
+        assert!(matches!(ast.statements[1], Statement::Select(_)));
+        assert!(matches!(ast.statements[2], Statement::Delete(_)));
+    }
+
+    #[test]
+    fn correctly_recovers_from_statements_with_error_and_continues() {
+        let parser = Parser::new("SELECT * FROM; Select * FROM users; DELETE table;");
+        let result = parser.parse_program();
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+        assert_eq!(error.len(), 2);
     }
 }
