@@ -1,9 +1,6 @@
 fn main() {
     println!("Hello server!");
     println!("Ouput from engine function: {}", engine::add(2, 3));
-
-    println!("Starting test");
-    engine::poc_cache::showcase();
 }
 
 #[cfg(test)]
