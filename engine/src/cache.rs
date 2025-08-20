@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use dashmap::DashMap;
+use moka::sync::Cache as MokaCache;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
@@ -11,7 +12,7 @@ use crate::{
     paged_file::{Page, PageId},
 };
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Clone)]
 pub(crate) struct FilePageRef {
     page_id: PageId,
     file_key: FileKey,
@@ -95,26 +96,25 @@ impl PinnedWritePage {
     }
 }
 
-pub(crate) struct Cache {
-    cache: DashMap<FilePageRef, Arc<PageFrame>>,
+pub(crate) struct Cache<const N: usize> {
+    frames: DashMap<FilePageRef, Arc<PageFrame>>,
+    lru: MokaCache<FilePageRef, ()>,
 }
 
-impl Cache {
-    const CACHE_SIZE: usize = 1024;
+impl<const N: usize> Cache<N> {
+    const CACHE_CAPACITY: usize = N;
 
     pub(crate) fn new() -> Self {
         Self {
-            cache: DashMap::with_capacity(Self::CACHE_SIZE),
+            frames: DashMap::with_capacity(Self::CACHE_CAPACITY),
+            lru: MokaCache::builder()
+                .max_capacity(Self::CACHE_CAPACITY as _)
+                .build(),
         }
     }
 
-    fn get_or_load_frame(&self, id: FilePageRef) -> Arc<PageFrame> {
-        todo!()
-    }
-
     pub(crate) fn pin_read(&self, id: FilePageRef) -> PinnedReadPage {
-        let frame = self.get_or_load_frame(id);
-        frame.pin();
+        let frame = self.get_pinned_frame(id);
 
         let guard_local = frame.read();
         // SAFETY: we transmute the guard's lifetime to 'static.
@@ -132,8 +132,7 @@ impl Cache {
     }
 
     pub(crate) fn pin_write(&self, id: FilePageRef) -> PinnedWritePage {
-        let frame = self.get_or_load_frame(id);
-        frame.pin();
+        let frame = self.get_pinned_frame(id);
 
         let guard_local = frame.write();
         // SAFETY: we transmute the guard's lifetime to 'static.
@@ -150,5 +149,71 @@ impl Cache {
         }
     }
 
-    // if we want to remove something from cache we first need to check .pin_count() of this, cannot remove somehting that is pinned
+    /// Returns [`Arc<PageFrame>`] and pinnes the underlying [`PageFrame`].
+    /// It first looks for frame in [`Cache::frames`]. If it's found there then its key in [`Cache::lru`] is updated (making it MRU).
+    /// Otherwise [`PageFrame`] is loaded from disk using [`FilesManager`] and frame's key is inserted into [`Cache::lru`].
+    fn get_pinned_frame(&self, id: FilePageRef) -> Arc<PageFrame> {
+        let frame = self.frames.get(&id);
+        if let Some(frame) = frame {
+            self.lru.insert(id, ());
+            frame.pin();
+            return frame.clone();
+        }
+
+        todo!("implement case when frame not found in cache")
+    }
+
+    /// Evicts the first frame (starting from LRU) that has [`PageFrame::pin_count`] equal to 0.
+    /// If frame is selected to be evicted (using LRU), but its pin count is greater than 0, it will not be evicted and instead its key is updated in [`Cache::lru`] (making it MRU). In that case the next LRU is picked and so on.
+    // TODO: figure out what to do if every page has pin_count > 0 and we are stuck
+    fn evict_frame(&self) {
+        // Eviction can be cancelled if current cache size is < half of the capacity.
+        let target_size = Self::CACHE_CAPACITY / 2;
+
+        for (inspected, (key, _)) in self.lru.iter().enumerate() {
+            if self.frames.len() <= target_size {
+                return;
+            }
+            if inspected >= Self::CACHE_CAPACITY {
+                break;
+            }
+
+            let key = (*key).clone();
+
+            match self.frames.remove(&key) {
+                Some((_, frame)) => {
+                    let safe_to_delete = frame.pinned_count() == 0;
+                    match safe_to_delete {
+                        true => {
+                            if frame.dirty.load(Ordering::Acquire) {
+                                self.flush_frame(frame);
+                            }
+                            self.lru.invalidate(&key);
+                        }
+                        false => {
+                            // Other thread pinned it - put back to frames + make it MRU.
+                            self.frames.insert(key.clone(), frame);
+                            self.lru.insert(key.clone(), ());
+                        }
+                    }
+                }
+                None => {
+                    // Already removed by other thread.
+                    continue;
+                }
+            }
+        }
+
+        todo!("We couldn't evict any page - what to do now?")
+    }
+
+    /// Flushes the frame to the disk.
+    fn flush_frame(&self, frame: Arc<PageFrame>) {
+        if !frame.dirty.load(Ordering::Acquire) {
+            // Other thread already flushed it.
+            return;
+        }
+
+        todo!()
+    }
 }
