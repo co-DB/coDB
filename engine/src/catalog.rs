@@ -438,6 +438,10 @@ impl ColumnMetadata {
         })
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn ty(&self) -> ColumnType {
         self.ty
     }
@@ -464,7 +468,7 @@ pub enum ColumnType {
     I64,
     Bool,
     Date,
-    Datetime,
+    DateTime,
 }
 
 impl ColumnType {
@@ -477,7 +481,7 @@ impl ColumnType {
             ColumnType::I64 => true,
             ColumnType::Bool => true,
             ColumnType::Date => true,
-            ColumnType::Datetime => true,
+            ColumnType::DateTime => true,
         }
     }
 }
