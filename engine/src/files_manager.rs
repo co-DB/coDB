@@ -1,9 +1,11 @@
 ﻿//! FilesManager module — manages and distributes paged files in a single database.
 
 use crate::paged_file::{PagedFile, PagedFileError};
+use dashmap::DashMap;
 use directories::ProjectDirs;
-use std::collections::HashMap;
+use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Represents possible file types inside a table directory (refer to `docs/file_structure.md` for more
@@ -43,11 +45,10 @@ impl FileKey {
 
 /// Responsible for storing and distributing [`PagedFile`]s of a single database
 /// to higher level components.
-///
-/// As a singleton it allows the [`PagedFile`]s to persist beyond a single query and thus
-/// eliminates the time needed to instantiate them each time.
 pub struct FilesManager {
-    open_files: HashMap<FileKey, PagedFile>,
+    /// (Almost) All public api of [`PagedFile`] takes `&mut self`, so there is
+    /// no point in using [`RwLock`] instead of [`Mutex`] here.
+    open_files: DashMap<FileKey, Arc<Mutex<PagedFile>>>,
     base_path: PathBuf,
 }
 
@@ -75,27 +76,28 @@ impl FilesManager {
                     .to_path_buf()
                     .join(database_name);
                 Ok(FilesManager {
-                    open_files: HashMap::new(),
+                    open_files: DashMap::new(),
                     base_path,
                 })
             }
         }
     }
 
-    /// Returns a [`PagedFile`] for a specific combination of table name and file type stored in
+    /// Returns a [`Arc<Mutext<PagedFile>>`] for a specific combination of table name and file type stored in
     /// FileKey or creates and stores it if one didn't exist beforehand.
     ///
     /// Can fail if [`PagedFile`] instantiation didn't succeed (refer to
     /// [`PagedFile`]'s implementation for more details)
     pub fn get_or_open_new_file(
-        &mut self,
-        key: FileKey,
-    ) -> Result<&mut PagedFile, FilesManagerError> {
+        &self,
+        key: &FileKey,
+    ) -> Result<Arc<Mutex<PagedFile>>, FilesManagerError> {
         let file_path = self.base_path.join(&key.table_name);
         Ok(self
             .open_files
-            .entry(key)
-            .or_insert(PagedFile::new(file_path)?))
+            .entry(key.clone())
+            .or_insert(Arc::new(Mutex::new(PagedFile::new(file_path)?)))
+            .clone())
     }
 
     /// Closes a file and removes its entry from the stored [`PagedFile`]s. Can be used for when
