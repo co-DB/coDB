@@ -108,9 +108,20 @@ impl Field {
     ) -> Result<(Self, &'a [u8]), RecordError> {
         match column_type {
             ColumnType::Bool => {
-                // we know a bool is a single byte so we can just compare it to 0.
-                Self::read_fixed_and_convert::<bool, 1>(buffer, |b| b[0] != 0, name)
-                    .map(|(val, rest)| (Field::Bool(val), rest))
+                if buffer.is_empty() {
+                    return Err(RecordError::UnexpectedEnd {
+                        field_name: name.into(),
+                        expected: 1,
+                        actual: buffer.len(),
+                    });
+                }
+                match buffer[0] {
+                    0 => Ok((Field::Bool(false), &buffer[1..])),
+                    1 => Ok((Field::Bool(true), &buffer[1..])),
+                    _ => Err(RecordError::FailedToDeserialize {
+                        field_name: name.into(),
+                    }),
+                }
             }
             ColumnType::I32 => {
                 Self::read_fixed_and_convert::<i32, 4>(buffer, i32::from_le_bytes, name)
@@ -217,6 +228,17 @@ mod tests {
         let result = Field::deserialize(&buffer, ColumnType::String, "name");
         assert!(result.is_err());
         assert!(matches!(result, Err(RecordError::UnexpectedEnd { .. })));
+    }
+
+    #[test]
+    fn fails_for_invalid_bool() {
+        let buffer = [0x02];
+        let result = Field::deserialize(&buffer, ColumnType::Bool, "name");
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(RecordError::FailedToDeserialize { .. })
+        ));
     }
 
     #[test]
