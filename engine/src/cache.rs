@@ -1,15 +1,19 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    num::NonZero,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
-use dashmap::DashMap;
-use moka::sync::Cache as MokaCache;
+use dashmap::{DashMap, Entry};
+use lru::LruCache;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use thiserror::Error;
 
 use crate::{
-    files_manager::FileKey,
-    paged_file::{Page, PageId},
+    files_manager::{FileKey, FilesManager, FilesManagerError},
+    paged_file::{Page, PageId, PagedFileError},
 };
 
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -43,8 +47,7 @@ impl PageFrame {
 
     /// Acquires exclusive write guard on [`PageFrame::page`].
     fn write(&self) -> RwLockWriteGuard<'_, Page> {
-        // TODO: figure out if its right ordering and explain in comment why
-        self.dirty.fetch_or(true, Ordering::Release);
+        self.dirty.fetch_or(true, Ordering::AcqRel);
         self.page.write()
     }
 
@@ -58,9 +61,9 @@ impl PageFrame {
         self.pin_count.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Returns current value of [`PageFrame::pin_count`]. Should be used for checking if [`PageFrame`] is used by other threads.
-    fn pinned_count(&self) -> usize {
-        self.pin_count.load(Ordering::Acquire)
+    /// Returns true if [`PageFrame`] is used by other threads.
+    fn is_pinned(&self) -> bool {
+        self.pin_count.load(Ordering::Acquire) > 0
     }
 }
 
@@ -96,25 +99,36 @@ impl PinnedWritePage {
     }
 }
 
+/// Error for cache related operations.
+#[derive(Debug, Error)]
+pub(crate) enum CacheError {
+    #[error("failed to load file: {0}")]
+    FilesManagerError(#[from] FilesManagerError),
+    #[error("{0}")]
+    PagedFileError(#[from] PagedFileError),
+}
+
 pub(crate) struct Cache<const N: usize> {
     frames: DashMap<FilePageRef, Arc<PageFrame>>,
-    lru: MokaCache<FilePageRef, ()>,
+    lru: Arc<RwLock<LruCache<FilePageRef, ()>>>,
+    files: Arc<FilesManager>,
 }
 
 impl<const N: usize> Cache<N> {
     const CACHE_CAPACITY: usize = N;
 
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(files: Arc<FilesManager>) -> Self {
         Self {
             frames: DashMap::with_capacity(Self::CACHE_CAPACITY),
-            lru: MokaCache::builder()
-                .max_capacity(Self::CACHE_CAPACITY as _)
-                .build(),
+            lru: Arc::new(RwLock::new(LruCache::new(
+                NonZero::new(Self::CACHE_CAPACITY).unwrap(),
+            ))),
+            files,
         }
     }
 
-    pub(crate) fn pin_read(&self, id: FilePageRef) -> PinnedReadPage {
-        let frame = self.get_pinned_frame(id);
+    pub(crate) fn pin_read(&self, id: FilePageRef) -> Result<PinnedReadPage, CacheError> {
+        let frame = self.get_pinned_frame(id)?;
 
         let guard_local = frame.read();
         // SAFETY: we transmute the guard's lifetime to 'static.
@@ -125,14 +139,14 @@ impl<const N: usize> Cache<N> {
                 guard_local,
             )
         };
-        PinnedReadPage {
+        Ok(PinnedReadPage {
             frame,
             guard: guard_static,
-        }
+        })
     }
 
-    pub(crate) fn pin_write(&self, id: FilePageRef) -> PinnedWritePage {
-        let frame = self.get_pinned_frame(id);
+    pub(crate) fn pin_write(&self, id: FilePageRef) -> Result<PinnedWritePage, CacheError> {
+        let frame = self.get_pinned_frame(id)?;
 
         let guard_local = frame.write();
         // SAFETY: we transmute the guard's lifetime to 'static.
@@ -143,68 +157,86 @@ impl<const N: usize> Cache<N> {
                 guard_local,
             )
         };
-        PinnedWritePage {
+        Ok(PinnedWritePage {
             frame,
             guard: guard_static,
-        }
+        })
     }
 
     /// Returns [`Arc<PageFrame>`] and pinnes the underlying [`PageFrame`].
     /// It first looks for frame in [`Cache::frames`]. If it's found there then its key in [`Cache::lru`] is updated (making it MRU).
     /// Otherwise [`PageFrame`] is loaded from disk using [`FilesManager`] and frame's key is inserted into [`Cache::lru`].
-    fn get_pinned_frame(&self, id: FilePageRef) -> Arc<PageFrame> {
-        let frame = self.frames.get(&id);
-        if let Some(frame) = frame {
-            self.lru.insert(id, ());
+    fn get_pinned_frame(&self, id: FilePageRef) -> Result<Arc<PageFrame>, CacheError> {
+        if let Some(frame) = self.frames.get(&id) {
             frame.pin();
-            return frame.clone();
+            self.lru.write().push(id.clone(), ());
+            let frame = frame.clone();
+            return Ok(frame);
         }
 
-        todo!("implement case when frame not found in cache")
+        let pf = self.files.get_or_open_new_file(&id.file_key)?;
+        let page = pf.lock().read_page(id.page_id)?;
+        let new_frame = Arc::new(PageFrame::new(id.clone(), page));
+
+        let frame = match self.frames.entry(id.clone()) {
+            Entry::Occupied(occupied_entry) => {
+                // Already inserted by other thread.
+                let existing = occupied_entry.get().clone();
+                existing.pin();
+                self.lru.write().push(id.clone(), ());
+                existing
+            }
+            Entry::Vacant(vacant_entry) => {
+                // Not yet inserted.
+                // Pin immiedietaly so it's not evicted right after insertion.
+                new_frame.pin();
+                vacant_entry.insert(new_frame.clone());
+
+                if self.frames.len() > Self::CACHE_CAPACITY {
+                    self.try_evict_frame();
+                }
+
+                self.lru.write().push(id.clone(), ());
+                new_frame
+            }
+        };
+        Ok(frame)
     }
 
     /// Evicts the first frame (starting from LRU) that has [`PageFrame::pin_count`] equal to 0.
     /// If frame is selected to be evicted (using LRU), but its pin count is greater than 0, it will not be evicted and instead its key is updated in [`Cache::lru`] (making it MRU). In that case the next LRU is picked and so on.
-    // TODO: figure out what to do if every page has pin_count > 0 and we are stuck
-    fn evict_frame(&self) {
-        // Eviction can be cancelled if current cache size is < half of the capacity.
-        let target_size = Self::CACHE_CAPACITY / 2;
+    /// Returns `false` if could not evict any page - every page in cache is pinned.
+    fn try_evict_frame(&self) -> bool {
+        let max_attemps = Self::CACHE_CAPACITY;
 
-        for (inspected, (key, _)) in self.lru.iter().enumerate() {
-            if self.frames.len() <= target_size {
-                return;
-            }
-            if inspected >= Self::CACHE_CAPACITY {
-                break;
-            }
-
-            let key = (*key).clone();
-
-            match self.frames.remove(&key) {
-                Some((_, frame)) => {
-                    let safe_to_delete = frame.pinned_count() == 0;
-                    match safe_to_delete {
-                        true => {
-                            if frame.dirty.load(Ordering::Acquire) {
-                                self.flush_frame(frame);
-                            }
-                            self.lru.invalidate(&key);
-                        }
-                        false => {
-                            // Other thread pinned it - put back to frames + make it MRU.
-                            self.frames.insert(key.clone(), frame);
-                            self.lru.insert(key.clone(), ());
-                        }
-                    }
+        for _ in 0..max_attemps {
+            let victim_id = {
+                let mut lru_write = self.lru.write();
+                if let Some((id, _)) = lru_write.pop_lru() {
+                    id
+                } else {
+                    // LRU is empty
+                    return false;
                 }
-                None => {
-                    // Already removed by other thread.
-                    continue;
+            };
+
+            if let Some(frame_entry) = self.frames.get(&victim_id) {
+                let frame = frame_entry.value().clone();
+                if !frame.is_pinned() {
+                    drop(frame_entry); // Release the reference before removal
+
+                    if self.frames.remove(&victim_id).is_some() {
+                        self.flush_frame(frame);
+                        return true;
+                    }
+                } else {
+                    // Frame is pinned, put it back as MRU
+                    let _ = self.lru.write().push(victim_id, ());
                 }
             }
         }
 
-        todo!("We couldn't evict any page - what to do now?")
+        false
     }
 
     /// Flushes the frame to the disk.
@@ -213,6 +245,8 @@ impl<const N: usize> Cache<N> {
             // Other thread already flushed it.
             return;
         }
+
+        // TODO: do we need to check if its pinned? and if it is then what?
 
         todo!()
     }
