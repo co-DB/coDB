@@ -17,16 +17,22 @@ use crate::{
     paged_file::{Page, PageId, PagedFile, PagedFileError},
 };
 
+/// Structure for referring to single page in the file.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub(crate) struct FilePageRef {
     page_id: PageId,
     file_key: FileKey,
 }
 
+/// Wrapper around the [`Page`] and its metadata used for concurrent usage.
 pub(crate) struct PageFrame {
+    /// Page id and file identifier - unique per frame.
     file_page_ref: FilePageRef,
+    /// Reader-writer lock around [`Page`].
     page: RwLock<Page>,
+    /// Set to true if [`PageFrame::page`] was modified and needs to be flushed to disk.
     dirty: AtomicBool,
+    /// Number of threads currently using this frame. Frame can only be dropped if its `pin_count` is 0.
     pin_count: AtomicUsize,
 }
 
@@ -68,8 +74,11 @@ impl PageFrame {
     }
 }
 
+/// Wrapper around frame and its guard - shared or exclusive lock.
 pub(crate) struct PinnedPage<G> {
+    /// This field should not be exposed. It's here because [`PinnedPage::guard`] cannot outlive it.
     frame: Arc<PageFrame>,
+    /// The content of the [`Page`] wrapped in a guard.
     guard: G,
 }
 
@@ -82,6 +91,7 @@ impl<G> Drop for PinnedPage<G> {
     }
 }
 
+/// [`Page`] wrapped in shared lock.
 pub(crate) type PinnedReadPage = PinnedPage<RwLockReadGuard<'static, Page>>;
 
 impl PinnedReadPage {
@@ -90,6 +100,7 @@ impl PinnedReadPage {
     }
 }
 
+/// [`Page`] wrapped in exclusive lock.
 pub(crate) type PinnedWritePage = PinnedPage<RwLockWriteGuard<'static, Page>>;
 
 impl PinnedWritePage {
@@ -111,15 +122,32 @@ pub(crate) enum CacheError {
     PagedFileError(#[from] PagedFileError),
 }
 
+/// Responsible for caching [`Page`]s and distributing it to other threads.
+/// Threads that use [`Cache`] should not have to worry about multithreading problems - all of them should be handled by [`Cache`].
+/// [`Cache`] must be used per-database, as it depends on [`FilesManager`] which works that way.
 pub(crate) struct Cache<const N: usize> {
+    /// List of the [`PageFrame`]s currently stored in cache. This is the source of truth from [`Cache`]'s point of view.
+    ///
+    /// It is guaranteed that:
+    /// - any page that is used by at least one thread will not be removed from the [`Cache`].
+    /// - any frame that is selected for eviction and is dirty will have its page flushed to disk.
+    ///
+    /// [`Cache`] tries to keep the size of it <= [`Cache::CACHE_CAPACITY`], but it is not always true.  
+    /// Check [`Cache::get_pinned_frame`] and [`Cache::try_evict_frame`] for more details.
     frames: DashMap<FilePageRef, Arc<PageFrame>>,
+    /// LRU list of the [`FilePageRef`]s used for deciding which [`PageFrame`] is best candidate for eviction (it does not mean it will always be picked as the victim - check [`Cache::try_evict_frame`] for details).
+    /// It is guaranteed that `lru.keys()` are subset of `frames.keys()` - it means that there might be [`PageFrame`] that is
+    /// stored in [`Cache::frames`] but not in [`Cache::lru`]. Such thing may happen if for some reason [`Cache::try_evict_frame`] failed.
+    /// This is not a problem as there is a background thread (TODO: replace it with the ref to actual structure/function) that periodically cleans [`Cache`] from such frames.
     lru: Arc<RwLock<LruCache<FilePageRef, ()>>>,
+    /// Pointer to [`FilesManager`], used for file operations when page must be load from/flush to disk.
     files: Arc<FilesManager>,
 }
 
 impl<const N: usize> Cache<N> {
     const CACHE_CAPACITY: usize = N;
 
+    /// Creates new [`Cache`] that handles frames for single database.
     pub(crate) fn new(files: Arc<FilesManager>) -> Self {
         Self {
             frames: DashMap::with_capacity(Self::CACHE_CAPACITY),
@@ -208,6 +236,23 @@ impl<const N: usize> Cache<N> {
                 Ok(())
             }
         }
+    }
+
+    /// Returns root page id of the file. Refer to [`PagedFile`] for more details.
+    pub(crate) fn root_page_id(&self, file: &FileKey) -> Result<Option<PageId>, CacheError> {
+        let pf = self.files.get_or_open_new_file(file)?;
+        Ok(pf.lock().root_page_id())
+    }
+
+    /// Sets root page id of the file. Refer to [`PagedFile`] for more details.
+    pub(crate) fn set_root_page_id(
+        &self,
+        file: &FileKey,
+        page_id: PageId,
+    ) -> Result<(), CacheError> {
+        let pf = self.files.get_or_open_new_file(file)?;
+        pf.lock().set_root_page_id(page_id)?;
+        Ok(())
     }
 
     /// Returns [`Arc<PageFrame>`] and pinnes the underlying [`PageFrame`].
