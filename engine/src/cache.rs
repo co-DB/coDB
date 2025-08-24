@@ -57,7 +57,7 @@ impl PageFrame {
         self.pin_count.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Dencreases [`PageFrame::pin_count`] by one.
+    /// Decreases [`PageFrame::pin_count`] by one.
     fn unpin(&self) {
         self.pin_count.fetch_sub(1, Ordering::AcqRel);
     }
@@ -180,6 +180,9 @@ impl<const N: usize> Cache<N> {
         self.pin_write(&id)
     }
 
+    /// Remove page from file. If there is a lock on the frame this will block
+    /// until it gets the exclusive lock on the frame. Any changes made to the page
+    /// after calling this function will not be flushed to the disk.
     pub(crate) fn free_page(&self, id: &FilePageRef) -> Result<(), CacheError> {
         match self.frames.entry(id.clone()) {
             Entry::Occupied(occupied_entry) => {
@@ -900,5 +903,54 @@ mod tests {
 
         assert!(cache.frames.is_empty());
         assert!(cache.lru.read().is_empty());
+    }
+
+    #[test]
+    fn cache_lru_skips_pinned_and_evicts_next() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("table1");
+
+        let pid1 = alloc_page_with_u64(&files, &file_key, 1);
+        let pid2 = alloc_page_with_u64(&files, &file_key, 2);
+        let pid3 = alloc_page_with_u64(&files, &file_key, 3);
+
+        let cache = Arc::new(Cache::<2>::new(files.clone()));
+
+        let fp1 = FilePageRef {
+            page_id: pid1,
+            file_key: file_key.clone(),
+        };
+        let fp2 = FilePageRef {
+            page_id: pid2,
+            file_key: file_key.clone(),
+        };
+        let fp3 = FilePageRef {
+            page_id: pid3,
+            file_key: file_key.clone(),
+        };
+
+        // load fp1 and hold the read pin (so it's pinned)
+        let pinned1 = cache.pin_read(&fp1).expect("pin_read fp1 failed");
+
+        // load fp2 and drop immediately (unpins)
+        {
+            let p2 = cache.pin_read(&fp2).expect("pin_read fp2 failed");
+            drop(p2);
+        }
+
+        // now load fp3 which should trigger eviction.
+        // eviction must not remove pinned fp1, so fp2 should be evicted.
+        {
+            let p3 = cache.pin_read(&fp3).expect("pin_read fp3 failed");
+            drop(p3);
+        }
+
+        // verify frames contain fp1 and fp3, and fp2 was evicted
+        assert_eq!(cache.frames.len(), 2);
+        assert_cached(&cache, &fp1);
+        assert_cached(&cache, &fp3);
+
+        drop(pinned1);
+        assert_all_frames_unpinned(&cache);
     }
 }
