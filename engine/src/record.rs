@@ -1,11 +1,11 @@
 ﻿use crate::catalog::{ColumnMetadata, ColumnType};
+use crate::data_types::{DbDate, DbDateTime};
 use thiserror::Error;
-
 /// Error for record related operations
 #[derive(Error, Debug)]
-enum RecordError {
+pub(crate) enum RecordError {
     #[error(
-        "while reading field {field_name}: expected to read {expected} bytes, but only {actual} were left"
+        "while reading field {field_name}: expected to read {expected} bytes, but only {actual} were left in the buffer"
     )]
     UnexpectedEnd {
         field_name: String,
@@ -21,8 +21,8 @@ enum RecordError {
 /// A record is a collection of fields that correspond to the columns
 /// defined in a table schema. Records can be serialized to bytes for
 /// storage and deserialized back to their structured form.
-struct Record {
-    fields: Vec<Field>,
+pub(crate) struct Record {
+    pub fields: Vec<Field>,
 }
 
 impl Record {
@@ -36,6 +36,7 @@ impl Record {
     /// Fields are serialized in order using little-endian byte ordering.
     /// Variable-length fields (like strings) are prefixed with their length.
     pub fn serialize(self) -> Vec<u8> {
+        // TODO: Figure out where and when to return serialized record size for slotted page header and deserialization
         let mut bytes = vec![];
         for field in self.fields {
             field.serialize(&mut bytes);
@@ -72,8 +73,8 @@ pub enum Field {
     Int64(i64),
     Float32(f32),
     Float64(f64),
-    DateTime(i64),
-    Date(i32),
+    DateTime(DbDateTime),
+    Date(DbDate),
     String(String),
     Bool(bool),
 }
@@ -88,8 +89,11 @@ impl Field {
             Field::Int64(i) => buffer.extend(i.to_le_bytes()),
             Field::Float32(f) => buffer.extend(f.to_le_bytes()),
             Field::Float64(f) => buffer.extend(f.to_le_bytes()),
-            Field::DateTime(d) => buffer.extend(d.to_le_bytes()),
-            Field::Date(d) => buffer.extend(d.to_le_bytes()),
+            Field::DateTime(d) => {
+                buffer.extend(d.days_since_epoch().to_le_bytes());
+                buffer.extend(d.milliseconds_since_midnight().to_le_bytes());
+            }
+            Field::Date(d) => buffer.extend(d.days_since_epoch().to_le_bytes()),
             Field::String(s) => {
                 buffer.extend((s.len() as u16).to_le_bytes());
                 buffer.extend(s.as_bytes());
@@ -107,49 +111,67 @@ impl Field {
         name: &str,
     ) -> Result<(Self, &'a [u8]), RecordError> {
         match column_type {
-            ColumnType::Bool => {
-                if buffer.is_empty() {
-                    return Err(RecordError::UnexpectedEnd {
-                        field_name: name.into(),
-                        expected: 1,
-                        actual: buffer.len(),
-                    });
-                }
-                match buffer[0] {
-                    0 => Ok((Field::Bool(false), &buffer[1..])),
-                    1 => Ok((Field::Bool(true), &buffer[1..])),
-                    _ => Err(RecordError::FailedToDeserialize {
-                        field_name: name.into(),
-                    }),
-                }
-            }
-            ColumnType::I32 => {
-                Self::read_fixed_and_convert::<i32, 4>(buffer, i32::from_le_bytes, name)
-                    .map(|(val, rest)| (Field::Int32(val), rest))
-            }
-            ColumnType::I64 => {
-                Self::read_fixed_and_convert::<i64, 8>(buffer, i64::from_le_bytes, name)
-                    .map(|(val, rest)| (Field::Int64(val), rest))
-            }
-            ColumnType::F32 => {
-                Self::read_fixed_and_convert::<f32, 4>(buffer, f32::from_le_bytes, name)
-                    .map(|(val, rest)| (Field::Float32(val), rest))
-            }
-            ColumnType::F64 => {
-                Self::read_fixed_and_convert::<f64, 8>(buffer, f64::from_le_bytes, name)
-                    .map(|(val, rest)| (Field::Float64(val), rest))
-            }
-            ColumnType::Date => {
-                Self::read_fixed_and_convert::<i32, 4>(buffer, i32::from_le_bytes, name)
-                    .map(|(val, rest)| (Field::Date(val), rest))
-            }
+            ColumnType::Bool => Self::read_fixed_and_convert::<u8, { size_of::<u8>() }>(
+                buffer,
+                |bytes| bytes[0],
+                name,
+            )
+            .and_then(|(val, rest)| match val {
+                0 => Ok((Field::Bool(false), rest)),
+                1 => Ok((Field::Bool(true), rest)),
+                _ => Err(RecordError::FailedToDeserialize {
+                    field_name: name.into(),
+                }),
+            }),
+            ColumnType::I32 => Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
+                buffer,
+                i32::from_le_bytes,
+                name,
+            )
+            .map(|(val, rest)| (Field::Int32(val), rest)),
+            ColumnType::I64 => Self::read_fixed_and_convert::<i64, { size_of::<i64>() }>(
+                buffer,
+                i64::from_le_bytes,
+                name,
+            )
+            .map(|(val, rest)| (Field::Int64(val), rest)),
+            ColumnType::F32 => Self::read_fixed_and_convert::<f32, { size_of::<f32>() }>(
+                buffer,
+                f32::from_le_bytes,
+                name,
+            )
+            .map(|(val, rest)| (Field::Float32(val), rest)),
+            ColumnType::F64 => Self::read_fixed_and_convert::<f64, { size_of::<f64>() }>(
+                buffer,
+                f64::from_le_bytes,
+                name,
+            )
+            .map(|(val, rest)| (Field::Float64(val), rest)),
+            ColumnType::Date => Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
+                buffer,
+                i32::from_le_bytes,
+                name,
+            )
+            .map(|(val, rest)| (Field::Date(DbDate::new(val)), rest)),
             ColumnType::DateTime => {
-                Self::read_fixed_and_convert::<i64, 8>(buffer, i64::from_le_bytes, name)
-                    .map(|(val, rest)| (Field::DateTime(val), rest))
+                let (days, rest) = Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
+                    buffer,
+                    i32::from_le_bytes,
+                    name,
+                )?;
+                let (milliseconds, rest) = Self::read_fixed_and_convert::<u32, { size_of::<u32>() }>(
+                    rest,
+                    u32::from_le_bytes,
+                    name,
+                )?;
+                Ok((Field::DateTime(DbDateTime::new(days, milliseconds)), rest))
             }
             ColumnType::String => {
-                let (len, rest) =
-                    Self::read_fixed_and_convert::<u16, 2>(buffer, u16::from_le_bytes, name)?;
+                let (len, rest) = Self::read_fixed_and_convert::<u16, { size_of::<u16>() }>(
+                    buffer,
+                    u16::from_le_bytes,
+                    name,
+                )?;
                 let string_len = len as usize;
                 if rest.len() < string_len {
                     return Err(RecordError::UnexpectedEnd {
@@ -259,10 +281,13 @@ mod tests {
             ),
             (Field::Bool(true), vec![0x01]),
             (Field::Bool(false), vec![0x00]),
-            (Field::Date(19000), 19000_i32.to_le_bytes().to_vec()),
             (
-                Field::DateTime(1640995200),
-                1640995200_i64.to_le_bytes().to_vec(),
+                Field::Date(DbDate::new(19000)),
+                19000i32.to_le_bytes().to_vec(),
+            ),
+            (
+                Field::DateTime(DbDateTime::new(1234, 451)),
+                [1234i32.to_le_bytes(), 451u32.to_le_bytes()].concat(),
             ),
         ];
 
@@ -324,8 +349,8 @@ mod tests {
         let fields = vec![
             Field::Int32(-42),
             Field::Int64(-10000000),
-            Field::Date(2500),
-            Field::DateTime(-13569),
+            Field::Date(DbDate::new(2500)),
+            Field::DateTime(DbDateTime::new(-12456, 1244)),
             Field::Bool(true),
             Field::String("true".into()),
         ];
