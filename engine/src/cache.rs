@@ -180,6 +180,33 @@ impl<const N: usize> Cache<N> {
         self.pin_write(&id)
     }
 
+    pub(crate) fn free_page(&self, id: &FilePageRef) -> Result<(), CacheError> {
+        match self.frames.entry(id.clone()) {
+            Entry::Occupied(occupied_entry) => {
+                // We hold exclusive lock on the key and remove it from the dashmap,
+                // so no other thread can get this key.
+                // Additionaly, we get exclusive lock on the page in the frame to wait until all other threads stop working with the frame.
+                let frame = occupied_entry.remove();
+                let w = frame.write();
+                // We can drop it right away as now we are sure no other thread can access it now. We do not need to flush it first, as it will be discarded anyway (the page will be freed).
+                drop(w);
+                self.lru.write().pop_entry(id);
+
+                let pf = self.files.get_or_open_new_file(&id.file_key)?;
+                pf.lock().free_page(id.page_id)?;
+                Ok(())
+            }
+            Entry::Vacant(_) => {
+                // In this case page is not in the cache. We hold exclusive lock
+                // on its key in the dashmap, so we can safely just free it
+                // in underlying file.
+                let pf = self.files.get_or_open_new_file(&id.file_key)?;
+                pf.lock().free_page(id.page_id)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Returns [`Arc<PageFrame>`] and pinnes the underlying [`PageFrame`].
     /// It first looks for frame in [`Cache::frames`]. If it's found there then its key in [`Cache::lru`] is updated (making it MRU).
     /// Otherwise [`PageFrame`] is loaded from disk using [`FilesManager`] and frame's key is inserted into [`Cache::lru`].
@@ -776,5 +803,102 @@ mod tests {
         assert_all_frames_unpinned(&cache);
         assert_eq!(cache.frames.len(), 1);
         assert_eq!(cache.lru.read().len(), 1);
+    }
+
+    #[test]
+    fn cache_free_page_normal() {
+        let files = create_files_manager();
+        let fk = FileKey::data("table_free");
+        let pid = alloc_page_with_u64(&files, &fk, 0xAA);
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: fk.clone(),
+        };
+
+        let cache = Arc::new(Cache::<1>::new(files.clone()));
+
+        {
+            let h = spawn_check_page(cache.clone(), id.clone(), 0xAA);
+            h.join().unwrap();
+        }
+
+        cache
+            .free_page(&id)
+            .expect("free_page failed in normal case");
+
+        assert!(cache.frames.is_empty());
+        assert!(cache.lru.read().is_empty());
+    }
+
+    #[test]
+    fn cache_free_page_blocks_until_reader_released() {
+        let files = create_files_manager();
+        let fk = FileKey::data("table_free_reader");
+        let pid = alloc_page_with_u64(&files, &fk, 0xBB);
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: fk.clone(),
+        };
+
+        let cache = Arc::new(Cache::<1>::new(files.clone()));
+
+        // pin for read and hold it
+        let pinned = cache.pin_read(&id).expect("pin_read failed (holder)");
+
+        // spawn free_page which should block until we drop `pinned`
+        let cache_cl = cache.clone();
+        let id_cl = id.clone();
+        let handle = thread::spawn(move || {
+            // this call should block until the reader drops its guard
+            cache_cl
+                .free_page(&id_cl)
+                .expect("free_page blocked and failed");
+        });
+
+        // give free_page a moment to reach the blocking write-lock call
+        thread::sleep(Duration::from_millis(50));
+
+        drop(pinned);
+
+        handle.join().expect("free_page thread panicked");
+
+        assert!(cache.frames.is_empty());
+        assert!(cache.lru.read().is_empty());
+    }
+
+    #[test]
+    fn cache_free_page_blocks_until_writer_released() {
+        let files = create_files_manager();
+        let fk = FileKey::data("table_free_writer");
+        let pid = alloc_page_with_u64(&files, &fk, 0xCC);
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: fk.clone(),
+        };
+
+        let cache = Arc::new(Cache::<1>::new(files.clone()));
+
+        // pin for write and hold it
+        let mut pinned_w = cache.pin_write(&id).expect("pin_write failed (holder)");
+        pinned_w.page_mut()[0..8].copy_from_slice(&0xDEADu64.to_be_bytes());
+
+        // spawn free_page which should block until we drop `pinned_w`
+        let cache_cl = cache.clone();
+        let id_cl = id.clone();
+        let handle = std::thread::spawn(move || {
+            cache_cl
+                .free_page(&id_cl)
+                .expect("free_page blocked and failed");
+        });
+
+        // let free_page attempt to block
+        thread::sleep(Duration::from_millis(50));
+
+        drop(pinned_w);
+
+        handle.join().expect("free_page thread panicked");
+
+        assert!(cache.frames.is_empty());
+        assert!(cache.lru.read().is_empty());
     }
 }
