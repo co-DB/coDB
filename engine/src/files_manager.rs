@@ -2,9 +2,8 @@
 
 use crate::paged_file::{PagedFile, PagedFileError};
 use dashmap::DashMap;
-use directories::ProjectDirs;
 use parking_lot::Mutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -41,6 +40,19 @@ impl FileKey {
     pub fn index(table_name: impl Into<String>) -> Self {
         Self::new(table_name, FileType::Index)
     }
+
+    /// Returns an extension of the file.
+    fn extension(&self) -> &str {
+        match self.file_type {
+            FileType::Data => "tbl",
+            FileType::Index => "idx",
+        }
+    }
+
+    /// Returns a full name of the file. Refer to `docs/files_structure.md`.
+    fn file_name(&self) -> String {
+        format!("{}.{}", self.table_name, self.extension())
+    }
 }
 
 /// Responsible for storing and distributing [`PagedFile`]s of a single database
@@ -67,19 +79,20 @@ impl FilesManager {
     ///
     /// Can fail if the directory in which we want to store the data (refer to `docs/file_structure.md` for
     /// OS-specific details) doesn't exist.
-    pub fn new(database_name: &str) -> Result<Self, FilesManagerError> {
-        match ProjectDirs::from("", "", "CoDB") {
-            None => Err(FilesManagerError::DirectoryNotFound),
-            Some(project_dir) => {
-                let base_path = project_dir
-                    .data_local_dir()
-                    .to_path_buf()
-                    .join(database_name);
-                Ok(FilesManager {
-                    open_files: DashMap::new(),
-                    base_path,
-                })
-            }
+    pub fn new<P>(base_path: P, database_name: &str) -> Result<Self, FilesManagerError>
+    where
+        P: AsRef<Path>,
+    {
+        let base_path = base_path.as_ref().join(database_name);
+        if let Ok(exists) = base_path.try_exists()
+            && exists
+        {
+            Ok(FilesManager {
+                open_files: DashMap::new(),
+                base_path,
+            })
+        } else {
+            Err(FilesManagerError::DirectoryNotFound)
         }
     }
 
@@ -92,7 +105,7 @@ impl FilesManager {
         &self,
         key: &FileKey,
     ) -> Result<Arc<Mutex<PagedFile>>, FilesManagerError> {
-        let file_path = self.base_path.join(&key.table_name);
+        let file_path = self.base_path.join(&key.table_name).join(key.file_name());
         Ok(self
             .open_files
             .entry(key.clone())
