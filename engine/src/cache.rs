@@ -130,7 +130,8 @@ impl<const N: usize> Cache<N> {
         }
     }
 
-    pub(crate) fn pin_read(&self, id: FilePageRef) -> Result<PinnedReadPage, CacheError> {
+    /// Returns shared lock to the page. If page was not found in the cache it loads it from disk.
+    pub(crate) fn pin_read(&self, id: &FilePageRef) -> Result<PinnedReadPage, CacheError> {
         let frame = self.get_pinned_frame(id)?;
 
         let guard_local = frame.read();
@@ -148,7 +149,8 @@ impl<const N: usize> Cache<N> {
         })
     }
 
-    pub(crate) fn pin_write(&self, id: FilePageRef) -> Result<PinnedWritePage, CacheError> {
+    /// Returns exclusive lock to the page. If page was not found in the cache it loads it from disk.
+    pub(crate) fn pin_write(&self, id: &FilePageRef) -> Result<PinnedWritePage, CacheError> {
         let frame = self.get_pinned_frame(id)?;
 
         let guard_local = frame.write();
@@ -166,10 +168,22 @@ impl<const N: usize> Cache<N> {
         })
     }
 
+    /// Allocates new page in `file` and returns exclusive lock to that page.
+    /// In case if lock is not needed the return value should not be assigned, so that lock lives as little as needed.
+    pub(crate) fn allocate_page(&self, file: &FileKey) -> Result<PinnedWritePage, CacheError> {
+        let pf = self.files.get_or_open_new_file(file)?;
+        let page_id = pf.lock().allocate_page()?;
+        let id = FilePageRef {
+            file_key: file.clone(),
+            page_id,
+        };
+        self.pin_write(&id)
+    }
+
     /// Returns [`Arc<PageFrame>`] and pinnes the underlying [`PageFrame`].
     /// It first looks for frame in [`Cache::frames`]. If it's found there then its key in [`Cache::lru`] is updated (making it MRU).
     /// Otherwise [`PageFrame`] is loaded from disk using [`FilesManager`] and frame's key is inserted into [`Cache::lru`].
-    fn get_pinned_frame(&self, id: FilePageRef) -> Result<Arc<PageFrame>, CacheError> {
+    fn get_pinned_frame(&self, id: &FilePageRef) -> Result<Arc<PageFrame>, CacheError> {
         if let Some(frame) = self.frames.get(&id) {
             frame.pin();
             self.lru.write().push(id.clone(), ());
@@ -254,11 +268,16 @@ impl<const N: usize> Cache<N> {
     }
 
     /// Flushes the frame to the disk.
+    /// Should be called while holding exclusive lock on the shard in which frame's key was located.
     fn flush_frame(
         &self,
         frame: Arc<PageFrame>,
         mut file_lock: MutexGuard<'_, PagedFile>,
     ) -> Result<(), CacheError> {
+        // We do not need to check if pin_count > 0 - at this point this frame was removed from dashmap and we hold the
+        // exclusive lock on the shard in which frame's key was, so it cannot be increased. At the same time we hold the lock
+        // to underlying file, meaning no other thread can create frame for the same page - we are safe to flush.
+
         if !frame.dirty.load(Ordering::Acquire) {
             // Other thread already flushed it.
             return Ok(());
@@ -298,7 +317,7 @@ mod tests {
         expected: u64,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
-            let pinned = cache.pin_read(id).expect("pin_read failed");
+            let pinned = cache.pin_read(&id).expect("pin_read failed");
             let data = pinned.page();
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&data[0..8]);
@@ -516,7 +535,7 @@ mod tests {
                 start_cloned.wait();
 
                 // pin for read (should take shared lock)
-                let pinned = cache_cloned.pin_read(id_cloned).expect("pin_read failed");
+                let pinned = cache_cloned.pin_read(&id_cloned).expect("pin_read failed");
 
                 let data = pinned.page();
                 let mut buf = [0u8; 8];
@@ -581,7 +600,7 @@ mod tests {
         let done_h = done.clone();
         let fp1_clone = fp1.clone();
         let holder = thread::spawn(move || {
-            let pinned = cache_h.pin_read(fp1_clone).expect("holder pin failed");
+            let pinned = cache_h.pin_read(&fp1_clone).expect("holder pin failed");
             // ensure loaders will attempt to load while we hold the pin
             start_h.wait();
             // wait until loaders signal they're done loading
@@ -597,7 +616,7 @@ mod tests {
         let loader1 = thread::spawn(move || {
             start_l1.wait();
             // this should insert a new frame while fp1 is still pinned
-            let pinned = cache_l1.pin_read(fp2_clone).expect("loader1 pin failed");
+            let pinned = cache_l1.pin_read(&fp2_clone).expect("loader1 pin failed");
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&pinned.page()[0..8]);
             assert_eq!(u64::from_be_bytes(buf), 102u64);
@@ -613,7 +632,7 @@ mod tests {
         let loader2 = thread::spawn(move || {
             start_l2.wait();
             // this should also insert a new frame while fp1 is still pinned
-            let pinned = cache_l2.pin_read(fp3_clone).expect("loader2 pin failed");
+            let pinned = cache_l2.pin_read(&fp3_clone).expect("loader2 pin failed");
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&pinned.page()[0..8]);
             assert_eq!(u64::from_be_bytes(buf), 103u64);
@@ -656,7 +675,7 @@ mod tests {
         };
 
         {
-            let mut w = cache.pin_write(id.clone()).expect("pin_write");
+            let mut w = cache.pin_write(&id.clone()).expect("pin_write");
             w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
             // drop -> dirty = true, unpinned
         }
@@ -667,7 +686,7 @@ mod tests {
             page_id: pid2,
             file_key: file_key.clone(),
         };
-        let _p = cache.pin_read(id2).expect("pin_read");
+        let _p = cache.pin_read(&id2).expect("pin_read");
 
         // now underlying file should contain 0xBEEF at pid (evicted & flushed)
         let pf = files.get_or_open_new_file(&file_key).unwrap();
@@ -698,7 +717,7 @@ mod tests {
             let s = start.clone();
             handles.push(thread::spawn(move || {
                 s.wait();
-                let mut w = c.pin_write(idc).expect("pin_write");
+                let mut w = c.pin_write(&idc).expect("pin_write");
                 w.page_mut()[0..8].copy_from_slice(&(1000 + i as u64).to_be_bytes());
                 // hold write briefly to increase chance of overlap
                 thread::sleep(std::time::Duration::from_millis(10));
@@ -716,7 +735,7 @@ mod tests {
             page_id: pid2,
             file_key: fk.clone(),
         };
-        let _ = cache.pin_read(id2).expect("pin_read to trigger eviction");
+        let _ = cache.pin_read(&id2).expect("pin_read to trigger eviction");
 
         // check last value on disk via fresh file handle
         let pf = files.get_or_open_new_file(&fk).unwrap();
@@ -726,5 +745,36 @@ mod tests {
         let val = u64::from_be_bytes(buf);
         // must be one of written values
         assert!(val >= 1000 && val < 1000 + writers as u64);
+    }
+
+    #[test]
+    fn cache_allocate_page_via_cache() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_alloc");
+
+        let cache = Arc::new(Cache::<1>::new(files.clone()));
+
+        let mut pinned = cache
+            .allocate_page(&file_key)
+            .expect("allocate_page failed");
+
+        pinned.page_mut()[0..8].copy_from_slice(&0xFEEDu64.to_be_bytes());
+
+        let allocated_ref = pinned.frame.file_page_ref.clone();
+
+        // drop the write guard (unpin) so the page remains in cache but is free
+        drop(pinned);
+
+        // read it back via cache to ensure the in-memory page contains our value
+        let pinned_read = cache.pin_read(&allocated_ref).expect("pin_read failed");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&pinned_read.page()[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xFEEDu64);
+        drop(pinned_read);
+
+        assert_cached_and_in_lru(&cache, &allocated_ref);
+        assert_all_frames_unpinned(&cache);
+        assert_eq!(cache.frames.len(), 1);
+        assert_eq!(cache.lru.read().len(), 1);
     }
 }
