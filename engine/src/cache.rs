@@ -199,10 +199,11 @@ impl<const N: usize> Cache<N> {
                 new_frame.pin();
                 vacant_entry.insert(new_frame.clone());
 
-                if self.frames.len() > Self::CACHE_CAPACITY
-                    && !self.try_evict_frame()? {
-                        warn!("Cache: cannot evict frame - every frame in cache is pinned.");
-                    }
+                if self.frames.len() > Self::CACHE_CAPACITY && !self.try_evict_frame()? {
+                    warn!(
+                        "Cache: cannot evict frame - every frame in cache is pinned or lru is empty."
+                    );
+                }
 
                 self.lru.write().push(id.clone(), ());
                 new_frame
@@ -274,7 +275,9 @@ impl<const N: usize> Cache<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     /// Creates new files manager pointing to temporary directory.
@@ -305,13 +308,18 @@ mod tests {
         })
     }
 
-    /// Asserts that `id` is present in both frames map and LRU.
-    fn assert_cached_and_in_lru<const N: usize>(cache: &Arc<Cache<N>>, id: &FilePageRef) {
+    /// Asserts that `id` is present frames map.
+    fn assert_cached<const N: usize>(cache: &Arc<Cache<N>>, id: &FilePageRef) {
         assert!(
             cache.frames.contains_key(id),
             "expected frame present in frames for {:?}",
             id
         );
+    }
+
+    /// Asserts that `id` is present in both frames map and LRU.
+    fn assert_cached_and_in_lru<const N: usize>(cache: &Arc<Cache<N>>, id: &FilePageRef) {
+        assert_cached(cache, id);
         let lru_guard = cache.lru.read();
         assert!(
             lru_guard.contains(id),
@@ -478,5 +486,245 @@ mod tests {
         assert_eq!(cache.lru.read().len(), 3);
 
         assert_all_frames_unpinned(&cache);
+    }
+
+    #[test]
+    fn cache_concurrent_readers_same_page() {
+        let files = create_files_manager();
+
+        let file_key = FileKey::data("table1");
+        let page_id = alloc_page_with_u64(&files, &file_key, 0xdeadbeefu64);
+
+        let cache = Arc::new(Cache::<2>::new(files.clone()));
+
+        let id = FilePageRef {
+            page_id,
+            file_key: file_key.clone(),
+        };
+
+        let readers = 8;
+        let start = Arc::new(Barrier::new(readers + 1));
+        let mut handles = Vec::with_capacity(readers);
+
+        for _ in 0..readers {
+            let cache_cloned = cache.clone();
+            let id_cloned = id.clone();
+            let start_cloned = start.clone();
+
+            handles.push(thread::spawn(move || {
+                // wait for all threads + main to reach this point to make pin_read run concurrently
+                start_cloned.wait();
+
+                // pin for read (should take shared lock)
+                let pinned = cache_cloned.pin_read(id_cloned).expect("pin_read failed");
+
+                let data = pinned.page();
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[0..8]);
+                let v = u64::from_be_bytes(buf);
+                assert_eq!(v, 0xdeadbeefu64);
+
+                // hold the pinned read for a short while to ensure overlap
+                thread::sleep(Duration::from_millis(100));
+
+                drop(pinned);
+            }));
+        }
+
+        // release threads to start pin_read at (almost) the same time
+        start.wait();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_all_frames_unpinned(&cache);
+        assert_cached_and_in_lru(&cache, &id);
+        assert_eq!(cache.frames.len(), 1);
+        assert_eq!(cache.lru.read().len(), 1);
+    }
+
+    #[test]
+    fn cache_over_capacity_when_pinned_with_concurrent_loaders() {
+        use std::sync::Barrier;
+
+        let files = create_files_manager();
+
+        let file_key = FileKey::data("table1");
+        let id1 = alloc_page_with_u64(&files, &file_key, 101);
+        let id2 = alloc_page_with_u64(&files, &file_key, 102);
+        let id3 = alloc_page_with_u64(&files, &file_key, 103);
+
+        let cache = Arc::new(Cache::<1>::new(files.clone()));
+
+        let fp1 = FilePageRef {
+            page_id: id1,
+            file_key: file_key.clone(),
+        };
+        let fp2 = FilePageRef {
+            page_id: id2,
+            file_key: file_key.clone(),
+        };
+        let fp3 = FilePageRef {
+            page_id: id3,
+            file_key: file_key.clone(),
+        };
+
+        // Barriers to coordinate: start all 3 threads approximately together, and then wait
+        // until both loaders finished before releasing the holder.
+        let start = Arc::new(Barrier::new(3));
+        let done = Arc::new(Barrier::new(3));
+
+        // Holder thread: pins fp1 and holds until loaders finish.
+        let cache_h = cache.clone();
+        let start_h = start.clone();
+        let done_h = done.clone();
+        let fp1_clone = fp1.clone();
+        let holder = thread::spawn(move || {
+            let pinned = cache_h.pin_read(fp1_clone).expect("holder pin failed");
+            // ensure loaders will attempt to load while we hold the pin
+            start_h.wait();
+            // wait until loaders signal they're done loading
+            done_h.wait();
+            drop(pinned);
+        });
+
+        // Loader 1
+        let cache_l1 = cache.clone();
+        let start_l1 = start.clone();
+        let done_l1 = done.clone();
+        let fp2_clone = fp2.clone();
+        let loader1 = thread::spawn(move || {
+            start_l1.wait();
+            // this should insert a new frame while fp1 is still pinned
+            let pinned = cache_l1.pin_read(fp2_clone).expect("loader1 pin failed");
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pinned.page()[0..8]);
+            assert_eq!(u64::from_be_bytes(buf), 102u64);
+            done_l1.wait();
+            drop(pinned);
+        });
+
+        // Loader 2
+        let cache_l2 = cache.clone();
+        let start_l2 = start.clone();
+        let done_l2 = done.clone();
+        let fp3_clone = fp3.clone();
+        let loader2 = thread::spawn(move || {
+            start_l2.wait();
+            // this should also insert a new frame while fp1 is still pinned
+            let pinned = cache_l2.pin_read(fp3_clone).expect("loader2 pin failed");
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pinned.page()[0..8]);
+            assert_eq!(u64::from_be_bytes(buf), 103u64);
+            done_l2.wait();
+            drop(pinned);
+        });
+
+        // join all threads
+        holder.join().unwrap();
+        loader1.join().unwrap();
+        loader2.join().unwrap();
+
+        // After all finished: frames should contain all three entries (no permanent removal was possible while a frame was pinned).
+        assert_eq!(cache.frames.len(), 3);
+
+        // LRU has capacity 1, so only one key should be present (from one of the loaders).
+        let lru_guard = cache.lru.read();
+        assert_eq!(lru_guard.len(), 1);
+        let contains_fp1 = lru_guard.contains(&fp1);
+        assert!(
+            !contains_fp1,
+            "LRU should not contain originally pinned entry fp1"
+        );
+
+        assert_all_frames_unpinned(&cache);
+        assert_cached(&cache, &fp1);
+        assert_cached(&cache, &fp2);
+        assert_cached(&cache, &fp3);
+    }
+
+    #[test]
+    fn cache_eviction_flush_persists() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("table1");
+        let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
+        let cache = Arc::new(Cache::<1>::new(files.clone()));
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+
+        {
+            let mut w = cache.pin_write(id.clone()).expect("pin_write");
+            w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+            // drop -> dirty = true, unpinned
+        }
+
+        // allocate another page so insertion will trigger eviction of id (capacity=1)
+        let pid2 = alloc_page_with_u64(&files, &file_key, 0x2222);
+        let id2 = FilePageRef {
+            page_id: pid2,
+            file_key: file_key.clone(),
+        };
+        let _p = cache.pin_read(id2).expect("pin_read");
+
+        // now underlying file should contain 0xBEEF at pid (evicted & flushed)
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let mut pf_lock = pf.lock();
+        let page = pf_lock.read_page(pid).expect("read_page");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xBEEFu64);
+    }
+
+    #[test]
+    fn cache_concurrent_writers_same_page() {
+        let files = create_files_manager();
+        let fk = FileKey::data("table1");
+        let pid = alloc_page_with_u64(&files, &fk, 0);
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: fk.clone(),
+        };
+        let cache = Arc::new(Cache::<1>::new(files.clone()));
+
+        let writers = 4;
+        let start = Arc::new(Barrier::new(writers + 1));
+        let mut handles = Vec::new();
+        for i in 0..writers {
+            let c = cache.clone();
+            let idc = id.clone();
+            let s = start.clone();
+            handles.push(thread::spawn(move || {
+                s.wait();
+                let mut w = c.pin_write(idc).expect("pin_write");
+                w.page_mut()[0..8].copy_from_slice(&(1000 + i as u64).to_be_bytes());
+                // hold write briefly to increase chance of overlap
+                thread::sleep(std::time::Duration::from_millis(10));
+            }));
+        }
+
+        start.wait();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // read final persisted value (force eviction to trigger flush)
+        let pid2 = alloc_page_with_u64(&files, &fk, 42);
+        let id2 = FilePageRef {
+            page_id: pid2,
+            file_key: fk.clone(),
+        };
+        let _ = cache.pin_read(id2).expect("pin_read to trigger eviction");
+
+        // check last value on disk via fresh file handle
+        let pf = files.get_or_open_new_file(&fk).unwrap();
+        let page = pf.lock().read_page(pid).unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page[0..8]);
+        let val = u64::from_be_bytes(buf);
+        // must be one of written values
+        assert!(val >= 1000 && val < 1000 + writers as u64);
     }
 }
