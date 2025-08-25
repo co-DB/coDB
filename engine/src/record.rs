@@ -164,7 +164,10 @@ impl Field {
                     u32::from_le_bytes,
                     name,
                 )?;
-                Ok((Field::DateTime(DbDateTime::new(days, milliseconds)), rest))
+                Ok((
+                    Field::DateTime(DbDateTime::new(DbDate::new(days), milliseconds)),
+                    rest,
+                ))
             }
             ColumnType::String => {
                 let (len, rest) = Self::read_fixed_and_convert::<u16, { size_of::<u16>() }>(
@@ -286,7 +289,7 @@ mod tests {
                 19000i32.to_le_bytes().to_vec(),
             ),
             (
-                Field::DateTime(DbDateTime::new(1234, 451)),
+                Field::DateTime(DbDateTime::new(DbDate::new(1234), 451)),
                 [1234i32.to_le_bytes(), 451u32.to_le_bytes()].concat(),
             ),
         ];
@@ -350,7 +353,7 @@ mod tests {
             Field::Int32(-42),
             Field::Int64(-10000000),
             Field::Date(DbDate::new(2500)),
-            Field::DateTime(DbDateTime::new(-12456, 1244)),
+            Field::DateTime(DbDateTime::new(DbDate::new(-12456), 1244)),
             Field::Bool(true),
             Field::String("true".into()),
         ];
