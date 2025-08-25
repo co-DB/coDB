@@ -1,3 +1,4 @@
+pub mod background_worker;
 pub mod cache;
 pub mod catalog;
 pub mod files_manager;
