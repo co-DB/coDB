@@ -278,7 +278,7 @@ impl<const N: usize> Cache<N> {
     fn get_pinned_frame(&self, id: &FilePageRef) -> Result<Arc<PageFrame>, CacheError> {
         if let Some(frame) = self.frames.get(id) {
             frame.pin();
-            self.lru.write().push(id.clone(), ());
+            self.push_to_lru(id);
             let frame = frame.clone();
             return Ok(frame);
         }
@@ -296,7 +296,7 @@ impl<const N: usize> Cache<N> {
                 // update its pin count.
                 let existing = occupied_entry.get().clone();
                 existing.pin();
-                self.lru.write().push(id.clone(), ());
+                self.push_to_lru(id);
                 existing
             }
             Entry::Vacant(vacant_entry) => {
@@ -311,7 +311,7 @@ impl<const N: usize> Cache<N> {
                     );
                 }
 
-                self.lru.write().push(id.clone(), ());
+                self.push_to_lru(id);
                 new_frame
             }
         };
@@ -428,6 +428,12 @@ impl<const N: usize> Cache<N> {
                 }
             }
         }
+    }
+
+    /// Inserts `key` to [`Cache::lru`].
+    /// Cannot be called when shared/exclusive lock to [`Cache::lru`] is held (in the same thread).
+    fn push_to_lru(&self, key: &FilePageRef) {
+        self.lru.write().push(key.clone(), ());
     }
 }
 
@@ -1213,5 +1219,91 @@ mod tests {
 
         cleaner.shutdown().unwrap();
         cleaner.join().unwrap();
+    }
+
+    #[test]
+    fn background_cache_cleaner_preserves_lru_frames() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("bg_clean_preserve");
+        let pid1 = alloc_page_with_u64(&files, &file_key, 0x1);
+        let pid2 = alloc_page_with_u64(&files, &file_key, 0x2);
+        let pid3 = alloc_page_with_u64(&files, &file_key, 0x3);
+
+        let id1 = FilePageRef {
+            page_id: pid1,
+            file_key: file_key.clone(),
+        };
+        let id2 = FilePageRef {
+            page_id: pid2,
+            file_key: file_key.clone(),
+        };
+        let id3 = FilePageRef {
+            page_id: pid3,
+            file_key: file_key.clone(),
+        };
+
+        let (cache, mut cleaner) =
+            Cache::<3>::with_background_cleaner(files.clone(), Duration::from_millis(50));
+
+        let page: Page = [0u8; 4096];
+
+        // Insert frame1 and put it into LRU (should be preserved)
+        let f1 = Arc::new(PageFrame::new(id1.clone(), page));
+        cache.frames.insert(id1.clone(), f1);
+        cache.push_to_lru(&id1);
+
+        // Insert frame2 but DO NOT put into LRU (should be removed)
+        let f2 = Arc::new(PageFrame::new(id2.clone(), page));
+        cache.frames.insert(id2.clone(), f2);
+
+        // Insert frame3 and put into LRU (should be preserved)
+        let f3 = Arc::new(PageFrame::new(id3.clone(), page));
+        cache.frames.insert(id3.clone(), f3);
+        cache.push_to_lru(&id3);
+
+        assert!(cache.frames.contains_key(&id1));
+        assert!(cache.frames.contains_key(&id2));
+        assert!(cache.frames.contains_key(&id3));
+        assert!(cache.lru.read().contains(&id1));
+        assert!(cache.lru.read().contains(&id3));
+        assert!(!cache.lru.read().contains(&id2));
+
+        // wait for cleaner to run
+        thread::sleep(Duration::from_millis(300));
+
+        // frames in LRU should remain, orphan not in LRU should be removed
+        assert!(cache.frames.contains_key(&id1));
+        assert!(!cache.frames.contains_key(&id2));
+        assert!(cache.frames.contains_key(&id3));
+
+        cleaner.shutdown().unwrap();
+        cleaner.join().unwrap();
+    }
+
+    #[test]
+    fn cache_drop_flushes_dirty_frames_to_disk() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("drop_flush_table");
+        let pid = alloc_page_with_u64(&files, &file_key, 0xAAAAu64);
+
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+
+        let cache = Cache::<1>::new(files.clone());
+
+        {
+            let mut w = cache.pin_write(&id).expect("pin_write failed");
+            w.page_mut()[0..8].copy_from_slice(&0xDEADu64.to_be_bytes());
+        }
+
+        drop(cache);
+
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let page = pf.lock().read_page(pid).expect("read_page");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xDEADu64);
     }
 }
