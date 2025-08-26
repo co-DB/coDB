@@ -530,8 +530,7 @@ mod tests {
         std::fs::create_dir_all(&db_dir).unwrap();
 
         let files = FilesManager::new(tmp.path(), "db").unwrap();
-        let files = Arc::new(files);
-        files
+        Arc::new(files)
     }
 
     /// Spawns a thread that pins `id` from `cache`, reads the first 8 bytes and asserts it equals `expected`.
@@ -555,8 +554,7 @@ mod tests {
     fn assert_cached<const N: usize>(cache: &Arc<Cache<N>>, id: &FilePageRef) {
         assert!(
             cache.frames.contains_key(id),
-            "expected frame present in frames for {:?}",
-            id
+            "expected frame present in frames for {id:?}",
         );
     }
 
@@ -566,8 +564,7 @@ mod tests {
         let lru_guard = cache.lru.read();
         assert!(
             lru_guard.contains(id),
-            "expected key present in LRU for {:?}",
-            id
+            "expected key present in LRU for {id:?}"
         );
     }
 
@@ -959,7 +956,8 @@ mod tests {
             page_id: pid2,
             file_key: fk.clone(),
         };
-        let _ = cache.pin_read(&id2).expect("pin_read to trigger eviction");
+        let r = cache.pin_read(&id2).expect("pin_read to trigger eviction");
+        drop(r);
 
         // check last value on disk via fresh file handle
         let pf = files.get_or_open_new_file(&fk).unwrap();
