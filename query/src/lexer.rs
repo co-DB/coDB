@@ -1,4 +1,4 @@
-﻿use super::tokens::{Token, TokenType};
+use super::tokens::{Token, TokenType};
 
 /// Responsible for transforming an input CoSQL string into a stream of [`Token`]s.
 ///
@@ -51,12 +51,13 @@ impl Lexer {
     fn read_char(&mut self) {
         if self.is_at_end() {
             self.ch = '\0';
-        } else {
-            self.ch = self.input[self.read_pos];
-            if self.ch == '\n' {
-                self.line += 1;
-                self.column = 0;
-            }
+            self.pos = self.read_pos;
+            return;
+        }
+        self.ch = self.input[self.read_pos];
+        if self.ch == '\n' {
+            self.line += 1;
+            self.column = 0;
         }
         self.pos = self.read_pos;
         self.read_pos += 1;
@@ -64,7 +65,7 @@ impl Lexer {
     }
 
     /// Checks if current position is at the end of input.
-    fn is_at_end(&self) -> bool {
+    pub fn is_at_end(&self) -> bool {
         self.read_pos >= self.input.len()
     }
 
@@ -92,6 +93,7 @@ impl Lexer {
             "where" => self.create_token(TokenType::Where),
             "from" => self.create_token(TokenType::From),
             "set" => self.create_token(TokenType::Set),
+            "values" => self.create_token(TokenType::Values),
             "and" => self.create_token(TokenType::And),
             "or" => self.create_token(TokenType::Or),
             "into" => self.create_token(TokenType::Into),
@@ -212,9 +214,7 @@ impl Lexer {
                     self.read_char();
                     self.create_token(TokenType::NotEqual)
                 }
-                _ => self.create_token(TokenType::Illegal(String::from(
-                    "invalid character literal",
-                ))),
+                _ => self.create_token(TokenType::Bang),
             },
             '>' => match self.peek_char() {
                 '=' => {
@@ -454,24 +454,6 @@ mod tests {
             TokenType::Ident(String::from("users")),
             TokenType::Illegal(String::from("unrecognized character: '$'")),
             TokenType::Where,
-            TokenType::Semicolon,
-            TokenType::EOF,
-        ];
-
-        assert_works(&mut lexer, &expected_tokens);
-    }
-
-    #[test]
-    fn test_illegal_bang_without_equal() {
-        let input = "select ! from users;";
-
-        let mut lexer = Lexer::new(input);
-
-        let expected_tokens = [
-            TokenType::Select,
-            TokenType::Illegal(String::from("invalid character literal")),
-            TokenType::From,
-            TokenType::Ident(String::from("users")),
             TokenType::Semicolon,
             TokenType::EOF,
         ];
