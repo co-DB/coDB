@@ -1153,7 +1153,7 @@ mod tests {
         };
 
         // start cache with a short cleanup interval
-        let (cache, cleaner) =
+        let (cache, mut cleaner) =
             Cache::<2>::with_background_cleaner(files.clone(), Duration::from_millis(50));
 
         // create a frame and insert it directly into frames map WITHOUT adding to LRU
@@ -1190,7 +1190,7 @@ mod tests {
             file_key: file_key.clone(),
         };
 
-        let (cache, cleaner) =
+        let (cache, mut cleaner) =
             Cache::<2>::with_background_cleaner(files.clone(), Duration::from_millis(50));
 
         let page: Page = [0u8; 4096];
