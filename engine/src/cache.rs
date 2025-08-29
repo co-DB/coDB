@@ -354,7 +354,7 @@ impl<const N: usize> Cache<N> {
     where
         F: FnOnce(&FilePageRef, &Arc<PageFrame>) -> bool,
     {
-        // `remove_if` execusively locks shard that contains the frame. This means that `predicate` can assume that while it's running
+        // `remove_if` exclusively locks shard that contains the frame. This means that `predicate` can assume that while it's running
         // no other thread is capable of editing the frame
         // Check here: https://docs.rs/dashmap/6.1.0/src/dashmap/lib.rs.html#978-1000
         if let Some((_, frame)) = self
