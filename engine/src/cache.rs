@@ -144,7 +144,7 @@ pub(crate) struct Cache<const N: usize> {
     /// stored in [`Cache::frames`] but not in [`Cache::lru`]. Such thing may happen if for some reason [`Cache::try_evict_frame`] failed.
     /// This is not a problem as there is a background thread ([`BackgroundCacheCleaner`]) that periodically cleans [`Cache`] from such frames.
     lru: Arc<RwLock<LruCache<FilePageRef, ()>>>,
-    /// Pointer to [`FilesManager`], used for file operations when page must be load from/flush to disk.
+    /// Pointer to [`FilesManager`], used for file operations when page must be loaded from/flushed to disk.
     files: Arc<FilesManager>,
 }
 
@@ -292,7 +292,7 @@ impl<const N: usize> Cache<N> {
         let frame = match self.frames.entry(id.clone()) {
             Entry::Occupied(occupied_entry) => {
                 // Already inserted by other thread.
-                // We don't want to reinsert it, as we will lose the information about [`PageFrame::pin_count`]. We need to get the alreaxy existing entry and
+                // We don't want to reinsert it, as we will lose the information about [`PageFrame::pin_count`]. We need to get the already existing entry and
                 // update its pin count.
                 let existing = occupied_entry.get().clone();
                 existing.pin();
@@ -301,7 +301,7 @@ impl<const N: usize> Cache<N> {
             }
             Entry::Vacant(vacant_entry) => {
                 // Not yet inserted.
-                // Pin immiedietaly so it's not evicted right after insertion.
+                // Pin immediately so it's not evicted right after insertion.
                 new_frame.pin();
                 vacant_entry.insert(new_frame.clone());
 
@@ -322,9 +322,9 @@ impl<const N: usize> Cache<N> {
     /// If frame is selected to be evicted (using LRU), but its pin count is greater than 0, it will not be evicted and instead its key is updated in [`Cache::lru`] (making it MRU). In that case the next LRU is picked and so on.
     /// Returns `false` if could not evict any page - every page in cache is pinned or LRU is empty.
     fn try_evict_frame(&self) -> Result<bool, CacheError> {
-        let max_attemps = Self::CACHE_CAPACITY;
+        let max_attempts = Self::CACHE_CAPACITY;
 
-        for _ in 0..max_attemps {
+        for _ in 0..max_attempts {
             let victim_id = {
                 let mut lru_write = self.lru.write();
                 if let Some((id, _)) = lru_write.pop_lru() {
@@ -344,7 +344,7 @@ impl<const N: usize> Cache<N> {
         Ok(false)
     }
 
-    /// Removes frame with id `victim_id` if `predicate` is `full`. If frame is removed then underlying page if flushed to disk.
+    /// Removes frame with id `victim_id` if `predicate` evaluates to `true`. If frame is removed then underlying page if flushed to disk.
     /// Returns `Ok(true)` if frame was removed and `Ok(false)` otherwise.
     fn remove_from_cache_if<F>(
         &self,
@@ -354,7 +354,8 @@ impl<const N: usize> Cache<N> {
     where
         F: FnOnce(&FilePageRef, &Arc<PageFrame>) -> bool,
     {
-        // This `remove_if` locks execusively element in map, so when we are inside `remove_if` closure we are sure that no other thread will be able to get this frame.
+        // `remove_if` execusively locks shard that contains the frame. This means that `predicate` can assume that while it's running
+        // no other thread is capable of editing the frame
         // Check here: https://docs.rs/dashmap/6.1.0/src/dashmap/lib.rs.html#978-1000
         if let Some((_, frame)) = self
             .frames
