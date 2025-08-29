@@ -1,9 +1,10 @@
 ﻿//! FilesManager module — manages and distributes paged files in a single database.
 
 use crate::paged_file::{PagedFile, PagedFileError};
-use directories::ProjectDirs;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use dashmap::DashMap;
+use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Represents possible file types inside a table directory (refer to `docs/file_structure.md` for more
@@ -39,15 +40,27 @@ impl FileKey {
     pub fn index(table_name: impl Into<String>) -> Self {
         Self::new(table_name, FileType::Index)
     }
+
+    /// Returns an extension of the file.
+    fn extension(&self) -> &str {
+        match self.file_type {
+            FileType::Data => "tbl",
+            FileType::Index => "idx",
+        }
+    }
+
+    /// Returns a full name of the file. Refer to `docs/files_structure.md`.
+    fn file_name(&self) -> String {
+        format!("{}.{}", self.table_name, self.extension())
+    }
 }
 
 /// Responsible for storing and distributing [`PagedFile`]s of a single database
 /// to higher level components.
-///
-/// As a singleton it allows the [`PagedFile`]s to persist beyond a single query and thus
-/// eliminates the time needed to instantiate them each time.
 pub struct FilesManager {
-    open_files: HashMap<FileKey, PagedFile>,
+    /// (Almost) All public api of [`PagedFile`] takes `&mut self`, so there is
+    /// no point in using [`RwLock`] instead of [`Mutex`] here.
+    open_files: DashMap<FileKey, Arc<Mutex<PagedFile>>>,
     base_path: PathBuf,
 }
 
@@ -66,36 +79,38 @@ impl FilesManager {
     ///
     /// Can fail if the directory in which we want to store the data (refer to `docs/file_structure.md` for
     /// OS-specific details) doesn't exist.
-    pub fn new(database_name: &str) -> Result<Self, FilesManagerError> {
-        match ProjectDirs::from("", "", "CoDB") {
-            None => Err(FilesManagerError::DirectoryNotFound),
-            Some(project_dir) => {
-                let base_path = project_dir
-                    .data_local_dir()
-                    .to_path_buf()
-                    .join(database_name);
-                Ok(FilesManager {
-                    open_files: HashMap::new(),
-                    base_path,
-                })
-            }
+    pub fn new<P>(base_path: P, database_name: &str) -> Result<Self, FilesManagerError>
+    where
+        P: AsRef<Path>,
+    {
+        let base_path = base_path.as_ref().join(database_name);
+        if let Ok(exists) = base_path.try_exists()
+            && exists
+        {
+            Ok(FilesManager {
+                open_files: DashMap::new(),
+                base_path,
+            })
+        } else {
+            Err(FilesManagerError::DirectoryNotFound)
         }
     }
 
-    /// Returns a [`PagedFile`] for a specific combination of table name and file type stored in
+    /// Returns a [`Arc<Mutext<PagedFile>>`] for a specific combination of table name and file type stored in
     /// FileKey or creates and stores it if one didn't exist beforehand.
     ///
     /// Can fail if [`PagedFile`] instantiation didn't succeed (refer to
     /// [`PagedFile`]'s implementation for more details)
     pub fn get_or_open_new_file(
-        &mut self,
-        key: FileKey,
-    ) -> Result<&mut PagedFile, FilesManagerError> {
-        let file_path = self.base_path.join(&key.table_name);
+        &self,
+        key: &FileKey,
+    ) -> Result<Arc<Mutex<PagedFile>>, FilesManagerError> {
+        let file_path = self.base_path.join(&key.table_name).join(key.file_name());
         Ok(self
             .open_files
-            .entry(key)
-            .or_insert(PagedFile::new(file_path)?))
+            .entry(key.clone())
+            .or_insert(Arc::new(Mutex::new(PagedFile::new(file_path)?)))
+            .clone())
     }
 
     /// Closes a file and removes its entry from the stored [`PagedFile`]s. Can be used for when

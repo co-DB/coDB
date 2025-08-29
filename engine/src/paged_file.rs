@@ -11,13 +11,13 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
 
 /// Type representing page id, should be used instead of using bare `u64`.
-type PageId = u64;
+pub type PageId = u64;
 
 /// Size of each page in [`PagedFile`].
 const PAGE_SIZE: usize = 4096; // 4 kB
 
 /// Type representing page, should be used instead of bare array of bytes.
-type Page = [u8; PAGE_SIZE];
+pub type Page = [u8; PAGE_SIZE];
 
 /// Responsible for managing a single on-disk file.
 /// Only this structure should be responsible for directly communicating with disk.
@@ -70,6 +70,10 @@ impl PagedFile {
                 PagedFile::try_from(file)
             }
             false => {
+                if let Some(parent) = file_path.as_ref().parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
                 let file = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
