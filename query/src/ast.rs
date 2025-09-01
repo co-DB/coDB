@@ -69,29 +69,29 @@ pub enum Statement {
 
 #[derive(Debug)]
 pub struct SelectStatement {
-    pub column_ids: Option<Vec<NodeId>>,
-    pub table_name_id: NodeId,
-    pub where_clause_id: Option<NodeId>,
+    pub columns: Option<Vec<NodeId>>,
+    pub table_name: NodeId,
+    pub where_clause: Option<NodeId>,
 }
 
 #[derive(Debug)]
 pub struct InsertStatement {
-    pub table_name_id: NodeId,
-    pub column_ids: Option<Vec<NodeId>>,
-    pub value_ids: Vec<NodeId>,
+    pub table_name: NodeId,
+    pub columns: Option<Vec<NodeId>>,
+    pub values: Vec<NodeId>,
 }
 
 #[derive(Debug)]
 pub struct UpdateStatement {
-    pub table_name_id: NodeId,
+    pub table_name: NodeId,
     pub column_setters: Vec<(NodeId, NodeId)>,
-    pub where_clause_id: Option<NodeId>,
+    pub where_clause: Option<NodeId>,
 }
 
 #[derive(Debug)]
 pub struct DeleteStatement {
-    pub table_name_id: NodeId,
-    pub where_clause_id: Option<NodeId>,
+    pub table_name: NodeId,
+    pub where_clause: Option<NodeId>,
 }
 
 #[derive(Debug)]
@@ -268,9 +268,9 @@ mod tests {
 
         // when adding a valid select statement
         let stmt = Statement::Select(SelectStatement {
-            column_ids: Some(vec![col_id]),
-            table_name_id: table_id,
-            where_clause_id: None,
+            columns: Some(vec![col_id]),
+            table_name: table_id,
+            where_clause: None,
         });
 
         // then it is added to the AST
@@ -290,9 +290,9 @@ mod tests {
 
         // when adding an insert statement
         let stmt = Statement::Insert(InsertStatement {
-            table_name_id: table_id,
-            column_ids: Some(vec![col_id1, col_id2]),
-            value_ids: vec![val_id1, val_id2],
+            table_name: table_id,
+            columns: Some(vec![col_id1, col_id2]),
+            values: vec![val_id1, val_id2],
         });
 
         // then it is added to the AST
@@ -311,9 +311,9 @@ mod tests {
 
         // when adding an update statement
         let stmt = Statement::Update(UpdateStatement {
-            table_name_id: table_id,
+            table_name: table_id,
             column_setters: vec![(col_id, val_id)],
-            where_clause_id: Some(where_id),
+            where_clause: Some(where_id),
         });
 
         // then it is added to the AST
@@ -330,8 +330,8 @@ mod tests {
 
         // when adding a delete statement
         let stmt = Statement::Delete(DeleteStatement {
-            table_name_id: table_id,
-            where_clause_id: Some(where_id),
+            table_name: table_id,
+            where_clause: Some(where_id),
         });
 
         // then it is added to the AST
