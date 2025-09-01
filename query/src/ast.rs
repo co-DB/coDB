@@ -65,6 +65,10 @@ pub enum Statement {
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
+    Create(CreateStatement),
+    Alter(AlterStatement),
+    Truncate(TruncateStatement),
+    Drop(DropStatement),
 }
 
 #[derive(Debug)]
@@ -95,11 +99,88 @@ pub struct DeleteStatement {
 }
 
 #[derive(Debug)]
+pub struct CreateStatement {
+    pub table_name: NodeId,
+    pub columns: Vec<CreateColumnDescriptor>,
+}
+
+#[derive(Debug)]
+pub struct CreateColumnDescriptor {
+    pub name: NodeId,
+    pub ty: Type,
+    pub addon: Option<CreateColumnAddon>,
+}
+
+#[derive(Debug)]
+pub enum CreateColumnAddon {
+    PrimaryKey,
+}
+
+#[derive(Debug)]
+pub struct AlterStatement {
+    pub table_name: NodeId,
+    pub action: AlterAction,
+}
+
+#[derive(Debug)]
+pub enum AlterAction {
+    Add(AddAlterAction),
+    Rename(RenameAlterAction),
+    Drop(DropAlterAction),
+}
+
+#[derive(Debug)]
+pub struct AddAlterAction {
+    pub column_name: NodeId,
+    pub column_type: Type,
+}
+
+#[derive(Debug)]
+pub struct RenameAlterAction {
+    pub previous_name: NodeId,
+    pub new_name: NodeId,
+    pub ty: RenameType,
+}
+
+#[derive(Debug)]
+pub enum RenameType {
+    Table,
+    Column,
+}
+
+#[derive(Debug)]
+pub struct DropAlterAction {
+    pub column_name: NodeId,
+}
+
+#[derive(Debug)]
+pub struct TruncateStatement {
+    pub table_name: NodeId,
+}
+
+#[derive(Debug)]
+pub struct DropStatement {
+    pub table_name: NodeId,
+}
+
+#[derive(Debug)]
 pub enum Literal {
     String(String),
     Float(f64),
     Int(i64),
     Bool(bool),
+}
+
+#[derive(Debug)]
+pub enum Type {
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Bool,
+    String,
+    Date,
+    DateTime,
 }
 
 #[derive(Debug)]
