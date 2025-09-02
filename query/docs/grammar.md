@@ -183,7 +183,7 @@ Precedence (from lowest to highest)
  <add_alter_action> :: ADD <column_name> <type>
  <rename_alter_action> :: RENAME <rename_target>
  <rename_target> :: COLUMN <column_name> TO <column_name> | TABLE <table_name> TO <table_name>
- <drop_alter_action> :: COLUMN <column_name>
+ <drop_alter_action> :: DROP COLUMN <column_name>
 ```
 
 #### Truncate Table
