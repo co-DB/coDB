@@ -416,11 +416,11 @@ impl Parser {
     /// Syntax: `DELETE FROM <table> [WHERE <expression>]`
     fn parse_delete_statement(&mut self) -> Result<Statement, ParserError> {
         self.expect_token(TokenType::From)?;
-        let table_name_id = self.parse_table_name()?;
-        let where_clause_id = self.parse_where_clause()?;
+        let table_name = self.parse_table_name()?;
+        let where_clause = self.parse_where_clause()?;
         Ok(Statement::Delete(DeleteStatement {
-            table_name_id,
-            where_clause_id,
+            table_name,
+            where_clause,
         }))
     }
 
@@ -428,14 +428,14 @@ impl Parser {
     ///
     /// Syntax: `UPDATE <table> SET col1 = val1, col2 = val2 [WHERE <expression>]`
     fn parse_update_statement(&mut self) -> Result<Statement, ParserError> {
-        let table_name_id = self.parse_table_name()?;
+        let table_name = self.parse_table_name()?;
         self.expect_token(TokenType::Set)?;
         let column_setters = self.parse_column_setters()?;
-        let where_clause_id = self.parse_where_clause()?;
+        let where_clause = self.parse_where_clause()?;
         Ok(Statement::Update(UpdateStatement {
-            table_name_id,
+            table_name,
             column_setters,
-            where_clause_id,
+            where_clause,
         }))
     }
 
@@ -467,14 +467,14 @@ impl Parser {
     /// `INSERT INTO <table> [(col1, col2, ...)] VALUES (val1, val2, ...)`
     fn parse_insert_statement(&mut self) -> Result<Statement, ParserError> {
         self.expect_token(TokenType::Into)?;
-        let table_name_id = self.parse_table_name()?;
-        let column_ids = self.parse_insert_columns()?;
+        let table_name = self.parse_table_name()?;
+        let columns = self.parse_insert_columns()?;
         self.expect_token(TokenType::Values)?;
-        let value_ids = self.parse_insert_values()?;
+        let values = self.parse_insert_values()?;
         Ok(Statement::Insert(InsertStatement {
-            table_name_id,
-            column_ids,
-            value_ids,
+            table_name,
+            columns,
+            values,
         }))
     }
 
@@ -515,14 +515,14 @@ impl Parser {
     /// Syntax:
     /// `SELECT <columns> FROM <table> [WHERE <expression>]`
     fn parse_select_statement(&mut self) -> Result<Statement, ParserError> {
-        let column_ids = self.parse_select_columns()?;
+        let columns = self.parse_select_columns()?;
         self.expect_token(TokenType::From)?;
-        let table_name_id = self.parse_table_name()?;
-        let where_clause_id = self.parse_where_clause()?;
+        let table_name = self.parse_table_name()?;
+        let where_clause = self.parse_where_clause()?;
         Ok(Statement::Select(SelectStatement {
-            column_ids,
-            table_name_id,
-            where_clause_id,
+            columns,
+            table_name,
+            where_clause,
         }))
     }
 
@@ -626,62 +626,62 @@ mod tests {
 
     #[test]
     fn parses_select_statement_correctly() {
-        let parser = Parser::new("Select * from table;");
+        let parser = Parser::new("Select * from table_name;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
         let Statement::Select(select_stmt) = &ast.statements[0] else {
             panic!("Expected Select statement, got {:#?}", ast.statements[0]);
         };
-        assert!(select_stmt.where_clause_id.is_none());
+        assert!(select_stmt.where_clause.is_none());
 
-        let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name_id) else {
+        let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name) else {
             panic!(
                 "Expected Identifier for table, got {:#?}",
-                ast.node(select_stmt.table_name_id)
+                ast.node(select_stmt.table_name)
             );
         };
-        assert_eq!(table_ident.value, "table");
+        assert_eq!(table_ident.value, "table_name");
     }
 
     #[test]
     fn parses_delete_statement_correctly() {
-        let parser = Parser::new("DELETE FROM table;");
+        let parser = Parser::new("DELETE FROM table_name;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
         let Statement::Delete(delete_stmt) = &ast.statements[0] else {
             panic!("Expected Delete statement, got {:?}", &ast.statements[0]);
         };
-        assert!(delete_stmt.where_clause_id.is_none());
+        assert!(delete_stmt.where_clause.is_none());
 
-        let Expression::Identifier(ident) = ast.node(delete_stmt.table_name_id) else {
+        let Expression::Identifier(ident) = ast.node(delete_stmt.table_name) else {
             panic!(
                 "Expected Identifier, got {:?}",
-                ast.node(delete_stmt.table_name_id)
+                ast.node(delete_stmt.table_name)
             );
         };
-        assert_eq!(ident.value, "table");
+        assert_eq!(ident.value, "table_name");
     }
 
     #[test]
     fn parses_update_statement_correctly() {
-        let parser = Parser::new("UPDATE table SET col1 = 4, col2 = 6.1;");
+        let parser = Parser::new("UPDATE table_name SET col1 = 4, col2 = 6.1;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
         let Statement::Update(update_stmt) = &ast.statements[0] else {
             panic!("Expected Update statement, got {:#?}", ast.statements[0]);
         };
-        assert!(update_stmt.where_clause_id.is_none());
+        assert!(update_stmt.where_clause.is_none());
 
-        let Expression::Identifier(table_ident) = ast.node(update_stmt.table_name_id) else {
+        let Expression::Identifier(table_ident) = ast.node(update_stmt.table_name) else {
             panic!(
                 "Expected Identifier for table, got {:#?}",
-                ast.node(update_stmt.table_name_id)
+                ast.node(update_stmt.table_name)
             );
         };
-        assert_eq!(table_ident.value, "table");
+        assert_eq!(table_ident.value, "table_name");
 
         assert_eq!(update_stmt.column_setters.len(), 2);
 
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn parses_insert_statement_correctly() {
-        let parser = Parser::new("INSERT INTO table (col1, col2) VALUES (1, 2.5);");
+        let parser = Parser::new("INSERT INTO table_name (col1, col2) VALUES (1, 2.5);");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -736,15 +736,15 @@ mod tests {
             panic!("Expected Insert statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(insert_stmt.table_name_id) else {
+        let Expression::Identifier(table_ident) = ast.node(insert_stmt.table_name) else {
             panic!(
                 "Expected Identifier for table, got {:#?}",
-                ast.node(insert_stmt.table_name_id)
+                ast.node(insert_stmt.table_name)
             );
         };
-        assert_eq!(table_ident.value, "table");
+        assert_eq!(table_ident.value, "table_name");
 
-        let column_ids = insert_stmt.column_ids.as_ref().unwrap();
+        let column_ids = insert_stmt.columns.as_ref().unwrap();
         assert_eq!(column_ids.len(), 2);
 
         let Expression::Identifier(col1_ident) = ast.node(column_ids[0]) else {
@@ -763,10 +763,10 @@ mod tests {
         };
         assert_eq!(col2_ident.value, "col2");
 
-        let Expression::Literal(val1) = ast.node(insert_stmt.value_ids[0]) else {
+        let Expression::Literal(val1) = ast.node(insert_stmt.values[0]) else {
             panic!(
                 "Expected Literal for value1, got {:#?}",
-                ast.node(insert_stmt.value_ids[0])
+                ast.node(insert_stmt.values[0])
             );
         };
         let Literal::Int(i1) = val1.value else {
@@ -774,10 +774,10 @@ mod tests {
         };
         assert_eq!(i1, 1);
 
-        let Expression::Literal(val2) = ast.node(insert_stmt.value_ids[1]) else {
+        let Expression::Literal(val2) = ast.node(insert_stmt.values[1]) else {
             panic!(
                 "Expected Literal for value2, got {:#?}",
-                ast.node(insert_stmt.value_ids[1])
+                ast.node(insert_stmt.values[1])
             );
         };
         let Literal::Float(f2) = val2.value else {
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn parses_select_with_complex_where_clause() {
-        let parser = Parser::new("SELECT * FROM table WHERE a + 3 * b > 10;");
+        let parser = Parser::new("SELECT * FROM table_name WHERE a + 3 * b > 10;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -796,12 +796,12 @@ mod tests {
             panic!("Expected Select statement, got {:?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name_id) else {
+        let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name) else {
             panic!("Expected Identifier for table name");
         };
-        assert_eq!(table_ident.value, "table");
+        assert_eq!(table_ident.value, "table_name");
 
-        let where_id = select_stmt.where_clause_id.expect("Expected WHERE clause");
+        let where_id = select_stmt.where_clause.expect("Expected WHERE clause");
 
         let Expression::Binary(where_binary) = ast.node(where_id) else {
             panic!("Expected Binary expression at WHERE clause root");
@@ -841,7 +841,7 @@ mod tests {
 
     #[test]
     fn parses_where_with_function_call_and_parentheses() {
-        let parser = Parser::new("SELECT * FROM table WHERE (LENGTH(name) + 3) * 2 > 10;");
+        let parser = Parser::new("SELECT * FROM table_name WHERE (LENGTH(name) + 3) * 2 > 10;");
         let result = parser.parse_program();
         assert!(result.is_ok(), "Parser error: {:?}", result.err());
         let ast = result.unwrap();
@@ -850,7 +850,7 @@ mod tests {
             panic!("Expected SELECT statement, got {:?}", ast.statements[0]);
         };
 
-        let where_id = select_stmt.where_clause_id.expect("Expected WHERE clause");
+        let where_id = select_stmt.where_clause.expect("Expected WHERE clause");
         let root_expr = ast.node(where_id);
         let Expression::Binary(root_bin) = root_expr else {
             panic!("Expected Binary expression at root, got {root_expr:?}");
@@ -924,9 +924,9 @@ mod tests {
         let Statement::Select(select_stmt) = &ast.statements[0] else {
             panic!("Expected Select statement, got {:?}", ast.statements[0]);
         };
-        assert!(select_stmt.where_clause_id.is_some());
+        assert!(select_stmt.where_clause.is_some());
 
-        let where_id = select_stmt.where_clause_id.unwrap();
+        let where_id = select_stmt.where_clause.unwrap();
 
         let Expression::Binary(greater_expr) = ast.node(where_id) else {
             panic!(
@@ -1016,7 +1016,8 @@ mod tests {
 
     #[test]
     fn parses_multiple_statements() {
-        let parser = Parser::new("SELECT * FROM products; Select * FROM users; DELETE FROM table;");
+        let parser =
+            Parser::new("SELECT * FROM products; Select * FROM users; DELETE FROM table_name;");
         let result = parser.parse_program();
         assert!(result.is_ok());
         let ast = result.unwrap();
@@ -1028,7 +1029,7 @@ mod tests {
 
     #[test]
     fn correctly_recovers_from_statements_with_error_and_continues() {
-        let parser = Parser::new("SELECT * FROM; Select * FROM users; DELETE table;");
+        let parser = Parser::new("SELECT * FROM; Select * FROM users; DELETE table_name;");
         let result = parser.parse_program();
         assert!(result.is_err());
         let error = result.err().unwrap();

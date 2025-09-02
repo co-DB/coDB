@@ -65,33 +65,102 @@ pub enum Statement {
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
+    Create(CreateStatement),
+    Alter(AlterStatement),
+    Truncate(TruncateStatement),
+    Drop(DropStatement),
 }
 
 #[derive(Debug)]
 pub struct SelectStatement {
-    pub column_ids: Option<Vec<NodeId>>,
-    pub table_name_id: NodeId,
-    pub where_clause_id: Option<NodeId>,
+    pub columns: Option<Vec<NodeId>>,
+    pub table_name: NodeId,
+    pub where_clause: Option<NodeId>,
 }
 
 #[derive(Debug)]
 pub struct InsertStatement {
-    pub table_name_id: NodeId,
-    pub column_ids: Option<Vec<NodeId>>,
-    pub value_ids: Vec<NodeId>,
+    pub table_name: NodeId,
+    pub columns: Option<Vec<NodeId>>,
+    pub values: Vec<NodeId>,
 }
 
 #[derive(Debug)]
 pub struct UpdateStatement {
-    pub table_name_id: NodeId,
+    pub table_name: NodeId,
     pub column_setters: Vec<(NodeId, NodeId)>,
-    pub where_clause_id: Option<NodeId>,
+    pub where_clause: Option<NodeId>,
 }
 
 #[derive(Debug)]
 pub struct DeleteStatement {
-    pub table_name_id: NodeId,
-    pub where_clause_id: Option<NodeId>,
+    pub table_name: NodeId,
+    pub where_clause: Option<NodeId>,
+}
+
+#[derive(Debug)]
+pub struct CreateStatement {
+    pub table_name: NodeId,
+    pub columns: Vec<CreateColumnDescriptor>,
+}
+
+#[derive(Debug)]
+pub struct CreateColumnDescriptor {
+    pub name: NodeId,
+    pub ty: Type,
+    pub addon: Option<CreateColumnAddon>,
+}
+
+#[derive(Debug)]
+pub enum CreateColumnAddon {
+    PrimaryKey,
+}
+
+#[derive(Debug)]
+pub struct AlterStatement {
+    pub table_name: NodeId,
+    pub action: AlterAction,
+}
+
+#[derive(Debug)]
+pub enum AlterAction {
+    Add(AddAlterAction),
+    Rename(RenameAlterAction),
+    Drop(DropAlterAction),
+}
+
+#[derive(Debug)]
+pub struct AddAlterAction {
+    pub column_name: NodeId,
+    pub column_type: Type,
+}
+
+#[derive(Debug)]
+pub struct RenameAlterAction {
+    pub previous_name: NodeId,
+    pub new_name: NodeId,
+    pub ty: RenameType,
+}
+
+#[derive(Debug)]
+pub enum RenameType {
+    Table,
+    Column,
+}
+
+#[derive(Debug)]
+pub struct DropAlterAction {
+    pub column_name: NodeId,
+}
+
+#[derive(Debug)]
+pub struct TruncateStatement {
+    pub table_name: NodeId,
+}
+
+#[derive(Debug)]
+pub struct DropStatement {
+    pub table_name: NodeId,
 }
 
 #[derive(Debug)]
@@ -100,6 +169,18 @@ pub enum Literal {
     Float(f64),
     Int(i64),
     Bool(bool),
+}
+
+#[derive(Debug)]
+pub enum Type {
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Bool,
+    String,
+    Date,
+    DateTime,
 }
 
 #[derive(Debug)]
@@ -257,85 +338,5 @@ mod tests {
             }
             _ => panic!("Expected FunctionCallNode"),
         }
-    }
-
-    #[test]
-    fn ast_add_select_statement() {
-        // given a new AST and valid column/table nodes
-        let mut ast = Ast::new();
-        let col_id = add_identifier(&mut ast, "col");
-        let table_id = add_identifier(&mut ast, "table");
-
-        // when adding a valid select statement
-        let stmt = Statement::Select(SelectStatement {
-            column_ids: Some(vec![col_id]),
-            table_name_id: table_id,
-            where_clause_id: None,
-        });
-
-        // then it is added to the AST
-        ast.add_statement(stmt);
-        assert_eq!(ast.statements().len(), 1);
-    }
-
-    #[test]
-    fn ast_add_insert_statement() {
-        // given a new AST, a table node, column nodes, and value nodes
-        let mut ast = Ast::new();
-        let table_id = add_identifier(&mut ast, "users");
-        let col_id1 = add_identifier(&mut ast, "id");
-        let col_id2 = add_identifier(&mut ast, "name");
-        let val_id1 = add_literal(&mut ast, Literal::Int(1));
-        let val_id2 = add_literal(&mut ast, Literal::String("Alice".to_string()));
-
-        // when adding an insert statement
-        let stmt = Statement::Insert(InsertStatement {
-            table_name_id: table_id,
-            column_ids: Some(vec![col_id1, col_id2]),
-            value_ids: vec![val_id1, val_id2],
-        });
-
-        // then it is added to the AST
-        ast.add_statement(stmt);
-        assert_eq!(ast.statements().len(), 1);
-    }
-
-    #[test]
-    fn ast_add_update_statement() {
-        // given a new AST, a table node, column/value nodes, and a where clause
-        let mut ast = Ast::new();
-        let table_id = add_identifier(&mut ast, "users");
-        let col_id = add_identifier(&mut ast, "name");
-        let val_id = add_literal(&mut ast, Literal::String("Bob".to_string()));
-        let where_id = add_literal(&mut ast, Literal::Int(1));
-
-        // when adding an update statement
-        let stmt = Statement::Update(UpdateStatement {
-            table_name_id: table_id,
-            column_setters: vec![(col_id, val_id)],
-            where_clause_id: Some(where_id),
-        });
-
-        // then it is added to the AST
-        ast.add_statement(stmt);
-        assert_eq!(ast.statements().len(), 1);
-    }
-
-    #[test]
-    fn ast_add_delete_statement() {
-        // given a new AST, a table node, and a where clause
-        let mut ast = Ast::new();
-        let table_id = add_identifier(&mut ast, "users");
-        let where_id = add_literal(&mut ast, Literal::Int(1));
-
-        // when adding a delete statement
-        let stmt = Statement::Delete(DeleteStatement {
-            table_name_id: table_id,
-            where_clause_id: Some(where_id),
-        });
-
-        // then it is added to the AST
-        ast.add_statement(stmt);
-        assert_eq!(ast.statements().len(), 1);
     }
 }
