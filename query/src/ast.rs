@@ -108,12 +108,13 @@ pub struct CreateStatement {
 pub struct CreateColumnDescriptor {
     pub name: NodeId,
     pub ty: Type,
-    pub addon: Option<CreateColumnAddon>,
+    pub addon: CreateColumnAddon,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CreateColumnAddon {
     PrimaryKey,
+    None,
 }
 
 #[derive(Debug)]

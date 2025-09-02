@@ -380,6 +380,27 @@ impl Parser {
         Ok(expression_node_id)
     }
 
+    /// Parses type and transforms it to matching [`Ast::Type`].
+    fn parse_type(&mut self) -> Result<Type, ParserError> {
+        let ty = match self.peek_token.token_type {
+            TokenType::Int32Type => Type::Int32,
+            TokenType::Int64Type => Type::Int64,
+            TokenType::Float32Type => Type::Float32,
+            TokenType::Float64Type => Type::Float64,
+            TokenType::BoolType => Type::Bool,
+            TokenType::StringType => Type::String,
+            TokenType::DateType => Type::Date,
+            TokenType::DateTimeType => Type::DateTime,
+            _ => {
+                return Err(self.unexpected_token_error(
+                    "any type (INT32, INT64, FLOAT32, FLOAT64, BOOL, STRING, DATE, DATETIME",
+                ));
+            }
+        };
+        self.read_token()?;
+        Ok(ty)
+    }
+
     /// Determines the correct statement parser based on the current token and runs it.
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         match self.curr_token.token_type {
@@ -387,26 +408,26 @@ impl Parser {
             TokenType::Insert => self.parse_insert_statement(),
             TokenType::Update => self.parse_update_statement(),
             TokenType::Delete => self.parse_delete_statement(),
-            _ => Err(self.unexpected_token_error("one of INSERT, SELECT, UPDATE, DELETE")),
+            TokenType::Create => self.parse_create_statement(),
+            TokenType::Alter => self.parse_alter_statement(),
+            TokenType::Truncate => self.parse_truncate_statement(),
+            TokenType::Drop => self.parse_drop_statement(),
+            _ => Err(self.unexpected_token_error(
+                "one of INSERT, SELECT, UPDATE, DELETE, CREATE, ALTER, TRUNCATE, DROP",
+            )),
         }
     }
 
     /// Parses a comma-separated list of column identifiers.
     fn parse_columns_common(&mut self) -> Result<Vec<NodeId>, ParserError> {
         let mut columns = Vec::new();
-        let first_col = self.expect_ident()?;
-        columns.push(
-            self.ast
-                .add_node(Expression::Identifier(IdentifierNode { value: first_col })),
-        );
+        let first_col = self.parse_column_name()?;
+        columns.push(first_col);
 
         while self.peek_token.token_type == TokenType::Comma {
             self.read_token()?;
-            let column = self.expect_ident()?;
-            columns.push(
-                self.ast
-                    .add_node(Expression::Identifier(IdentifierNode { value: column })),
-            );
+            let column = self.parse_column_name()?;
+            columns.push(column);
         }
         Ok(columns)
     }
@@ -452,10 +473,7 @@ impl Parser {
 
     /// Parses a single column-value pair for an UPDATE statement.
     fn parse_column_setter(&mut self) -> Result<(NodeId, NodeId), ParserError> {
-        let column = self.expect_ident()?;
-        let column_id = self
-            .ast
-            .add_node(Expression::Identifier(IdentifierNode { value: column }));
+        let column_id = self.parse_column_name()?;
         self.expect_token(TokenType::Equal)?;
         let value_id = self.parse_expression(Precedence::Lowest)?;
         Ok((column_id, value_id))
@@ -544,6 +562,15 @@ impl Parser {
         Ok(node_id)
     }
 
+    /// Parses a column name as an identifier expression.
+    fn parse_column_name(&mut self) -> Result<NodeId, ParserError> {
+        let column_name = self.expect_ident()?;
+        let node_id = self.ast.add_node(Expression::Identifier(IdentifierNode {
+            value: column_name,
+        }));
+        Ok(node_id)
+    }
+
     /// Parses the column list in a SELECT statement.
     ///
     /// Returns:
@@ -556,6 +583,73 @@ impl Parser {
         }
         let columns = self.parse_columns_common()?;
         Ok(Some(columns))
+    }
+
+    /// Parses an CREATE statement:
+    ///
+    /// Syntax:
+    /// `CREATE TABLE <table> (column_descriptor_1, column_descriptor_2,...)`
+    fn parse_create_statement(&mut self) -> Result<Statement, ParserError> {
+        self.expect_token(TokenType::Table)?;
+        let table_name = self.parse_table_name()?;
+        let columns = self.parse_create_column_descriptors()?;
+        Ok(Statement::Create(CreateStatement {
+            table_name,
+            columns,
+        }))
+    }
+
+    /// Parses list of column descriptors inside parenthesis.
+    fn parse_create_column_descriptors(
+        &mut self,
+    ) -> Result<Vec<CreateColumnDescriptor>, ParserError> {
+        self.expect_token(TokenType::LParen)?;
+        let mut column_descriptors = vec![];
+        let first = self.parse_create_single_column_descriptor()?;
+        column_descriptors.push(first);
+        while self.peek_token.token_type == TokenType::Comma {
+            self.read_token()?;
+            column_descriptors.push(self.parse_create_single_column_descriptor()?);
+        }
+        self.expect_token(TokenType::RParen)?;
+        Ok(column_descriptors)
+    }
+
+    /// Parses single column descriptor.
+    ///
+    /// Syntax:
+    /// `column_descriptor -> <column_name> <type> <addon>`
+    fn parse_create_single_column_descriptor(
+        &mut self,
+    ) -> Result<CreateColumnDescriptor, ParserError> {
+        let name = self.parse_column_name()?;
+        let ty = self.parse_type()?;
+        let addon = self.parse_create_addon()?;
+        Ok(CreateColumnDescriptor { name, ty, addon })
+    }
+
+    /// Parses column descriptor addon.
+    fn parse_create_addon(&mut self) -> Result<CreateColumnAddon, ParserError> {
+        let addon = match self.peek_token.token_type {
+            TokenType::PrimaryKey => CreateColumnAddon::PrimaryKey,
+            _ => CreateColumnAddon::None,
+        };
+        if addon != CreateColumnAddon::None {
+            self.read_token()?;
+        }
+        Ok(addon)
+    }
+
+    fn parse_alter_statement(&mut self) -> Result<Statement, ParserError> {
+        todo!()
+    }
+
+    fn parse_truncate_statement(&mut self) -> Result<Statement, ParserError> {
+        todo!()
+    }
+
+    fn parse_drop_statement(&mut self) -> Result<Statement, ParserError> {
+        todo!()
     }
 
     /// Advances the parser by one token.
@@ -1034,5 +1128,48 @@ mod tests {
         assert!(result.is_err());
         let error = result.err().unwrap();
         assert_eq!(error.len(), 2);
+    }
+
+    #[test]
+    fn parses_create_table_statement_correctly() {
+        let parser = Parser::new("CREATE TABLE users (id INT64 PRIMARY_KEY, name STRING);");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Create(create_stmt) = &ast.statements[0] else {
+            panic!("Expected Create statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(create_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(create_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        assert_eq!(create_stmt.columns.len(), 2);
+
+        let col0 = &create_stmt.columns[0];
+        let Expression::Identifier(col0_ident) = ast.node(col0.name) else {
+            panic!(
+                "Expected Identifier for first column, got {:#?}",
+                ast.node(col0.name)
+            );
+        };
+        assert_eq!(col0_ident.value, "id");
+        assert!(matches!(col0.ty, Type::Int64));
+        assert!(matches!(col0.addon, CreateColumnAddon::PrimaryKey));
+
+        let col1 = &create_stmt.columns[1];
+        let Expression::Identifier(col1_ident) = ast.node(col1.name) else {
+            panic!(
+                "Expected Identifier for second column, got {:#?}",
+                ast.node(col1.name)
+            );
+        };
+        assert_eq!(col1_ident.value, "name");
+        assert!(matches!(col1.ty, Type::String));
+        assert!(matches!(col1.addon, CreateColumnAddon::None));
     }
 }
