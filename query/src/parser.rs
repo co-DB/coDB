@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn parses_select_statement_correctly() {
-        let parser = Parser::new("Select * from table;");
+        let parser = Parser::new("Select * from table_name;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -641,12 +641,12 @@ mod tests {
                 ast.node(select_stmt.table_name)
             );
         };
-        assert_eq!(table_ident.value, "table");
+        assert_eq!(table_ident.value, "table_name");
     }
 
     #[test]
     fn parses_delete_statement_correctly() {
-        let parser = Parser::new("DELETE FROM table;");
+        let parser = Parser::new("DELETE FROM table_name;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -661,12 +661,12 @@ mod tests {
                 ast.node(delete_stmt.table_name)
             );
         };
-        assert_eq!(ident.value, "table");
+        assert_eq!(ident.value, "table_name");
     }
 
     #[test]
     fn parses_update_statement_correctly() {
-        let parser = Parser::new("UPDATE table SET col1 = 4, col2 = 6.1;");
+        let parser = Parser::new("UPDATE table_name SET col1 = 4, col2 = 6.1;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -681,7 +681,7 @@ mod tests {
                 ast.node(update_stmt.table_name)
             );
         };
-        assert_eq!(table_ident.value, "table");
+        assert_eq!(table_ident.value, "table_name");
 
         assert_eq!(update_stmt.column_setters.len(), 2);
 
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn parses_insert_statement_correctly() {
-        let parser = Parser::new("INSERT INTO table (col1, col2) VALUES (1, 2.5);");
+        let parser = Parser::new("INSERT INTO table_name (col1, col2) VALUES (1, 2.5);");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -742,7 +742,7 @@ mod tests {
                 ast.node(insert_stmt.table_name)
             );
         };
-        assert_eq!(table_ident.value, "table");
+        assert_eq!(table_ident.value, "table_name");
 
         let column_ids = insert_stmt.columns.as_ref().unwrap();
         assert_eq!(column_ids.len(), 2);
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn parses_select_with_complex_where_clause() {
-        let parser = Parser::new("SELECT * FROM table WHERE a + 3 * b > 10;");
+        let parser = Parser::new("SELECT * FROM table_name WHERE a + 3 * b > 10;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -799,7 +799,7 @@ mod tests {
         let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name) else {
             panic!("Expected Identifier for table name");
         };
-        assert_eq!(table_ident.value, "table");
+        assert_eq!(table_ident.value, "table_name");
 
         let where_id = select_stmt.where_clause.expect("Expected WHERE clause");
 
@@ -841,7 +841,7 @@ mod tests {
 
     #[test]
     fn parses_where_with_function_call_and_parentheses() {
-        let parser = Parser::new("SELECT * FROM table WHERE (LENGTH(name) + 3) * 2 > 10;");
+        let parser = Parser::new("SELECT * FROM table_name WHERE (LENGTH(name) + 3) * 2 > 10;");
         let result = parser.parse_program();
         assert!(result.is_ok(), "Parser error: {:?}", result.err());
         let ast = result.unwrap();
@@ -1016,7 +1016,8 @@ mod tests {
 
     #[test]
     fn parses_multiple_statements() {
-        let parser = Parser::new("SELECT * FROM products; Select * FROM users; DELETE FROM table;");
+        let parser =
+            Parser::new("SELECT * FROM products; Select * FROM users; DELETE FROM table_name;");
         let result = parser.parse_program();
         assert!(result.is_ok());
         let ast = result.unwrap();
@@ -1028,7 +1029,7 @@ mod tests {
 
     #[test]
     fn correctly_recovers_from_statements_with_error_and_continues() {
-        let parser = Parser::new("SELECT * FROM; Select * FROM users; DELETE table;");
+        let parser = Parser::new("SELECT * FROM; Select * FROM users; DELETE table_name;");
         let result = parser.parse_program();
         assert!(result.is_err());
         let error = result.err().unwrap();
