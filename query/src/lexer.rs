@@ -97,6 +97,24 @@ impl Lexer {
             "and" => self.create_token(TokenType::And),
             "or" => self.create_token(TokenType::Or),
             "into" => self.create_token(TokenType::Into),
+            "create" => self.create_token(TokenType::Create),
+            "alter" => self.create_token(TokenType::Alter),
+            "truncate" => self.create_token(TokenType::Truncate),
+            "drop" => self.create_token(TokenType::Drop),
+            "primary_key" => self.create_token(TokenType::PrimaryKey),
+            "table" => self.create_token(TokenType::Table),
+            "column" => self.create_token(TokenType::Column),
+            "add" => self.create_token(TokenType::Add),
+            "rename" => self.create_token(TokenType::Rename),
+            "to" => self.create_token(TokenType::To),
+            "int32" => self.create_token(TokenType::Int32Type),
+            "int64" => self.create_token(TokenType::Int64Type),
+            "float32" => self.create_token(TokenType::Float32Type),
+            "float64" => self.create_token(TokenType::Float64Type),
+            "bool" => self.create_token(TokenType::BoolType),
+            "string" => self.create_token(TokenType::StringType),
+            "date" => self.create_token(TokenType::DateType),
+            "datetime" => self.create_token(TokenType::DateTimeType),
             _ => self.create_token(TokenType::Ident(ident)),
         }
     }
@@ -285,6 +303,10 @@ mod tests {
                 &actual_token.token_type
             );
         }
+        assert!(
+            lexer.is_at_end(),
+            "Not all tokens were consumed from lexer."
+        );
     }
 
     #[test]
@@ -522,6 +544,105 @@ mod tests {
             TokenType::Semicolon,
             TokenType::EOF,
         ];
+
+        assert_works(&mut lexer, &expected_tokens);
+    }
+
+    #[test]
+    fn test_create_table_query() {
+        let input = "create table example column1 int32 primary_key column2 string;";
+
+        let expected_tokens = [
+            TokenType::Create,
+            TokenType::Table,
+            TokenType::Ident("example".into()),
+            TokenType::Ident("column1".into()),
+            TokenType::Int32Type,
+            TokenType::PrimaryKey,
+            TokenType::Ident("column2".into()),
+            TokenType::StringType,
+            TokenType::Semicolon,
+            TokenType::EOF,
+        ];
+
+        let mut lexer = Lexer::new(input);
+
+        assert_works(&mut lexer, &expected_tokens);
+    }
+
+    #[test]
+    fn test_alter_add_query() {
+        let input = "alter table example ADD column3 date;";
+
+        let expected_tokens = [
+            TokenType::Alter,
+            TokenType::Table,
+            TokenType::Ident("example".into()),
+            TokenType::Add,
+            TokenType::Ident("column3".into()),
+            TokenType::DateType,
+            TokenType::Semicolon,
+            TokenType::EOF,
+        ];
+
+        let mut lexer = Lexer::new(input);
+
+        assert_works(&mut lexer, &expected_tokens);
+    }
+
+    #[test]
+    fn test_alter_rename_query() {
+        let input = "alter table rename column column_prev to column_new;";
+
+        let expected_tokens = [
+            TokenType::Alter,
+            TokenType::Table,
+            TokenType::Rename,
+            TokenType::Column,
+            TokenType::Ident("column_prev".into()),
+            TokenType::To,
+            TokenType::Ident("column_new".into()),
+            TokenType::Semicolon,
+            TokenType::EOF,
+        ];
+
+        let mut lexer = Lexer::new(input);
+
+        assert_works(&mut lexer, &expected_tokens);
+    }
+
+    #[test]
+    fn test_alter_drop_query() {
+        let input = "alter table drop column column4;";
+
+        let expected_tokens = [
+            TokenType::Alter,
+            TokenType::Table,
+            TokenType::Drop,
+            TokenType::Column,
+            TokenType::Ident("column4".into()),
+            TokenType::Semicolon,
+            TokenType::EOF,
+        ];
+
+        let mut lexer = Lexer::new(input);
+
+        assert_works(&mut lexer, &expected_tokens);
+    }
+
+    #[test]
+    fn test_truncate_query() {
+        let input = "truncate table example;";
+
+        let expected_tokens = [
+            TokenType::Truncate,
+            TokenType::Table,
+            TokenType::Ident("example".into()),
+            TokenType::Semicolon,
+            TokenType::EOF,
+        ];
+
+        let mut lexer = Lexer::new(input);
 
         assert_works(&mut lexer, &expected_tokens);
     }
