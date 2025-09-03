@@ -585,7 +585,7 @@ impl Parser {
         Ok(Some(columns))
     }
 
-    /// Parses an CREATE statement:
+    /// Parses a CREATE statement:
     ///
     /// Syntax:
     /// `CREATE TABLE <table> (column_descriptor_1, column_descriptor_2,...)`
@@ -640,8 +640,75 @@ impl Parser {
         Ok(addon)
     }
 
+    /// Parses an ALTER statement:
+    ///
+    /// Syntax:
+    /// `ALTER TABLE <table> <alter_action>`
     fn parse_alter_statement(&mut self) -> Result<Statement, ParserError> {
-        todo!()
+        self.expect_token(TokenType::Table)?;
+        let table_name = self.parse_table_name()?;
+        let action = match self.peek_token.token_type {
+            TokenType::Add => self.parse_alter_add()?,
+            TokenType::Rename => self.parse_alter_rename()?,
+            TokenType::Drop => self.parse_alter_drop()?,
+            _ => return Err(self.unexpected_token_error("one of ADD, RENAME, DROP")),
+        };
+        Ok(Statement::Alter(AlterStatement { table_name, action }))
+    }
+
+    /// Parses ADD variant of the ALTER statement.
+    ///
+    /// Syntax:
+    /// `<add_alter_action> -> ADD <column> <type>`
+    fn parse_alter_add(&mut self) -> Result<AlterAction, ParserError> {
+        self.expect_token(TokenType::Add)?;
+        let column_name = self.parse_column_name()?;
+        let column_type = self.parse_type()?;
+        Ok(AlterAction::Add(AddAlterAction {
+            column_name,
+            column_type,
+        }))
+    }
+
+    /// Parses RENAME variant of the ALTER statement.
+    ///
+    /// Syntax:
+    /// `<rename_column_alter_action> -> RENAME COLUMN <prev> TO <new>`
+    /// `rename_table_alter_action -> RENAME TABLE TO <new>`
+    fn parse_alter_rename(&mut self) -> Result<AlterAction, ParserError> {
+        self.expect_token(TokenType::Rename)?;
+        match self.peek_token.token_type {
+            TokenType::Column => {
+                self.read_token()?;
+                let previous_name = self.parse_column_name()?;
+                self.expect_token(TokenType::To)?;
+                let new_name = self.parse_column_name()?;
+                Ok(AlterAction::RenameColumn(RenameColumnAlterAction {
+                    previous_name,
+                    new_name,
+                }))
+            }
+            TokenType::Table => {
+                self.read_token()?;
+                self.expect_token(TokenType::To)?;
+                let new_name = self.parse_table_name()?;
+                Ok(AlterAction::RenameTable(RenameTableAlterAction {
+                    new_name,
+                }))
+            }
+            _ => Err(self.unexpected_token_error("one of COLUMN, TABLE")),
+        }
+    }
+
+    /// Parses DROP variant of the ALTER statement.
+    ///
+    /// Syntax:
+    /// `<drop_alter_action> -> DROP COLUMN <column>`
+    fn parse_alter_drop(&mut self) -> Result<AlterAction, ParserError> {
+        self.expect_token(TokenType::Drop)?;
+        self.expect_token(TokenType::Column)?;
+        let column_name = self.parse_column_name()?;
+        Ok(AlterAction::Drop(DropAlterAction { column_name }))
     }
 
     fn parse_truncate_statement(&mut self) -> Result<Statement, ParserError> {
@@ -1171,5 +1238,142 @@ mod tests {
         assert_eq!(col1_ident.value, "name");
         assert!(matches!(col1.ty, Type::String));
         assert!(matches!(col1.addon, CreateColumnAddon::None));
+    }
+
+    #[test]
+    fn parses_alter_add_correctly() {
+        let parser = Parser::new("ALTER TABLE users ADD age INT32;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Alter(alter_stmt) = &ast.statements[0] else {
+            panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(alter_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        match &alter_stmt.action {
+            AlterAction::Add(add) => {
+                let Expression::Identifier(col_ident) = ast.node(add.column_name) else {
+                    panic!(
+                        "Expected Identifier for added column, got {:#?}",
+                        ast.node(add.column_name)
+                    );
+                };
+                assert_eq!(col_ident.value, "age");
+                assert!(matches!(add.column_type, Type::Int32));
+            }
+            other => panic!("Expected Add action, got {:#?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_alter_rename_column_correctly() {
+        let parser = Parser::new("ALTER TABLE users RENAME COLUMN old_name TO new_name;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Alter(alter_stmt) = &ast.statements[0] else {
+            panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(alter_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        match &alter_stmt.action {
+            AlterAction::RenameColumn(rename) => {
+                let Expression::Identifier(prev_ident) = ast.node(rename.previous_name) else {
+                    panic!(
+                        "Expected Identifier for previous column name, got {:#?}",
+                        ast.node(rename.previous_name)
+                    );
+                };
+                assert_eq!(prev_ident.value, "old_name");
+
+                let Expression::Identifier(new_ident) = ast.node(rename.new_name) else {
+                    panic!(
+                        "Expected Identifier for new column name, got {:#?}",
+                        ast.node(rename.new_name)
+                    );
+                };
+                assert_eq!(new_ident.value, "new_name");
+            }
+            other => panic!("Expected Rename action, got {:#?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_alter_rename_table_correctly() {
+        let parser = Parser::new("ALTER TABLE users RENAME TABLE TO new_users;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Alter(alter_stmt) = &ast.statements[0] else {
+            panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(alter_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        match &alter_stmt.action {
+            AlterAction::RenameTable(rename) => {
+                let Expression::Identifier(new_ident) = ast.node(rename.new_name) else {
+                    panic!(
+                        "Expected Identifier for new table name, got {:#?}",
+                        ast.node(rename.new_name)
+                    );
+                };
+                assert_eq!(new_ident.value, "new_users");
+            }
+            other => panic!("Expected Rename action, got {:#?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_alter_drop_correctly() {
+        let parser = Parser::new("ALTER TABLE users DROP COLUMN age;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Alter(alter_stmt) = &ast.statements[0] else {
+            panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(alter_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        match &alter_stmt.action {
+            AlterAction::Drop(drop) => {
+                let Expression::Identifier(col_ident) = ast.node(drop.column_name) else {
+                    panic!(
+                        "Expected Identifier for dropped column, got {:#?}",
+                        ast.node(drop.column_name)
+                    );
+                };
+                assert_eq!(col_ident.value, "age");
+            }
+            other => panic!("Expected Drop action, got {:#?}", other),
+        }
     }
 }
