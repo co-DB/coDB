@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
 
 /// Type representing page id, should be used instead of using bare `u64`.
@@ -285,16 +285,16 @@ impl TryFrom<Page> for FileMetadata {
         if magic_number != Self::CODB_MAGIC_NUMBER {
             return Err(PagedFileError::InvalidFileFormat("invalid magic number"));
         }
-        let root_page_value = cursor.read_u64::<BigEndian>()?;
+        let root_page_value = cursor.read_u64::<LittleEndian>()?;
         let root_page_id = match root_page_value {
             0 => None,
             _ => Some(root_page_value),
         };
-        let next_page_id = cursor.read_u64::<BigEndian>()?;
-        let free_pages_length = cursor.read_u32::<BigEndian>()? as _;
+        let next_page_id = cursor.read_u64::<LittleEndian>()?;
+        let free_pages_length = cursor.read_u32::<LittleEndian>()? as _;
         let mut free_pages = HashSet::with_capacity(free_pages_length);
         for _ in 0..free_pages_length {
-            let free_page_id = cursor.read_u64::<BigEndian>()?;
+            let free_page_id = cursor.read_u64::<LittleEndian>()?;
             free_pages.insert(free_page_id);
         }
         Ok(FileMetadata {
@@ -313,11 +313,11 @@ impl TryFrom<&FileMetadata> for Page {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
         buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
         let root_page_id = value.root_page_id.unwrap_or(0);
-        buffer.write_u64::<BigEndian>(root_page_id)?;
-        buffer.write_u64::<BigEndian>(value.next_page_id)?;
-        buffer.write_u32::<BigEndian>(value.free_pages.len() as _)?;
+        buffer.write_u64::<LittleEndian>(root_page_id)?;
+        buffer.write_u64::<LittleEndian>(value.next_page_id)?;
+        buffer.write_u32::<LittleEndian>(value.free_pages.len() as _)?;
         for free_page_id in &value.free_pages {
-            buffer.write_u64::<BigEndian>(*free_page_id)?;
+            buffer.write_u64::<LittleEndian>(*free_page_id)?;
         }
         buffer.resize(PAGE_SIZE, 0);
         // We can unwrap here as we are sure that buffer size is `PAGE_SIZE`.
@@ -344,7 +344,7 @@ impl Default for FileMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use byteorder::{BigEndian, WriteBytesExt};
+    use byteorder::{LittleEndian, WriteBytesExt};
     use std::collections::HashSet;
     use tempfile::NamedTempFile;
 
@@ -356,14 +356,14 @@ mod tests {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
         buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
         buffer
-            .write_u64::<BigEndian>(root_page_id.unwrap_or(0))
+            .write_u64::<LittleEndian>(root_page_id.unwrap_or(0))
             .unwrap();
-        buffer.write_u64::<BigEndian>(next_page_id).unwrap();
+        buffer.write_u64::<LittleEndian>(next_page_id).unwrap();
         buffer
-            .write_u32::<BigEndian>(free_pages.len() as u32)
+            .write_u32::<LittleEndian>(free_pages.len() as u32)
             .unwrap();
         for id in free_pages {
-            buffer.write_u64::<BigEndian>(*id).unwrap();
+            buffer.write_u64::<LittleEndian>(*id).unwrap();
         }
         buffer.resize(PAGE_SIZE, 0);
         buffer.try_into().unwrap()
