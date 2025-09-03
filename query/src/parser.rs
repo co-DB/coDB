@@ -720,9 +720,14 @@ impl Parser {
         let table_name = self.parse_table_name()?;
         Ok(Statement::Truncate(TruncateStatement { table_name }))
     }
-
+    /// Parses a DROP statement.
+    ///
+    /// Syntax:
+    /// `DROP TABLE <table>`
     fn parse_drop_statement(&mut self) -> Result<Statement, ParserError> {
-        todo!()
+        self.expect_token(TokenType::Table)?;
+        let table_name = self.parse_table_name()?;
+        Ok(Statement::Drop(DropStatement { table_name }))
     }
 
     /// Advances the parser by one token.
@@ -1397,6 +1402,25 @@ mod tests {
             panic!(
                 "Expected Identifier for table, got {:#?}",
                 ast.node(trunc_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "sessions");
+    }
+
+    #[test]
+    fn parses_drop_statement_correctly() {
+        let parser = Parser::new("DROP TABLE sessions;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Drop(drop_stmt) = &ast.statements[0] else {
+            panic!("Expected Drop statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(drop_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(drop_stmt.table_name)
             );
         };
         assert_eq!(table_ident.value, "sessions");
