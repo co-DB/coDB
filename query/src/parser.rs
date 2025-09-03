@@ -711,8 +711,14 @@ impl Parser {
         Ok(AlterAction::Drop(DropAlterAction { column_name }))
     }
 
+    /// Parses a TRUNCATE statement.
+    ///
+    /// Syntax:
+    /// `TRUNCATE TABLE <table>`
     fn parse_truncate_statement(&mut self) -> Result<Statement, ParserError> {
-        todo!()
+        self.expect_token(TokenType::Table)?;
+        let table_name = self.parse_table_name()?;
+        Ok(Statement::Truncate(TruncateStatement { table_name }))
     }
 
     fn parse_drop_statement(&mut self) -> Result<Statement, ParserError> {
@@ -1375,5 +1381,24 @@ mod tests {
             }
             other => panic!("Expected Drop action, got {:#?}", other),
         }
+    }
+
+    #[test]
+    fn parses_truncate_statement_correctly() {
+        let parser = Parser::new("TRUNCATE TABLE sessions;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Truncate(trunc_stmt) = &ast.statements[0] else {
+            panic!("Expected Truncate statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(trunc_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(trunc_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "sessions");
     }
 }
