@@ -380,6 +380,27 @@ impl Parser {
         Ok(expression_node_id)
     }
 
+    /// Parses type and transforms it to matching [`Ast::Type`].
+    fn parse_type(&mut self) -> Result<Type, ParserError> {
+        let ty = match self.peek_token.token_type {
+            TokenType::Int32Type => Type::Int32,
+            TokenType::Int64Type => Type::Int64,
+            TokenType::Float32Type => Type::Float32,
+            TokenType::Float64Type => Type::Float64,
+            TokenType::BoolType => Type::Bool,
+            TokenType::StringType => Type::String,
+            TokenType::DateType => Type::Date,
+            TokenType::DateTimeType => Type::DateTime,
+            _ => {
+                return Err(self.unexpected_token_error(
+                    "any type (INT32, INT64, FLOAT32, FLOAT64, BOOL, STRING, DATE, DATETIME",
+                ));
+            }
+        };
+        self.read_token()?;
+        Ok(ty)
+    }
+
     /// Determines the correct statement parser based on the current token and runs it.
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         match self.curr_token.token_type {
@@ -387,26 +408,26 @@ impl Parser {
             TokenType::Insert => self.parse_insert_statement(),
             TokenType::Update => self.parse_update_statement(),
             TokenType::Delete => self.parse_delete_statement(),
-            _ => Err(self.unexpected_token_error("one of INSERT, SELECT, UPDATE, DELETE")),
+            TokenType::Create => self.parse_create_statement(),
+            TokenType::Alter => self.parse_alter_statement(),
+            TokenType::Truncate => self.parse_truncate_statement(),
+            TokenType::Drop => self.parse_drop_statement(),
+            _ => Err(self.unexpected_token_error(
+                "one of INSERT, SELECT, UPDATE, DELETE, CREATE, ALTER, TRUNCATE, DROP",
+            )),
         }
     }
 
     /// Parses a comma-separated list of column identifiers.
     fn parse_columns_common(&mut self) -> Result<Vec<NodeId>, ParserError> {
         let mut columns = Vec::new();
-        let first_col = self.expect_ident()?;
-        columns.push(
-            self.ast
-                .add_node(Expression::Identifier(IdentifierNode { value: first_col })),
-        );
+        let first_col = self.parse_column_name()?;
+        columns.push(first_col);
 
         while self.peek_token.token_type == TokenType::Comma {
             self.read_token()?;
-            let column = self.expect_ident()?;
-            columns.push(
-                self.ast
-                    .add_node(Expression::Identifier(IdentifierNode { value: column })),
-            );
+            let column = self.parse_column_name()?;
+            columns.push(column);
         }
         Ok(columns)
     }
@@ -452,10 +473,7 @@ impl Parser {
 
     /// Parses a single column-value pair for an UPDATE statement.
     fn parse_column_setter(&mut self) -> Result<(NodeId, NodeId), ParserError> {
-        let column = self.expect_ident()?;
-        let column_id = self
-            .ast
-            .add_node(Expression::Identifier(IdentifierNode { value: column }));
+        let column_id = self.parse_column_name()?;
         self.expect_token(TokenType::Equal)?;
         let value_id = self.parse_expression(Precedence::Lowest)?;
         Ok((column_id, value_id))
@@ -544,6 +562,15 @@ impl Parser {
         Ok(node_id)
     }
 
+    /// Parses a column name as an identifier expression.
+    fn parse_column_name(&mut self) -> Result<NodeId, ParserError> {
+        let column_name = self.expect_ident()?;
+        let node_id = self.ast.add_node(Expression::Identifier(IdentifierNode {
+            value: column_name,
+        }));
+        Ok(node_id)
+    }
+
     /// Parses the column list in a SELECT statement.
     ///
     /// Returns:
@@ -556,6 +583,151 @@ impl Parser {
         }
         let columns = self.parse_columns_common()?;
         Ok(Some(columns))
+    }
+
+    /// Parses a CREATE statement:
+    ///
+    /// Syntax:
+    /// `CREATE TABLE <table> (column_descriptor_1, column_descriptor_2,...)`
+    fn parse_create_statement(&mut self) -> Result<Statement, ParserError> {
+        self.expect_token(TokenType::Table)?;
+        let table_name = self.parse_table_name()?;
+        let columns = self.parse_create_column_descriptors()?;
+        Ok(Statement::Create(CreateStatement {
+            table_name,
+            columns,
+        }))
+    }
+
+    /// Parses list of column descriptors inside parenthesis.
+    fn parse_create_column_descriptors(
+        &mut self,
+    ) -> Result<Vec<CreateColumnDescriptor>, ParserError> {
+        self.expect_token(TokenType::LParen)?;
+        let mut column_descriptors = vec![];
+        let first = self.parse_create_single_column_descriptor()?;
+        column_descriptors.push(first);
+        while self.peek_token.token_type == TokenType::Comma {
+            self.read_token()?;
+            column_descriptors.push(self.parse_create_single_column_descriptor()?);
+        }
+        self.expect_token(TokenType::RParen)?;
+        Ok(column_descriptors)
+    }
+
+    /// Parses single column descriptor.
+    ///
+    /// Syntax:
+    /// `column_descriptor -> <column_name> <type> <addon>`
+    fn parse_create_single_column_descriptor(
+        &mut self,
+    ) -> Result<CreateColumnDescriptor, ParserError> {
+        let name = self.parse_column_name()?;
+        let ty = self.parse_type()?;
+        let addon = self.parse_create_addon()?;
+        Ok(CreateColumnDescriptor { name, ty, addon })
+    }
+
+    /// Parses column descriptor addon.
+    fn parse_create_addon(&mut self) -> Result<CreateColumnAddon, ParserError> {
+        let addon = match self.peek_token.token_type {
+            TokenType::PrimaryKey => CreateColumnAddon::PrimaryKey,
+            _ => CreateColumnAddon::None,
+        };
+        if addon != CreateColumnAddon::None {
+            self.read_token()?;
+        }
+        Ok(addon)
+    }
+
+    /// Parses an ALTER statement:
+    ///
+    /// Syntax:
+    /// `ALTER TABLE <table> <alter_action>`
+    fn parse_alter_statement(&mut self) -> Result<Statement, ParserError> {
+        self.expect_token(TokenType::Table)?;
+        let table_name = self.parse_table_name()?;
+        let action = match self.peek_token.token_type {
+            TokenType::Add => self.parse_alter_add()?,
+            TokenType::Rename => self.parse_alter_rename()?,
+            TokenType::Drop => self.parse_alter_drop()?,
+            _ => return Err(self.unexpected_token_error("one of ADD, RENAME, DROP")),
+        };
+        Ok(Statement::Alter(AlterStatement { table_name, action }))
+    }
+
+    /// Parses ADD variant of the ALTER statement.
+    ///
+    /// Syntax:
+    /// `<add_alter_action> -> ADD <column> <type>`
+    fn parse_alter_add(&mut self) -> Result<AlterAction, ParserError> {
+        self.expect_token(TokenType::Add)?;
+        let column_name = self.parse_column_name()?;
+        let column_type = self.parse_type()?;
+        Ok(AlterAction::Add(AddAlterAction {
+            column_name,
+            column_type,
+        }))
+    }
+
+    /// Parses RENAME variant of the ALTER statement.
+    ///
+    /// Syntax:
+    /// `<rename_column_alter_action> -> RENAME COLUMN <prev> TO <new>`
+    /// `rename_table_alter_action -> RENAME TABLE TO <new>`
+    fn parse_alter_rename(&mut self) -> Result<AlterAction, ParserError> {
+        self.expect_token(TokenType::Rename)?;
+        match self.peek_token.token_type {
+            TokenType::Column => {
+                self.read_token()?;
+                let previous_name = self.parse_column_name()?;
+                self.expect_token(TokenType::To)?;
+                let new_name = self.parse_column_name()?;
+                Ok(AlterAction::RenameColumn(RenameColumnAlterAction {
+                    previous_name,
+                    new_name,
+                }))
+            }
+            TokenType::Table => {
+                self.read_token()?;
+                self.expect_token(TokenType::To)?;
+                let new_name = self.parse_table_name()?;
+                Ok(AlterAction::RenameTable(RenameTableAlterAction {
+                    new_name,
+                }))
+            }
+            _ => Err(self.unexpected_token_error("one of COLUMN, TABLE")),
+        }
+    }
+
+    /// Parses DROP variant of the ALTER statement.
+    ///
+    /// Syntax:
+    /// `<drop_alter_action> -> DROP COLUMN <column>`
+    fn parse_alter_drop(&mut self) -> Result<AlterAction, ParserError> {
+        self.expect_token(TokenType::Drop)?;
+        self.expect_token(TokenType::Column)?;
+        let column_name = self.parse_column_name()?;
+        Ok(AlterAction::Drop(DropAlterAction { column_name }))
+    }
+
+    /// Parses a TRUNCATE statement.
+    ///
+    /// Syntax:
+    /// `TRUNCATE TABLE <table>`
+    fn parse_truncate_statement(&mut self) -> Result<Statement, ParserError> {
+        self.expect_token(TokenType::Table)?;
+        let table_name = self.parse_table_name()?;
+        Ok(Statement::Truncate(TruncateStatement { table_name }))
+    }
+    /// Parses a DROP statement.
+    ///
+    /// Syntax:
+    /// `DROP TABLE <table>`
+    fn parse_drop_statement(&mut self) -> Result<Statement, ParserError> {
+        self.expect_token(TokenType::Table)?;
+        let table_name = self.parse_table_name()?;
+        Ok(Statement::Drop(DropStatement { table_name }))
     }
 
     /// Advances the parser by one token.
@@ -1034,5 +1206,223 @@ mod tests {
         assert!(result.is_err());
         let error = result.err().unwrap();
         assert_eq!(error.len(), 2);
+    }
+
+    #[test]
+    fn parses_create_table_statement_correctly() {
+        let parser = Parser::new("CREATE TABLE users (id INT64 PRIMARY_KEY, name STRING);");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Create(create_stmt) = &ast.statements[0] else {
+            panic!("Expected Create statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(create_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(create_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        assert_eq!(create_stmt.columns.len(), 2);
+
+        let col0 = &create_stmt.columns[0];
+        let Expression::Identifier(col0_ident) = ast.node(col0.name) else {
+            panic!(
+                "Expected Identifier for first column, got {:#?}",
+                ast.node(col0.name)
+            );
+        };
+        assert_eq!(col0_ident.value, "id");
+        assert!(matches!(col0.ty, Type::Int64));
+        assert!(matches!(col0.addon, CreateColumnAddon::PrimaryKey));
+
+        let col1 = &create_stmt.columns[1];
+        let Expression::Identifier(col1_ident) = ast.node(col1.name) else {
+            panic!(
+                "Expected Identifier for second column, got {:#?}",
+                ast.node(col1.name)
+            );
+        };
+        assert_eq!(col1_ident.value, "name");
+        assert!(matches!(col1.ty, Type::String));
+        assert!(matches!(col1.addon, CreateColumnAddon::None));
+    }
+
+    #[test]
+    fn parses_alter_add_correctly() {
+        let parser = Parser::new("ALTER TABLE users ADD age INT32;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Alter(alter_stmt) = &ast.statements[0] else {
+            panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(alter_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        match &alter_stmt.action {
+            AlterAction::Add(add) => {
+                let Expression::Identifier(col_ident) = ast.node(add.column_name) else {
+                    panic!(
+                        "Expected Identifier for added column, got {:#?}",
+                        ast.node(add.column_name)
+                    );
+                };
+                assert_eq!(col_ident.value, "age");
+                assert!(matches!(add.column_type, Type::Int32));
+            }
+            other => panic!("Expected Add action, got {:#?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_alter_rename_column_correctly() {
+        let parser = Parser::new("ALTER TABLE users RENAME COLUMN old_name TO new_name;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Alter(alter_stmt) = &ast.statements[0] else {
+            panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(alter_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        match &alter_stmt.action {
+            AlterAction::RenameColumn(rename) => {
+                let Expression::Identifier(prev_ident) = ast.node(rename.previous_name) else {
+                    panic!(
+                        "Expected Identifier for previous column name, got {:#?}",
+                        ast.node(rename.previous_name)
+                    );
+                };
+                assert_eq!(prev_ident.value, "old_name");
+
+                let Expression::Identifier(new_ident) = ast.node(rename.new_name) else {
+                    panic!(
+                        "Expected Identifier for new column name, got {:#?}",
+                        ast.node(rename.new_name)
+                    );
+                };
+                assert_eq!(new_ident.value, "new_name");
+            }
+            other => panic!("Expected Rename action, got {:#?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_alter_rename_table_correctly() {
+        let parser = Parser::new("ALTER TABLE users RENAME TABLE TO new_users;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Alter(alter_stmt) = &ast.statements[0] else {
+            panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(alter_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        match &alter_stmt.action {
+            AlterAction::RenameTable(rename) => {
+                let Expression::Identifier(new_ident) = ast.node(rename.new_name) else {
+                    panic!(
+                        "Expected Identifier for new table name, got {:#?}",
+                        ast.node(rename.new_name)
+                    );
+                };
+                assert_eq!(new_ident.value, "new_users");
+            }
+            other => panic!("Expected Rename action, got {:#?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_alter_drop_correctly() {
+        let parser = Parser::new("ALTER TABLE users DROP COLUMN age;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Alter(alter_stmt) = &ast.statements[0] else {
+            panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(alter_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "users");
+
+        match &alter_stmt.action {
+            AlterAction::Drop(drop) => {
+                let Expression::Identifier(col_ident) = ast.node(drop.column_name) else {
+                    panic!(
+                        "Expected Identifier for dropped column, got {:#?}",
+                        ast.node(drop.column_name)
+                    );
+                };
+                assert_eq!(col_ident.value, "age");
+            }
+            other => panic!("Expected Drop action, got {:#?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_truncate_statement_correctly() {
+        let parser = Parser::new("TRUNCATE TABLE sessions;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Truncate(trunc_stmt) = &ast.statements[0] else {
+            panic!("Expected Truncate statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(trunc_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(trunc_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "sessions");
+    }
+
+    #[test]
+    fn parses_drop_statement_correctly() {
+        let parser = Parser::new("DROP TABLE sessions;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Drop(drop_stmt) = &ast.statements[0] else {
+            panic!("Expected Drop statement, got {:#?}", ast.statements[0]);
+        };
+
+        let Expression::Identifier(table_ident) = ast.node(drop_stmt.table_name) else {
+            panic!(
+                "Expected Identifier for table, got {:#?}",
+                ast.node(drop_stmt.table_name)
+            );
+        };
+        assert_eq!(table_ident.value, "sessions");
     }
 }

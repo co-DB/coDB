@@ -108,12 +108,13 @@ pub struct CreateStatement {
 pub struct CreateColumnDescriptor {
     pub name: NodeId,
     pub ty: Type,
-    pub addon: Option<CreateColumnAddon>,
+    pub addon: CreateColumnAddon,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CreateColumnAddon {
     PrimaryKey,
+    None,
 }
 
 #[derive(Debug)]
@@ -125,7 +126,8 @@ pub struct AlterStatement {
 #[derive(Debug)]
 pub enum AlterAction {
     Add(AddAlterAction),
-    Rename(RenameAlterAction),
+    RenameColumn(RenameColumnAlterAction),
+    RenameTable(RenameTableAlterAction),
     Drop(DropAlterAction),
 }
 
@@ -136,16 +138,14 @@ pub struct AddAlterAction {
 }
 
 #[derive(Debug)]
-pub struct RenameAlterAction {
+pub struct RenameColumnAlterAction {
     pub previous_name: NodeId,
     pub new_name: NodeId,
-    pub ty: RenameType,
 }
 
 #[derive(Debug)]
-pub enum RenameType {
-    Table,
-    Column,
+pub struct RenameTableAlterAction {
+    pub new_name: NodeId,
 }
 
 #[derive(Debug)]
