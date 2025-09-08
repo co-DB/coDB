@@ -581,7 +581,10 @@ impl TryFrom<ColumnJson> for ColumnMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
+    use filetime::{FileTime, set_file_mtime};
     use serde::de::Error;
     use tempfile::NamedTempFile;
 
@@ -837,9 +840,13 @@ mod tests {
 }"#;
         let tmp_epoch = 12345;
         let tmp_path = tmp_path(tmp_dir.path(), db, tmp_epoch);
-        // ensure mtime is newer
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path, tmp_json);
+
+        // ensure tmp file mtime > main mtime
+        let now = FileTime::from_system_time(SystemTime::now());
+        set_file_mtime(&db_path, now).unwrap();
+        let later = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
+        set_file_mtime(&tmp_path, later).unwrap();
 
         // when loading `Catalog`
         let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
@@ -898,10 +905,16 @@ mod tests {
 
         let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
         let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path1, tmp_json1);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path2, tmp_json2);
+
+        // ensure proper mtimes
+        let now = FileTime::from_system_time(SystemTime::now());
+        set_file_mtime(&db_path, now).unwrap();
+        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
+        set_file_mtime(&tmp_path1, later1).unwrap();
+        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
+        set_file_mtime(&tmp_path2, later2).unwrap();
 
         // when loading `Catalog`
         let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
@@ -951,12 +964,19 @@ mod tests {
         let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
         let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
         let tmp_path3 = tmp_path(tmp_dir.path(), db, 300);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path1, "not json");
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path2, tmp_json_valid);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path3, "not json");
+
+        // ensure proper mtimes
+        let now = FileTime::from_system_time(SystemTime::now());
+        set_file_mtime(&db_path, now).unwrap();
+        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
+        set_file_mtime(&tmp_path1, later1).unwrap();
+        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
+        set_file_mtime(&tmp_path2, later2).unwrap();
+        let later3 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(30));
+        set_file_mtime(&tmp_path3, later3).unwrap();
 
         // when loading `Catalog`
         let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
@@ -992,10 +1012,16 @@ mod tests {
 
         let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
         let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path1, "not json");
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path2, "not json");
+
+        // ensure proper mtimes
+        let now = FileTime::from_system_time(SystemTime::now());
+        set_file_mtime(&db_path, now).unwrap();
+        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
+        set_file_mtime(&tmp_path1, later1).unwrap();
+        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
+        set_file_mtime(&tmp_path2, later2).unwrap();
 
         // when loading `Catalog`
         let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
