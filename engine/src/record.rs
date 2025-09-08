@@ -1,6 +1,8 @@
-﻿use crate::catalog::{ColumnMetadata, ColumnType};
-use crate::data_types::{DbDate, DbDateTime};
+﻿use crate::data_types::{DbDate, DbDateTime};
+
+use metadata::catalog::{ColumnMetadata, ColumnType};
 use thiserror::Error;
+
 /// Error for record related operations
 #[derive(Error, Debug)]
 pub(crate) enum RecordError {
