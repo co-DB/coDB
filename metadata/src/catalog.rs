@@ -67,10 +67,11 @@ impl Catalog {
 
     /// Returns table with `table_name` name.
     /// Can fail if table with `table_name` name does not exist.
-    pub fn table(&self, table_name: &str) -> Result<&TableMetadata, CatalogError> {
+    pub fn table(&self, table_name: &str) -> Result<TableMetadata, CatalogError> {
         self.tables
             .get(table_name)
             .ok_or(CatalogError::TableNotFound(table_name.into()))
+            .map(|t| t.clone())
     }
 
     /// Adds `table` to list of tables in the catalog.
@@ -319,16 +320,16 @@ impl TableMetadata {
 
     /// Returns column metadata for column with `column_name`.
     /// Can fail if column with `column_name` does not exist.
-    pub fn column(&self, column_name: &str) -> Result<&ColumnMetadata, TableMetadataError> {
+    pub fn column(&self, column_name: &str) -> Result<ColumnMetadata, TableMetadataError> {
         self.columns_by_name
             .get(column_name)
-            .map(|&idx| &self.columns[idx])
+            .map(|&idx| self.columns[idx].clone())
             .ok_or(TableMetadataError::ColumnNotFound(column_name.into()))
     }
 
     /// Returns metadata of each column stored in table sorted by columns position in disk layout.
-    pub fn columns(&self) -> impl Iterator<Item = &ColumnMetadata> {
-        self.columns.iter()
+    pub fn columns(&self) -> impl Iterator<Item = ColumnMetadata> {
+        self.columns.iter().cloned()
     }
 
     /// Adds new column to the table.
@@ -1115,7 +1116,7 @@ mod tests {
 
         // then table `users` is returned
         assert!(result.is_ok());
-        assert_table(&users, result.unwrap());
+        assert_table(&users, &result.unwrap());
     }
 
     #[test]
@@ -1322,7 +1323,7 @@ mod tests {
 
         // then column is returned
         assert!(result.is_ok());
-        assert_column(&columns[1], result.unwrap());
+        assert_column(&columns[1], &result.unwrap());
     }
 
     #[test]
@@ -1355,10 +1356,10 @@ mod tests {
         // then column "name" is present
         assert!(result.is_ok());
         let col = table.column("name").unwrap();
-        assert_column(&new_col, col);
+        assert_column(&new_col, &col);
         // and column "id" still exists
         let col = table.column("id").unwrap();
-        assert_column(&id_col, col)
+        assert_column(&id_col, &col)
     }
 
     #[test]
