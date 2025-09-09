@@ -1,3 +1,6 @@
+use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
+use crate::types::Type;
+
 use super::ast::*;
 use super::lexer::Lexer;
 use super::tokens::{Token, TokenType};

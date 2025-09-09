@@ -1,6 +1,11 @@
 //! AST module - definition of coSQL syntax tree nodes and statements.
 
-/// [`Ast`] represents query as list of statements ([`Ast::statements`]). Each statement is built using nodes defined in [`Ast::nodes`]. Every statement inserted to [`Ast`] is guaranteed to have every node id valid - user of this module does not need to assert it.
+use crate::{
+    operators::{BinaryOperator, LogicalOperator, UnaryOperator},
+    types::Type,
+};
+
+/// [`Ast`] represents query as list of statements ([`Ast::statements`]). Each statement is built using nodes defined in [`Ast::nodes`].
 ///
 /// When executing, statements should be run in order of appearance.
 pub struct Ast {
@@ -172,18 +177,6 @@ pub enum Literal {
 }
 
 #[derive(Debug)]
-pub enum Type {
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Bool,
-    String,
-    Date,
-    DateTime,
-}
-
-#[derive(Debug)]
 pub enum Expression {
     Logical(LogicalExpressionNode),
     Binary(BinaryExpressionNode),
@@ -194,12 +187,6 @@ pub enum Expression {
 }
 
 #[derive(Debug)]
-pub enum LogicalOperator {
-    And,
-    Or,
-}
-
-#[derive(Debug)]
 pub struct LogicalExpressionNode {
     pub left_id: NodeId,
     pub right_id: NodeId,
@@ -207,32 +194,10 @@ pub struct LogicalExpressionNode {
 }
 
 #[derive(Debug)]
-pub enum BinaryOperator {
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Modulo,
-    Equal,
-    NotEqual,
-    Greater,
-    GreaterEqual,
-    Less,
-    LessEqual,
-}
-
-#[derive(Debug)]
 pub struct BinaryExpressionNode {
     pub left_id: NodeId,
     pub right_id: NodeId,
     pub op: BinaryOperator,
-}
-
-#[derive(Debug)]
-pub enum UnaryOperator {
-    Plus,
-    Minus,
-    Bang,
 }
 
 #[derive(Debug)]
