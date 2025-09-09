@@ -11,6 +11,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::types::Type;
+
 /// [`Catalog`] is an in-memory structure that holds information about a database's tables.
 /// It maps to the underlying file `{PATH_TO_CODB}/{DATABASE_NAME}/metadata.coDB`.
 /// The on-disk file format is JSON.
@@ -382,7 +384,7 @@ impl TableMetadata {
 #[derive(Debug, Clone)]
 pub struct ColumnMetadata {
     name: String,
-    ty: ColumnType,
+    ty: Type,
     /// Position of the column in the table's disk layout.
     /// For example, for layout:
     /// | colA | colB | colC |
@@ -419,7 +421,7 @@ impl ColumnMetadata {
     /// Can fail if `base_offset_pos > pos`.
     pub fn new(
         name: String,
-        ty: ColumnType,
+        ty: Type,
         pos: u16,
         base_offset: usize,
         base_offset_pos: u16,
@@ -443,7 +445,7 @@ impl ColumnMetadata {
         &self.name
     }
 
-    pub fn ty(&self) -> ColumnType {
+    pub fn ty(&self) -> Type {
         self.ty
     }
 
@@ -457,33 +459,6 @@ impl ColumnMetadata {
 
     pub fn base_offset_pos(&self) -> u16 {
         self.base_offset_pos
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ColumnType {
-    String,
-    F32,
-    F64,
-    I32,
-    I64,
-    Bool,
-    Date,
-    DateTime,
-}
-
-impl ColumnType {
-    pub fn is_fixed_size(&self) -> bool {
-        match self {
-            ColumnType::String => false,
-            ColumnType::F32 => true,
-            ColumnType::F64 => true,
-            ColumnType::I32 => true,
-            ColumnType::I64 => true,
-            ColumnType::Bool => true,
-            ColumnType::Date => true,
-            ColumnType::DateTime => true,
-        }
     }
 }
 
@@ -548,7 +523,7 @@ impl TryFrom<TableJson> for TableMetadata {
 #[derive(Serialize, Deserialize)]
 struct ColumnJson {
     name: String,
-    ty: ColumnType,
+    ty: Type,
     pos: u16,
     base_offset: usize,
     base_offset_pos: u16,
@@ -590,7 +565,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     // Helper to create a dummy column
-    fn dummy_column(name: &str, ty: ColumnType, pos: u16) -> ColumnMetadata {
+    fn dummy_column(name: &str, ty: Type, pos: u16) -> ColumnMetadata {
         ColumnMetadata::new(name.to_string(), ty, pos, pos as usize * 4, pos).unwrap()
     }
 
@@ -617,8 +592,8 @@ mod tests {
     // Helper to create example users table
     fn users_table() -> TableMetadata {
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("name", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
         ];
         dummy_table("users", &columns, "id")
     }
@@ -1227,8 +1202,8 @@ mod tests {
 
         // add another table
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("title", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("title", Type::String, 1),
         ];
         let posts = dummy_table("posts", &columns, "id");
         catalog.add_table(posts.clone()).unwrap();
@@ -1260,8 +1235,8 @@ mod tests {
     fn table_metadata_new_returns_error_on_duplicate_column_names() {
         // given two columns with the same name
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("id", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("id", Type::String, 1),
         ];
         // when creating new [`TableMetadata`]
         let result = TableMetadata::new("users", &columns, "id");
@@ -1277,8 +1252,8 @@ mod tests {
     fn table_metadata_new_returns_error_on_invalid_primary_key_column() {
         // given two columns
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("name", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
         ];
         // when creating [`TableMetadata`] with unknown primary key column name
         let result = TableMetadata::new("users", &columns, "not_a_column");
@@ -1294,8 +1269,8 @@ mod tests {
     fn table_metadata_new_returns_self_on_valid_input() {
         // given valid columns and primary key
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("name", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
         ];
         // when creating new [`TableMetadata`]
         let result = TableMetadata::new("users", &columns, "id");
@@ -1313,8 +1288,8 @@ mod tests {
     fn table_metadata_column_returns_existing_column() {
         // given table with columns "id" and "name"
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("name", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
         ];
         let table = TableMetadata::new("users", &columns, "id").unwrap();
 
@@ -1345,12 +1320,12 @@ mod tests {
     #[test]
     fn table_metadata_add_column_adds_new_column() {
         // given table with one column "id"
-        let id_col = dummy_column("id", ColumnType::I32, 0);
+        let id_col = dummy_column("id", Type::I32, 0);
         let columns = vec![id_col.clone()];
         let mut table = TableMetadata::new("users", &columns, "id").unwrap();
 
         // when adding a new column "name"
-        let new_col = dummy_column("name", ColumnType::String, 1);
+        let new_col = dummy_column("name", Type::String, 1);
         let result = table.add_column(new_col.clone());
 
         // then column "name" is present
@@ -1365,11 +1340,11 @@ mod tests {
     #[test]
     fn table_metadata_add_column_returns_error_when_column_exists() {
         // given table with column "id"
-        let columns = vec![dummy_column("id", ColumnType::I32, 0)];
+        let columns = vec![dummy_column("id", Type::I32, 0)];
         let mut table = TableMetadata::new("users", &columns, "id").unwrap();
 
         // when adding column with same name
-        let duplicate_col = dummy_column("id", ColumnType::I32, 1);
+        let duplicate_col = dummy_column("id", Type::I32, 1);
         let result = table.add_column(duplicate_col);
 
         // then error is returned
@@ -1399,9 +1374,9 @@ mod tests {
     fn table_metadata_remove_column_removes_middle_column() {
         // given table with three columns
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("middle", ColumnType::String, 1),
-            dummy_column("last", ColumnType::Bool, 2),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("middle", Type::String, 1),
+            dummy_column("last", Type::Bool, 2),
         ];
         let mut table = TableMetadata::new("users", &columns, "id").unwrap();
 

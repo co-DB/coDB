@@ -1,9 +1,9 @@
 use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
-use crate::types::Type;
 
 use super::ast::*;
 use super::lexer::Lexer;
 use super::tokens::{Token, TokenType};
+use metadata::types::Type;
 use std::mem;
 use thiserror::Error;
 
@@ -77,7 +77,7 @@ impl Parser {
         let second_token = lexer.next_token();
         Self {
             lexer,
-            ast: Ast::new(),
+            ast: Ast::default(),
             errors: Vec::new(),
             curr_token: first_token,
             peek_token: second_token,
@@ -386,10 +386,10 @@ impl Parser {
     /// Parses type and transforms it to matching [`Ast::Type`].
     fn parse_type(&mut self) -> Result<Type, ParserError> {
         let ty = match self.peek_token.token_type {
-            TokenType::Int32Type => Type::Int32,
-            TokenType::Int64Type => Type::Int64,
-            TokenType::Float32Type => Type::Float32,
-            TokenType::Float64Type => Type::Float64,
+            TokenType::Int32Type => Type::I32,
+            TokenType::Int64Type => Type::I64,
+            TokenType::Float32Type => Type::F32,
+            TokenType::Float64Type => Type::F64,
             TokenType::BoolType => Type::Bool,
             TokenType::StringType => Type::String,
             TokenType::DateType => Type::Date,
@@ -1239,7 +1239,7 @@ mod tests {
             );
         };
         assert_eq!(col0_ident.value, "id");
-        assert!(matches!(col0.ty, Type::Int64));
+        assert!(matches!(col0.ty, Type::I64));
         assert!(matches!(col0.addon, CreateColumnAddon::PrimaryKey));
 
         let col1 = &create_stmt.columns[1];
@@ -1281,7 +1281,7 @@ mod tests {
                     );
                 };
                 assert_eq!(col_ident.value, "age");
-                assert!(matches!(add.column_type, Type::Int32));
+                assert!(matches!(add.column_type, Type::I32));
             }
             other => panic!("Expected Add action, got {:#?}", other),
         }

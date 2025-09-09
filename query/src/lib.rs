@@ -5,4 +5,3 @@ mod operators;
 pub mod parser;
 mod resolved_tree;
 pub mod tokens;
-mod types;
