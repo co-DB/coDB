@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+metadata = { path = "../metadata" }
+
 thiserror.workspace = true
+parking_lot.workspace = true
