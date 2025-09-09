@@ -406,6 +406,7 @@ version = "0.1.0"
 dependencies = [
  "metadata",
  "parking_lot",
+ "tempfile",
  "thiserror",
 ]
 
