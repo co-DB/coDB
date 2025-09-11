@@ -1,29 +1,36 @@
 //! AST module - definition of coSQL syntax tree nodes and statements.
 
-/// [`Ast`] represents query as list of statements ([`Ast::statements`]). Each statement is built using nodes defined in [`Ast::nodes`]. Every statement inserted to [`Ast`] is guaranteed to have every node id valid - user of this module does not need to assert it.
+use std::fmt;
+
+use metadata::types::Type;
+use thiserror::Error;
+
+use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
+
+/// Error for [`Ast`] related operations.
+#[derive(Error, Debug)]
+pub(crate) enum AstError {
+    #[error("invalid node type(expected {expected}, got: {got})")]
+    InvalidNodeType { expected: String, got: String },
+}
+
+/// [`Ast`] represents query as list of statements ([`Ast::statements`]). Each statement is built using nodes defined in [`Ast::nodes`].
 ///
 /// When executing, statements should be run in order of appearance.
-pub struct Ast {
-    pub nodes: Vec<Expression>,
-    pub statements: Vec<Statement>,
+#[derive(Default)]
+pub(crate) struct Ast {
+    pub(crate) nodes: Vec<Expression>,
+    pub(crate) statements: Vec<Statement>,
 }
 
 impl Ast {
-    /// Create new, empty [`Ast`].
-    pub fn new() -> Self {
-        Ast {
-            nodes: vec![],
-            statements: vec![],
-        }
-    }
-
     /// Returns all statements stored in [`Ast`]. They should be executed in the order of appearance.
-    pub fn statements(&self) -> &[Statement] {
+    pub(crate) fn statements(&self) -> &[Statement] {
         &self.statements
     }
 
     /// Returns node with `node_id`.
-    pub fn node(&self, node_id: NodeId) -> &Expression {
+    pub(crate) fn node(&self, node_id: NodeId) -> &Expression {
         &self.nodes[node_id.0]
     }
 
@@ -38,11 +45,16 @@ impl Ast {
         self.statements.push(statement);
         NodeId::new(self.statements.len() - 1)
     }
-}
 
-impl Default for Ast {
-    fn default() -> Self {
-        Self::new()
+    pub(crate) fn identifier(&self, identifier_id: NodeId) -> Result<&str, AstError> {
+        let identifier_expression = self.node(identifier_id);
+        match identifier_expression {
+            Expression::Identifier(IdentifierNode { value }) => Ok(&value),
+            _ => Err(AstError::InvalidNodeType {
+                expected: "Identifier".into(),
+                got: format!("{identifier_expression}"),
+            }),
+        }
     }
 }
 
@@ -172,18 +184,6 @@ pub enum Literal {
 }
 
 #[derive(Debug)]
-pub enum Type {
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Bool,
-    String,
-    Date,
-    DateTime,
-}
-
-#[derive(Debug)]
 pub enum Expression {
     Logical(LogicalExpressionNode),
     Binary(BinaryExpressionNode),
@@ -193,10 +193,17 @@ pub enum Expression {
     Identifier(IdentifierNode),
 }
 
-#[derive(Debug)]
-pub enum LogicalOperator {
-    And,
-    Or,
+impl fmt::Display for Expression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expression::Logical(_) => write!(f, "Logical"),
+            Expression::Binary(_) => write!(f, "Binary"),
+            Expression::Unary(_) => write!(f, "Unary"),
+            Expression::FunctionCall(_) => write!(f, "FunctionCall"),
+            Expression::Literal(_) => write!(f, "Literal"),
+            Expression::Identifier(_) => write!(f, "Identifier"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -207,32 +214,10 @@ pub struct LogicalExpressionNode {
 }
 
 #[derive(Debug)]
-pub enum BinaryOperator {
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Modulo,
-    Equal,
-    NotEqual,
-    Greater,
-    GreaterEqual,
-    Less,
-    LessEqual,
-}
-
-#[derive(Debug)]
 pub struct BinaryExpressionNode {
     pub left_id: NodeId,
     pub right_id: NodeId,
     pub op: BinaryOperator,
-}
-
-#[derive(Debug)]
-pub enum UnaryOperator {
-    Plus,
-    Minus,
-    Bang,
 }
 
 #[derive(Debug)]
@@ -276,7 +261,7 @@ mod tests {
     #[test]
     fn ast_add_identifier_node() {
         // given a new AST and an identifier node
-        let mut ast = Ast::new();
+        let mut ast = Ast::default();
         let id = add_identifier(&mut ast, "foo");
 
         // when retrieving the node by id
@@ -292,7 +277,7 @@ mod tests {
     #[test]
     fn ast_add_binary_expression() {
         // given a new AST and two literal nodes
-        let mut ast = Ast::new();
+        let mut ast = Ast::default();
         let left = add_literal(&mut ast, Literal::Int(1));
         let right = add_literal(&mut ast, Literal::Int(2));
 
@@ -317,7 +302,7 @@ mod tests {
     #[test]
     fn ast_add_function_call() {
         // given a new AST, a function identifier, and two argument literals
-        let mut ast = Ast::new();
+        let mut ast = Ast::default();
         let func_id = add_identifier(&mut ast, "SUM");
         let arg1 = add_literal(&mut ast, Literal::Int(10));
         let arg2 = add_literal(&mut ast, Literal::Int(20));

@@ -11,6 +11,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::types::Type;
+
 /// [`Catalog`] is an in-memory structure that holds information about a database's tables.
 /// It maps to the underlying file `{PATH_TO_CODB}/{DATABASE_NAME}/metadata.coDB`.
 /// The on-disk file format is JSON.
@@ -67,10 +69,11 @@ impl Catalog {
 
     /// Returns table with `table_name` name.
     /// Can fail if table with `table_name` name does not exist.
-    pub fn table(&self, table_name: &str) -> Result<&TableMetadata, CatalogError> {
+    pub fn table(&self, table_name: &str) -> Result<TableMetadata, CatalogError> {
         self.tables
             .get(table_name)
             .ok_or(CatalogError::TableNotFound(table_name.into()))
+            .map(|t| t.clone())
     }
 
     /// Adds `table` to list of tables in the catalog.
@@ -319,16 +322,16 @@ impl TableMetadata {
 
     /// Returns column metadata for column with `column_name`.
     /// Can fail if column with `column_name` does not exist.
-    pub fn column(&self, column_name: &str) -> Result<&ColumnMetadata, TableMetadataError> {
+    pub fn column(&self, column_name: &str) -> Result<ColumnMetadata, TableMetadataError> {
         self.columns_by_name
             .get(column_name)
-            .map(|&idx| &self.columns[idx])
+            .map(|&idx| self.columns[idx].clone())
             .ok_or(TableMetadataError::ColumnNotFound(column_name.into()))
     }
 
     /// Returns metadata of each column stored in table sorted by columns position in disk layout.
-    pub fn columns(&self) -> impl Iterator<Item = &ColumnMetadata> {
-        self.columns.iter()
+    pub fn columns(&self) -> impl Iterator<Item = ColumnMetadata> {
+        self.columns.iter().cloned()
     }
 
     /// Adds new column to the table.
@@ -381,7 +384,7 @@ impl TableMetadata {
 #[derive(Debug, Clone)]
 pub struct ColumnMetadata {
     name: String,
-    ty: ColumnType,
+    ty: Type,
     /// Position of the column in the table's disk layout.
     /// For example, for layout:
     /// | colA | colB | colC |
@@ -418,7 +421,7 @@ impl ColumnMetadata {
     /// Can fail if `base_offset_pos > pos`.
     pub fn new(
         name: String,
-        ty: ColumnType,
+        ty: Type,
         pos: u16,
         base_offset: usize,
         base_offset_pos: u16,
@@ -442,7 +445,7 @@ impl ColumnMetadata {
         &self.name
     }
 
-    pub fn ty(&self) -> ColumnType {
+    pub fn ty(&self) -> Type {
         self.ty
     }
 
@@ -456,33 +459,6 @@ impl ColumnMetadata {
 
     pub fn base_offset_pos(&self) -> u16 {
         self.base_offset_pos
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ColumnType {
-    String,
-    F32,
-    F64,
-    I32,
-    I64,
-    Bool,
-    Date,
-    DateTime,
-}
-
-impl ColumnType {
-    pub fn is_fixed_size(&self) -> bool {
-        match self {
-            ColumnType::String => false,
-            ColumnType::F32 => true,
-            ColumnType::F64 => true,
-            ColumnType::I32 => true,
-            ColumnType::I64 => true,
-            ColumnType::Bool => true,
-            ColumnType::Date => true,
-            ColumnType::DateTime => true,
-        }
     }
 }
 
@@ -547,7 +523,7 @@ impl TryFrom<TableJson> for TableMetadata {
 #[derive(Serialize, Deserialize)]
 struct ColumnJson {
     name: String,
-    ty: ColumnType,
+    ty: Type,
     pos: u16,
     base_offset: usize,
     base_offset_pos: u16,
@@ -581,12 +557,15 @@ impl TryFrom<ColumnJson> for ColumnMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
+    use filetime::{FileTime, set_file_mtime};
     use serde::de::Error;
     use tempfile::NamedTempFile;
 
     // Helper to create a dummy column
-    fn dummy_column(name: &str, ty: ColumnType, pos: u16) -> ColumnMetadata {
+    fn dummy_column(name: &str, ty: Type, pos: u16) -> ColumnMetadata {
         ColumnMetadata::new(name.to_string(), ty, pos, pos as usize * 4, pos).unwrap()
     }
 
@@ -613,8 +592,8 @@ mod tests {
     // Helper to create example users table
     fn users_table() -> TableMetadata {
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("name", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
         ];
         dummy_table("users", &columns, "id")
     }
@@ -837,9 +816,13 @@ mod tests {
 }"#;
         let tmp_epoch = 12345;
         let tmp_path = tmp_path(tmp_dir.path(), db, tmp_epoch);
-        // ensure mtime is newer
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path, tmp_json);
+
+        // ensure tmp file mtime > main mtime
+        let now = FileTime::from_system_time(SystemTime::now());
+        set_file_mtime(&db_path, now).unwrap();
+        let later = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
+        set_file_mtime(&tmp_path, later).unwrap();
 
         // when loading `Catalog`
         let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
@@ -898,10 +881,16 @@ mod tests {
 
         let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
         let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path1, tmp_json1);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path2, tmp_json2);
+
+        // ensure proper mtimes
+        let now = FileTime::from_system_time(SystemTime::now());
+        set_file_mtime(&db_path, now).unwrap();
+        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
+        set_file_mtime(&tmp_path1, later1).unwrap();
+        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
+        set_file_mtime(&tmp_path2, later2).unwrap();
 
         // when loading `Catalog`
         let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
@@ -951,12 +940,19 @@ mod tests {
         let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
         let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
         let tmp_path3 = tmp_path(tmp_dir.path(), db, 300);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path1, "not json");
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path2, tmp_json_valid);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path3, "not json");
+
+        // ensure proper mtimes
+        let now = FileTime::from_system_time(SystemTime::now());
+        set_file_mtime(&db_path, now).unwrap();
+        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
+        set_file_mtime(&tmp_path1, later1).unwrap();
+        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
+        set_file_mtime(&tmp_path2, later2).unwrap();
+        let later3 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(30));
+        set_file_mtime(&tmp_path3, later3).unwrap();
 
         // when loading `Catalog`
         let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
@@ -992,10 +988,16 @@ mod tests {
 
         let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
         let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path1, "not json");
-        std::thread::sleep(std::time::Duration::from_millis(2));
         write_json(&tmp_path2, "not json");
+
+        // ensure proper mtimes
+        let now = FileTime::from_system_time(SystemTime::now());
+        set_file_mtime(&db_path, now).unwrap();
+        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
+        set_file_mtime(&tmp_path1, later1).unwrap();
+        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
+        set_file_mtime(&tmp_path2, later2).unwrap();
 
         // when loading `Catalog`
         let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
@@ -1089,7 +1091,7 @@ mod tests {
 
         // then table `users` is returned
         assert!(result.is_ok());
-        assert_table(&users, result.unwrap());
+        assert_table(&users, &result.unwrap());
     }
 
     #[test]
@@ -1200,8 +1202,8 @@ mod tests {
 
         // add another table
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("title", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("title", Type::String, 1),
         ];
         let posts = dummy_table("posts", &columns, "id");
         catalog.add_table(posts.clone()).unwrap();
@@ -1233,8 +1235,8 @@ mod tests {
     fn table_metadata_new_returns_error_on_duplicate_column_names() {
         // given two columns with the same name
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("id", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("id", Type::String, 1),
         ];
         // when creating new [`TableMetadata`]
         let result = TableMetadata::new("users", &columns, "id");
@@ -1250,8 +1252,8 @@ mod tests {
     fn table_metadata_new_returns_error_on_invalid_primary_key_column() {
         // given two columns
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("name", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
         ];
         // when creating [`TableMetadata`] with unknown primary key column name
         let result = TableMetadata::new("users", &columns, "not_a_column");
@@ -1267,8 +1269,8 @@ mod tests {
     fn table_metadata_new_returns_self_on_valid_input() {
         // given valid columns and primary key
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("name", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
         ];
         // when creating new [`TableMetadata`]
         let result = TableMetadata::new("users", &columns, "id");
@@ -1286,8 +1288,8 @@ mod tests {
     fn table_metadata_column_returns_existing_column() {
         // given table with columns "id" and "name"
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("name", ColumnType::String, 1),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
         ];
         let table = TableMetadata::new("users", &columns, "id").unwrap();
 
@@ -1296,7 +1298,7 @@ mod tests {
 
         // then column is returned
         assert!(result.is_ok());
-        assert_column(&columns[1], result.unwrap());
+        assert_column(&columns[1], &result.unwrap());
     }
 
     #[test]
@@ -1318,31 +1320,31 @@ mod tests {
     #[test]
     fn table_metadata_add_column_adds_new_column() {
         // given table with one column "id"
-        let id_col = dummy_column("id", ColumnType::I32, 0);
+        let id_col = dummy_column("id", Type::I32, 0);
         let columns = vec![id_col.clone()];
         let mut table = TableMetadata::new("users", &columns, "id").unwrap();
 
         // when adding a new column "name"
-        let new_col = dummy_column("name", ColumnType::String, 1);
+        let new_col = dummy_column("name", Type::String, 1);
         let result = table.add_column(new_col.clone());
 
         // then column "name" is present
         assert!(result.is_ok());
         let col = table.column("name").unwrap();
-        assert_column(&new_col, col);
+        assert_column(&new_col, &col);
         // and column "id" still exists
         let col = table.column("id").unwrap();
-        assert_column(&id_col, col)
+        assert_column(&id_col, &col)
     }
 
     #[test]
     fn table_metadata_add_column_returns_error_when_column_exists() {
         // given table with column "id"
-        let columns = vec![dummy_column("id", ColumnType::I32, 0)];
+        let columns = vec![dummy_column("id", Type::I32, 0)];
         let mut table = TableMetadata::new("users", &columns, "id").unwrap();
 
         // when adding column with same name
-        let duplicate_col = dummy_column("id", ColumnType::I32, 1);
+        let duplicate_col = dummy_column("id", Type::I32, 1);
         let result = table.add_column(duplicate_col);
 
         // then error is returned
@@ -1372,9 +1374,9 @@ mod tests {
     fn table_metadata_remove_column_removes_middle_column() {
         // given table with three columns
         let columns = vec![
-            dummy_column("id", ColumnType::I32, 0),
-            dummy_column("middle", ColumnType::String, 1),
-            dummy_column("last", ColumnType::Bool, 2),
+            dummy_column("id", Type::I32, 0),
+            dummy_column("middle", Type::String, 1),
+            dummy_column("last", Type::Bool, 2),
         ];
         let mut table = TableMetadata::new("users", &columns, "id").unwrap();
 

@@ -1,6 +1,8 @@
-﻿use crate::catalog::{ColumnMetadata, ColumnType};
-use crate::data_types::{DbDate, DbDateTime};
+﻿use crate::data_types::{DbDate, DbDateTime};
+
+use metadata::{catalog::ColumnMetadata, types::Type};
 use thiserror::Error;
+
 /// Error for record related operations
 #[derive(Error, Debug)]
 pub(crate) enum RecordError {
@@ -107,11 +109,11 @@ impl Field {
     /// Returns both the deserialized field and the remaining unconsumed bytes.
     fn deserialize<'a>(
         buffer: &'a [u8],
-        column_type: ColumnType,
+        column_type: Type,
         name: &str,
     ) -> Result<(Self, &'a [u8]), RecordError> {
         match column_type {
-            ColumnType::Bool => Self::read_fixed_and_convert::<u8, { size_of::<u8>() }>(
+            Type::Bool => Self::read_fixed_and_convert::<u8, { size_of::<u8>() }>(
                 buffer,
                 |bytes| bytes[0],
                 name,
@@ -123,37 +125,37 @@ impl Field {
                     field_name: name.into(),
                 }),
             }),
-            ColumnType::I32 => Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
+            Type::I32 => Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
                 buffer,
                 i32::from_le_bytes,
                 name,
             )
             .map(|(val, rest)| (Field::Int32(val), rest)),
-            ColumnType::I64 => Self::read_fixed_and_convert::<i64, { size_of::<i64>() }>(
+            Type::I64 => Self::read_fixed_and_convert::<i64, { size_of::<i64>() }>(
                 buffer,
                 i64::from_le_bytes,
                 name,
             )
             .map(|(val, rest)| (Field::Int64(val), rest)),
-            ColumnType::F32 => Self::read_fixed_and_convert::<f32, { size_of::<f32>() }>(
+            Type::F32 => Self::read_fixed_and_convert::<f32, { size_of::<f32>() }>(
                 buffer,
                 f32::from_le_bytes,
                 name,
             )
             .map(|(val, rest)| (Field::Float32(val), rest)),
-            ColumnType::F64 => Self::read_fixed_and_convert::<f64, { size_of::<f64>() }>(
+            Type::F64 => Self::read_fixed_and_convert::<f64, { size_of::<f64>() }>(
                 buffer,
                 f64::from_le_bytes,
                 name,
             )
             .map(|(val, rest)| (Field::Float64(val), rest)),
-            ColumnType::Date => Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
+            Type::Date => Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
                 buffer,
                 i32::from_le_bytes,
                 name,
             )
             .map(|(val, rest)| (Field::Date(DbDate::new(val)), rest)),
-            ColumnType::DateTime => {
+            Type::DateTime => {
                 let (days, rest) = Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
                     buffer,
                     i32::from_le_bytes,
@@ -169,7 +171,7 @@ impl Field {
                     rest,
                 ))
             }
-            ColumnType::String => {
+            Type::String => {
                 let (len, rest) = Self::read_fixed_and_convert::<u16, { size_of::<u16>() }>(
                     buffer,
                     u16::from_le_bytes,
@@ -217,13 +219,13 @@ mod tests {
     use super::*;
 
     // Helper function to create ColumnMetadata for testing
-    fn col(name: &str, ty: ColumnType) -> ColumnMetadata {
+    fn col(name: &str, ty: Type) -> ColumnMetadata {
         ColumnMetadata::new(name.to_string(), ty, 0, 0, 0).unwrap()
     }
     #[test]
     fn fails_when_buffer_smaller_than_expected() {
         let buffer = [0x32, 0x33];
-        let result = Field::deserialize(&buffer, ColumnType::I32, "name");
+        let result = Field::deserialize(&buffer, Type::I32, "name");
         assert!(result.is_err());
         assert!(matches!(result, Err(RecordError::UnexpectedEnd { .. })));
     }
@@ -231,7 +233,7 @@ mod tests {
     #[test]
     fn fails_when_string_bytes_are_invalid_utf8() {
         let buffer = [0x02, 0x00, 0xC2, 0x00];
-        let result = Field::deserialize(&buffer, ColumnType::String, "name");
+        let result = Field::deserialize(&buffer, Type::String, "name");
         assert!(result.is_err());
         assert!(matches!(
             result,
@@ -242,7 +244,7 @@ mod tests {
     #[test]
     fn fails_when_string_length_is_too_big() {
         let buffer = [0x03, 0x00, 0x01, 0x01];
-        let result = Field::deserialize(&buffer, ColumnType::String, "name");
+        let result = Field::deserialize(&buffer, Type::String, "name");
         assert!(result.is_err());
         assert!(matches!(result, Err(RecordError::UnexpectedEnd { .. })));
     }
@@ -250,7 +252,7 @@ mod tests {
     #[test]
     fn fails_when_deserializing_string_from_1_byte() {
         let buffer = [0x01];
-        let result = Field::deserialize(&buffer, ColumnType::String, "name");
+        let result = Field::deserialize(&buffer, Type::String, "name");
         assert!(result.is_err());
         assert!(matches!(result, Err(RecordError::UnexpectedEnd { .. })));
     }
@@ -258,7 +260,7 @@ mod tests {
     #[test]
     fn fails_for_invalid_bool() {
         let buffer = [0x02];
-        let result = Field::deserialize(&buffer, ColumnType::Bool, "name");
+        let result = Field::deserialize(&buffer, Type::Bool, "name");
         assert!(result.is_err());
         assert!(matches!(
             result,
@@ -324,10 +326,10 @@ mod tests {
 
         let mut rest = buffer.as_slice();
         let test_cases = [
-            (ColumnType::I32, "age", Field::Int32(42)),
-            (ColumnType::Bool, "flag", Field::Bool(true)),
-            (ColumnType::String, "greeting", Field::String("Hi".into())),
-            (ColumnType::F64, "pi", Field::Float64(2.5)),
+            (Type::I32, "age", Field::Int32(42)),
+            (Type::Bool, "flag", Field::Bool(true)),
+            (Type::String, "greeting", Field::String("Hi".into())),
+            (Type::F64, "pi", Field::Float64(2.5)),
         ];
 
         for case in test_cases {
@@ -342,7 +344,7 @@ mod tests {
     #[test]
     fn deserialize_empty_string() {
         let buffer = [0x00, 0x00];
-        let (field, rest) = Field::deserialize(&buffer, ColumnType::String, "empty").unwrap();
+        let (field, rest) = Field::deserialize(&buffer, Type::String, "empty").unwrap();
         assert_eq!(field, Field::String("".into()));
         assert!(rest.is_empty());
     }
@@ -359,12 +361,12 @@ mod tests {
         ];
 
         let column_metadata = vec![
-            col("int32", ColumnType::I32),
-            col("int64", ColumnType::I64),
-            col("date", ColumnType::Date),
-            col("datetime", ColumnType::DateTime),
-            col("flag", ColumnType::Bool),
-            col("string", ColumnType::String),
+            col("int32", Type::I32),
+            col("int64", Type::I64),
+            col("date", Type::Date),
+            col("datetime", Type::DateTime),
+            col("flag", Type::Bool),
+            col("string", Type::String),
         ];
 
         let cloned_fields = fields.clone();
