@@ -1,4 +1,5 @@
 use metadata::types::Type;
+use time::{Date, PrimitiveDateTime};
 
 use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
 
@@ -114,7 +115,6 @@ pub(crate) enum ResolvedLiteral {
     Int32(i32),
     Int64(i64),
     Bool(bool),
-    // TODO:
-    // Date()
-    // DateTime
+    Date(Date),
+    DateTime(PrimitiveDateTime),
 }
