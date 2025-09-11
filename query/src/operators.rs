@@ -20,7 +20,7 @@ pub(crate) enum LogicalOperator {
 }
 
 #[derive(Debug)]
-pub enum UnaryOperator {
+pub(crate) enum UnaryOperator {
     Plus,
     Minus,
     Bang,
