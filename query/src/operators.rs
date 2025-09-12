@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum BinaryOperator {
     Plus,
     Minus,
@@ -13,13 +13,13 @@ pub(crate) enum BinaryOperator {
     LessEqual,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum LogicalOperator {
     And,
     Or,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum UnaryOperator {
     Plus,
     Minus,
