@@ -30,7 +30,9 @@ pub(crate) enum UnaryOperator {
     Bang,
 }
 
+/// [`SupportsType`] should be implement for each of coDB operator. It's used for checking compatibiliy between operator and [`Type`].
 pub(crate) trait SupportsType {
+    /// Returns `true` if `ty` can be used with `self`.
     fn supports_type(&self, ty: &Type) -> bool;
 }
 

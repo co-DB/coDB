@@ -13,29 +13,37 @@ pub(crate) struct ResolvedTree {
 }
 
 impl ResolvedTree {
+    /// Adds node to [`ResolvedTree`] and returns its [`ResolvedNodeId`].
     pub(crate) fn add_node(&mut self, node: ResolvedExpression) -> ResolvedNodeId {
         self.nodes.push(node);
         ResolvedNodeId::new(self.nodes.len() - 1)
     }
 
+    /// Adds statement to [`ResolvedTree`] and returns its [`ResolvedNodeId`].
     pub(crate) fn add_statement(&mut self, statement: ResolvedStatement) -> ResolvedNodeId {
         self.statements.push(statement);
         ResolvedNodeId::new(self.statements.len() - 1)
     }
 
+    /// Returns node with `node_id`.
     pub(crate) fn node(&self, id: ResolvedNodeId) -> &ResolvedExpression {
         &self.nodes[id.0]
     }
 
+    /// Returns statement with `node_id`.
     pub(crate) fn statement(&self, id: ResolvedNodeId) -> &ResolvedStatement {
         &self.statements[id.0]
     }
 
+    /// Returns all statements.
     pub(crate) fn statements(&self) -> &[ResolvedStatement] {
         &self.statements
     }
 }
 
+/// [`ResolvedNodeId`] is used for indexing nodes and statements inside [`ResolvedTree`].
+///
+/// Works similiary to [`NodeId`].
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedNodeId(usize);
 
@@ -128,6 +136,7 @@ pub(crate) enum ResolvedLiteral {
     DateTime(PrimitiveDateTime),
 }
 
+/// User for one-to-one mapping between [`ResolvedLiteral`] and [`Type`].
 impl From<&ResolvedLiteral> for Type {
     fn from(value: &ResolvedLiteral) -> Self {
         match value {
@@ -150,6 +159,7 @@ pub(crate) enum ResolvedType {
 }
 
 impl ResolvedExpression {
+    /// Returns [`ResolvedType`] of given [`ResolvedExpression`].
     pub(crate) fn resolved_type(&self) -> ResolvedType {
         match self {
             ResolvedExpression::TableRef(_) => ResolvedType::TableRef,
