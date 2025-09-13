@@ -1,8 +1,9 @@
 ﻿use crate::cache::{PageRead, PageWrite};
+use crate::slotted_page::SlottedPageError::ForbiddenSlotCompaction;
 use bytemuck::{Pod, PodCastError, Zeroable};
 use thiserror::Error;
 
-/// Struct responsible for storing metadata of a free block. We store it at the start of each free
+/// Struct responsible for storing metadata of a free block. Stored at the start of each free
 /// block.
 ///
 /// A free block is a way of allowing slotted page to reuse the empty space left after delete or
@@ -11,51 +12,99 @@ use thiserror::Error;
 #[derive(Pod, Zeroable, Copy, Clone)]
 #[repr(C)]
 pub(crate) struct FreeBlock {
-    /// Length of the whole block, including both the empty space and the space taken by storing this
-    /// struct
+    /// Length of the whole block, including the space taken by storing this struct
     len: u16,
     /// Offset inside the page to the next freeblock
     next_block_offset: u16,
 }
 impl FreeBlock {
-    /// A minimal size needed for a free block to be created. If the empty space is less than this
-    /// value we don't create a free block and don't use this space until it is reclaimed during
-    /// record compacting.
+    /// A minimal size needed for a free block to be created. If there is less empty space leftover
+    /// than this value we don't create a free block and don't use this space until it is reclaimed
+    /// during record compaction.
     pub const MIN_SIZE: u16 = 16;
+
+    pub const SIZE: usize = size_of::<FreeBlock>();
 }
 
+/// In the future add B-tree and heap file implementations of this
+/// The structs implementing this trait must use #[repr(C)]
+pub(crate) trait SlottedPageHeader: Pod {
+    fn base(&self) -> &SlottedPageBaseHeader;
+}
+
+/// Base header of the slotted page, which is the part of header we can access from all slotted
+/// page implementations.
 #[derive(Pod, Zeroable, Copy, Clone)]
 #[repr(C)]
 pub(crate) struct SlottedPageBaseHeader {
-    free_space_size: u16,
-    free_contiguous_size: u16,
-    free_space_offset: u16,
+    /// Total free space inside slotted page. Is equal to the sum of space inside free blocks and
+    /// contiguous free space.
+    total_free_space: u16,
+    /// Free space between slots directory and record space.
+    contiguous_free_space: u16,
+    /// Offset of the start of the record area (i.e. the first used byte from the top of the page).
+    /// This marks the end of the contiguous free space. All records are stored below this offset.
+    record_area_offset: u16,
+    /// Total size of the header including the base + custom header.
     header_size: u16,
-    first_freeblock_offset: u16,
+    /// Offset of the first free block in the free blocks linked list.
+    first_free_block_offset: u16,
+    /// Index of the first free slot in the slot directory, which we can reuse during inserts.
     first_free_slot: u16,
+    /// Total number of slots in the slots directory (including used and free slots).
     num_slots: u16,
 }
 
 impl SlottedPageBaseHeader {
+    pub const NO_FREE_BLOCKS: u16 = u16::MAX;
+    pub const NO_FREE_SLOTS: u16 = u16::MAX;
+
+    /// Function for calculating the offset of the end of the slot directory.
     pub fn free_space_start(&self) -> u16 {
-        self.header_size + self.num_slots * size_of::<Slot>() as u16
+        self.header_size + self.num_slots * Slot::SIZE as u16
+    }
+
+    pub fn has_free_slot(&self) -> bool {
+        self.first_free_slot != Self::NO_FREE_SLOTS
+    }
+
+    pub fn has_free_block(&self) -> bool {
+        self.first_free_block_offset != Self::NO_FREE_SLOTS
     }
 }
+
+impl SlottedPageHeader for SlottedPageBaseHeader {
+    fn base(&self) -> &SlottedPageBaseHeader {
+        self
+    }
+}
+
+/// Enum representing possible outcomes of an insert operation.
 pub(crate) enum InsertResult {
+    /// The insert succeeded and id of the slot referencing the inserted record is returned.
     Success(u16),
+    /// There is not enough space in neither free blocks nor contiguous free space, but if the
+    /// page was defragmented the record would fit.
     NeedsDefragmentation,
+    /// The page is full and won't fit a record of this length.
     PageFull,
 }
 
 #[derive(Debug, Error)]
 pub enum SlottedPageError {
     #[error(
-        "tried to access record at index: {out_of_bounds_index} while there were only {num_slots} records"
+        "tried to access record at index {out_of_bounds_index} while there were only {num_slots} records"
     )]
-    IndexOutOfBounds {
+    RecordIndexOutOfBounds {
         num_slots: u16,
         out_of_bounds_index: u16,
     },
+    #[error("tried to modify slot at position {position} while there were only {num_slots} slots")]
+    InvalidPosition { num_slots: u16, position: u16 },
+    #[error("tried to access deleted record with slot index {slot_index}")]
+    TriedToAccessDeletedRecord { slot_index: u16 },
+    #[error("tried to compact slots even though allow_slot_compaction was set to false")]
+    ForbiddenSlotCompaction,
     #[error("casting data from bytes failed for the following reason: {reason}")]
     CastError { reason: String },
 }
@@ -67,83 +116,26 @@ impl From<PodCastError> for SlottedPageError {
         }
     }
 }
-pub struct SlottedPage<P> {
-    page: P,
-}
 
-impl<P: PageRead> SlottedPage<P> {
-    pub fn new(page: P) -> Self {
-        Self { page }
-    }
-
-    pub fn get_header<T>(&self) -> Result<&T, SlottedPageError>
-    where
-        T: SlottedPageHeader,
-    {
-        Ok(bytemuck::try_from_bytes(
-            &self.page.data()[..size_of::<T>()],
-        )?)
-    }
-    fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
-        self.get_header::<SlottedPageBaseHeader>()
-    }
-
-    pub fn num_slots(&self) -> Result<u16, SlottedPageError> {
-        let header = self.get_base_header()?;
-        Ok(header.num_slots)
-    }
-
-    pub fn is_empty(&self) -> Result<bool, SlottedPageError> {
-        Ok(self.num_slots()?.eq(&0))
-    }
-
-    pub fn free_space(&self) -> Result<u16, SlottedPageError> {
-        let header = self.get_base_header()?;
-        Ok(header.free_space_size)
-    }
-    fn get_slots(&self) -> Result<&[Slot], SlottedPageError> {
-        let header = self.get_base_header()?;
-        let start = header.header_size as usize;
-        let end = start + (header.num_slots as usize * size_of::<Slot>());
-        Ok(bytemuck::try_cast_slice(&self.page.data()[start..end])?)
-    }
-
-    fn get_slot(&self, slot_idx: u16) -> Result<&Slot, SlottedPageError> {
-        let header = self.get_base_header()?;
-        if header.num_slots > slot_idx {
-            return Err(SlottedPageError::IndexOutOfBounds {
-                num_slots: header.num_slots,
-                out_of_bounds_index: slot_idx,
-            });
-        }
-        let start = header.header_size as usize;
-        let end = start + (header.num_slots as usize * size_of::<Slot>());
-        Ok(bytemuck::from_bytes(&self.page.data()[start..end]))
-    }
-    pub fn read_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
-        let num_slots = self.num_slots()?;
-        if slot_idx >= num_slots {
-            return Err(SlottedPageError::IndexOutOfBounds {
-                num_slots,
-                out_of_bounds_index: slot_idx,
-            });
-        }
-        let slot = &self.get_slots()?[slot_idx as usize];
-        Ok(&self.page.data()[slot.offset as usize..slot.offset as usize + slot.len as usize])
-    }
-}
-
+/// Slot containing data allowing for access to the record it references.
 #[derive(Pod, Zeroable, Clone, Copy)]
 #[repr(C)]
 pub struct Slot {
+    /// Offset to record data
     pub offset: u16,
+    /// Length of the record
     pub len: u16,
-    /// This is for storing information about deleted status + free slot offset for heap files
+    /// Stores deleted status + next free slot index.
+    /// Highest bit = deleted flag, lower 15 bits = next free slot index.
     pub flags: u16,
 }
 
 impl Slot {
     const NO_FREE_SLOTS: u16 = 0x7FFF;
+
+    const SIZE: usize = size_of::<Slot>();
+
+    /// Creates a new active slot with given offset and length.
     pub fn new(offset: u16, len: u16) -> Self {
         Self {
             offset,
@@ -152,46 +144,241 @@ impl Slot {
         }
     }
 
+    /// Returns true if this slot is marked as deleted (highest bit set).
     pub fn is_deleted(&self) -> bool {
         self.flags & 0x8000 != 0
     }
 
+    /// Marks this slot as deleted by setting the highest bit.
     pub fn mark_deleted(&mut self) {
         self.flags |= 0x8000;
     }
 
-    pub fn set_next_free_slot(&mut self, next_free_slot_offset: u16) {
-        let next = next_free_slot_offset & 0x7FFF;
+    /// Sets the index of the next free slot in the lower 15 bits of `flags`.
+    pub fn set_next_free_slot(&mut self, next_free_slot_index: u16) {
+        let next = next_free_slot_index & 0x7FFF;
         let deleted_flag = self.flags & 0x8000;
         self.flags = deleted_flag | next;
     }
 
+    /// Returns the index of the next free slot (lower 15 bits of `flags`).
     pub fn next_free_slot(&self) -> u16 {
         self.flags & 0x7FFF
     }
 }
 
+/// A wrapper around a page, that allows higher level abstractions to interact with structured
+/// page data without dealing directly with raw bytes. Exposes typical slotted page methods like
+/// read,insert,update,delete and also slot/record compaction.
+///
+/// A visual for how a slotted page looks can be seen in slotted_page.png in docs directory of this
+/// crate.
+pub(crate) struct SlottedPage<P> {
+    /// The underlying page, with which the slotted page interacts.
+    page: P,
+    /// Controls whether slots within the page can be compacted to reclaim space after deletions.
+    /// Safeguards the compact_slots method which should not be called by some higher level abstractions
+    /// (e.g. heap file slotted pages).
+    allow_slot_compaction: bool,
+}
+
+/// Implementation for read-only slotted page
+impl<P: PageRead> SlottedPage<P> {
+    /// Creates a new SlottedPage wrapper around a page
+    pub fn new(page: P, allow_slot_compaction: bool) -> Self {
+        Self {
+            page,
+            allow_slot_compaction,
+        }
+    }
+
+    /// Generic method to cast page header to any type implementing SlottedPageHeader
+    ///
+    /// Caller must ensure T matches the actual header type stored in the page
+    pub fn get_header<T>(&self) -> Result<&T, SlottedPageError>
+    where
+        T: SlottedPageHeader,
+    {
+        Ok(bytemuck::try_from_bytes(
+            &self.page.data()[..size_of::<T>()],
+        )?)
+    }
+
+    /// Gets a reference to the base header (common to all slotted pages).
+    fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
+        self.get_header::<SlottedPageBaseHeader>()
+    }
+
+    /// Returns the total number of slots (both used and unused) in this page
+    pub fn num_slots(&self) -> Result<u16, SlottedPageError> {
+        let header = self.get_base_header()?;
+        Ok(header.num_slots)
+    }
+
+    /// Returns the total amount of free space available on this page
+    /// This includes both contiguous free space and fragmented free blocks
+    pub fn free_space(&self) -> Result<u16, SlottedPageError> {
+        let header = self.get_base_header()?;
+        Ok(header.total_free_space)
+    }
+
+    /// Returns a slice containing all slots (casted) in the slot directory
+    fn get_slots(&self) -> Result<&[Slot], SlottedPageError> {
+        let header = self.get_base_header()?;
+        let start = header.header_size as usize;
+        let end = start + (header.num_slots as usize * Slot::SIZE);
+        Ok(bytemuck::try_cast_slice(&self.page.data()[start..end])?)
+    }
+
+    /// Gets a reference to a specific slot by index
+    fn get_slot(&self, slot_idx: u16) -> Result<&Slot, SlottedPageError> {
+        let header = self.get_base_header()?;
+
+        if slot_idx >= header.num_slots {
+            return Err(SlottedPageError::RecordIndexOutOfBounds {
+                num_slots: header.num_slots,
+                out_of_bounds_index: slot_idx,
+            });
+        }
+
+        let slots = self.get_slots()?;
+        Ok(&slots[slot_idx as usize])
+    }
+
+    /// Reads the record data for a given slot. Doesn't check if the record is deleted (since
+    /// we use deleted records in binary search for b-tree). For safe access use read_valid_record
+    pub fn read_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
+        let slot = self.get_slot(slot_idx)?;
+
+        let record_start = slot.offset as usize;
+        let record_end = record_start + slot.len as usize;
+
+        Ok(&self.page.data()[record_start..record_end])
+    }
+
+    /// Reads the record data for a given slot. Checks if the record is deleted . Safe version of
+    /// read_record
+    pub fn read_valid_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
+        let slot = self.get_slot(slot_idx)?;
+
+        if slot.is_deleted() {
+            return Err(SlottedPageError::TriedToAccessDeletedRecord {
+                slot_index: slot_idx,
+            });
+        }
+
+        let record_start = slot.offset as usize;
+        let record_end = record_start + slot.len as usize;
+
+        Ok(&self.page.data()[record_start..record_end])
+    }
+}
+
 impl<P: PageWrite + PageRead> SlottedPage<P> {
+    /// Generic method to cast page header to any type implementing SlottedPageHeader
+    ///
+    /// Caller must ensure T matches the actual header type stored in the page
     pub fn get_header_mut<T>(&mut self) -> Result<&mut T, SlottedPageError>
     where
-        T: SlottedPageHeader + Pod,
+        T: SlottedPageHeader,
     {
         Ok(bytemuck::try_from_bytes_mut(
             &mut self.page.data_mut()[..size_of::<T>()],
         )?)
     }
 
+    /// Gets a mutable reference to base header (common to all slotted pages).
     fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
         self.get_header_mut::<SlottedPageBaseHeader>()
     }
-    pub fn insert_record(&mut self, record: &[u8]) -> Result<InsertResult, SlottedPageError> {
+
+    /// Inserts a record at a given slot position.
+    ///
+    /// Shifts existing slots to the right if necessary, allocates space for the record,
+    /// writes it, and updates the header.
+    pub fn insert_at(
+        &mut self,
+        record: &[u8],
+        position: u16,
+    ) -> Result<InsertResult, SlottedPageError> {
         let header = self.get_base_header()?;
 
-        let needs_new_slot = header.first_free_slot == u16::MAX;
+        if position > header.num_slots {
+            return Err(SlottedPageError::InvalidPosition {
+                position,
+                num_slots: header.num_slots,
+            });
+        }
 
-        let required_space = record.len() + if needs_new_slot { size_of::<Slot>() } else { 0 };
+        let required_space = record.len() + Slot::SIZE;
 
-        if required_space as u16 > header.free_space_size {
+        if required_space as u16 > header.total_free_space {
+            return Ok(InsertResult::PageFull);
+        }
+
+        let offset = match self.get_allocated_space(record.len() as u16, true)? {
+            None => return Ok(InsertResult::NeedsDefragmentation),
+            Some(offset) => offset,
+        };
+
+        self.write_record_at(record, offset);
+
+        self.shift_slots_right(position)?;
+
+        self.write_slot_at(position, Slot::new(offset, record.len() as u16))?;
+
+        let header_mut = self.get_base_header_mut()?;
+        header_mut.num_slots += 1;
+        header_mut.total_free_space -= Slot::SIZE as u16;
+        header_mut.contiguous_free_space -= Slot::SIZE as u16;
+
+        Ok(InsertResult::Success(position))
+    }
+
+    /// Writes a slot to the slot directory at a given position.
+    fn write_slot_at(&mut self, position: u16, slot: Slot) -> Result<(), SlottedPageError> {
+        let header_size = self.get_base_header()?.header_size as usize;
+        let page = self.page.data_mut();
+
+        let start = header_size + position as usize * Slot::SIZE;
+        let end = start + Slot::SIZE;
+
+        page[start..end].copy_from_slice(bytemuck::bytes_of(&slot));
+
+        Ok(())
+    }
+
+    /// Shifts slots to the right starting from a given position.
+    ///
+    /// Used when inserting into the middle of the slot directory.
+    fn shift_slots_right(&mut self, position: u16) -> Result<(), SlottedPageError> {
+        let header = self.get_base_header()?;
+
+        let shifted_slots_num = header.num_slots - position;
+        if shifted_slots_num == 0 {
+            return Ok(());
+        }
+        let start = header.header_size as usize + position as usize * Slot::SIZE;
+        let end = start + shifted_slots_num as usize * Slot::SIZE;
+
+        let page = self.page.data_mut();
+
+        page.copy_within(start..end, start + Slot::SIZE);
+
+        Ok(())
+    }
+
+    /// Inserts a record at the end of the slot directory.
+    ///
+    /// Automatically reuses free slots if available, or appends a new one otherwise.
+    pub fn insert(&mut self, record: &[u8]) -> Result<InsertResult, SlottedPageError> {
+        let header = self.get_base_header()?;
+
+        let needs_new_slot = !header.has_free_slot();
+
+        let required_space = record.len() + if needs_new_slot { Slot::SIZE } else { 0 };
+
+        if required_space as u16 > header.total_free_space {
             return Ok(InsertResult::PageFull);
         }
 
@@ -204,95 +391,103 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
 
         let slot = Slot::new(offset, record.len() as u16);
 
+        // we call reuse or append here instead of just reuse to account for all possible situations.
         let slot_id = self.reuse_or_append_slot(slot)?;
         Ok(InsertResult::Success(slot_id))
     }
 
+    /// Appends a slot at the end of the slot directory.\
     fn append_slot(&mut self, slot: Slot) -> Result<u16, SlottedPageError> {
-        let free_space_start = self.get_base_header()?.free_space_start();
-        self.page.data_mut()
-            [free_space_start as usize..free_space_start as usize + size_of::<Slot>()]
-            .copy_from_slice(bytemuck::bytes_of(&slot));
+        let num_slots = self.get_base_header()?.num_slots;
+        self.write_slot_at(num_slots, slot)?;
         let header = self.get_base_header_mut()?;
         let slot_id = header.num_slots;
         header.num_slots += 1;
-        header.free_contiguous_size -= size_of::<Slot>() as u16;
-        header.free_space_size -= size_of::<Slot>() as u16;
+        header.contiguous_free_space -= Slot::SIZE as u16;
+        header.total_free_space -= Slot::SIZE as u16;
         Ok(slot_id)
     }
 
+    /// If a free slot exists, reuses it. Otherwise, appends a new slot.
     fn reuse_or_append_slot(&mut self, slot: Slot) -> Result<u16, SlottedPageError> {
         let header = self.get_base_header()?;
-        let free_slot_id = header.first_free_slot;
 
-        if free_slot_id == u16::MAX {
+        if !header.has_free_slot() {
             return self.append_slot(slot);
         }
+
+        let free_slot_id = header.first_free_slot;
 
         let free_slot = self.get_slot(free_slot_id)?;
         let next_free_slot_id = free_slot.next_free_slot();
 
-        let start = header.header_size as usize + free_slot_id as usize * size_of::<Slot>();
-        let end = start + size_of::<Slot>();
-        self.page.data_mut()[start..end].copy_from_slice(bytemuck::bytes_of(&slot));
+        self.write_slot_at(free_slot_id, slot)?;
 
         self.get_base_header_mut()?.first_free_slot = next_free_slot_id;
 
         Ok(free_slot_id)
     }
 
+    /// Writes record bytes into the page at the given offset.
     fn write_record_at(&mut self, record: &[u8], offset: u16) {
         let start = offset as usize;
         let end = start + record.len();
         self.page.data_mut()[start..end].copy_from_slice(record)
     }
 
+    /// Allocates space for a record of length `record_len`.
+    ///
+    /// Attempts to place it in contiguous free space first; if not possible,
+    /// searches the freeblock chain. May return `None` if defragmentation is required
     fn get_allocated_space(
         &mut self,
         record_len: u16,
         needs_new_slot: bool,
     ) -> Result<Option<u16>, SlottedPageError> {
         let header = self.get_base_header_mut()?;
-        let slot_size = if needs_new_slot {
-            size_of::<Slot>() as u16
-        } else {
-            0
-        };
+        let slot_size = if needs_new_slot { Slot::SIZE as u16 } else { 0 };
+        let required_space = record_len + slot_size;
 
-        if header.free_contiguous_size >= record_len + slot_size {
-            header.free_contiguous_size -= record_len;
-            header.free_space_size -= record_len;
-            header.free_space_offset -= record_len;
-            return Ok(Some(header.free_space_offset));
+        // First we check whether we can fit the record in the contiguous space between slot directory
+        // and record space.
+        if header.contiguous_free_space >= required_space {
+            header.contiguous_free_space -= record_len;
+            header.total_free_space -= record_len;
+            header.record_area_offset -= record_len;
+            return Ok(Some(header.record_area_offset));
         }
 
-        if needs_new_slot && header.free_contiguous_size < slot_size {
+        // This check is so we don't run into situations where we have enough space in a free block
+        // to insert a record, but we don't have enough space to add a new slot. In that case the
+        // insert must fail.
+        if needs_new_slot && header.contiguous_free_space < slot_size {
             return Ok(None);
         }
 
+        // If contiguous space allocation failed we search through free blocks.
         if let Some((prev_offset, offset)) = self.find_free_space(record_len)? {
             let block = *bytemuck::try_from_bytes::<FreeBlock>(
-                &self.page.data()[offset as usize..offset as usize + size_of::<FreeBlock>()],
+                &self.page.data()[offset as usize..offset as usize + FreeBlock::SIZE],
             )?;
 
+            // If leftover after insertion is too small, consume entire block.
             if block.len.saturating_sub(record_len) < FreeBlock::MIN_SIZE {
-                self.get_base_header_mut()?.free_space_size -= block.len;
+                self.get_base_header_mut()?.total_free_space -= block.len;
                 self.update_freeblock_chain(prev_offset, block.next_block_offset)?;
                 return Ok(Some(offset));
             }
 
-            // Here we handle the case where the freeblock has at least 16 bytes of space
-            // leftover after inserting the record, so we add another free block
-            let consumed_space = record_len + size_of::<FreeBlock>() as u16;
-            self.get_base_header_mut()?.free_space_size -= consumed_space;
+            // Otherwise, split block into record + smaller free block.
+            let consumed_space = record_len + FreeBlock::SIZE as u16;
+            self.get_base_header_mut()?.total_free_space -= consumed_space;
 
             let new_freeblock_offset = offset + record_len;
             let new_freeblock = FreeBlock {
                 next_block_offset: block.next_block_offset,
-                len: block.len - record_len - size_of::<FreeBlock>() as u16,
+                len: block.len - record_len - FreeBlock::SIZE as u16,
             };
-            self.page.data_mut()[new_freeblock_offset as usize
-                ..new_freeblock_offset as usize + size_of::<FreeBlock>()]
+            self.page.data_mut()
+                [new_freeblock_offset as usize..new_freeblock_offset as usize + FreeBlock::SIZE]
                 .copy_from_slice(bytemuck::bytes_of(&new_freeblock));
 
             self.update_freeblock_chain(prev_offset, new_freeblock_offset)?;
@@ -302,30 +497,39 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         Ok(None)
     }
 
+    /// Updates the linked list of free blocks when one is consumed or split.
     fn update_freeblock_chain(
         &mut self,
         prev_offset: u16,
         new_next: u16,
     ) -> Result<(), SlottedPageError> {
-        if prev_offset == u16::MAX {
-            self.get_base_header_mut()?.first_freeblock_offset = new_next;
+        // If prev offset is NO_FREE_BLOCKS then it means it was the first free block in the linked
+        // list, and thus we only need to replace the offset in the header (the head of the list)
+        if prev_offset == SlottedPageBaseHeader::NO_FREE_BLOCKS {
+            self.get_base_header_mut()?.first_free_block_offset = new_next;
         } else {
+            // Else we join together the previous block on the list and the next one after the deleted one
             let prev = bytemuck::try_from_bytes_mut::<FreeBlock>(
                 &mut self.page.data_mut()
-                    [prev_offset as usize..prev_offset as usize + size_of::<FreeBlock>()],
+                    [prev_offset as usize..prev_offset as usize + FreeBlock::SIZE],
             )?;
             prev.next_block_offset = new_next;
         }
         Ok(())
     }
+
+    /// Finds the first free block large enough for `record_len`.
     fn find_free_space(&self, record_len: u16) -> Result<Option<(u16, u16)>, SlottedPageError> {
         let header = self.get_base_header()?;
 
-        let mut block_offset = header.first_freeblock_offset;
-        let mut prev_offset = u16::MAX;
-        while block_offset != u16::MAX {
+        let mut block_offset = header.first_free_block_offset;
+        let mut prev_offset = SlottedPageBaseHeader::NO_FREE_BLOCKS;
+        // We go through the linked list of free blocks and read the metadata of each blocks until
+        // we encounter either a free block containing enough space or the end of the linked
+        // list - NO_FREE_BLOCKS.
+        while block_offset != SlottedPageBaseHeader::NO_FREE_BLOCKS {
             let start = block_offset as usize;
-            let end = start + size_of::<FreeBlock>();
+            let end = start + FreeBlock::SIZE;
             let freeblock = bytemuck::try_from_bytes::<FreeBlock>(&self.page.data()[start..end])?;
             if freeblock.len >= record_len {
                 return Ok(Some((prev_offset, block_offset)));
@@ -336,34 +540,41 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         Ok(None)
     }
 
+    /// Returns a mutable slice of all slots.
     fn get_slots_mut(&mut self) -> Result<&mut [Slot], SlottedPageError> {
         let header = self.get_base_header()?;
         let start = header.header_size as usize;
-        let end = start + (header.num_slots as usize * size_of::<Slot>());
+        let end = start + (header.num_slots as usize * Slot::SIZE);
         Ok(bytemuck::try_cast_slice_mut(
             &mut self.page.data_mut()[start..end],
         )?)
     }
 
-    fn get_slot_mut(&mut self, slot_idx: usize) -> Result<&mut Slot, SlottedPageError> {
+    /// Returns a mutable reference to a specific slot.
+    fn get_slot_mut(&mut self, slot_idx: u16) -> Result<&mut Slot, SlottedPageError> {
         let header = self.get_base_header()?;
-        let start = header.header_size as usize + slot_idx as usize * size_of::<Slot>();
-        let end = start + size_of::<Slot>();
+        let start = header.header_size as usize + slot_idx as usize * Slot::SIZE;
+        let end = start + Slot::SIZE;
         Ok(bytemuck::try_from_bytes_mut(
             &mut self.page.data_mut()[start..end],
         )?)
     }
 
-    /// Removes deleted slots and pushes the filled ones together. Keeps the order of slots intact and
-    /// frees space.
+    /// Compacts the slot directory by removing deleted slots and shifting
+    /// remaining slots toward the beginning of the slot array.
     ///
-    /// This is for B-Tree nodes only as there slots placement doesn't matter since they are never
-    /// referenced from outside the node. For heap file pages the slot ids matter and compacting
-    /// would change and thus invalidate the external references to them.
+    /// After compaction, the slot directory contains only active slots, packed
+    /// tightly from the start of the slot area.
     pub fn compact_slots(&mut self) -> Result<(), SlottedPageError> {
+        if !self.allow_slot_compaction {
+            return Err(ForbiddenSlotCompaction);
+        }
+
         let header_size = self.get_base_header()?.header_size as usize;
 
         let slots = self.get_slots()?;
+
+        // Collect all indices of non-deleted slots.
         let filled_slots: Vec<usize> = slots
             .iter()
             .enumerate()
@@ -371,29 +582,37 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
             .collect();
 
         let filled_count = filled_slots.len();
-        let freed_space = (slots.len() - filled_count) * size_of::<Slot>();
+        let deleted_count = slots.len() - filled_count;
+        let freed_space = deleted_count * Slot::SIZE;
 
         let page = self.page.data_mut();
 
+        // Compact slots by moving filled ones toward the start.
         for (dst_i, src_i) in filled_slots.into_iter().enumerate() {
-            let copy_location = header_size + dst_i * size_of::<Slot>();
-            let src_start = header_size + src_i * size_of::<Slot>();
-            let src_end = src_start + size_of::<Slot>();
+            let copy_location = header_size + dst_i * Slot::SIZE;
+            let src_start = header_size + src_i * Slot::SIZE;
+            let src_end = src_start + Slot::SIZE;
 
             page.copy_within(src_start..src_end, copy_location);
         }
 
         let header = self.get_base_header_mut()?;
         header.num_slots = filled_count as u16;
-        header.free_space_size += freed_space as u16;
-        header.free_contiguous_size += freed_space as u16;
+        header.total_free_space += freed_space as u16;
+        header.contiguous_free_space += freed_space as u16;
         header.first_free_slot = Slot::NO_FREE_SLOTS;
         Ok(())
     }
 
+    /// Compacts all non-deleted records in the slotted page by moving them
+    /// into a contiguous block at the end of the page.
+    ///
+    /// After compaction, all free space is guaranteed to be one contiguous
+    /// block between the slot directory and the record area.
     pub fn compact_records(&mut self) -> Result<(), SlottedPageError> {
         let mut write_pos = self.page.data().len();
 
+        // Get non-deleted slots (copied) and their indices
         let mut slots: Vec<(usize, Slot)> = self
             .get_slots()?
             .iter()
@@ -401,29 +620,20 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
             .filter_map(|(idx, slot)| (!slot.is_deleted()).then_some((idx, *slot)))
             .collect();
 
+        // Sort slots by descending offset to avoid overwriting the records that have not yet been moved.
         slots.sort_by_key(|(_, slot)| -(slot.offset as i32));
         for (idx, slot) in slots {
             write_pos -= slot.len as usize;
             let record_range = slot.offset as usize..slot.offset as usize + slot.len as usize;
+
+            // Move record into new compacted position and update its corresponding slot to new offset
             self.page.data_mut().copy_within(record_range, write_pos);
-            self.get_slot_mut(idx)?.offset = write_pos as u16;
+            self.get_slot_mut(idx as u16)?.offset = write_pos as u16;
         }
         let header = self.get_base_header_mut()?;
-        header.free_space_offset = write_pos as u16;
-        header.free_contiguous_size = write_pos as u16 - header.free_space_start();
-        header.first_freeblock_offset = u16::MAX;
+        header.record_area_offset = write_pos as u16;
+        header.contiguous_free_space = write_pos as u16 - header.free_space_start();
+        header.first_free_block_offset = SlottedPageBaseHeader::NO_FREE_BLOCKS;
         Ok(())
-    }
-}
-
-/// In the future add b-tree and heap file implementations of this
-/// The structs implementing this trait must use #[repr(C)]
-pub(crate) trait SlottedPageHeader: Pod {
-    fn base(&self) -> &SlottedPageBaseHeader;
-}
-
-impl SlottedPageHeader for SlottedPageBaseHeader {
-    fn base(&self) -> &SlottedPageBaseHeader {
-        self
     }
 }
