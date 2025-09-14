@@ -1,4 +1,4 @@
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use metadata::{
     catalog::{Catalog, CatalogError, ColumnMetadata, TableMetadata, TableMetadataError},
@@ -9,8 +9,9 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        Ast, AstError, BinaryExpressionNode, Expression, FunctionCallNode, Literal, LiteralNode,
-        LogicalExpressionNode, NodeId, SelectStatement, Statement, UnaryExpressionNode,
+        Ast, AstError, BinaryExpressionNode, Expression, FunctionCallNode, IdentifierNode, Literal,
+        LiteralNode, LogicalExpressionNode, NodeId, SelectStatement, Statement,
+        UnaryExpressionNode,
     },
     operators::SupportsType,
     resolved_tree::{
@@ -25,12 +26,12 @@ use crate::{
 pub(crate) enum AnalyzerError {
     #[error("table '{0}' was not found in database")]
     TableNotFound(String),
-    #[error("column '{column}' was not found in table '{table}'")]
-    ColumnNotFound { table: String, column: String },
+    #[error("column '{column}' was not found")]
+    ColumnNotFound { column: String },
     #[error("cannot find common type for '{left}' and '{right}'")]
     CommonTypeNotFound { left: String, right: String },
     #[error("type '{ty}' cannot be use with operator '{op}'")]
-    TypeUnsupportedByOperator { op: String, ty: String },
+    TypeNotSupportedByOperator { op: String, ty: String },
     #[error("unexpected type: expected {expected}, got {got}")]
     UnexpectedType { expected: String, got: String },
     #[error("unexpected catalog error: {0}")]
@@ -41,29 +42,69 @@ pub(crate) enum AnalyzerError {
     UnexpectedAstError(#[from] AstError),
 }
 
+/// Used for resolving identifiers when caller know from context what type of identifier is expected.
+enum ResolveIdentifierHint {
+    ExpectedColumn,
+    ExpectedTable,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct InsertedColumnRef {
+    table_name: String,
+    column_name: String,
+}
+
 /// [`Analyzer`] is responsible for performing semantic analysis on [`Ast`]. As the result it produces the [`ResolvedTree`].
 pub(crate) struct Analyzer<'a> {
+    /// [`Ast`] being analyzed.
     ast: &'a Ast,
+    /// Reference to database catalog, which provides table and column metadatas.
     catalog: Arc<RwLock<Catalog>>,
+    /// [`ResolvedTree`] being built - ouput of [`Analyzer`] work.
     resolved_tree: ResolvedTree,
+    /// Metadata of tables analyzed in current statement
+    tables_context: HashMap<String, TableMetadata>,
+    /// List of inserted [`TableMetadata`]s ids - used so that same node is not duplicated.
+    /// It should be used only per statement, as [`TableMetadata`] can be changed between statements.
+    inserted_tables: HashMap<String, ResolvedNodeId>,
+    /// Same as [`Analyzer::inserted_tables`] - used so that same node is not inserted multiple times.
+    /// It should be used only per statement, as [`ColumnMetadata`] can be changed between statements.
+    inserted_columns: HashMap<InsertedColumnRef, ResolvedNodeId>,
 }
 
 impl<'a> Analyzer<'a> {
+    /// Creates new [`Analyzer`] for given [`Ast`].
     pub(crate) fn new(ast: &'a Ast, catalog: Arc<RwLock<Catalog>>) -> Self {
         Analyzer {
             ast,
             catalog,
             resolved_tree: ResolvedTree::default(),
+            tables_context: HashMap::new(),
+            inserted_tables: HashMap::new(),
+            inserted_columns: HashMap::new(),
         }
     }
 
+    /// Analyzes [`Ast`] and returns resolved version of it - [`ResolvedTree`].
     pub(crate) fn analyze(mut self) -> Result<ResolvedTree, AnalyzerError> {
         for statement in self.ast.statements() {
+            self.clear_statement_context();
             self.analyze_statement(statement)?;
         }
         Ok(self.resolved_tree)
     }
 
+    /// Clears (resets to default) [`Analyzer`] statement-level fields.
+    /// Should be called before analyzing statement.
+    fn clear_statement_context(&mut self) {
+        self.tables_context.clear();
+        self.inserted_tables.clear();
+        self.inserted_columns.clear();
+    }
+
+    /// Analyzes statement. If statement was successfully analyzed then its resolved version ([`ResolvedStatement`]) is added to [`Analyzer::resolved_tree`].
+    /// When analyzing statement it's important to make sure that tables identifiers are resolved first,
+    /// as resolving columnd identifiers require information from their tables.
     fn analyze_statement(&mut self, statement: &Statement) -> Result<(), AnalyzerError> {
         match statement {
             Statement::Select(select) => self.analyze_select_statement(select),
@@ -78,14 +119,13 @@ impl<'a> Analyzer<'a> {
     }
 
     fn analyze_select_statement(&mut self, select: &SelectStatement) -> Result<(), AnalyzerError> {
-        let table_name = self.ast.identifier(select.table_name)?.to_string();
-        let table_metadata = self.get_table_metadata(&table_name)?;
-        let column_metadatas = match &select.columns {
-            Some(cols) => self.get_columns_metadata(&table_metadata, &table_name, cols)?,
-            None => table_metadata.columns().collect(),
+        let resolved_table = self.resolve_table(select.table_name)?;
+
+        let resolved_columns = match &select.columns {
+            Some(columns) => self.resolve_columns(columns)?,
+            None => todo!(),
         };
-        let resolved_table = self.resolve_table(table_name, &table_metadata);
-        let resolved_columns: Vec<_> = self.resolve_columns(&column_metadatas).collect();
+
         let select_statement = ResolvedSelectStatement {
             table: resolved_table,
             columns: resolved_columns,
@@ -97,37 +137,38 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    fn resolve_table(
-        &mut self,
-        table_name: String,
-        table_metadata: &TableMetadata,
-    ) -> ResolvedNodeId {
-        let resolved_table = ResolvedTable {
-            name: table_name,
-            primary_key_name: table_metadata.primary_key_column_name().into(),
-        };
-        self.resolved_tree
-            .add_node(ResolvedExpression::TableRef(resolved_table))
+    /// Resolves table with identifier id `table_name`.
+    /// If successful updates [`Analyzer::tables_context`] and [`Analyzer::inserted_tables`].
+    fn resolve_table(&mut self, table_name: NodeId) -> Result<ResolvedNodeId, AnalyzerError> {
+        let table_identifier = self.ast.identifier(table_name)?;
+        self.resolve_identifier(table_identifier, Some(ResolveIdentifierHint::ExpectedTable))
     }
 
+    /// Resolves column with identifier id `column_name`.
+    /// If successful updates [`Analyzer::inserted_columns`].
+    fn resolve_column(&mut self, column_name: NodeId) -> Result<ResolvedNodeId, AnalyzerError> {
+        let column_identifier = self.ast.identifier(column_name)?;
+        self.resolve_identifier(
+            column_identifier,
+            Some(ResolveIdentifierHint::ExpectedColumn),
+        )
+    }
+
+    /// Resolves list of collumns.
+    /// If successful updates [`Analyzer::inserted_columns`].
     fn resolve_columns(
         &mut self,
-        column_metadatas: &[ColumnMetadata],
-    ) -> impl Iterator<Item = ResolvedNodeId> {
-        column_metadatas.iter().map(|cm| self.resolve_column(cm))
+        columns: &[NodeId],
+    ) -> Result<Vec<ResolvedNodeId>, AnalyzerError> {
+        let mut resolved_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            let resolved_column = self.resolve_column(*column)?;
+            resolved_columns.push(resolved_column);
+        }
+        Ok(resolved_columns)
     }
 
-    fn resolve_column(&mut self, column_metadata: &ColumnMetadata) -> ResolvedNodeId {
-        let resolved_column = ResolvedColumn {
-            table_name: "IMPLEMENT_THIS".into(),
-            name: column_metadata.name().into(),
-            ty: column_metadata.ty(),
-            pos: column_metadata.pos(),
-        };
-        self.resolved_tree
-            .add_node(ResolvedExpression::ColumnRef(resolved_column))
-    }
-
+    /// Resolves ast [`Expression`] and returns [`ResolvedNodeId`] of its analyzed version ([`ResolvedExpression`]).
     fn resolve_expression(
         &mut self,
         expression_id: NodeId,
@@ -258,6 +299,86 @@ impl<'a> Analyzer<'a> {
             .add_node(ResolvedExpression::Literal(resolved))
     }
 
+    fn resolve_identifier(
+        &mut self,
+        identifier: &IdentifierNode,
+        hint: Option<ResolveIdentifierHint>,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        if let Some(hint) = hint {
+            match hint {
+                ResolveIdentifierHint::ExpectedColumn => {
+                    return self.resolve_column_identifier(identifier);
+                }
+                ResolveIdentifierHint::ExpectedTable => {
+                    return self.resolve_table_identifier(identifier);
+                }
+            }
+        }
+        // Hint was not provided, first we try column and then we try table.
+        todo!()
+    }
+
+    fn resolve_column_identifier(
+        &mut self,
+        identifier: &IdentifierNode,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        for (table_name, tm) in &self.tables_context {
+            let key = InsertedColumnRef {
+                column_name: identifier.value.clone(),
+                table_name: table_name.clone(),
+            };
+            if let Some(already_inserted) = self.inserted_columns.get(&key) {
+                return Ok(*already_inserted);
+            }
+            let column_metadata = self.get_column_metadata(tm, &identifier.value);
+            if let Ok(cm) = column_metadata {
+                // [`Analyzer::tables_context`] was out of sync with [`Analyzer::inserted_tables`].
+                // It should never happen, it can only happen in case of programmer mistake and
+                // there is nothing else to do here than just panic.
+                let resolved_table = self
+                    .inserted_tables
+                    .get(table_name)
+                    .expect("table inserted to 'tables_context' but not to `inserted_tables`");
+                let resolved_column = ResolvedColumn {
+                    table: *resolved_table,
+                    name: cm.name().into(),
+                    ty: cm.ty(),
+                    pos: cm.pos(),
+                };
+                let resolved_column_id = self
+                    .resolved_tree
+                    .add_node(ResolvedExpression::ColumnRef(resolved_column));
+                self.add_to_inserted_columns(key, resolved_column_id);
+                return Ok(resolved_column_id);
+            }
+        }
+        return Err(AnalyzerError::ColumnNotFound {
+            column: identifier.value.clone(),
+        });
+    }
+
+    /// Resolves identifier pointing to table and updates [`Analyzer::tables_context`] and [`Analyzer::inserted_tables`].
+    fn resolve_table_identifier(
+        &mut self,
+        identifier: &IdentifierNode,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        if let Some(alread_inserted) = self.inserted_tables.get(&identifier.value) {
+            return Ok(*alread_inserted);
+        }
+        let table_name = identifier.value.clone();
+        let table_metadata = self.get_table_metadata(&table_name)?;
+        let resolved = ResolvedTable {
+            name: table_name.clone(),
+            primary_key_name: table_metadata.primary_key_column_name().into(),
+        };
+        let resolved_node_id = self
+            .resolved_tree
+            .add_node(ResolvedExpression::TableRef(resolved));
+        self.add_to_inserted_tables(&table_name, resolved_node_id);
+        self.add_to_tables_context(table_metadata, table_name);
+        Ok(resolved_node_id)
+    }
+
     fn resolve_cast(
         &mut self,
         child: ResolvedNodeId,
@@ -273,6 +394,18 @@ impl<'a> Analyzer<'a> {
             .add_node(ResolvedExpression::Cast(resolved)))
     }
 
+    fn add_to_tables_context(&mut self, table_metadata: TableMetadata, table_name: String) {
+        self.tables_context.insert(table_name, table_metadata);
+    }
+
+    fn add_to_inserted_tables(&mut self, table_name: impl Into<String>, id: ResolvedNodeId) {
+        self.inserted_tables.insert(table_name.into(), id);
+    }
+
+    fn add_to_inserted_columns(&mut self, key: InsertedColumnRef, id: ResolvedNodeId) {
+        self.inserted_columns.insert(key, id);
+    }
+
     fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, AnalyzerError> {
         match self.catalog.read().table(table_name) {
             Ok(tm) => Ok(tm),
@@ -283,39 +416,22 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn get_columns_metadata(
-        &self,
-        table_metadata: &TableMetadata,
-        table_name: &str,
-        col_ids: &[NodeId],
-    ) -> Result<Vec<ColumnMetadata>, AnalyzerError> {
-        col_ids
-            .iter()
-            .map(|&node_id| {
-                let column_name = self.ast.identifier(node_id)?;
-                let column_metadata =
-                    self.get_column_metadata(&table_metadata, column_name, &table_name)?;
-                Ok(column_metadata)
-            })
-            .collect::<Result<Vec<_>, AnalyzerError>>()
-    }
-
     fn get_column_metadata(
         &self,
         table_metadata: &TableMetadata,
         column_name: &str,
-        table_name: &str,
     ) -> Result<ColumnMetadata, AnalyzerError> {
         match table_metadata.column(column_name) {
             Ok(cm) => Ok(cm),
             Err(TableMetadataError::ColumnNotFound(_)) => Err(AnalyzerError::ColumnNotFound {
-                table: table_name.into(),
                 column: column_name.into(),
             }),
             Err(e) => Err(AnalyzerError::UnexpectedTableMetadataError(e)),
         }
     }
 
+    /// Tries to find a common type for `left` and `right`.
+    /// If such type does not exist error is returned.
     fn get_common_type(
         &self,
         left: ResolvedNodeId,
@@ -329,6 +445,7 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    /// Checks if node pointed by `id` has the same [`ResolvedType`] as `expected_type`.
     fn assert_resolved_type(
         &self,
         id: ResolvedNodeId,
@@ -357,6 +474,8 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
+    /// Checks if node pointed by `id` has [`ResolvedType`] that is not [`ResolvedType::TableRef`].
+    /// In such case underlying [`ResolvedType::LiteralType`] is returned.
     fn assert_not_table_ref(&self, id: ResolvedNodeId) -> Result<Type, AnalyzerError> {
         let resolved_type = self.resolved_tree.node(id).resolved_type();
         match resolved_type {
@@ -368,13 +487,14 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Checks if provided `ty` and `op` are compatible.
     fn assert_type_and_operator_compatible(
         &self,
         ty: &Type,
         op: &(impl SupportsType + Display),
     ) -> Result<(), AnalyzerError> {
         if !op.supports_type(ty) {
-            return Err(AnalyzerError::TypeUnsupportedByOperator {
+            return Err(AnalyzerError::TypeNotSupportedByOperator {
                 op: op.to_string(),
                 ty: ty.to_string(),
             });
@@ -514,11 +634,11 @@ mod tests {
         let mut analyzer = Analyzer::new(&ast, catalog);
         let err = analyzer.resolve_expression(bin).unwrap_err();
         match err {
-            AnalyzerError::TypeUnsupportedByOperator { op, ty } => {
+            AnalyzerError::TypeNotSupportedByOperator { op, ty } => {
                 assert_eq!(op, "BinaryMinus");
                 assert_eq!(ty, "String");
             }
-            other => panic!("expected TypeUnsupportedByOperator, got: {:?}", other),
+            other => panic!("expected TypeNotSupportedByOperator, got: {:?}", other),
         }
     }
 
@@ -762,16 +882,17 @@ mod tests {
         let mut analyzer = Analyzer::new(&ast, catalog);
         let err = analyzer.resolve_expression(invalid).unwrap_err();
         match err {
-            AnalyzerError::TypeUnsupportedByOperator { op, ty } => {
+            AnalyzerError::TypeNotSupportedByOperator { op, ty } => {
                 assert_eq!(op, "UnaryMinus");
                 assert_eq!(ty, "Bool");
             }
-            other => panic!("expected TypeUnsupportedByOperator, got: {:?}", other),
+            other => panic!("expected TypeNotSupportedByOperator, got: {:?}", other),
         }
     }
 
     // Statements
 
+    // TODO: update to reflect changes made to [`ResolvedColumn`]
     #[test]
     fn analyze_simple_select() {
         let catalog = catalog_with_users();
@@ -862,8 +983,7 @@ mod tests {
         let analyzer = Analyzer::new(&ast, catalog);
         let err = analyzer.analyze().unwrap_err();
         match err {
-            AnalyzerError::ColumnNotFound { table, column } => {
-                assert_eq!(table, "users");
+            AnalyzerError::ColumnNotFound { column } => {
                 assert_eq!(column, "doesnotexist");
             }
             _ => panic!("Expected ColumnNotFound"),
