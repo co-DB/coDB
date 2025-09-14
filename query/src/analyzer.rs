@@ -9,14 +9,14 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        Ast, AstError, BinaryExpressionNode, Expression, Literal, LiteralNode,
-        LogicalExpressionNode, NodeId, SelectStatement, Statement,
+        Ast, AstError, BinaryExpressionNode, Expression, FunctionCallNode, Literal, LiteralNode,
+        LogicalExpressionNode, NodeId, SelectStatement, Statement, UnaryExpressionNode,
     },
     operators::SupportsType,
     resolved_tree::{
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedExpression,
         ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement,
-        ResolvedStatement, ResolvedTable, ResolvedTree, ResolvedType,
+        ResolvedStatement, ResolvedTable, ResolvedTree, ResolvedType, ResolvedUnaryExpression,
     },
 };
 
@@ -119,8 +119,10 @@ impl<'a> Analyzer<'a> {
 
     fn resolve_column(&mut self, column_metadata: &ColumnMetadata) -> ResolvedNodeId {
         let resolved_column = ResolvedColumn {
+            table_name: "IMPLEMENT_THIS".into(),
             name: column_metadata.name().into(),
             ty: column_metadata.ty(),
+            pos: column_metadata.pos(),
         };
         self.resolved_tree
             .add_node(ResolvedExpression::ColumnRef(resolved_column))
@@ -138,8 +140,12 @@ impl<'a> Analyzer<'a> {
             Expression::Binary(binary_expression_node) => {
                 self.resolve_binary_expression(binary_expression_node)
             }
-            Expression::Unary(unary_expression_node) => todo!(),
-            Expression::FunctionCall(function_call_node) => todo!(),
+            Expression::Unary(unary_expression_node) => {
+                self.resolve_unary_expression(unary_expression_node)
+            }
+            Expression::FunctionCall(function_call_node) => {
+                self.resolve_function_call(function_call_node)
+            }
             Expression::Literal(literal_node) => Ok(self.resolve_literal(literal_node)),
             Expression::Identifier(identifier_node) => todo!(),
         }
@@ -182,6 +188,31 @@ impl<'a> Analyzer<'a> {
         Ok(self
             .resolved_tree
             .add_node(ResolvedExpression::Binary(resolved)))
+    }
+
+    fn resolve_unary_expression(
+        &mut self,
+        unary_expression: &UnaryExpressionNode,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        let child_resolved = self.resolve_expression(unary_expression.expression_id)?;
+        let ty = self.assert_not_table_ref(child_resolved)?;
+        self.assert_type_and_operator_compatible(&ty, &unary_expression.op)?;
+        let resolved = ResolvedUnaryExpression {
+            expression: child_resolved,
+            op: unary_expression.op,
+            ty,
+        };
+        Ok(self
+            .resolved_tree
+            .add_node(ResolvedExpression::Unary(resolved)))
+    }
+
+    // TODO: should be implemented once functions are added to coDB
+    fn resolve_function_call(
+        &mut self,
+        function_call: &FunctionCallNode,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        todo!()
     }
 
     fn resolve_literal(&mut self, literal: &LiteralNode) -> ResolvedNodeId {
@@ -356,7 +387,7 @@ impl<'a> Analyzer<'a> {
 mod tests {
     use super::*;
     use crate::ast::{Ast, Expression, IdentifierNode, SelectStatement, Statement};
-    use crate::operators::{BinaryOperator, LogicalOperator};
+    use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
     use metadata::catalog::Catalog;
     use metadata::types::Type;
     use parking_lot::RwLock;
@@ -624,6 +655,118 @@ mod tests {
                 assert_eq!(*v, float_edge);
             }
             other => panic!("expected Float64 literal, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_unary_minus_numeric() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // -5
+        let five = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(5),
+        }));
+        let neg_five = ast.add_node(Expression::Unary(UnaryExpressionNode {
+            expression_id: five,
+            op: UnaryOperator::Minus,
+        }));
+
+        // -1.5
+        let one_point_five = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Float(1.5),
+        }));
+        let neg_float = ast.add_node(Expression::Unary(UnaryExpressionNode {
+            expression_id: one_point_five,
+            op: UnaryOperator::Minus,
+        }));
+
+        let mut analyzer = Analyzer::new(&ast, catalog);
+
+        let neg_five_res = analyzer
+            .resolve_expression(neg_five)
+            .expect("unary int resolve");
+        match analyzer.resolved_tree.node(neg_five_res) {
+            ResolvedExpression::Unary(u) => {
+                assert_eq!(u.ty, Type::I32);
+                assert!(matches!(u.op, UnaryOperator::Minus));
+                match analyzer.resolved_tree.node(u.expression) {
+                    ResolvedExpression::Literal(ResolvedLiteral::Int32(v)) => assert_eq!(*v, 5),
+                    other => panic!("expected Int32 literal child, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Unary resolved expression, got: {:?}", other),
+        }
+
+        let neg_float_res = analyzer
+            .resolve_expression(neg_float)
+            .expect("unary float resolve");
+        match analyzer.resolved_tree.node(neg_float_res) {
+            ResolvedExpression::Unary(u) => {
+                assert_eq!(u.ty, Type::F32);
+                assert!(matches!(u.op, UnaryOperator::Minus));
+                match analyzer.resolved_tree.node(u.expression) {
+                    ResolvedExpression::Literal(ResolvedLiteral::Float32(v)) => {
+                        assert_eq!(*v, 1.5f32)
+                    }
+                    other => panic!("expected Float32 literal child, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Unary resolved expression, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_unary_bang_bool() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let t = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Bool(true),
+        }));
+        let not_t = ast.add_node(Expression::Unary(UnaryExpressionNode {
+            expression_id: t,
+            op: UnaryOperator::Bang,
+        }));
+
+        let mut analyzer = Analyzer::new(&ast, catalog);
+        let res = analyzer
+            .resolve_expression(not_t)
+            .expect("unary bang resolve");
+        match analyzer.resolved_tree.node(res) {
+            ResolvedExpression::Unary(u) => {
+                assert_eq!(u.ty, Type::Bool);
+                assert!(matches!(u.op, UnaryOperator::Bang));
+                match analyzer.resolved_tree.node(u.expression) {
+                    ResolvedExpression::Literal(ResolvedLiteral::Bool(v)) => assert_eq!(*v, true),
+                    other => panic!("expected Bool literal child, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Unary resolved expression, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_unary_minus_bool_not_supported() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let b = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Bool(true),
+        }));
+        let invalid = ast.add_node(Expression::Unary(UnaryExpressionNode {
+            expression_id: b,
+            op: UnaryOperator::Minus,
+        }));
+
+        let mut analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.resolve_expression(invalid).unwrap_err();
+        match err {
+            AnalyzerError::TypeUnsupportedByOperator { op, ty } => {
+                assert_eq!(op, "UnaryMinus");
+                assert_eq!(ty, "Bool");
+            }
+            other => panic!("expected TypeUnsupportedByOperator, got: {:?}", other),
         }
     }
 

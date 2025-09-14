@@ -85,8 +85,10 @@ pub(crate) struct ResolvedTable {
 
 #[derive(Debug)]
 pub(crate) struct ResolvedColumn {
+    pub(crate) table_name: String,
     pub(crate) name: String,
     pub(crate) ty: Type,
+    pub(crate) pos: u16,
 }
 
 #[derive(Debug)]
