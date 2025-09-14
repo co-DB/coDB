@@ -939,7 +939,7 @@ mod tests {
                         header.header_size,
                         size_of::<SlottedPageBaseHeader>() as u16
                     );
-                    
+
                     let expected_free_space_start =
                         header.header_size + header.num_slots * Slot::SIZE as u16;
                     assert_eq!(header.free_space_start(), expected_free_space_start);
