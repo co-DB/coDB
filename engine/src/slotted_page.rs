@@ -3,6 +3,11 @@ use crate::slotted_page::SlottedPageError::ForbiddenSlotCompaction;
 use bytemuck::{Pod, PodCastError, Zeroable};
 use thiserror::Error;
 
+/// Helper trait meant for structs implementing SlottedPageHeader trait. Making implementing it
+/// compulsory should help remind to use #[repr(C)] for those structs (there is no way to ensure
+/// that it is used otherwise)
+unsafe trait ReprC {}
+
 /// Struct responsible for storing metadata of a free block. Stored at the start of each free
 /// block.
 ///
@@ -28,7 +33,7 @@ impl FreeBlock {
 
 /// In the future add B-tree and heap file implementations of this
 /// The structs implementing this trait must use #[repr(C)]
-pub(crate) trait SlottedPageHeader: Pod {
+pub(crate) trait SlottedPageHeader: Pod + ReprC {
     fn base(&self) -> &SlottedPageBaseHeader;
 }
 
@@ -78,6 +83,8 @@ impl SlottedPageHeader for SlottedPageBaseHeader {
         self
     }
 }
+
+unsafe impl ReprC for SlottedPageBaseHeader {}
 
 /// Enum representing possible outcomes of an insert operation.
 pub(crate) enum InsertResult {
@@ -133,6 +140,8 @@ pub struct Slot {
 impl Slot {
     const NO_FREE_SLOTS: u16 = 0x7FFF;
 
+    const SLOT_DELETED: u16 = 0x8000;
+
     const SIZE: usize = size_of::<Slot>();
 
     /// Creates a new active slot with given offset and length.
@@ -146,23 +155,25 @@ impl Slot {
 
     /// Returns true if this slot is marked as deleted (highest bit set).
     pub fn is_deleted(&self) -> bool {
-        self.flags & 0x8000 != 0
+        self.flags & Self::SLOT_DELETED != 0
     }
 
     /// Marks this slot as deleted by setting the highest bit.
     pub fn mark_deleted(&mut self) {
-        self.flags |= 0x8000;
+        self.flags |= Self::SLOT_DELETED;
     }
 
     /// Sets the index of the next free slot in the lower 15 bits of `flags`.
     pub fn set_next_free_slot(&mut self, next_free_slot_index: u16) {
+        // Ox7FFF here is the max value of the last 15 bits used for holding slot index
         let next = next_free_slot_index & 0x7FFF;
-        let deleted_flag = self.flags & 0x8000;
+        let deleted_flag = self.flags & Self::SLOT_DELETED;
         self.flags = deleted_flag | next;
     }
 
     /// Returns the index of the next free slot (lower 15 bits of `flags`).
     pub fn next_free_slot(&self) -> u16 {
+        // Ox7FFF here is the max value of the last 15 bits used for holding slot index
         self.flags & 0x7FFF
     }
 }
@@ -222,7 +233,7 @@ impl<P: PageRead> SlottedPage<P> {
         Ok(header.total_free_space)
     }
 
-    /// Returns a slice containing all slots (casted) in the slot directory
+    /// Returns a slice containing all slots (cast) in the slot directory
     fn get_slots(&self) -> Result<&[Slot], SlottedPageError> {
         let header = self.get_base_header()?;
         let start = header.header_size as usize;
@@ -624,6 +635,11 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         slots.sort_by_key(|(_, slot)| -(slot.offset as i32));
         for (idx, slot) in slots {
             write_pos -= slot.len as usize;
+
+            if slot.offset == write_pos as u16 {
+                continue;
+            }
+
             let record_range = slot.offset as usize..slot.offset as usize + slot.len as usize;
 
             // Move record into new compacted position and update its corresponding slot to new offset
