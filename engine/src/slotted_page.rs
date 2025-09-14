@@ -653,3 +653,343 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAGE_SIZE: usize = 4096;
+
+    // Simple page for testing with configurable size
+    struct TestPage {
+        data: Vec<u8>,
+    }
+
+    impl TestPage {
+        fn new(size: usize) -> Self {
+            Self {
+                data: vec![0; size],
+            }
+        }
+    }
+
+    impl PageRead for TestPage {
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl PageWrite for TestPage {
+        fn data_mut(&mut self) -> &mut [u8] {
+            &mut self.data
+        }
+    }
+
+    // Helper to create initialized slotted page
+    fn create_test_page(size: usize) -> SlottedPage<TestPage> {
+        let mut page = TestPage::new(size);
+
+        let header = SlottedPageBaseHeader {
+            total_free_space: (size - size_of::<SlottedPageBaseHeader>()) as u16,
+            contiguous_free_space: (size - size_of::<SlottedPageBaseHeader>()) as u16,
+            record_area_offset: size as u16,
+            header_size: size_of::<SlottedPageBaseHeader>() as u16,
+            first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
+            first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
+            num_slots: 0,
+        };
+
+        page.data_mut()[..size_of::<SlottedPageBaseHeader>()]
+            .copy_from_slice(bytemuck::bytes_of(&header));
+
+        SlottedPage::new(page, true)
+    }
+
+    #[test]
+    fn test_insert_and_read() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        let data = b"hello world";
+        let result = page.insert(data).unwrap();
+
+        assert!(matches!(result, InsertResult::Success(0)));
+        assert_eq!(page.read_valid_record(0).unwrap(), data);
+        assert_eq!(page.num_slots().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_multiple_inserts() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        let records = [b"first", b"secon", b"third"];
+
+        for (i, record) in records.iter().enumerate() {
+            let result = page.insert(*record).unwrap();
+            assert!(matches!(result, InsertResult::Success(_)));
+            assert_eq!(page.read_valid_record(i as u16).unwrap(), *record);
+        }
+
+        assert_eq!(page.num_slots().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_large_record() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        let large_data = vec![42u8; 1000];
+        let result = page.insert(&large_data).unwrap();
+
+        assert!(matches!(result, InsertResult::Success(0)));
+        assert_eq!(page.read_valid_record(0).unwrap(), large_data.as_slice());
+    }
+
+    #[test]
+    fn test_insert_at_beginning() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"second").unwrap();
+
+        let result = page.insert_at(b"first", 0).unwrap();
+        assert!(matches!(result, InsertResult::Success(0)));
+
+        assert_eq!(page.read_valid_record(0).unwrap(), b"first");
+        assert_eq!(page.read_valid_record(1).unwrap(), b"second");
+        assert_eq!(page.num_slots().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_insert_at_middle() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"first").unwrap();
+        page.insert(b"third").unwrap();
+
+        let result = page.insert_at(b"second", 1).unwrap();
+        assert!(matches!(result, InsertResult::Success(1)));
+
+        assert_eq!(page.read_valid_record(0).unwrap(), b"first");
+        assert_eq!(page.read_valid_record(1).unwrap(), b"second");
+        assert_eq!(page.read_valid_record(2).unwrap(), b"third");
+    }
+
+    #[test]
+    fn test_insert_at_end() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"first").unwrap();
+
+        let result = page.insert_at(b"second", 1).unwrap();
+        assert!(matches!(result, InsertResult::Success(1)));
+
+        assert_eq!(page.read_valid_record(1).unwrap(), b"second");
+    }
+
+    #[test]
+    fn test_insert_at_invalid_position() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        let result = page.insert_at(b"data", 1);
+        assert!(matches!(
+            result,
+            Err(SlottedPageError::InvalidPosition { .. })
+        ));
+    }
+
+    #[test]
+    fn test_exact_fit() {
+        let page_size = 128;
+        let mut page = create_test_page(page_size);
+
+        let header_size = size_of::<SlottedPageBaseHeader>();
+        let slot_size = size_of::<Slot>();
+        let available_space = page_size - header_size - slot_size;
+
+        let data = vec![42u8; available_space];
+        let result = page.insert(&data).unwrap();
+
+        assert!(matches!(result, InsertResult::Success(0)));
+        assert_eq!(page.free_space().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_exact_fit_plus_one_byte() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        let header_size = size_of::<SlottedPageBaseHeader>();
+        let slot_size = size_of::<Slot>();
+        let available_space = PAGE_SIZE - header_size - slot_size;
+
+        let data = vec![42u8; available_space + 1];
+        let result = page.insert(&data).unwrap();
+
+        assert!(matches!(result, InsertResult::PageFull));
+    }
+
+    #[test]
+    fn test_empty_record() {
+        let mut page = create_test_page(4096);
+        let result = page.insert(b"").unwrap();
+        assert!(matches!(result, InsertResult::Success(0)));
+        assert_eq!(page.read_valid_record(0).unwrap(), b"");
+    }
+
+    #[test]
+    fn test_page_full() {
+        let mut page = create_test_page(64);
+
+        let large_record = vec![0u8; 32];
+        page.insert(&large_record).unwrap();
+
+        let result = page.insert(b"too much").unwrap();
+        assert!(matches!(result, InsertResult::PageFull));
+    }
+
+    #[test]
+    fn test_read_out_of_bounds() {
+        let page = create_test_page(4096);
+
+        let result = page.read_valid_record(0);
+        assert!(matches!(
+            result,
+            Err(SlottedPageError::RecordIndexOutOfBounds {
+                num_slots: 0,
+                out_of_bounds_index: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn test_custom_header() {
+        #[derive(Pod, Zeroable, Copy, Clone)]
+        #[repr(C)]
+        struct CustomHeader {
+            base: SlottedPageBaseHeader,
+            custom_field: u16,
+        }
+
+        unsafe impl ReprC for CustomHeader {}
+
+        impl SlottedPageHeader for CustomHeader {
+            fn base(&self) -> &SlottedPageBaseHeader {
+                &self.base
+            }
+        }
+
+        let mut page = TestPage::new(4096);
+        let custom_header = CustomHeader {
+            base: SlottedPageBaseHeader {
+                total_free_space: (4096 - size_of::<CustomHeader>()) as u16,
+                contiguous_free_space: (4096 - size_of::<CustomHeader>()) as u16,
+                record_area_offset: 4096,
+                header_size: size_of::<CustomHeader>() as u16,
+                first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
+                first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
+                num_slots: 0,
+            },
+            custom_field: 42,
+        };
+
+        page.data_mut()[..size_of::<CustomHeader>()]
+            .copy_from_slice(bytemuck::bytes_of(&custom_header));
+
+        let slotted_page = SlottedPage::new(page, true);
+
+        let header: &CustomHeader = slotted_page.get_header().unwrap();
+        assert_eq!(header.custom_field, 42);
+    }
+
+    #[test]
+    fn test_many_small_records() {
+        let mut page = create_test_page(4096);
+        let mut inserted = Vec::new();
+
+        let initial_free_space = page.free_space().unwrap();
+        let initial_num_slots = page.num_slots().unwrap();
+
+        // Insert many small records until page is full
+        for i in 0..1000 {
+            let data = format!("rec{}", i);
+            let free_space_before = page.free_space().unwrap();
+            let num_slots_before = page.num_slots().unwrap();
+
+            match page.insert(data.as_bytes()).unwrap() {
+                InsertResult::Success(slot_id) => {
+                    inserted.push((slot_id, data.clone()));
+
+                    let header = page.get_base_header().unwrap();
+
+                    assert_eq!(header.num_slots, num_slots_before + 1);
+                    assert_eq!(page.num_slots().unwrap(), num_slots_before + 1);
+
+                    let expected_space_used = data.len() + size_of::<Slot>();
+                    assert_eq!(
+                        page.free_space().unwrap(),
+                        free_space_before - expected_space_used as u16
+                    );
+                    assert_eq!(
+                        header.total_free_space,
+                        free_space_before - expected_space_used as u16
+                    );
+
+                    if i == 0 {
+                        assert_eq!(header.first_free_slot, SlottedPageBaseHeader::NO_FREE_SLOTS);
+                    }
+
+                    assert_eq!(
+                        header.header_size,
+                        size_of::<SlottedPageBaseHeader>() as u16
+                    );
+                    
+                    let expected_free_space_start =
+                        header.header_size + header.num_slots * Slot::SIZE as u16;
+                    assert_eq!(header.free_space_start(), expected_free_space_start);
+                }
+                InsertResult::PageFull => {
+                    let header = page.get_base_header().unwrap();
+                    let required_space = data.len() + size_of::<Slot>();
+                    assert!(header.total_free_space < required_space as u16);
+                    break;
+                }
+                InsertResult::NeedsDefragmentation => {
+                    let header = page.get_base_header().unwrap();
+                    let required_space = data.len() + size_of::<Slot>();
+                    assert!(header.total_free_space >= required_space as u16);
+                    break;
+                }
+            }
+        }
+
+        let final_header = page.get_base_header().unwrap();
+        let total_inserted = inserted.len();
+
+        assert_eq!(
+            final_header.num_slots,
+            initial_num_slots + total_inserted as u16
+        );
+
+        let total_record_bytes: usize = inserted.iter().map(|(_, data)| data.len()).sum();
+        let total_slot_bytes = total_inserted * size_of::<Slot>();
+        let total_consumed = total_record_bytes + total_slot_bytes;
+
+        assert_eq!(
+            final_header.total_free_space,
+            initial_free_space - total_consumed as u16
+        );
+
+        assert_eq!(
+            final_header.header_size,
+            size_of::<SlottedPageBaseHeader>() as u16
+        );
+
+        let expected_free_space_start =
+            final_header.header_size + final_header.num_slots * Slot::SIZE as u16;
+        assert_eq!(final_header.free_space_start(), expected_free_space_start);
+
+        for (slot_id, expected_data) in inserted {
+            assert_eq!(
+                page.read_valid_record(slot_id).unwrap(),
+                expected_data.as_bytes()
+            );
+        }
+    }
+}
