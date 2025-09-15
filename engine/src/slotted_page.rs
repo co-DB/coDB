@@ -321,27 +321,36 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
             });
         }
 
-        let required_space = record.len() + Slot::SIZE;
+        let needs_new_slot = position == header.num_slots || !self.get_slot(position)?.is_deleted();
+
+        let required_space = record.len() + if needs_new_slot { Slot::SIZE } else { 0 };
 
         if required_space as u16 > header.total_free_space {
             return Ok(InsertResult::PageFull);
         }
 
-        let offset = match self.get_allocated_space(record.len() as u16, true)? {
+        let offset = match self.get_allocated_space(record.len() as u16, needs_new_slot)? {
             None => return Ok(InsertResult::NeedsDefragmentation),
             Some(offset) => offset,
         };
 
         self.write_record_at(record, offset);
 
-        self.shift_slots_right(position)?;
+        if needs_new_slot {
+            self.shift_slots_right(position)?;
+        } else {
+            self.remove_from_free_slot_chain(position)?;
+        }
 
         self.write_slot_at(position, Slot::new(offset, record.len() as u16))?;
 
         let header_mut = self.get_base_header_mut()?;
-        header_mut.num_slots += 1;
-        header_mut.total_free_space -= Slot::SIZE as u16;
-        header_mut.contiguous_free_space -= Slot::SIZE as u16;
+
+        if needs_new_slot {
+            header_mut.num_slots += 1;
+            header_mut.total_free_space -= Slot::SIZE as u16;
+            header_mut.contiguous_free_space -= Slot::SIZE as u16;
+        }
 
         Ok(InsertResult::Success(position))
     }
@@ -375,6 +384,43 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         let page = self.page.data_mut();
 
         page.copy_within(start..end, start + Slot::SIZE);
+
+        Ok(())
+    }
+
+    /// Walks the free slot linked list and removes slot with slot_id from it, updating the
+    /// previous slot's next pointer or the header's first_free_slot.
+    fn remove_from_free_slot_chain(&mut self, slot_id: u16) -> Result<(), SlottedPageError> {
+        let target_slot = self.get_slot(slot_id)?;
+
+        if !target_slot.is_deleted() {
+            return Ok(());
+        }
+
+        let next_free_slot_id = target_slot.next_free_slot();
+
+        let mut prev = Slot::NO_FREE_SLOTS;
+        let mut current_free_slot_id = self.get_base_header()?.first_free_slot;
+
+        while current_free_slot_id != Slot::NO_FREE_SLOTS {
+            if current_free_slot_id == slot_id {
+                if prev == Slot::NO_FREE_SLOTS {
+                    self.get_base_header_mut()?.first_free_slot = next_free_slot_id;
+                } else {
+                    self.get_slot_mut(prev)?
+                        .set_next_free_slot(next_free_slot_id);
+                }
+
+                let removed_slot = self.get_slot_mut(slot_id)?;
+                removed_slot.set_next_free_slot(Slot::NO_FREE_SLOTS);
+
+                return Ok(());
+            }
+
+            let current_slot = self.get_slot(current_free_slot_id)?;
+            prev = current_free_slot_id;
+            current_free_slot_id = current_slot.next_free_slot();
+        }
 
         Ok(())
     }
@@ -652,6 +698,8 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         header.first_free_block_offset = SlottedPageBaseHeader::NO_FREE_BLOCKS;
         Ok(())
     }
+
+    pub fn update(&mut self, slot_id: u16, updated_record: &[u8]) {}
 }
 
 #[cfg(test)]
