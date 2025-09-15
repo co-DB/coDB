@@ -123,7 +123,7 @@ impl<'a> Analyzer<'a> {
 
         let resolved_columns = match &select.columns {
             Some(columns) => self.resolve_columns(columns)?,
-            None => todo!(),
+            None => self.resolve_all_columns_from_table(resolved_table)?,
         };
 
         let select_statement = ResolvedSelectStatement {
@@ -164,6 +164,54 @@ impl<'a> Analyzer<'a> {
         for column in columns {
             let resolved_column = self.resolve_column(*column)?;
             resolved_columns.push(resolved_column);
+        }
+        Ok(resolved_columns)
+    }
+
+    /// Resolves all columns from table with `table_id`.
+    /// If successful updates [`Analyzer::inserted_columns`].
+    fn resolve_all_columns_from_table(
+        &mut self,
+        table_id: ResolvedNodeId,
+    ) -> Result<Vec<ResolvedNodeId>, AnalyzerError> {
+        let table_node = self.resolved_tree.node(table_id);
+        let table_name = match table_node {
+            ResolvedExpression::TableRef(table) => table.name.clone(),
+            _ => {
+                return Err(AnalyzerError::UnexpectedType {
+                    expected: "TableRef".into(),
+                    got: table_node.resolved_type().to_string(),
+                });
+            }
+        };
+        // If this panic we forgot to add table to [`Analyzer::tables_context`], but we added table node to the tree.
+        // In such case we should just panic as it cannot happen in correct code
+        let tm = self
+            .tables_context
+            .get(&table_name)
+            .expect("table inserted to 'resolved_tree' but not to `inserted_tables`");
+        let columns: Vec<_> = tm.columns().collect();
+        let mut resolved_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            let key = InsertedColumnRef {
+                column_name: column.name().into(),
+                table_name: table_name.clone(),
+            };
+            if let Some(already_inserted) = self.inserted_columns.get(&key) {
+                resolved_columns.push(*already_inserted);
+                continue;
+            }
+            let resolved_column = ResolvedColumn {
+                table: table_id,
+                name: column.name().into(),
+                ty: column.ty(),
+                pos: column.pos(),
+            };
+            let resolved_column_id = self
+                .resolved_tree
+                .add_node(ResolvedExpression::ColumnRef(resolved_column));
+            self.add_to_inserted_columns(key, resolved_column_id);
+            resolved_columns.push(resolved_column_id);
         }
         Ok(resolved_columns)
     }
@@ -560,6 +608,26 @@ mod tests {
         ast
     }
 
+    // Helper to assert column is as expected
+    fn assert_column(
+        rt: &ResolvedTree,
+        id: ResolvedNodeId,
+        expected_name: &str,
+        expected_ty: Type,
+        expected_table: ResolvedNodeId,
+        expected_pos: u16,
+    ) {
+        match rt.node(id) {
+            ResolvedExpression::ColumnRef(col) => {
+                assert_eq!(col.name, expected_name);
+                assert_eq!(col.ty, expected_ty);
+                assert_eq!(col.table, expected_table);
+                assert_eq!(col.pos, expected_pos);
+            }
+            _ => panic!("Expected ColumnRef"),
+        }
+    }
+
     // Expressions
 
     #[test]
@@ -892,7 +960,6 @@ mod tests {
 
     // Statements
 
-    // TODO: update to reflect changes made to [`ResolvedColumn`]
     #[test]
     fn analyze_simple_select() {
         let catalog = catalog_with_users();
@@ -914,22 +981,70 @@ mod tests {
                     _ => panic!("Expected TableRef"),
                 }
 
-                // Columns: collect names and types
-                let cols: Vec<(String, Type)> = select
-                    .columns
-                    .iter()
-                    .map(|&id| match resolved_tree.node(id) {
-                        ResolvedExpression::ColumnRef(col) => (col.name.clone(), col.ty.clone()),
-                        _ => panic!("Expected ColumnRef"),
-                    })
-                    .collect();
-
-                let col_names: Vec<_> = cols.iter().map(|(n, _)| n.clone()).collect();
-                let col_types: Vec<_> = cols.iter().map(|(_, t)| t.clone()).collect();
-
-                assert_eq!(col_names, vec!["id", "name"]);
-                assert_eq!(col_types, vec![Type::I32, Type::String]);
+                assert_eq!(select.columns.len(), 2);
+                assert_column(
+                    &resolved_tree,
+                    select.columns[0],
+                    "id",
+                    Type::I32,
+                    select.table,
+                    0,
+                );
+                assert_column(
+                    &resolved_tree,
+                    select.columns[1],
+                    "name",
+                    Type::String,
+                    select.table,
+                    1,
+                );
             }
+            _ => panic!("expected select"),
+        }
+    }
+
+    #[test]
+    fn analyze_select_star() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+
+        // SELECT * FROM users;
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let resolved_tree = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(resolved_tree.statements.len(), 1);
+
+        match &resolved_tree.statements[0] {
+            ResolvedStatement::Select(select) => {
+                assert_eq!(select.columns.len(), 2);
+                assert_column(
+                    &resolved_tree,
+                    select.columns[0],
+                    "id",
+                    Type::I32,
+                    select.table,
+                    0,
+                );
+                assert_column(
+                    &resolved_tree,
+                    select.columns[1],
+                    "name",
+                    Type::String,
+                    select.table,
+                    1,
+                );
+            }
+            _ => panic!("expected select"),
         }
     }
 

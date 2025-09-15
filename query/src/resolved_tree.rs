@@ -44,7 +44,7 @@ impl ResolvedTree {
 /// [`ResolvedNodeId`] is used for indexing nodes and statements inside [`ResolvedTree`].
 ///
 /// Works similiary to [`NodeId`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedNodeId(usize);
 
 impl ResolvedNodeId {
