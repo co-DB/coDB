@@ -117,6 +117,32 @@ impl PinnedWritePage {
     }
 }
 
+pub(crate) trait PageRead {
+    fn data(&self) -> &[u8];
+}
+
+pub(crate) trait PageWrite {
+    fn data_mut(&mut self) -> &mut [u8];
+}
+
+impl PageRead for PinnedReadPage {
+    fn data(&self) -> &[u8] {
+        self.page()
+    }
+}
+
+impl PageRead for PinnedWritePage {
+    fn data(&self) -> &[u8] {
+        self.page()
+    }
+}
+
+impl PageWrite for PinnedWritePage {
+    fn data_mut(&mut self) -> &mut [u8] {
+        self.page_mut()
+    }
+}
+
 /// Error for cache related operations.
 #[derive(Debug, Error)]
 pub(crate) enum CacheError {
