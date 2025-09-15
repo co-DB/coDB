@@ -142,6 +142,8 @@ impl Slot {
 
     const SLOT_DELETED: u16 = 0x8000;
 
+    const SLOT_INDEX_MASK: u16 = 0x7FFF;
+
     const SIZE: usize = size_of::<Slot>();
 
     /// Creates a new active slot with given offset and length.
@@ -165,16 +167,14 @@ impl Slot {
 
     /// Sets the index of the next free slot in the lower 15 bits of `flags`.
     pub fn set_next_free_slot(&mut self, next_free_slot_index: u16) {
-        // Ox7FFF here is the max value of the last 15 bits used for holding slot index
-        let next = next_free_slot_index & 0x7FFF;
+        let next = next_free_slot_index & Self::SLOT_INDEX_MASK;
         let deleted_flag = self.flags & Self::SLOT_DELETED;
         self.flags = deleted_flag | next;
     }
 
     /// Returns the index of the next free slot (lower 15 bits of `flags`).
     pub fn next_free_slot(&self) -> u16 {
-        // Ox7FFF here is the max value of the last 15 bits used for holding slot index
-        self.flags & 0x7FFF
+        self.flags & Self::SLOT_INDEX_MASK
     }
 }
 
@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_empty_record() {
-        let mut page = create_test_page(4096);
+        let mut page = create_test_page(PAGE_SIZE);
         let result = page.insert(b"").unwrap();
         assert!(matches!(result, InsertResult::Success(0)));
         assert_eq!(page.read_valid_record(0).unwrap(), b"");
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_read_out_of_bounds() {
-        let page = create_test_page(4096);
+        let page = create_test_page(PAGE_SIZE);
 
         let result = page.read_valid_record(0);
         assert!(matches!(
@@ -875,12 +875,12 @@ mod tests {
             }
         }
 
-        let mut page = TestPage::new(4096);
+        let mut page = TestPage::new(PAGE_SIZE);
         let custom_header = CustomHeader {
             base: SlottedPageBaseHeader {
-                total_free_space: (4096 - size_of::<CustomHeader>()) as u16,
-                contiguous_free_space: (4096 - size_of::<CustomHeader>()) as u16,
-                record_area_offset: 4096,
+                total_free_space: (PAGE_SIZE - size_of::<CustomHeader>()) as u16,
+                contiguous_free_space: (PAGE_SIZE - size_of::<CustomHeader>()) as u16,
+                record_area_offset: PAGE_SIZE as u16,
                 header_size: size_of::<CustomHeader>() as u16,
                 first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
                 first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_many_small_records() {
-        let mut page = create_test_page(4096);
+        let mut page = create_test_page(PAGE_SIZE);
         let mut inserted = Vec::new();
 
         let initial_free_space = page.free_space().unwrap();
