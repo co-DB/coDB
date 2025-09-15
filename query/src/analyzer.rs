@@ -13,7 +13,7 @@ use crate::{
         LiteralNode, LogicalExpressionNode, NodeId, SelectStatement, Statement,
         UnaryExpressionNode,
     },
-    operators::SupportsType,
+    operators::{BinaryOperator, SupportsType},
     resolved_tree::{
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedExpression,
         ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement,
@@ -24,10 +24,12 @@ use crate::{
 /// Error for [`Analyzer`] related operations.
 #[derive(Debug, Error)]
 pub(crate) enum AnalyzerError {
-    #[error("table '{0}' was not found in database")]
-    TableNotFound(String),
+    #[error("table '{table}' was not found in database")]
+    TableNotFound { table: String },
     #[error("column '{column}' was not found")]
     ColumnNotFound { column: String },
+    #[error("identifiern '{identifier}' is unknown and cannot be resolved")]
+    UnknownIdentifier { identifier: String },
     #[error("cannot find common type for '{left}' and '{right}'")]
     CommonTypeNotFound { left: String, right: String },
     #[error("type '{ty}' cannot be use with operator '{op}'")]
@@ -42,12 +44,13 @@ pub(crate) enum AnalyzerError {
     UnexpectedAstError(#[from] AstError),
 }
 
-/// Used for resolving identifiers when caller know from context what type of identifier is expected.
+/// Used for resolving identifiers when caller knows from context what type of identifier is expected.
 enum ResolveIdentifierHint {
     ExpectedColumn,
     ExpectedTable,
 }
 
+/// Used as a key type for [`Analyzer::inserted_columns`].
 #[derive(Debug, Hash, PartialEq, Eq)]
 struct InsertedColumnRef {
     table_name: String,
@@ -64,10 +67,10 @@ pub(crate) struct Analyzer<'a> {
     resolved_tree: ResolvedTree,
     /// Metadata of tables analyzed in current statement
     tables_context: HashMap<String, TableMetadata>,
-    /// List of inserted [`TableMetadata`]s ids - used so that same node is not duplicated.
+    /// List of inserted [`TableMetadata`]s ids - used to avoid duplicating nodes.
     /// It should be used only per statement, as [`TableMetadata`] can be changed between statements.
     inserted_tables: HashMap<String, ResolvedNodeId>,
-    /// Same as [`Analyzer::inserted_tables`] - used so that same node is not inserted multiple times.
+    /// Same as [`Analyzer::inserted_tables`] - used to avoid duplicating nodes.
     /// It should be used only per statement, as [`ColumnMetadata`] can be changed between statements.
     inserted_columns: HashMap<InsertedColumnRef, ResolvedNodeId>,
 }
@@ -118,19 +121,22 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Analyzes select statement.
+    /// If successful [`ResolvedSelectStatement`] is added to [`Analyzer::resolved_tree`].
     fn analyze_select_statement(&mut self, select: &SelectStatement) -> Result<(), AnalyzerError> {
         let resolved_table = self.resolve_table(select.table_name)?;
-
         let resolved_columns = match &select.columns {
             Some(columns) => self.resolve_columns(columns)?,
             None => self.resolve_all_columns_from_table(resolved_table)?,
         };
-
+        let resolved_where_clause = select
+            .where_clause
+            .map(|node_id| self.resolve_expression(node_id))
+            .transpose()?;
         let select_statement = ResolvedSelectStatement {
             table: resolved_table,
             columns: resolved_columns,
-            // TODO: parse this
-            where_clause: None,
+            where_clause: resolved_where_clause,
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Select(select_statement));
@@ -236,7 +242,9 @@ impl<'a> Analyzer<'a> {
                 self.resolve_function_call(function_call_node)
             }
             Expression::Literal(literal_node) => Ok(self.resolve_literal(literal_node)),
-            Expression::Identifier(identifier_node) => todo!(),
+            Expression::Identifier(identifier_node) => {
+                self.resolve_identifier(identifier_node, None)
+            }
         }
     }
 
@@ -268,15 +276,28 @@ impl<'a> Analyzer<'a> {
         let left_resolved = self.resolve_cast(left_resolved, common_type)?;
         let right_resolved = self.resolve_cast(right_resolved, common_type)?;
         self.assert_type_and_operator_compatible(&common_type, &binary_expression.op)?;
+        let final_type = self.binary_expression_type(&binary_expression.op, &common_type);
         let resolved = ResolvedBinaryExpression {
             left: left_resolved,
             right: right_resolved,
             op: binary_expression.op,
-            ty: common_type,
+            ty: final_type,
         };
         Ok(self
             .resolved_tree
             .add_node(ResolvedExpression::Binary(resolved)))
+    }
+
+    /// Returns type of binary expression based on its operator.
+    fn binary_expression_type(&self, op: &BinaryOperator, args_type: &Type) -> Type {
+        match op {
+            BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Star
+            | BinaryOperator::Slash
+            | BinaryOperator::Modulo => *args_type,
+            _ => Type::Bool,
+        }
     }
 
     fn resolve_unary_expression(
@@ -362,8 +383,17 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
-        // Hint was not provided, first we try column and then we try table.
-        todo!()
+        let resolved_column = self.resolve_column_identifier(identifier);
+        if resolved_column.is_ok() {
+            return resolved_column;
+        }
+        let resolved_table = self.resolve_table_identifier(identifier);
+        if resolved_table.is_ok() {
+            return resolved_table;
+        }
+        Err(AnalyzerError::UnknownIdentifier {
+            identifier: identifier.value.clone(),
+        })
     }
 
     fn resolve_column_identifier(
@@ -457,9 +487,9 @@ impl<'a> Analyzer<'a> {
     fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, AnalyzerError> {
         match self.catalog.read().table(table_name) {
             Ok(tm) => Ok(tm),
-            Err(CatalogError::TableNotFound(_)) => {
-                Err(AnalyzerError::TableNotFound(table_name.into()))
-            }
+            Err(CatalogError::TableNotFound(_)) => Err(AnalyzerError::TableNotFound {
+                table: table_name.into(),
+            }),
             Err(e) => Err(AnalyzerError::UnexpectedCatalogError(e)),
         }
     }
@@ -1070,7 +1100,7 @@ mod tests {
         let analyzer = Analyzer::new(&ast, catalog);
         let err = analyzer.analyze().unwrap_err();
         match err {
-            AnalyzerError::TableNotFound(name) => assert_eq!(name, "nonexistent"),
+            AnalyzerError::TableNotFound { table } => assert_eq!(table, "nonexistent"),
             _ => panic!("Expected TableNotFound"),
         }
     }
@@ -1102,6 +1132,268 @@ mod tests {
                 assert_eq!(column, "doesnotexist");
             }
             _ => panic!("Expected ColumnNotFound"),
+        }
+    }
+
+    #[test]
+    fn analyze_select_where() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // identifiers
+        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+
+        // literals
+        let lit_0 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(0),
+        }));
+        let lit_1000 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1000),
+        }));
+        let lit_300 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(300),
+        }));
+        let lit_codb = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("coDB".into()),
+        }));
+
+        // (id > 0)
+        let id_gt_0 = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: id_ident,
+            right_id: lit_0,
+            op: BinaryOperator::Greater,
+        }));
+        // (name == "coDB")
+        let name_eq_codb = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: name_ident,
+            right_id: lit_codb,
+            op: BinaryOperator::Equal,
+        }));
+        // left conjunct: (id > 0 AND name == "coDB")
+        let left_and = ast.add_node(Expression::Logical(LogicalExpressionNode {
+            left_id: id_gt_0,
+            right_id: name_eq_codb,
+            op: LogicalOperator::And,
+        }));
+
+        // (id < 1000)
+        let id_lt_1000 = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: id_ident,
+            right_id: lit_1000,
+            op: BinaryOperator::Less,
+        }));
+        // (id > 300)
+        let id_gt_300 = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: id_ident,
+            right_id: lit_300,
+            op: BinaryOperator::Greater,
+        }));
+        // right conjunct: (id < 1000 AND id > 300)
+        let right_and = ast.add_node(Expression::Logical(LogicalExpressionNode {
+            left_id: id_lt_1000,
+            right_id: id_gt_300,
+            op: LogicalOperator::And,
+        }));
+
+        // full where: (left_and) OR (right_and)
+        let where_node = ast.add_node(Expression::Logical(LogicalExpressionNode {
+            left_id: left_and,
+            right_id: right_and,
+            op: LogicalOperator::Or,
+        }));
+
+        // SELECT id FROM users WHERE (id > 0 AND name == "coDB") OR (id < 1000 AND id > 300)
+        let select = SelectStatement {
+            table_name,
+            columns: Some(vec![id_ident]),
+            where_clause: Some(where_node),
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let resolved_tree = analyzer.analyze().expect("analyze should succeed");
+
+        match &resolved_tree.statements[0] {
+            ResolvedStatement::Select(select) => {
+                let where_id = select.where_clause.expect("where clause resolved");
+                match resolved_tree.node(where_id) {
+                    ResolvedExpression::Logical(top_or) => {
+                        assert!(matches!(top_or.op, LogicalOperator::Or));
+
+                        // left side: (id > 0 AND name == "coDB")
+                        match resolved_tree.node(top_or.left) {
+                            ResolvedExpression::Logical(left_and_res) => {
+                                assert!(matches!(left_and_res.op, LogicalOperator::And));
+
+                                // id > 0
+                                match resolved_tree.node(left_and_res.left) {
+                                    ResolvedExpression::Binary(b) => {
+                                        assert!(matches!(b.op, BinaryOperator::Greater));
+                                        match resolved_tree.node(b.left) {
+                                            ResolvedExpression::ColumnRef(c) => {
+                                                assert_eq!(c.name, "id");
+                                            }
+                                            other => panic!(
+                                                "expected ColumnRef for id, got: {:?}",
+                                                other
+                                            ),
+                                        }
+                                        match resolved_tree.node(b.right) {
+                                            ResolvedExpression::Literal(
+                                                ResolvedLiteral::Int32(v),
+                                            ) => {
+                                                assert_eq!(*v, 0);
+                                            }
+                                            other => {
+                                                panic!("expected Int32 literal 0, got: {:?}", other)
+                                            }
+                                        }
+                                    }
+                                    other => panic!("expected Binary for id > 0, got: {:?}", other),
+                                }
+
+                                // name == "coDB"
+                                match resolved_tree.node(left_and_res.right) {
+                                    ResolvedExpression::Binary(b) => {
+                                        assert!(matches!(b.op, BinaryOperator::Equal));
+                                        match resolved_tree.node(b.left) {
+                                            ResolvedExpression::ColumnRef(c) => {
+                                                assert_eq!(c.name, "name");
+                                            }
+                                            other => panic!(
+                                                "expected ColumnRef for name, got: {:?}",
+                                                other
+                                            ),
+                                        }
+                                        match resolved_tree.node(b.right) {
+                                            ResolvedExpression::Literal(
+                                                ResolvedLiteral::String(s),
+                                            ) => {
+                                                assert_eq!(s, "coDB");
+                                            }
+                                            other => panic!(
+                                                "expected String literal \"coDB\", got: {:?}",
+                                                other
+                                            ),
+                                        }
+                                    }
+                                    other => panic!(
+                                        "expected Binary for name == \"coDB\", got: {:?}",
+                                        other
+                                    ),
+                                }
+                            }
+                            other => panic!("expected Logical (AND) on left, got: {:?}", other),
+                        }
+
+                        // right side: (id < 1000 AND id > 300)
+                        match resolved_tree.node(top_or.right) {
+                            ResolvedExpression::Logical(right_and_res) => {
+                                assert!(matches!(right_and_res.op, LogicalOperator::And));
+
+                                // id < 1000
+                                match resolved_tree.node(right_and_res.left) {
+                                    ResolvedExpression::Binary(b) => {
+                                        assert!(matches!(b.op, BinaryOperator::Less));
+                                        match resolved_tree.node(b.right) {
+                                            ResolvedExpression::Literal(
+                                                ResolvedLiteral::Int32(v),
+                                            ) => {
+                                                assert_eq!(*v, 1000);
+                                            }
+                                            other => panic!(
+                                                "expected Int32 literal 1000, got: {:?}",
+                                                other
+                                            ),
+                                        }
+                                    }
+                                    other => {
+                                        panic!("expected Binary for id < 1000, got: {:?}", other)
+                                    }
+                                }
+
+                                // id > 300
+                                match resolved_tree.node(right_and_res.right) {
+                                    ResolvedExpression::Binary(b) => {
+                                        assert!(matches!(b.op, BinaryOperator::Greater));
+                                        match resolved_tree.node(b.right) {
+                                            ResolvedExpression::Literal(
+                                                ResolvedLiteral::Int32(v),
+                                            ) => {
+                                                assert_eq!(*v, 300);
+                                            }
+                                            other => panic!(
+                                                "expected Int32 literal 300, got: {:?}",
+                                                other
+                                            ),
+                                        }
+                                    }
+                                    other => {
+                                        panic!("expected Binary for id > 300, got: {:?}", other)
+                                    }
+                                }
+                            }
+                            other => panic!("expected Logical (AND) on right, got: {:?}", other),
+                        }
+                    }
+                    other => panic!(
+                        "expected top-level Logical (OR) in where clause, got: {:?}",
+                        other
+                    ),
+                }
+            }
+            _ => panic!("expected select"),
+        }
+    }
+
+    #[test]
+    fn analyze_select_where_unknown_column() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+
+        let unknown_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "unknown_field".into(),
+        }));
+
+        let lit_5 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(5),
+        }));
+
+        let cond = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: unknown_ident,
+            right_id: lit_5,
+            op: BinaryOperator::Equal,
+        }));
+
+        // SELECT * FROM users WHERE unknown_field == 5
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(cond),
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let result = analyzer.analyze();
+
+        match result {
+            Err(AnalyzerError::UnknownIdentifier { identifier }) => {
+                assert_eq!(identifier, "unknown_field");
+            }
+            Err(e) => panic!("expected ColumnNotFound, got: {:?}", e),
+            Ok(_) => panic!("expected analysis to fail for unknown column"),
         }
     }
 }
