@@ -28,12 +28,14 @@ pub(crate) enum AnalyzerError {
     TableNotFound { table: String },
     #[error("column '{column}' was not found")]
     ColumnNotFound { column: String },
-    #[error("identifiern '{identifier}' is unknown and cannot be resolved")]
+    #[error("identifier '{identifier}' is unknown and cannot be resolved")]
     UnknownIdentifier { identifier: String },
     #[error("cannot find common type for '{left}' and '{right}'")]
     CommonTypeNotFound { left: String, right: String },
-    #[error("type '{ty}' cannot be use with operator '{op}'")]
+    #[error("type '{ty}' cannot be used with operator '{op}'")]
     TypeNotSupportedByOperator { op: String, ty: String },
+    #[error("column '{column}' found in more than one table")]
+    AmbigousColumn { column: String },
     #[error("unexpected type: expected {expected}, got {got}")]
     UnexpectedType { expected: String, got: String },
     #[error("unexpected catalog error: {0}")]
@@ -107,7 +109,7 @@ impl<'a> Analyzer<'a> {
 
     /// Analyzes statement. If statement was successfully analyzed then its resolved version ([`ResolvedStatement`]) is added to [`Analyzer::resolved_tree`].
     /// When analyzing statement it's important to make sure that tables identifiers are resolved first,
-    /// as resolving columnd identifiers require information from their tables.
+    /// as resolving column identifiers require information from their tables.
     fn analyze_statement(&mut self, statement: &Statement) -> Result<(), AnalyzerError> {
         match statement {
             Statement::Select(select) => self.analyze_select_statement(select),
@@ -328,7 +330,7 @@ impl<'a> Analyzer<'a> {
     fn resolve_literal(&mut self, literal: &LiteralNode) -> ResolvedNodeId {
         match &literal.value {
             Literal::String(value) => self.resolve_string_literal(value.clone()),
-            Literal::Float(value) => self.resolve_float_literat(*value),
+            Literal::Float(value) => self.resolve_float_literal(*value),
             Literal::Int(value) => self.resolve_int_literal(*value),
             Literal::Bool(value) => self.resolve_bool_literal(*value),
         }
@@ -340,7 +342,7 @@ impl<'a> Analyzer<'a> {
             .add_node(ResolvedExpression::Literal(resolved))
     }
 
-    fn resolve_float_literat(&mut self, value: f64) -> ResolvedNodeId {
+    fn resolve_float_literal(&mut self, value: f64) -> ResolvedNodeId {
         let can_fit_in_f32 = value > f32::MIN as f64 && value < f32::MAX as f64;
         let resolved = if can_fit_in_f32 {
             ResolvedLiteral::Float32(value as f32)
@@ -396,6 +398,9 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    /// Resolves column pointed by `indetifier`.
+    /// If more than one column matches `identifier` (meaning there are two tables with same column name
+    /// and alises weren't used) then error is returned.
     fn resolve_column_identifier(
         &mut self,
         identifier: &IdentifierNode,
@@ -405,18 +410,24 @@ impl<'a> Analyzer<'a> {
                 column_name: identifier.value.clone(),
                 table_name: table_name.clone(),
             };
+
+            // [`Analyzer::tables_context`] was out of sync with [`Analyzer::inserted_tables`].
+            // It should never happen, it can only happen in case of programmer mistake and
+            // there is nothing else to do here than just panic.
+            let resolved_table = self
+                .inserted_tables
+                .get(table_name)
+                .expect("table inserted to 'tables_context' but not to `inserted_tables`");
+
             if let Some(already_inserted) = self.inserted_columns.get(&key) {
+                self.assert_column_not_ambigous(&identifier.value, *resolved_table)?;
+
                 return Ok(*already_inserted);
             }
+
             let column_metadata = self.get_column_metadata(tm, &identifier.value);
             if let Ok(cm) = column_metadata {
-                // [`Analyzer::tables_context`] was out of sync with [`Analyzer::inserted_tables`].
-                // It should never happen, it can only happen in case of programmer mistake and
-                // there is nothing else to do here than just panic.
-                let resolved_table = self
-                    .inserted_tables
-                    .get(table_name)
-                    .expect("table inserted to 'tables_context' but not to `inserted_tables`");
+                self.assert_column_not_ambigous(&identifier.value, *resolved_table)?;
                 let resolved_column = ResolvedColumn {
                     table: *resolved_table,
                     name: cm.name().into(),
@@ -576,6 +587,31 @@ impl<'a> Analyzer<'a> {
                 op: op.to_string(),
                 ty: ty.to_string(),
             });
+        }
+        Ok(())
+    }
+
+    // TODO: test if it works as expected once JOINs are implemented
+    fn assert_column_not_ambigous(
+        &self,
+        column_identifier: &str,
+        expected_table: ResolvedNodeId,
+    ) -> Result<(), AnalyzerError> {
+        for (table_name, tm) in &self.tables_context {
+            if tm.column(column_identifier).is_ok() {
+                // [`Analyzer::tables_context`] was out of sync with [`Analyzer::inserted_tables`].
+                // It should never happen, it can only happen in case of programmer mistake and
+                // there is nothing else to do here than just panic.
+                let table_id = self
+                    .inserted_tables
+                    .get(table_name)
+                    .expect("table inserted to 'tables_context' but not to `inserted_tables`");
+                if *table_id != expected_table {
+                    return Err(AnalyzerError::AmbigousColumn {
+                        column: column_identifier.into(),
+                    });
+                }
+            }
         }
         Ok(())
     }
