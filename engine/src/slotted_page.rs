@@ -97,6 +97,11 @@ pub(crate) enum InsertResult {
     PageFull,
 }
 
+pub(crate) enum UpdateResult {
+    /// The update succeeded
+    Success,
+    NeedsDefragmentation,
+}
 #[derive(Debug, Error)]
 pub enum SlottedPageError {
     #[error(
@@ -109,7 +114,7 @@ pub enum SlottedPageError {
     #[error("tried to modify slot at position {position} while there were only {num_slots} slots")]
     InvalidPosition { num_slots: u16, position: u16 },
     #[error("tried to access deleted record with slot index {slot_index}")]
-    TriedToAccessDeletedRecord { slot_index: u16 },
+    ForbiddenDeletedRecordAccess { slot_index: u16 },
     #[error("tried to compact slots even though allow_slot_compaction was set to false")]
     ForbiddenSlotCompaction,
     #[error("casting data from bytes failed for the following reason: {reason}")]
@@ -273,7 +278,7 @@ impl<P: PageRead> SlottedPage<P> {
         let slot = self.get_slot(slot_idx)?;
 
         if slot.is_deleted() {
-            return Err(SlottedPageError::TriedToAccessDeletedRecord {
+            return Err(SlottedPageError::ForbiddenDeletedRecordAccess {
                 slot_index: slot_idx,
             });
         }
@@ -302,7 +307,57 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
         self.get_header_mut::<SlottedPageBaseHeader>()
     }
+    pub fn delete(&mut self, slot_id: u16) -> Result<(), SlottedPageError> {
+        let next_free_slot = self.get_base_header()?.first_free_slot;
+        let slot = self.get_slot_mut(slot_id)?;
+        if slot.is_deleted() {
+            return Err(SlottedPageError::ForbiddenDeletedRecordAccess {
+                slot_index: slot_id,
+            });
+        }
 
+        slot.mark_deleted();
+        slot.set_next_free_slot(next_free_slot);
+
+        // copy slot to handle borrow checker complaints
+        let copied_slot = *self.get_slot(slot_id)?;
+
+        let header = self.get_base_header_mut()?;
+        header.total_free_space += copied_slot.len;
+        header.first_free_slot = slot_id;
+
+        if copied_slot.offset == header.record_area_offset {
+            header.contiguous_free_space += copied_slot.len;
+            header.record_area_offset += copied_slot.len;
+        } else {
+            self.add_freeblock(copied_slot.offset, copied_slot.len)?;
+        }
+
+        Ok(())
+    }
+
+    fn add_freeblock(&mut self, offset: u16, len: u16) -> Result<(), SlottedPageError> {
+        if len < FreeBlock::MIN_SIZE {
+            return Ok(());
+        }
+
+        let next_block_offset = self.get_base_header()?.first_free_block_offset;
+
+        let page = self.page.data_mut();
+
+        let new_freeblock = FreeBlock {
+            len,
+            next_block_offset,
+        };
+
+        let start = offset as usize;
+        let end = start + FreeBlock::SIZE;
+        page[start..end].copy_from_slice(bytemuck::bytes_of(&new_freeblock));
+
+        self.get_base_header_mut()?.first_free_block_offset = offset;
+
+        Ok(())
+    }
     /// Inserts a record at a given slot position.
     ///
     /// Shifts existing slots to the right if necessary, allocates space for the record,
@@ -698,8 +753,6 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         header.first_free_block_offset = SlottedPageBaseHeader::NO_FREE_BLOCKS;
         Ok(())
     }
-
-    pub fn update(&mut self, slot_id: u16, updated_record: &[u8]) {}
 }
 
 #[cfg(test)]
