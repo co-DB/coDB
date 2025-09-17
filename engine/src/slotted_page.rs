@@ -101,13 +101,14 @@ pub(crate) enum UpdateResult {
     /// The update succeeded
     Success,
     NeedsDefragmentation,
+    PageFull,
 }
 #[derive(Debug, Error)]
 pub enum SlottedPageError {
     #[error(
-        "tried to access record at index {out_of_bounds_index} while there were only {num_slots} records"
+        "tried to access slot at index {out_of_bounds_index} while there were only {num_slots} records"
     )]
-    RecordIndexOutOfBounds {
+    SlotIndexOutOfBounds {
         num_slots: u16,
         out_of_bounds_index: u16,
     },
@@ -251,7 +252,7 @@ impl<P: PageRead> SlottedPage<P> {
         let header = self.get_base_header()?;
 
         if slot_idx >= header.num_slots {
-            return Err(SlottedPageError::RecordIndexOutOfBounds {
+            return Err(SlottedPageError::SlotIndexOutOfBounds {
                 num_slots: header.num_slots,
                 out_of_bounds_index: slot_idx,
             });
@@ -307,6 +308,104 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
         self.get_header_mut::<SlottedPageBaseHeader>()
     }
+
+    /// Updates the record at given position.
+    pub fn update(
+        &mut self,
+        slot_id: u16,
+        updated_record: &[u8],
+    ) -> Result<UpdateResult, SlottedPageError> {
+        let slot = self.get_slot(slot_id)?;
+
+        if slot.is_deleted() {
+            return Err(SlottedPageError::ForbiddenDeletedRecordAccess {
+                slot_index: slot_id,
+            });
+        }
+
+        let old_len = slot.len;
+        let new_len = updated_record.len() as u16;
+        let old_offset = slot.offset;
+
+        if old_len >= new_len {
+            self.write_record_at(updated_record, old_offset);
+
+            let updated_slot = self.get_slot_mut(slot_id)?;
+            updated_slot.len = new_len;
+
+            let leftover = old_len - new_len;
+            self.add_freeblock(old_offset + new_len, leftover)?;
+
+            let header = self.get_base_header_mut()?;
+            header.total_free_space += leftover;
+
+            return Ok(UpdateResult::Success);
+        }
+
+        let additional_space_needed = new_len - old_len;
+        let header = self.get_base_header()?;
+
+        if header.total_free_space < additional_space_needed {
+            return Ok(UpdateResult::PageFull);
+        }
+
+        let offset = match self.get_allocated_space(new_len, false)? {
+            Some(offset) => offset,
+            None => return Ok(UpdateResult::NeedsDefragmentation),
+        };
+
+        self.write_record_at(updated_record, offset);
+
+        // Create free block from old location
+        self.add_freeblock(old_offset, old_len)?;
+        let header = self.get_base_header_mut()?;
+        header.total_free_space += old_len;
+
+        let updated_slot = self.get_slot_mut(slot_id)?;
+        updated_slot.offset = offset;
+        updated_slot.len = new_len;
+
+        Ok(UpdateResult::Success)
+    }
+
+    /// Marks a slot as deleted, compacts records and inserts the updated record. This should
+    /// be used when update doesn't succeed with NeedsDefragmentation result.
+    pub fn defragment_and_update(
+        &mut self,
+        slot_id: u16,
+        updated_record: &[u8],
+    ) -> Result<UpdateResult, SlottedPageError> {
+        let slot = self.get_slot_mut(slot_id)?;
+        if slot.is_deleted() {
+            return Err(SlottedPageError::ForbiddenDeletedRecordAccess {
+                slot_index: slot_id,
+            });
+        }
+
+        let old_record_len = slot.len;
+        slot.mark_deleted();
+
+        let header = self.get_base_header_mut()?;
+        header.total_free_space += old_record_len;
+
+        self.compact_records()?;
+
+        let offset = match self.get_allocated_space(updated_record.len() as u16, false)? {
+            Some(offset) => offset,
+            None => return Ok(UpdateResult::PageFull),
+        };
+
+        self.write_record_at(updated_record, offset);
+
+        let slot = self.get_slot_mut(slot_id)?;
+        slot.offset = offset;
+        slot.len = updated_record.len() as u16;
+        slot.flags = 0;
+
+        Ok(UpdateResult::Success)
+    }
+
+    /// Deletes the record from the given position.
     pub fn delete(&mut self, slot_id: u16) -> Result<(), SlottedPageError> {
         let next_free_slot = self.get_base_header()?.first_free_slot;
         let slot = self.get_slot_mut(slot_id)?;
@@ -336,6 +435,8 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         Ok(())
     }
 
+    /// Adds a free block with given length at the given offset and adds it to the free block linked
+    /// list.
     fn add_freeblock(&mut self, offset: u16, len: u16) -> Result<(), SlottedPageError> {
         if len < FreeBlock::MIN_SIZE {
             return Ok(());
@@ -358,6 +459,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
 
         Ok(())
     }
+
     /// Inserts a record at a given slot position.
     ///
     /// Shifts existing slots to the right if necessary, allocates space for the record,
@@ -598,6 +700,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
                 next_block_offset: block.next_block_offset,
                 len: block.len - record_len - FreeBlock::SIZE as u16,
             };
+
             self.page.data_mut()
                 [new_freeblock_offset as usize..new_freeblock_offset as usize + FreeBlock::SIZE]
                 .copy_from_slice(bytemuck::bytes_of(&new_freeblock));
@@ -952,7 +1055,7 @@ mod tests {
         let result = page.read_valid_record(0);
         assert!(matches!(
             result,
-            Err(SlottedPageError::RecordIndexOutOfBounds {
+            Err(SlottedPageError::SlotIndexOutOfBounds {
                 num_slots: 0,
                 out_of_bounds_index: 0
             })
