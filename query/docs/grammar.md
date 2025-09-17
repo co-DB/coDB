@@ -40,7 +40,7 @@ CoSQL includes a set of essential data types suitable for building production-gr
 
 - SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, RENAME, DROP
 - INT32, INT64, FLOAT32, FLOAT64, BOOL, STRING, DATE, DATETIME
-- WHERE, FROM, INTO, SET, VALUES
+- WHERE, FROM, INTO, SET, VALUES, AS
 - TABLE, COLUMN, PRIMARY_KEY
 - TRUE, FALSE
 
@@ -115,8 +115,10 @@ Precedence (from lowest to highest)
 ### Database specifics
 
 ```
- <column_name> :: <identifier>
- <table_name> :: <identifier>
+ <column_name> :: <identifier> <column_alias>
+ <column_alias> :: '.' <identifier> | ε
+ <table_name> :: <identifier> <table_alias>
+ <table_alias> :: AS <identifier> | ε
  <value> :: <literal> | <expression>
  <type> :: INT32 | INT64 | FLOAT32 | FLOAT64 | BOOL | STRING | DATE | DATETIME
 ```
