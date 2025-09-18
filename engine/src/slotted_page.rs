@@ -21,6 +21,10 @@ pub(crate) struct FreeBlock {
     len: u16,
     /// Offset inside the page to the next freeblock
     next_block_offset: u16,
+    /// Actual offset of the free block struct in the page. May differ from the one in next_block_offset
+    /// since we need to align the free block in accordance to its alignment (2 bytes). Thus, when
+    /// the actual offset is odd we need to move the free block to the next even offset
+    actual_offset: u16,
 }
 impl FreeBlock {
     /// A minimal size needed for a free block to be created. If there is less empty space leftover
@@ -29,6 +33,8 @@ impl FreeBlock {
     pub const MIN_SIZE: u16 = 16;
 
     pub const SIZE: usize = size_of::<FreeBlock>();
+
+    pub const ALIGNMENT: u16 = align_of::<FreeBlock>() as u16;
 }
 
 /// In the future add B-tree and heap file implementations of this
@@ -435,6 +441,10 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         Ok(())
     }
 
+    /// Calculates the offset of the free block, so that it matches the alignment of the struct (2 bytes)
+    fn calculate_free_block_aligned_offset(actual_offset: u16) -> u16 {
+        actual_offset.next_multiple_of(FreeBlock::ALIGNMENT)
+    }
     /// Adds a free block with given length at the given offset and adds it to the free block linked
     /// list.
     fn add_freeblock(&mut self, offset: u16, len: u16) -> Result<(), SlottedPageError> {
@@ -449,13 +459,15 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         let new_freeblock = FreeBlock {
             len,
             next_block_offset,
+            actual_offset: offset,
         };
 
-        let start = offset as usize;
+        let aligned_offset = Self::calculate_free_block_aligned_offset(offset);
+        let start = aligned_offset as usize;
         let end = start + FreeBlock::SIZE;
         page[start..end].copy_from_slice(bytemuck::bytes_of(&new_freeblock));
 
-        self.get_base_header_mut()?.first_free_block_offset = offset;
+        self.get_base_header_mut()?.first_free_block_offset = aligned_offset;
 
         Ok(())
     }
@@ -490,7 +502,6 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
             None => return Ok(InsertResult::NeedsDefragmentation),
             Some(offset) => offset,
         };
-
         self.write_record_at(record, offset);
 
         if needs_new_slot {
@@ -684,29 +695,42 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
                 &self.page.data()[offset as usize..offset as usize + FreeBlock::SIZE],
             )?;
 
+            // actual offset is the non-aligned offset that holds the actual start of the free block,
+            // meaning the offset at which we want to write records
+            let actual_offset = block.actual_offset;
+
             // If leftover after insertion is too small, consume entire block.
             if block.len.saturating_sub(record_len) < FreeBlock::MIN_SIZE {
                 self.get_base_header_mut()?.total_free_space -= block.len;
                 self.update_freeblock_chain(prev_offset, block.next_block_offset)?;
-                return Ok(Some(offset));
+                return Ok(Some(actual_offset));
             }
 
             // Otherwise, split block into record + smaller free block.
             let consumed_space = record_len + FreeBlock::SIZE as u16;
             self.get_base_header_mut()?.total_free_space -= consumed_space;
 
-            let new_freeblock_offset = offset + record_len;
+            let new_freeblock_actual_offset = actual_offset + record_len;
+            
+            // aligned offset is used so we can use bytemuck's zero-copy from_bytes (free block 
+            // struct must be correctly aligned)
+            let aligned_offset =
+                Self::calculate_free_block_aligned_offset(new_freeblock_actual_offset);
+
             let new_freeblock = FreeBlock {
                 next_block_offset: block.next_block_offset,
                 len: block.len - record_len - FreeBlock::SIZE as u16,
+                actual_offset: new_freeblock_actual_offset,
             };
 
-            self.page.data_mut()
-                [new_freeblock_offset as usize..new_freeblock_offset as usize + FreeBlock::SIZE]
-                .copy_from_slice(bytemuck::bytes_of(&new_freeblock));
+            let start = aligned_offset as usize;
+            let end = start + FreeBlock::SIZE;
+            self.page.data_mut()[start..end].copy_from_slice(bytemuck::bytes_of(&new_freeblock));
 
-            self.update_freeblock_chain(prev_offset, new_freeblock_offset)?;
-            return Ok(Some(offset));
+            // we store the aligned offset in the free block linked list so we can read the free block
+            // without calculating aligned version of it every time.
+            self.update_freeblock_chain(prev_offset, aligned_offset)?;
+            return Ok(Some(actual_offset));
         }
 
         Ok(None)
@@ -733,7 +757,11 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         Ok(())
     }
 
-    /// Finds the first free block large enough for `record_len`.
+    /// Finds the first free block large enough for `record_len`. Returns offset of the free block
+    /// previous to the found one (SlottedPageBaseHeader::NO_FREE_BLOCKS in case this one is the
+    /// head of the list) and the offset of the found one. The offset are aligned meaning the user
+    /// can read the free block metadata from that exact offset, but for writing a new record
+    /// the offset is stored in free block's actual_offset field.
     fn find_free_space(&self, record_len: u16) -> Result<Option<(u16, u16)>, SlottedPageError> {
         let header = self.get_base_header()?;
 
@@ -861,6 +889,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
 
     const PAGE_SIZE: usize = 4096;
 
@@ -1195,5 +1224,161 @@ mod tests {
                 expected_data.as_bytes()
             );
         }
+    }
+    #[test]
+    fn test_delete_single_record() {
+        let mut page = create_test_page(PAGE_SIZE);
+        let insert_value = b"record";
+        page.insert(insert_value).unwrap();
+
+        let header_before = page.get_base_header().unwrap();
+        let free_space = header_before.total_free_space;
+        assert_eq!(header_before.num_slots, 1);
+        assert!(page.delete(0).is_ok());
+
+        let header_after = page.get_base_header().unwrap();
+        // checking if the logic for consuming free space if it is continuous works
+        assert_eq!(
+            header_after.first_free_block_offset,
+            SlottedPageBaseHeader::NO_FREE_BLOCKS
+        );
+
+        assert_eq!(header_after.first_free_slot, 0);
+        assert_eq!(
+            header_after.total_free_space,
+            free_space + insert_value.len() as u16
+        );
+        let slot = page.get_slot(0).unwrap();
+        assert!(slot.is_deleted());
+    }
+    #[test]
+    fn test_delete_multiple_records() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"first").unwrap();
+        page.insert(b"secondsecondsecondsecond").unwrap();
+        page.insert(b"third").unwrap();
+
+        page.delete(1).unwrap();
+
+        let slot = page.get_slot(1).unwrap();
+        assert!(slot.is_deleted());
+
+        let header = page.get_base_header().unwrap();
+        let expected_free_space = PAGE_SIZE as u16
+            - header.header_size
+            - header.num_slots * Slot::SIZE as u16
+            - b"first".len() as u16
+            - b"third".len() as u16;
+        assert_eq!(header.total_free_space, expected_free_space);
+        assert_ne!(
+            header.first_free_block_offset,
+            SlottedPageBaseHeader::NO_FREE_BLOCKS
+        );
+        assert_eq!(header.first_free_slot, 1);
+    }
+
+    #[test]
+    fn test_delete_out_of_bounds() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"first").unwrap();
+        page.insert(b"second").unwrap();
+
+        let result = page.delete(2);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.err().unwrap(),
+            SlottedPageError::SlotIndexOutOfBounds {
+                num_slots: 2,
+                out_of_bounds_index: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn test_delete_already_deleted_record() {
+        let mut page = create_test_page(64);
+        page.insert(b"first").unwrap();
+        page.insert(b"secondsecondseco").unwrap();
+        page.insert(b"third").unwrap();
+
+        page.delete(1).unwrap();
+
+        let slot = page.get_slot(1).unwrap();
+        assert!(slot.is_deleted());
+
+        let result = page.delete(1);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.err().unwrap(),
+            SlottedPageError::ForbiddenDeletedRecordAccess { slot_index: 1 }
+        ));
+    }
+
+    #[test]
+    fn test_delete_correctly_updates_free_blocks_and_free_slots() {
+        let mut page = create_test_page(PAGE_SIZE);
+        // Make the deleted records longer to trigger adding free blocks e.g. > 16 bytes
+        page.insert(b"firstfirstfirstfirst").unwrap();
+        page.insert(b"seconds").unwrap();
+        page.insert(b"thirdthirdthirdthird").unwrap();
+        page.insert(b"fourth").unwrap();
+        // We delete the in between records so the page looks like free space -> fourth -> free block
+        // -> second -> free block |.
+        page.delete(0).unwrap();
+        page.delete(2).unwrap();
+
+        let deleted_slot_1 = page.get_slot(0).unwrap();
+        let deleted_slot_2 = page.get_slot(2).unwrap();
+
+        let header = page.get_base_header().unwrap();
+
+        // Checking free slot list - should look like header -> 2 -> 0
+        assert_eq!(header.first_free_slot, 2);
+        assert_eq!(deleted_slot_2.next_free_slot(), 0);
+
+        // Checking free block list - should look like header -> slot id 2 offset -> slot id 0 offset
+        assert_eq!(
+            header.first_free_block_offset,
+            SlottedPage::<TestPage>::calculate_free_block_aligned_offset(deleted_slot_2.offset)
+        );
+
+        let range = header.first_free_block_offset as usize
+            ..header.first_free_block_offset as usize + FreeBlock::SIZE;
+        let first_free_block = &page.page.data()[range];
+        let free_block = bytemuck::from_bytes::<FreeBlock>(first_free_block);
+        assert_eq!(
+            free_block.next_block_offset,
+            SlottedPage::<TestPage>::calculate_free_block_aligned_offset(deleted_slot_1.offset)
+        );
+    }
+    #[test]
+    fn test_update_smaller_record() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"original").unwrap();
+
+        let old_total_free_space = page.free_space().unwrap();
+
+        let result = page.update(0, b"small").unwrap();
+        assert!(matches!(result, UpdateResult::Success));
+
+        let slot = page.get_slot(0).unwrap();
+        assert_eq!(slot.len, b"small".len() as u16);
+
+        let record = page.read_valid_record(0).unwrap();
+        assert_eq!(record, b"small");
+
+        let expected_free_space =
+            old_total_free_space + (b"original".len() as u16 - b"small".len() as u16);
+        assert_eq!(page.free_space().unwrap(), expected_free_space);
+    }
+
+    #[test]
+    fn test_update_record_will_not_fit() {
+        let mut page = create_test_page(64);
+        page.insert(b"tiny").unwrap();
+
+        let result = page.update(0, &[0u8; 100]).unwrap();
+        assert!(matches!(result, UpdateResult::PageFull));
     }
 }
