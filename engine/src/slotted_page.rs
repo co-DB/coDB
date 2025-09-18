@@ -711,8 +711,8 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
             self.get_base_header_mut()?.total_free_space -= consumed_space;
 
             let new_freeblock_actual_offset = actual_offset + record_len;
-            
-            // aligned offset is used so we can use bytemuck's zero-copy from_bytes (free block 
+
+            // aligned offset is used so we can use bytemuck's zero-copy from_bytes (free block
             // struct must be correctly aligned)
             let aligned_offset =
                 Self::calculate_free_block_aligned_offset(new_freeblock_actual_offset);
@@ -843,7 +843,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
         header.num_slots = filled_count as u16;
         header.total_free_space += freed_space as u16;
         header.contiguous_free_space += freed_space as u16;
-        header.first_free_slot = Slot::NO_FREE_SLOTS;
+        header.first_free_slot = SlottedPageBaseHeader::NO_FREE_SLOTS;
         Ok(())
     }
 
@@ -889,7 +889,6 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ops::Range;
 
     const PAGE_SIZE: usize = 4096;
 
@@ -1352,6 +1351,227 @@ mod tests {
             SlottedPage::<TestPage>::calculate_free_block_aligned_offset(deleted_slot_1.offset)
         );
     }
+
+    #[test]
+    fn test_record_defragmentation() {
+        let mut page = create_test_page(128);
+
+        let free_space = page.free_space().unwrap();
+
+        let record_1 = [1u8; 50];
+        let record_2 = [2u8; 50];
+
+        page.insert(&record_1).expect("Insert should succeed");
+        page.insert(&record_2).expect("Insert should succeed");
+
+        page.delete(0).unwrap();
+
+        let header = page.get_base_header().unwrap();
+        let before_defrag_continuous_space = header.contiguous_free_space;
+        let before_defrag_free_space = header.total_free_space;
+
+        assert!(before_defrag_free_space > 51);
+        assert!(before_defrag_continuous_space < 51);
+
+        let record_3 = [3u8; 51];
+
+        let insert_result = page.insert(&record_3).unwrap();
+        assert!(matches!(insert_result, InsertResult::NeedsDefragmentation));
+
+        page.compact_records().unwrap();
+
+        let header = page.get_base_header().unwrap();
+        let continuous_space = header.contiguous_free_space;
+        let free_space = header.total_free_space;
+
+        assert_eq!(free_space, before_defrag_free_space);
+        assert_eq!(continuous_space, free_space);
+
+        let insert_result = page.insert(&record_3).unwrap();
+        assert!(matches!(insert_result, InsertResult::Success(_)));
+    }
+
+    #[test]
+    fn test_defragmentation_multiple_fragments() {
+        let mut page = create_test_page(512);
+
+        for i in 0..6 {
+            let data = vec![i as u8; 30];
+            page.insert(&data).unwrap();
+        }
+
+        page.delete(1).unwrap();
+        page.delete(3).unwrap();
+        page.delete(4).unwrap();
+
+        let header_before = *page.get_base_header().unwrap();
+        assert_ne!(
+            header_before.first_free_block_offset,
+            SlottedPageBaseHeader::NO_FREE_BLOCKS
+        );
+
+        page.compact_records().unwrap();
+
+        let header_after = *page.get_base_header().unwrap();
+        assert_eq!(
+            header_after.first_free_block_offset,
+            SlottedPageBaseHeader::NO_FREE_BLOCKS
+        );
+        assert_eq!(
+            header_after.contiguous_free_space,
+            header_after.total_free_space
+        );
+    }
+
+    #[test]
+    fn test_defragmentation_preserves_record_order() {
+        let mut page = create_test_page(512);
+
+        let records = [b"firstt", b"second", b"thirdt", b"fourth"];
+        for record in &records {
+            page.insert(*record).unwrap();
+        }
+
+        page.delete(1).unwrap();
+        page.delete(2).unwrap();
+
+        page.compact_records().unwrap();
+
+        assert_eq!(page.read_valid_record(0).unwrap(), b"firstt");
+        assert_eq!(page.read_valid_record(3).unwrap(), b"fourth");
+
+        assert!(page.read_valid_record(1).is_err());
+        assert!(page.read_valid_record(2).is_err());
+    }
+
+    #[test]
+    fn test_defragmentation_all_records_deleted() {
+        let mut page = create_test_page(512);
+
+        page.insert(b"record1").unwrap();
+        page.insert(b"record2").unwrap();
+
+        page.delete(0).unwrap();
+        page.delete(1).unwrap();
+
+        page.compact_records().unwrap();
+
+        let header = page.get_base_header().unwrap();
+        let expected_free = 512 - header.header_size - (2 * size_of::<Slot>() as u16);
+        assert_eq!(header.contiguous_free_space, expected_free);
+    }
+
+    #[test]
+    fn test_defragmentation_no_deleted_records() {
+        let mut page = create_test_page(512);
+
+        page.insert(b"record1").unwrap();
+        page.insert(b"record2").unwrap();
+
+        let header_before = *page.get_base_header().unwrap();
+        page.compact_records().unwrap();
+        let header_after = *page.get_base_header().unwrap();
+
+        assert_eq!(
+            header_before.contiguous_free_space,
+            header_after.contiguous_free_space
+        );
+        assert_eq!(
+            header_before.record_area_offset,
+            header_after.record_area_offset
+        );
+    }
+
+    #[test]
+    fn test_slot_compaction_removes_deleted_slots() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"keep1").unwrap(); // slot 0
+        page.insert(b"delete1").unwrap(); // slot 1
+        page.insert(b"keep2").unwrap(); // slot 2
+        page.insert(b"delete2").unwrap(); // slot 3
+        page.insert(b"keep3").unwrap(); // slot 4
+
+        page.delete(1).unwrap();
+        page.delete(3).unwrap();
+
+        assert_eq!(page.num_slots().unwrap(), 5);
+
+        page.compact_slots().unwrap();
+
+        assert_eq!(page.num_slots().unwrap(), 3);
+
+        assert_eq!(page.read_valid_record(0).unwrap(), b"keep1");
+        assert_eq!(page.read_valid_record(1).unwrap(), b"keep2");
+        assert_eq!(page.read_valid_record(2).unwrap(), b"keep3");
+    }
+
+    #[test]
+    fn test_slot_compaction_reclaims_slot_space() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        for i in 0..10 {
+            let data = format!("record{}", i);
+            page.insert(data.as_bytes()).unwrap();
+        }
+
+        // Delete every other slot
+        for i in (1..10).step_by(2) {
+            page.delete(i).unwrap();
+        }
+
+        let free_space_before = page.free_space().unwrap();
+        let slots_before = page.num_slots().unwrap();
+
+        page.compact_slots().unwrap();
+
+        let free_space_after = page.free_space().unwrap();
+        let slots_after = page.num_slots().unwrap();
+
+        let reclaimed_space = (slots_before - slots_after) * size_of::<Slot>() as u16;
+        assert_eq!(free_space_after, free_space_before + reclaimed_space);
+
+        let header = page.get_base_header().unwrap();
+        assert_eq!(header.first_free_slot, SlottedPageBaseHeader::NO_FREE_SLOTS);
+    }
+
+    #[test]
+    fn test_slot_compaction_forbidden_when_disabled() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut slotted_page = SlottedPage::new(page, false); // slot compaction disabled
+
+        let result = slotted_page.compact_slots();
+        assert!(matches!(result, Err(ForbiddenSlotCompaction)));
+    }
+
+    #[test]
+    fn test_slot_compaction_preserves_relative_order() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        let records = [b"first2", b"second", b"third2", b"fourth", b"fifth2"];
+        for record in &records {
+            page.insert(*record).unwrap();
+        }
+
+        page.delete(1).unwrap();
+        page.delete(3).unwrap();
+
+        page.compact_slots().unwrap();
+
+        assert_eq!(page.read_valid_record(0).unwrap(), b"first2");
+        assert_eq!(page.read_valid_record(1).unwrap(), b"third2");
+        assert_eq!(page.read_valid_record(2).unwrap(), b"fifth2");
+    }
+
+    #[test]
+    fn test_update_record_will_not_fit() {
+        let mut page = create_test_page(64);
+        page.insert(b"tiny").unwrap();
+
+        let result = page.update(0, &[0u8; 100]).unwrap();
+        assert!(matches!(result, UpdateResult::PageFull));
+    }
+
     #[test]
     fn test_update_smaller_record() {
         let mut page = create_test_page(PAGE_SIZE);
@@ -1374,11 +1594,133 @@ mod tests {
     }
 
     #[test]
-    fn test_update_record_will_not_fit() {
-        let mut page = create_test_page(64);
-        page.insert(b"tiny").unwrap();
+    fn test_update_equal_size() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"original").unwrap();
 
-        let result = page.update(0, &[0u8; 100]).unwrap();
-        assert!(matches!(result, UpdateResult::PageFull));
+        let old_total_free_space = page.free_space().unwrap();
+
+        let result = page.update(0, b"0riginal").unwrap();
+        assert!(matches!(result, UpdateResult::Success));
+
+        let slot = page.get_slot(0).unwrap();
+        assert_eq!(slot.len, b"0riginal".len() as u16);
+
+        let record = page.read_valid_record(0).unwrap();
+        assert_eq!(record, b"0riginal");
+
+        assert_eq!(page.free_space().unwrap(), old_total_free_space);
+    }
+
+    #[test]
+    fn test_update_shrink_creates_free_block() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"very_long_record_that_will_create_free_block")
+            .unwrap();
+        let original_offset = page.get_slot(0).unwrap().offset;
+        let free_space_before = page.free_space().unwrap();
+
+        let result = page.update(0, b"short").unwrap();
+        assert!(matches!(result, UpdateResult::Success));
+
+        let header = page.get_base_header().unwrap();
+        assert_ne!(
+            header.first_free_block_offset,
+            SlottedPageBaseHeader::NO_FREE_BLOCKS
+        );
+
+        let slot = page.get_slot(0).unwrap();
+        assert_eq!(slot.offset, original_offset);
+        assert_eq!(slot.len, 5);
+
+        assert!(page.free_space().unwrap() > free_space_before);
+    }
+
+    #[test]
+    fn test_update_grow_with_available_space() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(&[1u8; 17]).unwrap();
+        let original_slot = *page.get_slot(0).unwrap();
+
+        let new_record = b"much_longer_record_that_needs_more_space_and_will_create_a_free_block";
+        let result = page.update(0, new_record).unwrap();
+        assert!(matches!(result, UpdateResult::Success));
+
+        let updated_slot = *page.get_slot(0).unwrap();
+        assert_ne!(updated_slot.offset, original_slot.offset);
+        assert_eq!(updated_slot.len, new_record.len() as u16);
+
+        let header = page.get_base_header().unwrap();
+        assert_ne!(
+            header.first_free_block_offset,
+            SlottedPageBaseHeader::NO_FREE_BLOCKS
+        );
+
+        assert_eq!(page.read_valid_record(0).unwrap(), new_record);
+    }
+
+    #[test]
+    fn test_update_needs_defragmentation() {
+        let mut page = create_test_page(160);
+
+        page.insert(b"record1").unwrap();
+        page.insert(b"large_record_to_create_fragment").unwrap();
+        page.insert(b"record3").unwrap();
+
+        page.delete(1).unwrap();
+
+        let large_update = vec![b'x'; 100];
+        let result = page.update(0, &large_update).unwrap();
+
+        assert!(matches!(result, UpdateResult::NeedsDefragmentation));
+
+        assert_eq!(page.read_valid_record(0).unwrap(), b"record1");
+    }
+    #[test]
+    fn test_update_deleted_record_error() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"test_record").unwrap();
+        page.delete(0).unwrap();
+
+        let result = page.update(0, b"new_data");
+        assert!(matches!(
+            result,
+            Err(SlottedPageError::ForbiddenDeletedRecordAccess { slot_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_defragment_and_update_actually_needs_defrag() {
+        let mut page = create_test_page(280); // Much smaller page
+
+        // Fill most of the page with records
+        let records = [
+            vec![1u8; 60], // slot 0
+            vec![2u8; 60], // slot 1
+            vec![3u8; 60], // slot 2
+            vec![4u8; 60], // slot 3
+        ];
+
+        for record in &records {
+            page.insert(record).unwrap();
+        }
+
+        // Delete middle records to create 120 bytes of fragmented space
+        page.delete(1).unwrap();
+        page.delete(2).unwrap();
+
+        // Try to update slot 0 to something that needs fragmented space
+        let large_update = vec![b'X'; 100]; // Needs more than contiguous space
+
+        // Regular update should fail
+        let update_result = page.update(0, &large_update).unwrap();
+        assert!(matches!(update_result, UpdateResult::NeedsDefragmentation));
+
+        // Defragment and update should succeed
+        let defrag_result = page.defragment_and_update(0, &large_update).unwrap();
+        assert!(matches!(defrag_result, UpdateResult::Success));
     }
 }
