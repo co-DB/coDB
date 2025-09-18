@@ -106,7 +106,10 @@ pub(crate) enum InsertResult {
 pub(crate) enum UpdateResult {
     /// The update succeeded
     Success,
+    /// There is not enough space in neither free blocks nor contiguous free space, but if the
+    /// page was defragmented the updated record would fit.
     NeedsDefragmentation,
+    /// The page is full and won't fit a record of this length.
     PageFull,
 }
 #[derive(Debug, Error)]
