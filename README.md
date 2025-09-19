@@ -29,7 +29,8 @@ The project is organized as a Cargo workspace with multiple crates for modularit
     cargo new <LIBRARY_NAME> --vsc none --lib
     ```
 
-Ensure the root `Cargo.toml` includes the new crate under `[workspace].members`. Add it manually if needed.
+Ensure the root `Cargo.toml` includes the new crate under `[workspace].members` and `new-crate/Cargo.toml` includes `rust-version.workspace = true` under `package`. Add those manually if needed.
+
 
 ### Adding internal dependency
 
@@ -64,7 +65,7 @@ external-common.workspace = true
 
 ### Prerequisites
 
-To build and run this project, you need Rust installed (version 1.88 or higher). You can install it from [https://rust-lang.org](https://rust-lang.org) or via `rustup`.
+To build and run this project, you need Rust installed. You can install it from [https://rust-lang.org](https://rust-lang.org) or via `rustup`.
 
 ### Running binaries
 
