@@ -8,6 +8,7 @@ coDB is a relational database built from scratch.
     - [Adding a new crate](#adding-a-new-crate)
     - [Adding internal dependency](#adding-internal-dependency)
     - [Adding external dependecy](#adding-external-dependecy)
+    - [Updating rust version](#updating-rust-version)
 - [Running locally](#running-locally)
     - [Prerequisites](#prerequisites)
     - [Running binaries](#running-binaries)
@@ -60,6 +61,12 @@ Then in `query/Cargo.toml` and `engine/Cargo.toml`:
 [dependencies]
 external-common.workspace = true 
 ```
+
+### Updating rust version
+
+To update rust version you should update:
+- `rust_version` field in root `Cargo.toml`
+- `Set up Rust 1.X` step in github actions (`github/workflows/build_and_test.yaml`)
 
 ## Running locally
 
