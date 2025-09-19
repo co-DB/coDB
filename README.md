@@ -42,7 +42,23 @@ crateB = { path = "../crateB" }
 
 ### Adding external dependecy
 
-TODO: figure out whether to do it in root Cargo.toml or do it in each crate separately. When decision is made update this paragraph.
+If an external crate is needed by only one coDB crate, add it to that crate's Cargo.toml.  
+For example, to add `external-1` to the `query` crate, add it in `query/Cargo.toml`.
+
+If an external crate is used by multiple workspace crates, add it to the root `Cargo.toml` under `[workspace.dependencies]` and reference it from each crate with `workspace = true`.  
+For example, add `external-common` to the root `Cargo.toml`:
+
+```toml
+[workspace.dependencies]
+external-common = "x.y"
+```
+
+Then in `query/Cargo.toml` and `engine/Cargo.toml`:
+
+```toml
+[dependencies]
+external-common.workspace = true 
+```
 
 ## Running locally
 
