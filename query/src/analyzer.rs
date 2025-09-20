@@ -59,6 +59,62 @@ struct InsertedColumnRef {
     column_name: String,
 }
 
+#[derive(Default)]
+struct StatementContext {
+    /// Metadata of tables analyzed in current statement
+    tables_metadata: HashMap<String, TableMetadata>,
+    /// List of inserted [`TableMetadata`]s ids - used to avoid duplicating nodes.
+    /// It should be used only per statement, as [`TableMetadata`] can be changed between statements.
+    inserted_tables: HashMap<String, ResolvedNodeId>,
+    /// Same as [`Analyzer::inserted_tables`] - used to avoid duplicating nodes.
+    /// It should be used only per statement, as [`ColumnMetadata`] can be changed between statements.
+    inserted_columns: HashMap<InsertedColumnRef, ResolvedNodeId>,
+}
+
+impl StatementContext {
+    /// Clears all data of [`StatementContext`]. Should be used when new statement is being analyzed.
+    fn clear(&mut self) {
+        self.tables_metadata.clear();
+        self.inserted_tables.clear();
+        self.inserted_columns.clear();
+    }
+
+    fn table_metadata(&self, table_name: &str) -> Option<&TableMetadata> {
+        self.tables_metadata.get(table_name)
+    }
+
+    fn add_table_metadata(&mut self, table_name: impl Into<String>, table_metadata: TableMetadata) {
+        self.tables_metadata
+            .insert(table_name.into(), table_metadata);
+    }
+
+    fn inserted_table(&self, table_name: &str) -> Option<&ResolvedNodeId> {
+        self.inserted_tables.get(table_name)
+    }
+
+    fn insert_table(&mut self, table_name: impl Into<String>, table_id: ResolvedNodeId) {
+        self.inserted_tables.insert(table_name.into(), table_id);
+    }
+
+    fn inserted_column(&self, column_ref: &InsertedColumnRef) -> Option<&ResolvedNodeId> {
+        self.inserted_columns.get(column_ref)
+    }
+
+    fn insert_column(&mut self, column_ref: InsertedColumnRef, column_id: ResolvedNodeId) {
+        self.inserted_columns.insert(column_ref, column_id);
+    }
+
+    fn add_new_table(
+        &mut self,
+        table_name: impl Into<String> + AsRef<str>,
+        table_metadata: TableMetadata,
+        table_id: ResolvedNodeId,
+    ) {
+        self.insert_table(table_name.as_ref(), table_id);
+        self.add_table_metadata(table_name.into(), table_metadata);
+    }
+}
+
 /// [`Analyzer`] is responsible for performing semantic analysis on [`Ast`]. As the result it produces the [`ResolvedTree`].
 pub(crate) struct Analyzer<'a> {
     /// [`Ast`] being analyzed.
@@ -67,14 +123,8 @@ pub(crate) struct Analyzer<'a> {
     catalog: Arc<RwLock<Catalog>>,
     /// [`ResolvedTree`] being built - ouput of [`Analyzer`] work.
     resolved_tree: ResolvedTree,
-    /// Metadata of tables analyzed in current statement
-    tables_context: HashMap<String, TableMetadata>,
-    /// List of inserted [`TableMetadata`]s ids - used to avoid duplicating nodes.
-    /// It should be used only per statement, as [`TableMetadata`] can be changed between statements.
-    inserted_tables: HashMap<String, ResolvedNodeId>,
-    /// Same as [`Analyzer::inserted_tables`] - used to avoid duplicating nodes.
-    /// It should be used only per statement, as [`ColumnMetadata`] can be changed between statements.
-    inserted_columns: HashMap<InsertedColumnRef, ResolvedNodeId>,
+    /// Details about currently analyzed statement (e.g. already resolved tables and columns).
+    statement_context: StatementContext,
 }
 
 impl<'a> Analyzer<'a> {
@@ -84,16 +134,14 @@ impl<'a> Analyzer<'a> {
             ast,
             catalog,
             resolved_tree: ResolvedTree::default(),
-            tables_context: HashMap::new(),
-            inserted_tables: HashMap::new(),
-            inserted_columns: HashMap::new(),
+            statement_context: StatementContext::default(),
         }
     }
 
     /// Analyzes [`Ast`] and returns resolved version of it - [`ResolvedTree`].
     pub(crate) fn analyze(mut self) -> Result<ResolvedTree, AnalyzerError> {
         for statement in self.ast.statements() {
-            self.clear_statement_context();
+            self.statement_context.clear();
             self.analyze_statement(statement)?;
         }
         Ok(self.resolved_tree)
@@ -101,11 +149,6 @@ impl<'a> Analyzer<'a> {
 
     /// Clears (resets to default) [`Analyzer`] statement-level fields.
     /// Should be called before analyzing statement.
-    fn clear_statement_context(&mut self) {
-        self.tables_context.clear();
-        self.inserted_tables.clear();
-        self.inserted_columns.clear();
-    }
 
     /// Analyzes statement. If statement was successfully analyzed then its resolved version ([`ResolvedStatement`]) is added to [`Analyzer::resolved_tree`].
     /// When analyzing statement it's important to make sure that tables identifiers are resolved first,
@@ -192,11 +235,9 @@ impl<'a> Analyzer<'a> {
                 });
             }
         };
-        // If this panic we forgot to add table to [`Analyzer::tables_context`], but we added table node to the tree.
-        // In such case we should just panic as it cannot happen in correct code
         let tm = self
-            .tables_context
-            .get(&table_name)
+            .statement_context
+            .table_metadata(&table_name)
             .expect("table inserted to 'resolved_tree' but not to `inserted_tables`");
         let columns: Vec<_> = tm.columns().collect();
         let mut resolved_columns = Vec::with_capacity(columns.len());
@@ -205,7 +246,7 @@ impl<'a> Analyzer<'a> {
                 column_name: column.name().into(),
                 table_name: table_name.clone(),
             };
-            if let Some(already_inserted) = self.inserted_columns.get(&key) {
+            if let Some(already_inserted) = self.statement_context.inserted_column(&key) {
                 resolved_columns.push(*already_inserted);
                 continue;
             }
@@ -218,7 +259,8 @@ impl<'a> Analyzer<'a> {
             let resolved_column_id = self
                 .resolved_tree
                 .add_node(ResolvedExpression::ColumnRef(resolved_column));
-            self.add_to_inserted_columns(key, resolved_column_id);
+            self.statement_context
+                .insert_column(key, resolved_column_id);
             resolved_columns.push(resolved_column_id);
         }
         Ok(resolved_columns)
@@ -247,6 +289,8 @@ impl<'a> Analyzer<'a> {
             Expression::Identifier(identifier_node) => {
                 self.resolve_identifier(identifier_node, None)
             }
+            Expression::TableIdentifier(table_identifier_node) => todo!(),
+            Expression::ColumnIdentifier(column_identifier_node) => todo!(),
         }
     }
 
@@ -398,14 +442,14 @@ impl<'a> Analyzer<'a> {
         })
     }
 
-    /// Resolves column pointed by `indetifier`.
+    /// Resolves column pointed by `identifier`.
     /// If more than one column matches `identifier` (meaning there are two tables with same column name
     /// and alises weren't used) then error is returned.
     fn resolve_column_identifier(
         &mut self,
         identifier: &IdentifierNode,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
-        for (table_name, tm) in &self.tables_context {
+        for (table_name, tm) in &self.statement_context.tables_metadata {
             let key = InsertedColumnRef {
                 column_name: identifier.value.clone(),
                 table_name: table_name.clone(),
@@ -415,11 +459,11 @@ impl<'a> Analyzer<'a> {
             // It should never happen, it can only happen in case of programmer mistake and
             // there is nothing else to do here than just panic.
             let resolved_table = self
-                .inserted_tables
-                .get(table_name)
+                .statement_context
+                .inserted_table(table_name)
                 .expect("table inserted to 'tables_context' but not to `inserted_tables`");
 
-            if let Some(already_inserted) = self.inserted_columns.get(&key) {
+            if let Some(already_inserted) = self.statement_context.inserted_column(&key) {
                 self.assert_column_not_ambigous(&identifier.value, *resolved_table)?;
 
                 return Ok(*already_inserted);
@@ -437,7 +481,8 @@ impl<'a> Analyzer<'a> {
                 let resolved_column_id = self
                     .resolved_tree
                     .add_node(ResolvedExpression::ColumnRef(resolved_column));
-                self.add_to_inserted_columns(key, resolved_column_id);
+                self.statement_context
+                    .insert_column(key, resolved_column_id);
                 return Ok(resolved_column_id);
             }
         }
@@ -451,7 +496,7 @@ impl<'a> Analyzer<'a> {
         &mut self,
         identifier: &IdentifierNode,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
-        if let Some(alread_inserted) = self.inserted_tables.get(&identifier.value) {
+        if let Some(alread_inserted) = self.statement_context.inserted_table(&identifier.value) {
             return Ok(*alread_inserted);
         }
         let table_name = identifier.value.clone();
@@ -463,8 +508,8 @@ impl<'a> Analyzer<'a> {
         let resolved_node_id = self
             .resolved_tree
             .add_node(ResolvedExpression::TableRef(resolved));
-        self.add_to_inserted_tables(&table_name, resolved_node_id);
-        self.add_to_tables_context(table_metadata, table_name);
+        self.statement_context
+            .add_new_table(table_name, table_metadata, resolved_node_id);
         Ok(resolved_node_id)
     }
 
@@ -481,18 +526,6 @@ impl<'a> Analyzer<'a> {
         Ok(self
             .resolved_tree
             .add_node(ResolvedExpression::Cast(resolved)))
-    }
-
-    fn add_to_tables_context(&mut self, table_metadata: TableMetadata, table_name: String) {
-        self.tables_context.insert(table_name, table_metadata);
-    }
-
-    fn add_to_inserted_tables(&mut self, table_name: impl Into<String>, id: ResolvedNodeId) {
-        self.inserted_tables.insert(table_name.into(), id);
-    }
-
-    fn add_to_inserted_columns(&mut self, key: InsertedColumnRef, id: ResolvedNodeId) {
-        self.inserted_columns.insert(key, id);
     }
 
     fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, AnalyzerError> {
@@ -597,14 +630,11 @@ impl<'a> Analyzer<'a> {
         column_identifier: &str,
         expected_table: ResolvedNodeId,
     ) -> Result<(), AnalyzerError> {
-        for (table_name, tm) in &self.tables_context {
+        for (table_name, tm) in &self.statement_context.tables_metadata {
             if tm.column(column_identifier).is_ok() {
-                // [`Analyzer::tables_context`] was out of sync with [`Analyzer::inserted_tables`].
-                // It should never happen, it can only happen in case of programmer mistake and
-                // there is nothing else to do here than just panic.
                 let table_id = self
-                    .inserted_tables
-                    .get(table_name)
+                    .statement_context
+                    .inserted_table(table_name)
                     .expect("table inserted to 'tables_context' but not to `inserted_tables`");
                 if *table_id != expected_table {
                     return Err(AnalyzerError::AmbigousColumn {
