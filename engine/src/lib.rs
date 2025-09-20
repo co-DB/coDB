@@ -4,3 +4,4 @@ mod data_types;
 pub mod files_manager;
 pub mod paged_file;
 pub mod record;
+mod slotted_page;

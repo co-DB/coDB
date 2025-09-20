@@ -193,6 +193,8 @@ pub enum Expression {
     FunctionCall(FunctionCallNode),
     Literal(LiteralNode),
     Identifier(IdentifierNode),
+    TableIdentifier(TableIdentifierNode),
+    ColumnIdentifier(ColumnIdentifierNode),
 }
 
 impl fmt::Display for Expression {
@@ -204,6 +206,8 @@ impl fmt::Display for Expression {
             Expression::FunctionCall(_) => write!(f, "FunctionCall"),
             Expression::Literal(_) => write!(f, "Literal"),
             Expression::Identifier(_) => write!(f, "Identifier"),
+            Expression::TableIdentifier(_) => write!(f, "TableIdentifier"),
+            Expression::ColumnIdentifier(_) => write!(f, "ColumnIdentifier"),
         }
     }
 }
@@ -242,6 +246,18 @@ pub struct LiteralNode {
 #[derive(Debug)]
 pub struct IdentifierNode {
     pub value: String,
+}
+
+#[derive(Debug)]
+pub struct TableIdentifierNode {
+    pub identifier: NodeId,
+    pub alias: Option<NodeId>,
+}
+
+#[derive(Debug)]
+pub struct ColumnIdentifierNode {
+    pub identifier: NodeId,
+    pub table_alias: Option<NodeId>,
 }
 
 #[cfg(test)]

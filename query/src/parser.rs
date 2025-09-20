@@ -179,14 +179,39 @@ impl Parser {
         Ok(self.ast.add_node(expression))
     }
 
-    /// Parses an identifier as an expression (e.g., column or table names).
+    /// Parses an identifier as an expression.
+    /// Tables cannot be used inside expressions, so it parses only columns and functions.
+    /// If after ident '(' is found it is assumed that identifier is function name.
+    /// Otherwise it's assumed to be column name and `ColumnIdentifierNode` is created (instead of `IdentifierNode`).
+    /// In case of column this function also parses potential alias, meaning it parses both `column` and `table.column`.
     fn parse_prefix_ident(&mut self) -> Result<NodeId, ParserError> {
-        if let TokenType::Ident(s) = &self.curr_token.token_type {
-            return Ok(self
-                .ast
-                .add_node(Expression::Identifier(IdentifierNode { value: s.clone() })));
+        let s = if let TokenType::Ident(s) = &self.curr_token.token_type {
+            s.clone()
+        } else {
+            return Err(self.unexpected_token_error("identifier"));
+        };
+        let is_function_name = self.peek_token.token_type == TokenType::LParen;
+        if is_function_name {
+            return Ok(self.add_identifier_node(s));
         }
-        Err(Self::unexpected_token_error(self, "identifier"))
+        let column_name = s;
+        let (table_alias, column_name) = match self.peek_token.token_type {
+            TokenType::Dot => {
+                let table_alias = column_name;
+                self.read_token()?;
+                let column_name = self.expect_ident()?;
+                (Some(table_alias), column_name)
+            }
+            _ => (None, column_name),
+        };
+        let column_name_id = self.add_identifier_node(column_name);
+        let table_alias_id = table_alias.map(|ta| self.add_identifier_node(ta));
+        return Ok(self
+            .ast
+            .add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+                identifier: column_name_id,
+                table_alias: table_alias_id,
+            })));
     }
 
     /// Parses an integer literal as an expression.
@@ -196,7 +221,7 @@ impl Parser {
                 value: Literal::Int(*s),
             })));
         }
-        Err(Self::unexpected_token_error(self, "integer"))
+        Err(self.unexpected_token_error("integer"))
     }
 
     /// Parses a floating-point literal.
@@ -206,7 +231,7 @@ impl Parser {
                 value: Literal::Float(*float),
             })));
         }
-        Err(Self::unexpected_token_error(self, "float"))
+        Err(self.unexpected_token_error("float"))
     }
 
     /// Parses a string literal.
@@ -216,7 +241,7 @@ impl Parser {
                 value: Literal::String(s.clone()),
             })));
         }
-        Err(Self::unexpected_token_error(self, "string"))
+        Err(self.unexpected_token_error("string"))
     }
 
     /// Parses a boolean literal (`true` or `false`).
@@ -230,7 +255,7 @@ impl Parser {
                 value: Literal::Bool(true),
             })));
         }
-        Err(Self::unexpected_token_error(self, "boolean"))
+        Err(self.unexpected_token_error("boolean"))
     }
 
     /// Parses an expression enclosed in parentheses: `( ... )`.
@@ -556,21 +581,54 @@ impl Parser {
         Ok(Some(self.parse_expression(Precedence::Lowest)?))
     }
 
-    /// Parses a table name as an identifier expression.
+    /// Parses a table name as a table identifier expression.
+    /// It handles aliases, meaning it parses both `table_name` and `table_name AS table_alias`.
     fn parse_table_name(&mut self) -> Result<NodeId, ParserError> {
         let table_name = self.expect_ident()?;
+
+        let table_alias = match self.peek_token.token_type {
+            TokenType::As => {
+                self.read_token()?;
+                Some(self.expect_ident()?)
+            }
+            _ => None,
+        };
+
+        let table_name_id = self.add_identifier_node(table_name);
+        let table_alias_id = table_alias.map(|ta| self.add_identifier_node(ta));
+
         let node_id = self
             .ast
-            .add_node(Expression::Identifier(IdentifierNode { value: table_name }));
+            .add_node(Expression::TableIdentifier(TableIdentifierNode {
+                identifier: table_name_id,
+                alias: table_alias_id,
+            }));
         Ok(node_id)
     }
 
-    /// Parses a column name as an identifier expression.
+    /// Parses a column name as a column identifier expression.
+    /// It handles aliases, meaning it parses both `column_name` and `table_alias.column_name`.
     fn parse_column_name(&mut self) -> Result<NodeId, ParserError> {
         let column_name = self.expect_ident()?;
-        let node_id = self.ast.add_node(Expression::Identifier(IdentifierNode {
-            value: column_name,
-        }));
+        let (table_alias, column_name) = match self.peek_token.token_type {
+            TokenType::Dot => {
+                let table_alias = column_name;
+                self.read_token()?;
+                let column_name = self.expect_ident()?;
+                (Some(table_alias), column_name)
+            }
+            _ => (None, column_name),
+        };
+
+        let column_name_id = self.add_identifier_node(column_name);
+        let table_alias_id = table_alias.map(|ta| self.add_identifier_node(ta));
+
+        let node_id = self
+            .ast
+            .add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+                identifier: column_name_id,
+                table_alias: table_alias_id,
+            }));
         Ok(node_id)
     }
 
@@ -780,11 +838,82 @@ impl Parser {
             column: self.peek_token.column,
         }
     }
+
+    /// Helper to add new identifier node to [`Parser::ast`].
+    fn add_identifier_node(&mut self, identifier: impl Into<String>) -> NodeId {
+        self.ast.add_node(Expression::Identifier(IdentifierNode {
+            value: identifier.into(),
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_table_identifier_node(
+        ast: &Ast,
+        node_id: NodeId,
+        expected_name: &str,
+        expected_alias: Option<&str>,
+    ) {
+        match ast.node(node_id) {
+            Expression::TableIdentifier(tbl) => {
+                match ast.node(tbl.identifier) {
+                    Expression::Identifier(ident) => {
+                        assert_eq!(ident.value, expected_name, "table name mismatch")
+                    }
+                    other => panic!("Expected Identifier for table name, got {other:?}"),
+                }
+                match (&tbl.alias, expected_alias) {
+                    (Some(alias_id), Some(expected)) => match ast.node(*alias_id) {
+                        Expression::Identifier(ident) => {
+                            assert_eq!(ident.value, expected, "table alias mismatch")
+                        }
+                        other => panic!("Expected Identifier for table alias, got {other:?}"),
+                    },
+                    (None, None) => {}
+                    (Some(_), None) => panic!("Unexpected table alias present"),
+                    (None, Some(expected)) => panic!("Expected table alias '{expected}' not found"),
+                }
+            }
+            other => panic!("Expected TableIdentifier node, got {other:?}"),
+        }
+    }
+
+    fn assert_column_identifier_node(
+        ast: &Ast,
+        node_id: NodeId,
+        expected_column: &str,
+        expected_table_alias: Option<&str>,
+    ) {
+        match ast.node(node_id) {
+            Expression::ColumnIdentifier(col) => {
+                match ast.node(col.identifier) {
+                    Expression::Identifier(ident) => {
+                        assert_eq!(ident.value, expected_column, "column name mismatch")
+                    }
+                    other => panic!("Expected Identifier for column name, got {other:?}"),
+                }
+                match (&col.table_alias, expected_table_alias) {
+                    (Some(alias_id), Some(expected)) => match ast.node(*alias_id) {
+                        Expression::Identifier(ident) => {
+                            assert_eq!(ident.value, expected, "column table alias mismatch")
+                        }
+                        other => {
+                            panic!("Expected Identifier for column table alias, got {other:?}")
+                        }
+                    },
+                    (None, None) => {}
+                    (Some(_), None) => panic!("Unexpected column table alias present"),
+                    (None, Some(expected)) => {
+                        panic!("Expected column table alias '{expected}' not found")
+                    }
+                }
+            }
+            other => panic!("Expected ColumnIdentifier node, got {other:?}"),
+        }
+    }
 
     #[test]
     fn returns_error_on_empty_input() {
@@ -810,13 +939,7 @@ mod tests {
         };
         assert!(select_stmt.where_clause.is_none());
 
-        let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(select_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "table_name");
+        assert_table_identifier_node(&ast, select_stmt.table_name, "table_name", None);
     }
 
     #[test]
@@ -830,18 +953,12 @@ mod tests {
         };
         assert!(delete_stmt.where_clause.is_none());
 
-        let Expression::Identifier(ident) = ast.node(delete_stmt.table_name) else {
-            panic!(
-                "Expected Identifier, got {:?}",
-                ast.node(delete_stmt.table_name)
-            );
-        };
-        assert_eq!(ident.value, "table_name");
+        assert_table_identifier_node(&ast, delete_stmt.table_name, "table_name", None);
     }
 
     #[test]
     fn parses_update_statement_correctly() {
-        let parser = Parser::new("UPDATE table_name SET col1 = 4, col2 = 6.1;");
+        let parser = Parser::new("UPDATE table_name AS tn SET col1 = 4, tn.col2 = 6.1;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -850,22 +967,13 @@ mod tests {
         };
         assert!(update_stmt.where_clause.is_none());
 
-        let Expression::Identifier(table_ident) = ast.node(update_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(update_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "table_name");
+        assert_table_identifier_node(&ast, update_stmt.table_name, "table_name", Some("tn"));
 
         assert_eq!(update_stmt.column_setters.len(), 2);
 
         let (col1_id, col1_val_id) = update_stmt.column_setters[0];
-        let Expression::Identifier(col1_ident) = ast.node(col1_id) else {
-            panic!("Expected Identifier for col1, got {:#?}", ast.node(col1_id));
-        };
-        assert_eq!(col1_ident.value, "col1");
 
+        assert_column_identifier_node(&ast, col1_id, "col1", None);
         let Expression::Literal(col1_literal) = ast.node(col1_val_id) else {
             panic!(
                 "Expected Literal for col1 value, got {:#?}",
@@ -881,11 +989,8 @@ mod tests {
         assert_eq!(i, 4);
 
         let (col2_id, col2_val_id) = update_stmt.column_setters[1];
-        let Expression::Identifier(col2_ident) = ast.node(col2_id) else {
-            panic!("Expected Identifier for col2, got {:#?}", ast.node(col2_id));
-        };
-        assert_eq!(col2_ident.value, "col2");
 
+        assert_column_identifier_node(&ast, col2_id, "col2", Some("tn"));
         let Expression::Literal(col2_literal) = ast.node(col2_val_id) else {
             panic!(
                 "Expected Literal for col2 value, got {:#?}",
@@ -911,32 +1016,14 @@ mod tests {
             panic!("Expected Insert statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(insert_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(insert_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "table_name");
+        assert_table_identifier_node(&ast, insert_stmt.table_name, "table_name", None);
 
         let column_ids = insert_stmt.columns.as_ref().unwrap();
         assert_eq!(column_ids.len(), 2);
 
-        let Expression::Identifier(col1_ident) = ast.node(column_ids[0]) else {
-            panic!(
-                "Expected Identifier for col1, got {:#?}",
-                ast.node(column_ids[0])
-            );
-        };
-        assert_eq!(col1_ident.value, "col1");
+        assert_column_identifier_node(&ast, column_ids[0], "col1", None);
 
-        let Expression::Identifier(col2_ident) = ast.node(column_ids[1]) else {
-            panic!(
-                "Expected Identifier for col2, got {:#?}",
-                ast.node(column_ids[1])
-            );
-        };
-        assert_eq!(col2_ident.value, "col2");
+        assert_column_identifier_node(&ast, column_ids[1], "col2", None);
 
         let Expression::Literal(val1) = ast.node(insert_stmt.values[0]) else {
             panic!(
@@ -963,7 +1050,7 @@ mod tests {
 
     #[test]
     fn parses_select_with_complex_where_clause() {
-        let parser = Parser::new("SELECT * FROM table_name WHERE a + 3 * b > 10;");
+        let parser = Parser::new("SELECT * FROM table_name AS tn WHERE tnA.a + 3 * tnB.b > 10;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -971,10 +1058,7 @@ mod tests {
             panic!("Expected Select statement, got {:?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(select_stmt.table_name) else {
-            panic!("Expected Identifier for table name");
-        };
-        assert_eq!(table_ident.value, "table_name");
+        assert_table_identifier_node(&ast, select_stmt.table_name, "table_name", Some("tn"));
 
         let where_id = select_stmt.where_clause.expect("Expected WHERE clause");
 
@@ -988,10 +1072,7 @@ mod tests {
         };
         assert!(matches!(add_expr.op, BinaryOperator::Plus));
 
-        let Expression::Identifier(a_ident) = ast.node(add_expr.left_id) else {
-            panic!("Expected Identifier on left of Plus");
-        };
-        assert_eq!(a_ident.value, "a");
+        assert_column_identifier_node(&ast, add_expr.left_id, "a", Some("tnA"));
 
         let Expression::Binary(mul_expr) = ast.node(add_expr.right_id) else {
             panic!("Expected Binary expression (Star) on right of Plus");
@@ -1003,10 +1084,7 @@ mod tests {
         };
         assert!(matches!(lit_three.value, Literal::Int(3)));
 
-        let Expression::Identifier(b_ident) = ast.node(mul_expr.right_id) else {
-            panic!("Expected Identifier on right of Star");
-        };
-        assert_eq!(b_ident.value, "b");
+        assert_column_identifier_node(&ast, mul_expr.right_id, "b", Some("tnB"));
 
         let Expression::Literal(lit_ten) = ast.node(where_binary.right_id) else {
             panic!("Expected Literal on right of Greater");
@@ -1024,6 +1102,8 @@ mod tests {
         let Statement::Select(select_stmt) = &ast.statements[0] else {
             panic!("Expected SELECT statement, got {:?}", ast.statements[0]);
         };
+
+        assert_table_identifier_node(&ast, select_stmt.table_name, "table_name", None);
 
         let where_id = select_stmt.where_clause.expect("Expected WHERE clause");
         let root_expr = ast.node(where_id);
@@ -1082,10 +1162,7 @@ mod tests {
         }
 
         assert_eq!(func_call.argument_ids.len(), 1);
-        match ast.node(func_call.argument_ids[0]) {
-            Expression::Identifier(ident) => assert_eq!(ident.value, "name"),
-            other => panic!("Expected identifier for function argument, got {other:?}"),
-        }
+        assert_column_identifier_node(&ast, func_call.argument_ids[0], "name", None);
     }
 
     #[test]
@@ -1099,6 +1176,9 @@ mod tests {
         let Statement::Select(select_stmt) = &ast.statements[0] else {
             panic!("Expected Select statement, got {:?}", ast.statements[0]);
         };
+
+        assert_table_identifier_node(&ast, select_stmt.table_name, "products", None);
+
         assert!(select_stmt.where_clause.is_some());
 
         let where_id = select_stmt.where_clause.unwrap();
@@ -1135,13 +1215,7 @@ mod tests {
         };
         assert!(matches!(unary_expr.op, UnaryOperator::Minus));
 
-        let Expression::Identifier(price_ident) = ast.node(unary_expr.expression_id) else {
-            panic!(
-                "Expected Identifier inside unary, got {:?}",
-                ast.node(unary_expr.expression_id)
-            );
-        };
-        assert_eq!(price_ident.value, "price");
+        assert_column_identifier_node(&ast, unary_expr.expression_id, "price", None);
 
         let Expression::FunctionCall(func_node) = ast.node(add_expr.right_id) else {
             panic!(
@@ -1158,13 +1232,7 @@ mod tests {
         assert_eq!(func_ident.value, "Length");
 
         let arg_id = func_node.argument_ids[0];
-        let Expression::Identifier(arg) = ast.node(arg_id) else {
-            panic!(
-                "Expected Identifier as function argument, got {:?}",
-                ast.node(arg_id)
-            );
-        };
-        assert_eq!(arg.value, "name");
+        assert_column_identifier_node(&ast, arg_id, "name", None);
 
         let Expression::Literal(literal_node) = ast.node(mul_expr.right_id) else {
             panic!(
@@ -1221,35 +1289,17 @@ mod tests {
             panic!("Expected Create statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(create_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(create_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "users");
+        assert_table_identifier_node(&ast, create_stmt.table_name, "users", None);
 
         assert_eq!(create_stmt.columns.len(), 2);
 
         let col0 = &create_stmt.columns[0];
-        let Expression::Identifier(col0_ident) = ast.node(col0.name) else {
-            panic!(
-                "Expected Identifier for first column, got {:#?}",
-                ast.node(col0.name)
-            );
-        };
-        assert_eq!(col0_ident.value, "id");
+        assert_column_identifier_node(&ast, col0.name, "id", None);
         assert!(matches!(col0.ty, Type::I64));
         assert!(matches!(col0.addon, CreateColumnAddon::PrimaryKey));
 
         let col1 = &create_stmt.columns[1];
-        let Expression::Identifier(col1_ident) = ast.node(col1.name) else {
-            panic!(
-                "Expected Identifier for second column, got {:#?}",
-                ast.node(col1.name)
-            );
-        };
-        assert_eq!(col1_ident.value, "name");
+        assert_column_identifier_node(&ast, col1.name, "name", None);
         assert!(matches!(col1.ty, Type::String));
         assert!(matches!(col1.addon, CreateColumnAddon::None));
     }
@@ -1264,23 +1314,11 @@ mod tests {
             panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(alter_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "users");
+        assert_table_identifier_node(&ast, alter_stmt.table_name, "users", None);
 
         match &alter_stmt.action {
             AlterAction::Add(add) => {
-                let Expression::Identifier(col_ident) = ast.node(add.column_name) else {
-                    panic!(
-                        "Expected Identifier for added column, got {:#?}",
-                        ast.node(add.column_name)
-                    );
-                };
-                assert_eq!(col_ident.value, "age");
+                assert_column_identifier_node(&ast, add.column_name, "age", None);
                 assert!(matches!(add.column_type, Type::I32));
             }
             other => panic!("Expected Add action, got {:#?}", other),
@@ -1297,31 +1335,12 @@ mod tests {
             panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(alter_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "users");
+        assert_table_identifier_node(&ast, alter_stmt.table_name, "users", None);
 
         match &alter_stmt.action {
             AlterAction::RenameColumn(rename) => {
-                let Expression::Identifier(prev_ident) = ast.node(rename.previous_name) else {
-                    panic!(
-                        "Expected Identifier for previous column name, got {:#?}",
-                        ast.node(rename.previous_name)
-                    );
-                };
-                assert_eq!(prev_ident.value, "old_name");
-
-                let Expression::Identifier(new_ident) = ast.node(rename.new_name) else {
-                    panic!(
-                        "Expected Identifier for new column name, got {:#?}",
-                        ast.node(rename.new_name)
-                    );
-                };
-                assert_eq!(new_ident.value, "new_name");
+                assert_column_identifier_node(&ast, rename.previous_name, "old_name", None);
+                assert_column_identifier_node(&ast, rename.new_name, "new_name", None);
             }
             other => panic!("Expected Rename action, got {:#?}", other),
         }
@@ -1337,23 +1356,11 @@ mod tests {
             panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(alter_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "users");
+        assert_table_identifier_node(&ast, alter_stmt.table_name, "users", None);
 
         match &alter_stmt.action {
             AlterAction::RenameTable(rename) => {
-                let Expression::Identifier(new_ident) = ast.node(rename.new_name) else {
-                    panic!(
-                        "Expected Identifier for new table name, got {:#?}",
-                        ast.node(rename.new_name)
-                    );
-                };
-                assert_eq!(new_ident.value, "new_users");
+                assert_table_identifier_node(&ast, rename.new_name, "new_users", None);
             }
             other => panic!("Expected Rename action, got {:#?}", other),
         }
@@ -1369,23 +1376,11 @@ mod tests {
             panic!("Expected Alter statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(alter_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(alter_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "users");
+        assert_table_identifier_node(&ast, alter_stmt.table_name, "users", None);
 
         match &alter_stmt.action {
             AlterAction::Drop(drop) => {
-                let Expression::Identifier(col_ident) = ast.node(drop.column_name) else {
-                    panic!(
-                        "Expected Identifier for dropped column, got {:#?}",
-                        ast.node(drop.column_name)
-                    );
-                };
-                assert_eq!(col_ident.value, "age");
+                assert_column_identifier_node(&ast, drop.column_name, "age", None);
             }
             other => panic!("Expected Drop action, got {:#?}", other),
         }
@@ -1401,13 +1396,7 @@ mod tests {
             panic!("Expected Truncate statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(trunc_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(trunc_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "sessions");
+        assert_table_identifier_node(&ast, trunc_stmt.table_name, "sessions", None);
     }
 
     #[test]
@@ -1420,12 +1409,6 @@ mod tests {
             panic!("Expected Drop statement, got {:#?}", ast.statements[0]);
         };
 
-        let Expression::Identifier(table_ident) = ast.node(drop_stmt.table_name) else {
-            panic!(
-                "Expected Identifier for table, got {:#?}",
-                ast.node(drop_stmt.table_name)
-            );
-        };
-        assert_eq!(table_ident.value, "sessions");
+        assert_table_identifier_node(&ast, drop_stmt.table_name, "sessions", None);
     }
 }

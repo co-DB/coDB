@@ -56,6 +56,8 @@ pub enum TokenType {
     StringType,
     DateType,
     DateTimeType,
+    As,
+    Dot,
 }
 
 impl TokenType {
@@ -143,6 +145,8 @@ impl fmt::Display for TokenType {
             TokenType::StringType => write!(f, "STRING"),
             TokenType::DateType => write!(f, "DATE"),
             TokenType::DateTimeType => write!(f, "DATETIME"),
+            TokenType::As => write!(f, "AS"),
+            TokenType::Dot => write!(f, "."),
         }
     }
 }
