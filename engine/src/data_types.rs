@@ -1,4 +1,133 @@
-﻿use time::{Date, Duration, PrimitiveDateTime, Time};
+﻿use crate::record::{Field, RecordError};
+use thiserror::Error;
+use time::{Date, Duration, PrimitiveDateTime, Time};
+
+/// A trait for types that can be serialized to and deserialized from bytes
+/// for database storage.
+pub(crate) trait DbSerializable {
+    /// Serializes the value into the provided buffer.
+    fn serialize(&self, buffer: &mut Vec<u8>);
+
+    /// Deserializes a value from the given byte slice.
+    ///
+    /// Returns a tuple containing the deserialized value and a slice
+    /// of the remaining unconsumed bytes.
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError>;
+
+    /// Helper function to read a fixed number of bytes and convert them to a value.
+    fn read_fixed_and_convert<T, const N: usize>(
+        buffer: &[u8],
+        convert: fn([u8; N]) -> T,
+    ) -> Result<(T, &[u8]), DbSerializationError> {
+        if buffer.len() < N {
+            return Err(DbSerializationError::UnexpectedEnd {
+                expected: N,
+                actual: buffer.len(),
+            });
+        }
+        let arr: [u8; N] = buffer[..N].try_into().unwrap();
+        Ok((convert(arr), &buffer[N..]))
+    }
+}
+
+#[derive(Error, Debug)]
+pub(crate) enum DbSerializationError {
+    #[error("expected to read {expected} bytes, but only {actual} were left in the buffer")]
+    UnexpectedEnd { expected: usize, actual: usize },
+    #[error("failed to deserialize")]
+    FailedToDeserialize,
+}
+
+impl DbSerializable for i32 {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.extend(self.to_le_bytes());
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        DbSerializable::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
+            buffer,
+            i32::from_le_bytes,
+        )
+    }
+}
+
+impl DbSerializable for i64 {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.extend(self.to_le_bytes());
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        DbSerializable::read_fixed_and_convert::<i64, { size_of::<i64>() }>(
+            buffer,
+            i64::from_le_bytes,
+        )
+    }
+}
+
+impl DbSerializable for f32 {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.extend(self.to_le_bytes());
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        DbSerializable::read_fixed_and_convert::<f32, { size_of::<f32>() }>(
+            buffer,
+            f32::from_le_bytes,
+        )
+    }
+}
+
+impl DbSerializable for f64 {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.extend(self.to_le_bytes());
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        DbSerializable::read_fixed_and_convert::<f64, { size_of::<f64>() }>(
+            buffer,
+            f64::from_le_bytes,
+        )
+    }
+}
+
+impl DbSerializable for String {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.extend((self.len() as u16).to_le_bytes());
+        buffer.extend(self.as_bytes());
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        let (len, rest) =
+            Self::read_fixed_and_convert::<u16, { size_of::<u16>() }>(buffer, u16::from_le_bytes)?;
+        let string_len = len as usize;
+        if rest.len() < string_len {
+            return Err(DbSerializationError::UnexpectedEnd {
+                expected: string_len,
+                actual: rest.len(),
+            });
+        }
+        let string_bytes = &rest[..string_len];
+        let string = std::str::from_utf8(string_bytes)
+            .map_err(|_| DbSerializationError::FailedToDeserialize)?
+            .into();
+        Ok((string, &rest[string_len..]))
+    }
+}
+
+impl DbSerializable for bool {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.push(*self as u8)
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        DbSerializable::read_fixed_and_convert::<u8, { size_of::<u8>() }>(buffer, |bytes| bytes[0])
+            .and_then(|(val, rest)| match val {
+                0 => Ok((false, rest)),
+                1 => Ok((true, rest)),
+                _ => Err(DbSerializationError::FailedToDeserialize),
+            })
+    }
+}
 
 // 1970-01-01 - the date we measure our date against.
 const EPOCH_DATE: Date = match Date::from_ordinal_date(1970, 1) {
@@ -33,6 +162,20 @@ impl DbDate {
 
     pub fn days_since_epoch(&self) -> i32 {
         self.days_since_epoch
+    }
+}
+
+impl DbSerializable for DbDate {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.extend(self.days_since_epoch().to_le_bytes());
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        DbSerializable::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
+            buffer,
+            i32::from_le_bytes,
+        )
+        .map(|(val, rest)| (DbDate::new(val), rest))
     }
 }
 
@@ -107,6 +250,21 @@ impl DbDateTime {
 
     pub fn millisecond(&self) -> u16 {
         (self.milliseconds_since_midnight % 1000) as u16
+    }
+}
+
+impl DbSerializable for DbDateTime {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        buffer.extend(self.days_since_epoch().to_le_bytes());
+        buffer.extend(self.milliseconds_since_midnight().to_le_bytes());
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        let (days, rest) =
+            Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(buffer, i32::from_le_bytes)?;
+        let (milliseconds, rest) =
+            Self::read_fixed_and_convert::<u32, { size_of::<u32>() }>(rest, u32::from_le_bytes)?;
+        Ok((DbDateTime::new(DbDate::new(days), milliseconds), rest))
     }
 }
 
