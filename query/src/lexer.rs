@@ -115,6 +115,7 @@ impl Lexer {
             "string" => self.create_token(TokenType::StringType),
             "date" => self.create_token(TokenType::DateType),
             "datetime" => self.create_token(TokenType::DateTimeType),
+            "as" => self.create_token(TokenType::As),
             _ => self.create_token(TokenType::Ident(ident)),
         }
     }
@@ -250,10 +251,7 @@ impl Lexer {
             },
             '.' => match self.peek_char() {
                 peak_ch if peak_ch.is_ascii_digit() => self.read_numeric(),
-                _ => self.create_token(TokenType::Illegal(format!(
-                    "unrecognized character: '{}'",
-                    self.ch
-                ))),
+                _ => self.create_token(TokenType::Dot),
             },
             '+' => self.create_token(TokenType::Plus),
             '-' => self.create_token(TokenType::Minus),
@@ -538,7 +536,7 @@ mod tests {
             TokenType::Float(456.789),
             TokenType::Float(999.),
             TokenType::Float(0.123),
-            TokenType::Illegal(String::from("unrecognized character: '.'")),
+            TokenType::Dot,
             TokenType::From,
             TokenType::Ident(String::from("users")),
             TokenType::Semicolon,
@@ -640,6 +638,36 @@ mod tests {
             TokenType::Ident("example".into()),
             TokenType::Semicolon,
             TokenType::EOF,
+        ];
+
+        let mut lexer = Lexer::new(input);
+
+        assert_works(&mut lexer, &expected_tokens);
+    }
+
+    #[test]
+    fn test_select_with_alias() {
+        let input = "SELECT u.id, u.age FROM users AS u WHERE u.id = 200";
+
+        let expected_tokens = [
+            TokenType::Select,
+            TokenType::Ident("u".into()),
+            TokenType::Dot,
+            TokenType::Ident("id".into()),
+            TokenType::Comma,
+            TokenType::Ident("u".into()),
+            TokenType::Dot,
+            TokenType::Ident("age".into()),
+            TokenType::From,
+            TokenType::Ident("users".into()),
+            TokenType::As,
+            TokenType::Ident("u".into()),
+            TokenType::Where,
+            TokenType::Ident("u".into()),
+            TokenType::Dot,
+            TokenType::Ident("id".into()),
+            TokenType::Equal,
+            TokenType::Int(200),
         ];
 
         let mut lexer = Lexer::new(input);
