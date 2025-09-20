@@ -188,7 +188,7 @@ impl Parser {
         let s = if let TokenType::Ident(s) = &self.curr_token.token_type {
             s.clone()
         } else {
-            return Err(Self::unexpected_token_error(self, "identifier"));
+            return Err(self.unexpected_token_error("identifier"));
         };
         let is_function_name = self.peek_token.token_type == TokenType::LParen;
         if is_function_name {
@@ -221,7 +221,7 @@ impl Parser {
                 value: Literal::Int(*s),
             })));
         }
-        Err(Self::unexpected_token_error(self, "integer"))
+        Err(self.unexpected_token_error("integer"))
     }
 
     /// Parses a floating-point literal.
@@ -231,7 +231,7 @@ impl Parser {
                 value: Literal::Float(*float),
             })));
         }
-        Err(Self::unexpected_token_error(self, "float"))
+        Err(self.unexpected_token_error("float"))
     }
 
     /// Parses a string literal.
@@ -241,7 +241,7 @@ impl Parser {
                 value: Literal::String(s.clone()),
             })));
         }
-        Err(Self::unexpected_token_error(self, "string"))
+        Err(self.unexpected_token_error("string"))
     }
 
     /// Parses a boolean literal (`true` or `false`).
@@ -255,7 +255,7 @@ impl Parser {
                 value: Literal::Bool(true),
             })));
         }
-        Err(Self::unexpected_token_error(self, "boolean"))
+        Err(self.unexpected_token_error("boolean"))
     }
 
     /// Parses an expression enclosed in parentheses: `( ... )`.
