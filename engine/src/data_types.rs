@@ -4,7 +4,7 @@ use time::{Date, Duration, PrimitiveDateTime, Time};
 
 /// A trait for types that can be serialized to and deserialized from bytes
 /// for database storage.
-pub(crate) trait DbSerializable {
+pub(crate) trait DbSerializable: Sized {
     /// Serializes the value into the provided buffer.
     fn serialize(&self, buffer: &mut Vec<u8>);
 
@@ -44,10 +44,7 @@ impl DbSerializable for i32 {
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        DbSerializable::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
-            buffer,
-            i32::from_le_bytes,
-        )
+        Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(buffer, i32::from_le_bytes)
     }
 }
 
@@ -57,10 +54,7 @@ impl DbSerializable for i64 {
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        DbSerializable::read_fixed_and_convert::<i64, { size_of::<i64>() }>(
-            buffer,
-            i64::from_le_bytes,
-        )
+        Self::read_fixed_and_convert::<i64, { size_of::<i64>() }>(buffer, i64::from_le_bytes)
     }
 }
 
@@ -70,10 +64,7 @@ impl DbSerializable for f32 {
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        DbSerializable::read_fixed_and_convert::<f32, { size_of::<f32>() }>(
-            buffer,
-            f32::from_le_bytes,
-        )
+        Self::read_fixed_and_convert::<f32, { size_of::<f32>() }>(buffer, f32::from_le_bytes)
     }
 }
 
@@ -83,10 +74,7 @@ impl DbSerializable for f64 {
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        DbSerializable::read_fixed_and_convert::<f64, { size_of::<f64>() }>(
-            buffer,
-            f64::from_le_bytes,
-        )
+        Self::read_fixed_and_convert::<f64, { size_of::<f64>() }>(buffer, f64::from_le_bytes)
     }
 }
 
@@ -120,12 +108,13 @@ impl DbSerializable for bool {
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        DbSerializable::read_fixed_and_convert::<u8, { size_of::<u8>() }>(buffer, |bytes| bytes[0])
-            .and_then(|(val, rest)| match val {
+        Self::read_fixed_and_convert::<u8, { size_of::<u8>() }>(buffer, |bytes| bytes[0]).and_then(
+            |(val, rest)| match val {
                 0 => Ok((false, rest)),
                 1 => Ok((true, rest)),
                 _ => Err(DbSerializationError::FailedToDeserialize),
-            })
+            },
+        )
     }
 }
 
@@ -171,11 +160,8 @@ impl DbSerializable for DbDate {
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        DbSerializable::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
-            buffer,
-            i32::from_le_bytes,
-        )
-        .map(|(val, rest)| (DbDate::new(val), rest))
+        Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(buffer, i32::from_le_bytes)
+            .map(|(val, rest)| (DbDate::new(val), rest))
     }
 }
 
