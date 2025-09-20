@@ -56,46 +56,6 @@ pub(crate) enum DbSerializationError {
     FailedToDeserialize,
 }
 
-// impl DbSerializable for i32 {
-//     fn serialize(&self, buffer: &mut Vec<u8>) {
-//         buffer.extend(self.to_le_bytes());
-//     }
-//
-//     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-//         Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(buffer, i32::from_le_bytes)
-//     }
-// }
-//
-// impl DbSerializable for i64 {
-//     fn serialize(&self, buffer: &mut Vec<u8>) {
-//         buffer.extend(self.to_le_bytes());
-//     }
-//
-//     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-//         Self::read_fixed_and_convert::<i64, { size_of::<i64>() }>(buffer, i64::from_le_bytes)
-//     }
-// }
-//
-// impl DbSerializable for f32 {
-//     fn serialize(&self, buffer: &mut Vec<u8>) {
-//         buffer.extend(self.to_le_bytes());
-//     }
-//
-//     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-//         Self::read_fixed_and_convert::<f32, { size_of::<f32>() }>(buffer, f32::from_le_bytes)
-//     }
-// }
-//
-// impl DbSerializable for f64 {
-//     fn serialize(&self, buffer: &mut Vec<u8>) {
-//         buffer.extend(self.to_le_bytes());
-//     }
-//
-//     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-//         Self::read_fixed_and_convert::<f64, { size_of::<f64>() }>(buffer, f64::from_le_bytes)
-//     }
-// }
-
 impl DbSerializable for String {
     fn serialize(&self, buffer: &mut Vec<u8>) {
         buffer.extend((self.len() as u16).to_le_bytes());
