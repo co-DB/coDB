@@ -1,4 +1,4 @@
-﻿use crate::data_types::{DbDate, DbDateTime};
+﻿use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
 
 use metadata::{catalog::ColumnMetadata, types::Type};
 use thiserror::Error;
@@ -16,6 +16,25 @@ pub(crate) enum RecordError {
     },
     #[error("failed to deserialize field {field_name}")]
     FailedToDeserialize { field_name: String },
+}
+
+impl RecordError {
+    /// Returns a mapped serialization error that now includes the name of the field being (de)serialized.
+    fn map_serialization_error(
+        db_serialization_error: DbSerializationError,
+        field_name: &str,
+    ) -> Self {
+        match db_serialization_error {
+            DbSerializationError::UnexpectedEnd { expected, actual } => Self::UnexpectedEnd {
+                field_name: field_name.to_string(),
+                expected,
+                actual,
+            },
+            DbSerializationError::FailedToDeserialize => Self::FailedToDeserialize {
+                field_name: field_name.to_string(),
+            },
+        }
+    }
 }
 
 /// Represents a database record containing multiple typed fields.
@@ -87,21 +106,31 @@ impl Field {
     /// All numeric types use little-endian byte ordering.
     fn serialize(self, buffer: &mut Vec<u8>) {
         match self {
-            Field::Int32(i) => buffer.extend(i.to_le_bytes()),
-            Field::Int64(i) => buffer.extend(i.to_le_bytes()),
-            Field::Float32(f) => buffer.extend(f.to_le_bytes()),
-            Field::Float64(f) => buffer.extend(f.to_le_bytes()),
-            Field::DateTime(d) => {
-                buffer.extend(d.days_since_epoch().to_le_bytes());
-                buffer.extend(d.milliseconds_since_midnight().to_le_bytes());
-            }
-            Field::Date(d) => buffer.extend(d.days_since_epoch().to_le_bytes()),
-            Field::String(s) => {
-                buffer.extend((s.len() as u16).to_le_bytes());
-                buffer.extend(s.as_bytes());
-            }
-            Field::Bool(b) => buffer.push(b as u8),
+            Field::Int32(i) => i.serialize(buffer),
+            Field::Int64(i) => i.serialize(buffer),
+            Field::Float32(f) => f.serialize(buffer),
+            Field::Float64(f) => f.serialize(buffer),
+            Field::DateTime(d) => d.serialize(buffer),
+            Field::Date(d) => d.serialize(buffer),
+            Field::String(s) => s.serialize(buffer),
+            Field::Bool(b) => b.serialize(buffer),
         }
+    }
+
+    /// Deserializes raw data type, wraps it into the corresponding field and maps the error to the
+    /// field error type (adding the name of the field we are deserializing)
+    fn deserialize_and_wrap<'a, T, F>(
+        buffer: &'a [u8],
+        constructor: F,
+        name: &str,
+    ) -> Result<(Field, &'a [u8]), RecordError>
+    where
+        T: DbSerializable,
+        F: FnOnce(T) -> Field,
+    {
+        T::deserialize(buffer)
+            .map(|(val, rest)| (constructor(val), rest))
+            .map_err(|err| RecordError::map_serialization_error(err, name))
     }
 
     /// Deserializes a field from bytes using the provided column metadata.
@@ -113,104 +142,15 @@ impl Field {
         name: &str,
     ) -> Result<(Self, &'a [u8]), RecordError> {
         match column_type {
-            Type::Bool => Self::read_fixed_and_convert::<u8, { size_of::<u8>() }>(
-                buffer,
-                |bytes| bytes[0],
-                name,
-            )
-            .and_then(|(val, rest)| match val {
-                0 => Ok((Field::Bool(false), rest)),
-                1 => Ok((Field::Bool(true), rest)),
-                _ => Err(RecordError::FailedToDeserialize {
-                    field_name: name.into(),
-                }),
-            }),
-            Type::I32 => Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
-                buffer,
-                i32::from_le_bytes,
-                name,
-            )
-            .map(|(val, rest)| (Field::Int32(val), rest)),
-            Type::I64 => Self::read_fixed_and_convert::<i64, { size_of::<i64>() }>(
-                buffer,
-                i64::from_le_bytes,
-                name,
-            )
-            .map(|(val, rest)| (Field::Int64(val), rest)),
-            Type::F32 => Self::read_fixed_and_convert::<f32, { size_of::<f32>() }>(
-                buffer,
-                f32::from_le_bytes,
-                name,
-            )
-            .map(|(val, rest)| (Field::Float32(val), rest)),
-            Type::F64 => Self::read_fixed_and_convert::<f64, { size_of::<f64>() }>(
-                buffer,
-                f64::from_le_bytes,
-                name,
-            )
-            .map(|(val, rest)| (Field::Float64(val), rest)),
-            Type::Date => Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
-                buffer,
-                i32::from_le_bytes,
-                name,
-            )
-            .map(|(val, rest)| (Field::Date(DbDate::new(val)), rest)),
-            Type::DateTime => {
-                let (days, rest) = Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(
-                    buffer,
-                    i32::from_le_bytes,
-                    name,
-                )?;
-                let (milliseconds, rest) = Self::read_fixed_and_convert::<u32, { size_of::<u32>() }>(
-                    rest,
-                    u32::from_le_bytes,
-                    name,
-                )?;
-                Ok((
-                    Field::DateTime(DbDateTime::new(DbDate::new(days), milliseconds)),
-                    rest,
-                ))
-            }
-            Type::String => {
-                let (len, rest) = Self::read_fixed_and_convert::<u16, { size_of::<u16>() }>(
-                    buffer,
-                    u16::from_le_bytes,
-                    name,
-                )?;
-                let string_len = len as usize;
-                if rest.len() < string_len {
-                    return Err(RecordError::UnexpectedEnd {
-                        field_name: name.into(),
-                        expected: string_len,
-                        actual: rest.len(),
-                    });
-                }
-                let string_bytes = &rest[..string_len];
-                let string = std::str::from_utf8(string_bytes)
-                    .map_err(|_| RecordError::FailedToDeserialize {
-                        field_name: name.into(),
-                    })?
-                    .into();
-                Ok((Field::String(string), &rest[string_len..]))
-            }
+            Type::Bool => Self::deserialize_and_wrap(buffer, Field::Bool, name),
+            Type::I32 => Self::deserialize_and_wrap(buffer, Field::Int32, name),
+            Type::I64 => Self::deserialize_and_wrap(buffer, Field::Int64, name),
+            Type::F32 => Self::deserialize_and_wrap(buffer, Field::Float32, name),
+            Type::F64 => Self::deserialize_and_wrap(buffer, Field::Float64, name),
+            Type::Date => Self::deserialize_and_wrap(buffer, Field::Date, name),
+            Type::DateTime => Self::deserialize_and_wrap(buffer, Field::DateTime, name),
+            Type::String => Self::deserialize_and_wrap(buffer, Field::String, name),
         }
-    }
-
-    /// Helper function to read a fixed number of bytes and convert them to a value.
-    fn read_fixed_and_convert<'a, T, const N: usize>(
-        buffer: &'a [u8],
-        convert: fn([u8; N]) -> T,
-        field_name: &str,
-    ) -> Result<(T, &'a [u8]), RecordError> {
-        if buffer.len() < N {
-            return Err(RecordError::UnexpectedEnd {
-                field_name: field_name.to_owned(),
-                expected: N,
-                actual: buffer.len(),
-            });
-        }
-        let arr: [u8; N] = buffer[..N].try_into().unwrap();
-        Ok((convert(arr), &buffer[N..]))
     }
 }
 
