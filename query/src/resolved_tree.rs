@@ -1,3 +1,5 @@
+use std::fmt;
+
 use metadata::types::Type;
 use time::{Date, PrimitiveDateTime};
 
@@ -11,30 +13,38 @@ pub(crate) struct ResolvedTree {
 }
 
 impl ResolvedTree {
+    /// Adds node to [`ResolvedTree`] and returns its [`ResolvedNodeId`].
     pub(crate) fn add_node(&mut self, node: ResolvedExpression) -> ResolvedNodeId {
         self.nodes.push(node);
         ResolvedNodeId::new(self.nodes.len() - 1)
     }
 
+    /// Adds statement to [`ResolvedTree`] and returns its [`ResolvedNodeId`].
     pub(crate) fn add_statement(&mut self, statement: ResolvedStatement) -> ResolvedNodeId {
         self.statements.push(statement);
         ResolvedNodeId::new(self.statements.len() - 1)
     }
 
+    /// Returns node with `node_id`.
     pub(crate) fn node(&self, id: ResolvedNodeId) -> &ResolvedExpression {
         &self.nodes[id.0]
     }
 
+    /// Returns statement with `node_id`.
     pub(crate) fn statement(&self, id: ResolvedNodeId) -> &ResolvedStatement {
         &self.statements[id.0]
     }
 
+    /// Returns all statements.
     pub(crate) fn statements(&self) -> &[ResolvedStatement] {
         &self.statements
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// [`ResolvedNodeId`] is used for indexing nodes and statements inside [`ResolvedTree`].
+///
+/// Works similiary to [`NodeId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedNodeId(usize);
 
 impl ResolvedNodeId {
@@ -63,6 +73,7 @@ pub(crate) enum ResolvedExpression {
     Logical(ResolvedLogicalExpression),
     Binary(ResolvedBinaryExpression),
     Unary(ResolvedUnaryExpression),
+    Cast(ResolvedCast),
     Literal(ResolvedLiteral),
 }
 
@@ -74,8 +85,10 @@ pub(crate) struct ResolvedTable {
 
 #[derive(Debug)]
 pub(crate) struct ResolvedColumn {
+    pub(crate) table: ResolvedNodeId,
     pub(crate) name: String,
     pub(crate) ty: Type,
+    pub(crate) pos: u16,
 }
 
 #[derive(Debug)]
@@ -108,6 +121,12 @@ pub(crate) struct ResolvedUnaryExpression {
 }
 
 #[derive(Debug)]
+pub(crate) struct ResolvedCast {
+    pub(crate) child: ResolvedNodeId,
+    pub(crate) new_ty: Type,
+}
+
+#[derive(Debug)]
 pub(crate) enum ResolvedLiteral {
     String(String),
     Float32(f32),
@@ -117,4 +136,61 @@ pub(crate) enum ResolvedLiteral {
     Bool(bool),
     Date(Date),
     DateTime(PrimitiveDateTime),
+}
+
+/// User for one-to-one mapping between [`ResolvedLiteral`] and [`Type`].
+impl From<&ResolvedLiteral> for Type {
+    fn from(value: &ResolvedLiteral) -> Self {
+        match value {
+            ResolvedLiteral::String(_) => Type::String,
+            ResolvedLiteral::Float32(_) => Type::F32,
+            ResolvedLiteral::Float64(_) => Type::F64,
+            ResolvedLiteral::Int32(_) => Type::I32,
+            ResolvedLiteral::Int64(_) => Type::I64,
+            ResolvedLiteral::Bool(_) => Type::Bool,
+            ResolvedLiteral::Date(_) => Type::Date,
+            ResolvedLiteral::DateTime(_) => Type::DateTime,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) enum ResolvedType {
+    LiteralType(Type),
+    TableRef,
+}
+
+impl ResolvedExpression {
+    /// Returns [`ResolvedType`] of given [`ResolvedExpression`].
+    pub(crate) fn resolved_type(&self) -> ResolvedType {
+        match self {
+            ResolvedExpression::TableRef(_) => ResolvedType::TableRef,
+            ResolvedExpression::ColumnRef(cr) => ResolvedType::LiteralType(cr.ty),
+            ResolvedExpression::FunctionRef(resolved_function) => {
+                ResolvedType::LiteralType(resolved_function.output_ty)
+            }
+            ResolvedExpression::Logical(_) => ResolvedType::LiteralType(Type::Bool),
+            ResolvedExpression::Binary(resolved_binary_expression) => {
+                ResolvedType::LiteralType(resolved_binary_expression.ty)
+            }
+            ResolvedExpression::Unary(resolved_unary_expression) => {
+                ResolvedType::LiteralType(resolved_unary_expression.ty)
+            }
+            ResolvedExpression::Literal(resolved_literal) => {
+                ResolvedType::LiteralType(resolved_literal.into())
+            }
+            ResolvedExpression::Cast(resolved_cast) => {
+                ResolvedType::LiteralType(resolved_cast.new_ty)
+            }
+        }
+    }
+}
+
+impl fmt::Display for ResolvedType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResolvedType::LiteralType(ty) => write!(f, "{ty}"),
+            ResolvedType::TableRef => write!(f, "TableRef"),
+        }
+    }
 }

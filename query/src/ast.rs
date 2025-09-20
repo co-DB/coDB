@@ -46,10 +46,12 @@ impl Ast {
         NodeId::new(self.statements.len() - 1)
     }
 
-    pub(crate) fn identifier(&self, identifier_id: NodeId) -> Result<&str, AstError> {
+    /// Returns [`IdentifierNode`] with id `indentifier_id`.
+    /// If `identifier_id` points to a node that is not a [`IdentifierNode`] an error is returned.
+    pub(crate) fn identifier(&self, identifier_id: NodeId) -> Result<&IdentifierNode, AstError> {
         let identifier_expression = self.node(identifier_id);
         match identifier_expression {
-            Expression::Identifier(IdentifierNode { value }) => Ok(&value),
+            Expression::Identifier(id) => Ok(id),
             _ => Err(AstError::InvalidNodeType {
                 expected: "Identifier".into(),
                 got: format!("{identifier_expression}"),
@@ -58,7 +60,7 @@ impl Ast {
     }
 }
 
-/// [`NodeId`] is used for indexing nodes inside [`Ast`].
+/// [`NodeId`] is used for indexing nodes and statements inside [`Ast`].
 ///
 /// It's a wrapper around `usize`, but thanks to it being our custom type, fact that it can only be created inside `ast` ([`NodeId::new`] is private)
 /// and a fact that we don't allow to remove nodes once added to [`Ast`] we can assume that each [`NodeId`] is correct and don't need to validate it each time we want to add new node.
