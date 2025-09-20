@@ -18,7 +18,7 @@ macro_rules! impl_db_serializable_for {
     };
 }
 
-impl_db_serializable_for!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+impl_db_serializable_for!(i32, i64, u16, u32, f32, f64);
 
 /// A trait for types that can be serialized to and deserialized from bytes
 /// for database storage.
@@ -63,8 +63,7 @@ impl DbSerializable for String {
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        let (len, rest) =
-            Self::read_fixed_and_convert::<u16, { size_of::<u16>() }>(buffer, u16::from_le_bytes)?;
+        let (len, rest) = u16::deserialize(buffer)?;
         let string_len = len as usize;
         if rest.len() < string_len {
             return Err(DbSerializationError::UnexpectedEnd {
@@ -224,10 +223,8 @@ impl DbSerializable for DbDateTime {
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        let (days, rest) =
-            Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(buffer, i32::from_le_bytes)?;
-        let (milliseconds, rest) =
-            Self::read_fixed_and_convert::<u32, { size_of::<u32>() }>(rest, u32::from_le_bytes)?;
+        let (days, rest) = i32::deserialize(buffer)?;
+        let (milliseconds, rest) = u32::deserialize(rest)?;
         Ok((DbDateTime::new(DbDate::new(days), milliseconds), rest))
     }
 }
