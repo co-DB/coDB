@@ -115,13 +115,13 @@ impl StatementContext {
 
     fn add_new_table(
         &mut self,
-        table_name: impl Into<String> + AsRef<str> + Clone,
+        table_name: &str,
         table_metadata: TableMetadata,
         table_id: ResolvedNodeId,
         table_alias: Option<String>,
     ) -> Result<(), AnalyzerError> {
-        self.insert_table(table_name.as_ref(), table_id);
-        self.add_table_metadata(table_name.clone().into(), table_metadata);
+        self.insert_table(table_name, table_id);
+        self.add_table_metadata(table_name, table_metadata);
         if let Some(ta) = table_alias {
             let is_duplicate = self
                 .alias_to_table
@@ -240,7 +240,8 @@ impl<'a> Analyzer<'a> {
         let tm = self
             .statement_context
             .table_metadata(&table_name)
-            .expect("table inserted to 'resolved_tree' but not to `inserted_tables`");
+            .expect("'inserted_tables' out of sync");
+
         let columns: Vec<_> = tm.columns().collect();
         let mut resolved_columns = Vec::with_capacity(columns.len());
         for column in columns {
@@ -427,74 +428,51 @@ impl<'a> Analyzer<'a> {
                 .statement_context
                 .alias_to_table(&ta)
                 .ok_or(AnalyzerError::TableWithAliasNotFound { table_alias: ta })?;
-            let key = InsertedColumnRef {
-                column_name: column_name.clone(),
-                table_name: table_name.clone(),
-            };
-
-            if let Some(already_inserted) = self.statement_context.inserted_column(&key) {
-                return Ok(*already_inserted);
-            }
-
-            let tm = self
-                .statement_context
-                .table_metadata(&table_name)
-                .expect("table inserted to 'alias_to_table' but not to 'table_metadata'");
-            let cm = self.get_column_metadata(tm, &column_name)?;
-
-            let resolved_table_id = self
-                .statement_context
-                .inserted_table(&table_name)
-                .expect("table not inserted");
-            let resolved_column = ResolvedColumn {
-                table: *resolved_table_id,
-                name: cm.name().into(),
-                ty: cm.ty(),
-                pos: cm.pos(),
-            };
-            let resolved_column_id = self.add_resolved_column(key, resolved_column);
-            return Ok(resolved_column_id);
+            return self.resolve_column_from_table(&table_name.clone(), &column_name);
         }
-        self.resolve_column_identifier_without_alias(column_name)
+        self.resolve_column_identifier_without_alias(&column_name)
     }
 
     fn resolve_column_identifier_without_alias(
         &mut self,
-        column_name: String,
+        column_name: &str,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
-        for (table_name, tm) in &self.statement_context.tables_metadata {
-            let key = InsertedColumnRef {
-                column_name: column_name.clone(),
-                table_name: table_name.clone(),
-            };
+        let table_name = self.find_table_for_column(&column_name)?;
+        self.resolve_column_from_table(&table_name, &column_name)
+    }
 
-            let resolved_table = self
-                .statement_context
-                .inserted_table(table_name)
-                .expect("table inserted to 'tables_context' but not to `inserted_tables`");
+    fn resolve_column_from_table(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        let key = InsertedColumnRef {
+            column_name: column_name.to_string(),
+            table_name: table_name.to_string(),
+        };
 
-            if let Some(already_inserted) = self.statement_context.inserted_column(&key) {
-                self.assert_column_not_ambigous(&column_name, *resolved_table)?;
-
-                return Ok(*already_inserted);
-            }
-
-            let column_metadata = self.get_column_metadata(tm, &column_name);
-            if let Ok(cm) = column_metadata {
-                self.assert_column_not_ambigous(&column_name, *resolved_table)?;
-                let resolved_column = ResolvedColumn {
-                    table: *resolved_table,
-                    name: cm.name().into(),
-                    ty: cm.ty(),
-                    pos: cm.pos(),
-                };
-                let resolved_column_id = self.add_resolved_column(key, resolved_column);
-                return Ok(resolved_column_id);
-            }
+        if let Some(already_inserted) = self.statement_context.inserted_column(&key) {
+            return Ok(*already_inserted);
         }
-        return Err(AnalyzerError::ColumnNotFound {
-            column: column_name,
-        });
+
+        let tm = self
+            .statement_context
+            .table_metadata(table_name)
+            .expect("'table_metadata' out of sync");
+        let cm = self.get_column_metadata(tm, column_name)?;
+
+        let resolved_table_id = self
+            .statement_context
+            .inserted_table(table_name)
+            .expect("'inserted_table' ouf of sync");
+        let resolved_column = ResolvedColumn {
+            table: *resolved_table_id,
+            name: cm.name().into(),
+            ty: cm.ty(),
+            pos: cm.pos(),
+        };
+        let resolved_column_id = self.add_resolved_column(key, resolved_column);
+        Ok(resolved_column_id)
     }
 
     fn resolve_table_identifier(
@@ -514,7 +492,7 @@ impl<'a> Analyzer<'a> {
             .alias
             .map(|id| self.get_identifier_value(id))
             .transpose()?;
-        self.add_resolved_table(table_alias, table_name, table_metadata, resolved)
+        self.add_resolved_table(table_alias, &table_name, table_metadata, resolved)
     }
 
     fn resolve_cast(
@@ -535,7 +513,7 @@ impl<'a> Analyzer<'a> {
     fn add_resolved_table(
         &mut self,
         table_alias: Option<String>,
-        table_name: impl Into<String> + AsRef<str> + Clone,
+        table_name: &str,
         table_metadata: TableMetadata,
         resolved_table: ResolvedTable,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
@@ -603,9 +581,32 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    /// Returns identifier as string.
+    /// Returns error when node with `identifier_id` is not [`IndetifierNode`].
     fn get_identifier_value(&self, identifier_id: NodeId) -> Result<String, AnalyzerError> {
         let node = self.ast.identifier(identifier_id)?;
         Ok(node.value.clone())
+    }
+
+    /// Finds for column with `column_name` in all tables in current [`Analyzer::statement_context`].
+    /// Returns an error when no column is found or more than one column matches the name.
+    ///
+    /// It should be used only when column does not use table alias.
+    fn find_table_for_column(&self, column_name: &str) -> Result<String, AnalyzerError> {
+        let mut found: Option<String> = None;
+        for (table_name, tm) in &self.statement_context.tables_metadata {
+            if tm.column(column_name).is_ok() {
+                if found.is_some() {
+                    return Err(AnalyzerError::AmbigousColumn {
+                        column: column_name.into(),
+                    });
+                }
+                found = Some(table_name.clone());
+            }
+        }
+        found.ok_or(AnalyzerError::ColumnNotFound {
+            column: column_name.into(),
+        })
     }
 
     /// Checks if node pointed by `id` has the same [`ResolvedType`] as `expected_type`.
@@ -661,28 +662,6 @@ impl<'a> Analyzer<'a> {
                 op: op.to_string(),
                 ty: ty.to_string(),
             });
-        }
-        Ok(())
-    }
-
-    // TODO: test if it works as expected once JOINs are implemented
-    fn assert_column_not_ambigous(
-        &self,
-        column_identifier: &str,
-        expected_table: ResolvedNodeId,
-    ) -> Result<(), AnalyzerError> {
-        for (table_name, tm) in &self.statement_context.tables_metadata {
-            if tm.column(column_identifier).is_ok() {
-                let table_id = self
-                    .statement_context
-                    .inserted_table(table_name)
-                    .expect("table inserted to 'tables_context' but not to `inserted_tables`");
-                if *table_id != expected_table {
-                    return Err(AnalyzerError::AmbigousColumn {
-                        column: column_identifier.into(),
-                    });
-                }
-            }
         }
         Ok(())
     }
