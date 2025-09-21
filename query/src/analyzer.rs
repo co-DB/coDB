@@ -9,9 +9,9 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        Ast, AstError, BinaryExpressionNode, Expression, FunctionCallNode, IdentifierNode, Literal,
-        LiteralNode, LogicalExpressionNode, NodeId, SelectStatement, Statement,
-        UnaryExpressionNode,
+        Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, Expression, FunctionCallNode,
+        Literal, LiteralNode, LogicalExpressionNode, NodeId, SelectStatement, Statement,
+        TableIdentifierNode, UnaryExpressionNode,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
@@ -28,14 +28,16 @@ pub(crate) enum AnalyzerError {
     TableNotFound { table: String },
     #[error("column '{column}' was not found")]
     ColumnNotFound { column: String },
-    #[error("identifier '{identifier}' is unknown and cannot be resolved")]
-    UnknownIdentifier { identifier: String },
     #[error("cannot find common type for '{left}' and '{right}'")]
     CommonTypeNotFound { left: String, right: String },
     #[error("type '{ty}' cannot be used with operator '{op}'")]
     TypeNotSupportedByOperator { op: String, ty: String },
     #[error("column '{column}' found in more than one table")]
     AmbigousColumn { column: String },
+    #[error("table alias '{table_alias}' used for more than one table")]
+    AmbigousTableAlias { table_alias: String },
+    #[error("no table with alias '{table_alias}' was found")]
+    TableWithAliasNotFound { table_alias: String },
     #[error("unexpected type: expected {expected}, got {got}")]
     UnexpectedType { expected: String, got: String },
     #[error("unexpected catalog error: {0}")]
@@ -66,6 +68,8 @@ struct StatementContext {
     /// List of inserted [`TableMetadata`]s ids - used to avoid duplicating nodes.
     /// It should be used only per statement, as [`TableMetadata`] can be changed between statements.
     inserted_tables: HashMap<String, ResolvedNodeId>,
+    /// Maps table alias to its name.
+    alias_to_table: HashMap<String, String>,
     /// Same as [`Analyzer::inserted_tables`] - used to avoid duplicating nodes.
     /// It should be used only per statement, as [`ColumnMetadata`] can be changed between statements.
     inserted_columns: HashMap<InsertedColumnRef, ResolvedNodeId>,
@@ -76,6 +80,7 @@ impl StatementContext {
     fn clear(&mut self) {
         self.tables_metadata.clear();
         self.inserted_tables.clear();
+        self.alias_to_table.clear();
         self.inserted_columns.clear();
     }
 
@@ -96,6 +101,10 @@ impl StatementContext {
         self.inserted_tables.insert(table_name.into(), table_id);
     }
 
+    fn alias_to_table(&self, alias: &str) -> Option<&String> {
+        self.alias_to_table.get(alias)
+    }
+
     fn inserted_column(&self, column_ref: &InsertedColumnRef) -> Option<&ResolvedNodeId> {
         self.inserted_columns.get(column_ref)
     }
@@ -106,12 +115,23 @@ impl StatementContext {
 
     fn add_new_table(
         &mut self,
-        table_name: impl Into<String> + AsRef<str>,
+        table_name: impl Into<String> + AsRef<str> + Clone,
         table_metadata: TableMetadata,
         table_id: ResolvedNodeId,
-    ) {
+        table_alias: Option<String>,
+    ) -> Result<(), AnalyzerError> {
         self.insert_table(table_name.as_ref(), table_id);
-        self.add_table_metadata(table_name.into(), table_metadata);
+        self.add_table_metadata(table_name.clone().into(), table_metadata);
+        if let Some(ta) = table_alias {
+            let is_duplicate = self
+                .alias_to_table
+                .insert(ta.clone(), table_name.into())
+                .is_some();
+            if is_duplicate {
+                return Err(AnalyzerError::AmbigousTableAlias { table_alias: ta });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -169,7 +189,7 @@ impl<'a> Analyzer<'a> {
     /// Analyzes select statement.
     /// If successful [`ResolvedSelectStatement`] is added to [`Analyzer::resolved_tree`].
     fn analyze_select_statement(&mut self, select: &SelectStatement) -> Result<(), AnalyzerError> {
-        let resolved_table = self.resolve_table(select.table_name)?;
+        let resolved_table = self.resolve_expression(select.table_name)?;
         let resolved_columns = match &select.columns {
             Some(columns) => self.resolve_columns(columns)?,
             None => self.resolve_all_columns_from_table(resolved_table)?,
@@ -188,32 +208,14 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    /// Resolves table with identifier id `table_name`.
-    /// If successful updates [`Analyzer::tables_context`] and [`Analyzer::inserted_tables`].
-    fn resolve_table(&mut self, table_name: NodeId) -> Result<ResolvedNodeId, AnalyzerError> {
-        let table_identifier = self.ast.identifier(table_name)?;
-        self.resolve_identifier(table_identifier, Some(ResolveIdentifierHint::ExpectedTable))
-    }
-
-    /// Resolves column with identifier id `column_name`.
-    /// If successful updates [`Analyzer::inserted_columns`].
-    fn resolve_column(&mut self, column_name: NodeId) -> Result<ResolvedNodeId, AnalyzerError> {
-        let column_identifier = self.ast.identifier(column_name)?;
-        self.resolve_identifier(
-            column_identifier,
-            Some(ResolveIdentifierHint::ExpectedColumn),
-        )
-    }
-
     /// Resolves list of collumns.
-    /// If successful updates [`Analyzer::inserted_columns`].
     fn resolve_columns(
         &mut self,
         columns: &[NodeId],
     ) -> Result<Vec<ResolvedNodeId>, AnalyzerError> {
         let mut resolved_columns = Vec::with_capacity(columns.len());
         for column in columns {
-            let resolved_column = self.resolve_column(*column)?;
+            let resolved_column = self.resolve_expression(*column)?;
             resolved_columns.push(resolved_column);
         }
         Ok(resolved_columns)
@@ -256,12 +258,8 @@ impl<'a> Analyzer<'a> {
                 ty: column.ty(),
                 pos: column.pos(),
             };
-            let resolved_column_id = self
-                .resolved_tree
-                .add_node(ResolvedExpression::ColumnRef(resolved_column));
-            self.statement_context
-                .insert_column(key, resolved_column_id);
-            resolved_columns.push(resolved_column_id);
+            let id = self.add_resolved_column(key, resolved_column);
+            resolved_columns.push(id);
         }
         Ok(resolved_columns)
     }
@@ -286,11 +284,15 @@ impl<'a> Analyzer<'a> {
                 self.resolve_function_call(function_call_node)
             }
             Expression::Literal(literal_node) => Ok(self.resolve_literal(literal_node)),
-            Expression::Identifier(identifier_node) => {
-                self.resolve_identifier(identifier_node, None)
+            Expression::Identifier(_) => {
+                unreachable!("IdentifierNode should never be reached from `resolve_expression`")
             }
-            Expression::TableIdentifier(table_identifier_node) => todo!(),
-            Expression::ColumnIdentifier(column_identifier_node) => todo!(),
+            Expression::TableIdentifier(table_identifier_node) => {
+                self.resolve_table_identifier(table_identifier_node)
+            }
+            Expression::ColumnIdentifier(column_identifier_node) => {
+                self.resolve_column_identifier(column_identifier_node)
+            }
         }
     }
 
@@ -414,103 +416,105 @@ impl<'a> Analyzer<'a> {
             .add_node(ResolvedExpression::Literal(resolved))
     }
 
-    fn resolve_identifier(
-        &mut self,
-        identifier: &IdentifierNode,
-        hint: Option<ResolveIdentifierHint>,
-    ) -> Result<ResolvedNodeId, AnalyzerError> {
-        if let Some(hint) = hint {
-            match hint {
-                ResolveIdentifierHint::ExpectedColumn => {
-                    return self.resolve_column_identifier(identifier);
-                }
-                ResolveIdentifierHint::ExpectedTable => {
-                    return self.resolve_table_identifier(identifier);
-                }
-            }
-        }
-        let resolved_column = self.resolve_column_identifier(identifier);
-        if resolved_column.is_ok() {
-            return resolved_column;
-        }
-        let resolved_table = self.resolve_table_identifier(identifier);
-        if resolved_table.is_ok() {
-            return resolved_table;
-        }
-        Err(AnalyzerError::UnknownIdentifier {
-            identifier: identifier.value.clone(),
-        })
-    }
-
-    /// Resolves column pointed by `identifier`.
-    /// If more than one column matches `identifier` (meaning there are two tables with same column name
-    /// and alises weren't used) then error is returned.
     fn resolve_column_identifier(
         &mut self,
-        identifier: &IdentifierNode,
+        column_identifier: &ColumnIdentifierNode,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
-        for (table_name, tm) in &self.statement_context.tables_metadata {
+        let column_name = self.get_identifier_value(column_identifier.identifier)?;
+        if let Some(table_alias_id) = column_identifier.table_alias {
+            let ta = self.get_identifier_value(table_alias_id)?;
+            let table_name = self
+                .statement_context
+                .alias_to_table(&ta)
+                .ok_or(AnalyzerError::TableWithAliasNotFound { table_alias: ta })?;
             let key = InsertedColumnRef {
-                column_name: identifier.value.clone(),
+                column_name: column_name.clone(),
                 table_name: table_name.clone(),
             };
 
-            // [`Analyzer::tables_context`] was out of sync with [`Analyzer::inserted_tables`].
-            // It should never happen, it can only happen in case of programmer mistake and
-            // there is nothing else to do here than just panic.
+            if let Some(already_inserted) = self.statement_context.inserted_column(&key) {
+                return Ok(*already_inserted);
+            }
+
+            let tm = self
+                .statement_context
+                .table_metadata(&table_name)
+                .expect("table inserted to 'alias_to_table' but not to 'table_metadata'");
+            let cm = self.get_column_metadata(tm, &column_name)?;
+
+            let resolved_table_id = self
+                .statement_context
+                .inserted_table(&table_name)
+                .expect("table not inserted");
+            let resolved_column = ResolvedColumn {
+                table: *resolved_table_id,
+                name: cm.name().into(),
+                ty: cm.ty(),
+                pos: cm.pos(),
+            };
+            let resolved_column_id = self.add_resolved_column(key, resolved_column);
+            return Ok(resolved_column_id);
+        }
+        self.resolve_column_identifier_without_alias(column_name)
+    }
+
+    fn resolve_column_identifier_without_alias(
+        &mut self,
+        column_name: String,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        for (table_name, tm) in &self.statement_context.tables_metadata {
+            let key = InsertedColumnRef {
+                column_name: column_name.clone(),
+                table_name: table_name.clone(),
+            };
+
             let resolved_table = self
                 .statement_context
                 .inserted_table(table_name)
                 .expect("table inserted to 'tables_context' but not to `inserted_tables`");
 
             if let Some(already_inserted) = self.statement_context.inserted_column(&key) {
-                self.assert_column_not_ambigous(&identifier.value, *resolved_table)?;
+                self.assert_column_not_ambigous(&column_name, *resolved_table)?;
 
                 return Ok(*already_inserted);
             }
 
-            let column_metadata = self.get_column_metadata(tm, &identifier.value);
+            let column_metadata = self.get_column_metadata(tm, &column_name);
             if let Ok(cm) = column_metadata {
-                self.assert_column_not_ambigous(&identifier.value, *resolved_table)?;
+                self.assert_column_not_ambigous(&column_name, *resolved_table)?;
                 let resolved_column = ResolvedColumn {
                     table: *resolved_table,
                     name: cm.name().into(),
                     ty: cm.ty(),
                     pos: cm.pos(),
                 };
-                let resolved_column_id = self
-                    .resolved_tree
-                    .add_node(ResolvedExpression::ColumnRef(resolved_column));
-                self.statement_context
-                    .insert_column(key, resolved_column_id);
+                let resolved_column_id = self.add_resolved_column(key, resolved_column);
                 return Ok(resolved_column_id);
             }
         }
         return Err(AnalyzerError::ColumnNotFound {
-            column: identifier.value.clone(),
+            column: column_name,
         });
     }
 
-    /// Resolves identifier pointing to table and updates [`Analyzer::tables_context`] and [`Analyzer::inserted_tables`].
     fn resolve_table_identifier(
         &mut self,
-        identifier: &IdentifierNode,
+        table_identifier: &TableIdentifierNode,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
-        if let Some(alread_inserted) = self.statement_context.inserted_table(&identifier.value) {
+        let table_name = self.get_identifier_value(table_identifier.identifier)?;
+        if let Some(alread_inserted) = self.statement_context.inserted_table(&table_name) {
             return Ok(*alread_inserted);
         }
-        let table_name = identifier.value.clone();
         let table_metadata = self.get_table_metadata(&table_name)?;
         let resolved = ResolvedTable {
             name: table_name.clone(),
             primary_key_name: table_metadata.primary_key_column_name().into(),
         };
-        let resolved_node_id = self
-            .resolved_tree
-            .add_node(ResolvedExpression::TableRef(resolved));
-        self.statement_context
-            .add_new_table(table_name, table_metadata, resolved_node_id);
-        Ok(resolved_node_id)
+        let table_alias = table_identifier
+            .alias
+            .map(|id| self.get_identifier_value(id))
+            .transpose()?;
+        self.add_resolved_table(table_alias, table_name, table_metadata, resolved)
     }
 
     fn resolve_cast(
@@ -526,6 +530,38 @@ impl<'a> Analyzer<'a> {
         Ok(self
             .resolved_tree
             .add_node(ResolvedExpression::Cast(resolved)))
+    }
+
+    fn add_resolved_table(
+        &mut self,
+        table_alias: Option<String>,
+        table_name: impl Into<String> + AsRef<str> + Clone,
+        table_metadata: TableMetadata,
+        resolved_table: ResolvedTable,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        let resolved_node_id = self
+            .resolved_tree
+            .add_node(ResolvedExpression::TableRef(resolved_table));
+        self.statement_context.add_new_table(
+            table_name,
+            table_metadata,
+            resolved_node_id,
+            table_alias,
+        )?;
+        Ok(resolved_node_id)
+    }
+
+    fn add_resolved_column(
+        &mut self,
+        key: InsertedColumnRef,
+        resolved_column: ResolvedColumn,
+    ) -> ResolvedNodeId {
+        let resolved_column_id = self
+            .resolved_tree
+            .add_node(ResolvedExpression::ColumnRef(resolved_column));
+        self.statement_context
+            .insert_column(key, resolved_column_id);
+        resolved_column_id
     }
 
     fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, AnalyzerError> {
@@ -565,6 +601,11 @@ impl<'a> Analyzer<'a> {
             left: left_ty.to_string(),
             right: right_ty.to_string(),
         })
+    }
+
+    fn get_identifier_value(&self, identifier_id: NodeId) -> Result<String, AnalyzerError> {
+        let node = self.ast.identifier(identifier_id)?;
+        Ok(node.value.clone())
     }
 
     /// Checks if node pointed by `id` has the same [`ResolvedType`] as `expected_type`.
@@ -686,15 +727,31 @@ mod tests {
     // Helper to create an ast "SELECT id, name FROM users"
     fn build_select_ast() -> Ast {
         let mut ast = Ast::default();
-        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "users".into(),
         }));
-        let col_id = ast.add_node(Expression::Identifier(IdentifierNode {
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "id".into(),
         }));
-        let col_name = ast.add_node(Expression::Identifier(IdentifierNode {
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "name".into(),
         }));
+        let col_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
+        }));
+
         let select = SelectStatement {
             table_name,
             columns: Some(vec![col_id, col_name]),
@@ -1103,8 +1160,12 @@ mod tests {
     fn analyze_select_star() {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
-        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
         }));
 
         // SELECT * FROM users;
@@ -1153,8 +1214,12 @@ mod tests {
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();
-        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "nonexistent".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
         }));
         let select = SelectStatement {
             table_name,
@@ -1175,15 +1240,30 @@ mod tests {
     fn analyze_select_column_not_found() {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
-        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "users".into(),
         }));
-        let col_id = ast.add_node(Expression::Identifier(IdentifierNode {
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "id".into(),
         }));
-        let col_fake = ast.add_node(Expression::Identifier(IdentifierNode {
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let fake_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "doesnotexist".into(),
         }));
+        let col_fake = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: fake_ident,
+            table_alias: None,
+        }));
+
         let select = SelectStatement {
             table_name,
             columns: Some(vec![col_id, col_fake]),
@@ -1206,15 +1286,30 @@ mod tests {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
 
-        // identifiers
-        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "users".into(),
         }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // column identifiers
         let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "id".into(),
         }));
+        let id_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
         let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "name".into(),
+        }));
+        let name_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
         }));
 
         // literals
@@ -1233,13 +1328,13 @@ mod tests {
 
         // (id > 0)
         let id_gt_0 = ast.add_node(Expression::Binary(BinaryExpressionNode {
-            left_id: id_ident,
+            left_id: id_col,
             right_id: lit_0,
             op: BinaryOperator::Greater,
         }));
         // (name == "coDB")
         let name_eq_codb = ast.add_node(Expression::Binary(BinaryExpressionNode {
-            left_id: name_ident,
+            left_id: name_col,
             right_id: lit_codb,
             op: BinaryOperator::Equal,
         }));
@@ -1252,13 +1347,13 @@ mod tests {
 
         // (id < 1000)
         let id_lt_1000 = ast.add_node(Expression::Binary(BinaryExpressionNode {
-            left_id: id_ident,
+            left_id: id_col,
             right_id: lit_1000,
             op: BinaryOperator::Less,
         }));
         // (id > 300)
         let id_gt_300 = ast.add_node(Expression::Binary(BinaryExpressionNode {
-            left_id: id_ident,
+            left_id: id_col,
             right_id: lit_300,
             op: BinaryOperator::Greater,
         }));
@@ -1279,7 +1374,7 @@ mod tests {
         // SELECT id FROM users WHERE (id > 0 AND name == "coDB") OR (id < 1000 AND id > 300)
         let select = SelectStatement {
             table_name,
-            columns: Some(vec![id_ident]),
+            columns: Some(vec![id_col]),
             where_clause: Some(where_node),
         };
         ast.add_statement(Statement::Select(select));
@@ -1421,45 +1516,112 @@ mod tests {
     }
 
     #[test]
-    fn analyze_select_where_unknown_column() {
+    fn analyze_select_with_table_alias() {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
 
-        let table_name = ast.add_node(Expression::Identifier(IdentifierNode {
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
             value: "users".into(),
         }));
-
-        let unknown_ident = ast.add_node(Expression::Identifier(IdentifierNode {
-            value: "unknown_field".into(),
+        let table_alias_ident =
+            ast.add_node(Expression::Identifier(IdentifierNode { value: "u".into() }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: Some(table_alias_ident),
         }));
 
-        let lit_5 = ast.add_node(Expression::Literal(LiteralNode {
-            value: Literal::Int(5),
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_u_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: Some(table_alias_ident),
         }));
 
-        let cond = ast.add_node(Expression::Binary(BinaryExpressionNode {
-            left_id: unknown_ident,
-            right_id: lit_5,
-            op: BinaryOperator::Equal,
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let col_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
         }));
 
-        // SELECT * FROM users WHERE unknown_field == 5
         let select = SelectStatement {
             table_name,
-            columns: None,
-            where_clause: Some(cond),
+            columns: Some(vec![col_u_id, col_name]),
+            where_clause: None,
         };
+
+        // SELECT u.id, name FROM users AS u;
         ast.add_statement(Statement::Select(select));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let result = analyzer.analyze();
+        let resolved_tree = analyzer.analyze().expect("analyze should succeed");
 
-        match result {
-            Err(AnalyzerError::UnknownIdentifier { identifier }) => {
-                assert_eq!(identifier, "unknown_field");
+        match &resolved_tree.statements[0] {
+            ResolvedStatement::Select(select) => {
+                assert_eq!(select.columns.len(), 2);
+                assert_column(
+                    &resolved_tree,
+                    select.columns[0],
+                    "id",
+                    Type::I32,
+                    select.table,
+                    0,
+                );
+                assert_column(
+                    &resolved_tree,
+                    select.columns[1],
+                    "name",
+                    Type::String,
+                    select.table,
+                    1,
+                );
             }
-            Err(e) => panic!("expected ColumnNotFound, got: {:?}", e),
-            Ok(_) => panic!("expected analysis to fail for unknown column"),
+            _ => panic!("expected select"),
+        }
+    }
+
+    #[test]
+    fn analyze_select_table_alias_mismatch_errors() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_alias_ident =
+            ast.add_node(Expression::Identifier(IdentifierNode { value: "u".into() }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: Some(table_alias_ident),
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let k_ident = ast.add_node(Expression::Identifier(IdentifierNode { value: "k".into() }));
+        let col_k_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: Some(k_ident),
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: Some(vec![col_k_id]),
+            where_clause: None,
+        };
+
+        // SELECT k.id FROM users AS u;
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::TableWithAliasNotFound { table_alias } => {
+                assert_eq!(table_alias, "k");
+            }
+            other => panic!("expected TableWithAliasNotFound, got: {:?}", other),
         }
     }
 }
