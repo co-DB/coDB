@@ -63,13 +63,13 @@ impl SupportsType for BinaryOperator {
             (BinaryOperator::Modulo, _) => false,
             (BinaryOperator::Equal, _) => true,
             (BinaryOperator::NotEqual, _) => true,
-            (BinaryOperator::Greater, Type::String) => false,
+            (BinaryOperator::Greater, Type::Bool) => false,
             (BinaryOperator::Greater, _) => true,
-            (BinaryOperator::GreaterEqual, Type::String) => false,
+            (BinaryOperator::GreaterEqual, Type::Bool) => false,
             (BinaryOperator::GreaterEqual, _) => true,
-            (BinaryOperator::Less, Type::String) => false,
+            (BinaryOperator::Less, Type::Bool) => false,
             (BinaryOperator::Less, _) => true,
-            (BinaryOperator::LessEqual, Type::String) => false,
+            (BinaryOperator::LessEqual, Type::Bool) => false,
             (BinaryOperator::LessEqual, _) => true,
         }
     }
@@ -84,8 +84,10 @@ impl SupportsType for LogicalOperator {
 impl SupportsType for UnaryOperator {
     fn supports_type(&self, ty: &Type) -> bool {
         match (self, ty) {
-            (UnaryOperator::Plus, Type::Date) => false,
-            (UnaryOperator::Plus, Type::DateTime) => false,
+            (UnaryOperator::Plus, Type::F32) => true,
+            (UnaryOperator::Plus, Type::F64) => true,
+            (UnaryOperator::Plus, Type::I32) => true,
+            (UnaryOperator::Plus, Type::I64) => true,
             (UnaryOperator::Plus, _) => true,
             (UnaryOperator::Minus, Type::F32) => true,
             (UnaryOperator::Minus, Type::F64) => true,
