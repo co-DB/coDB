@@ -773,6 +773,99 @@ mod tests {
         }
     }
 
+    // Helpers for asserting node type.
+
+    fn expect_table(rt: &ResolvedTree, id: ResolvedNodeId) -> &ResolvedTable {
+        match rt.node(id) {
+            ResolvedExpression::TableRef(t) => t,
+            other => panic!("expected TableRef, got: {:?}", other),
+        }
+    }
+
+    fn expect_column(rt: &ResolvedTree, id: ResolvedNodeId) -> &ResolvedColumn {
+        match rt.node(id) {
+            ResolvedExpression::ColumnRef(c) => c,
+            other => panic!("expected ColumnRef, got: {:?}", other),
+        }
+    }
+
+    fn expect_literal_f32(rt: &ResolvedTree, id: ResolvedNodeId) -> f32 {
+        match rt.node(id) {
+            ResolvedExpression::Literal(ResolvedLiteral::Float32(v)) => *v,
+            other => panic!("expected Float32 literal, got: {:?}", other),
+        }
+    }
+
+    fn expect_literal_f64(rt: &ResolvedTree, id: ResolvedNodeId) -> f64 {
+        match rt.node(id) {
+            ResolvedExpression::Literal(ResolvedLiteral::Float64(v)) => *v,
+            other => panic!("expected Float64 literal, got: {:?}", other),
+        }
+    }
+
+    fn expect_literal_i32(rt: &ResolvedTree, id: ResolvedNodeId) -> i32 {
+        match rt.node(id) {
+            ResolvedExpression::Literal(ResolvedLiteral::Int32(v)) => *v,
+            other => panic!("expected Int32 literal, got: {:?}", other),
+        }
+    }
+
+    fn expect_literal_i64(rt: &ResolvedTree, id: ResolvedNodeId) -> i64 {
+        match rt.node(id) {
+            ResolvedExpression::Literal(ResolvedLiteral::Int64(v)) => *v,
+            other => panic!("expected Int64 literal, got: {:?}", other),
+        }
+    }
+
+    fn expect_literal_bool(rt: &ResolvedTree, id: ResolvedNodeId) -> bool {
+        match rt.node(id) {
+            ResolvedExpression::Literal(ResolvedLiteral::Bool(v)) => *v,
+            other => panic!("expected Bool literal, got: {:?}", other),
+        }
+    }
+
+    fn expect_literal_string(rt: &ResolvedTree, id: ResolvedNodeId) -> String {
+        match rt.node(id) {
+            ResolvedExpression::Literal(ResolvedLiteral::String(s)) => s.clone(),
+            other => panic!("expected String literal, got: {:?}", other),
+        }
+    }
+
+    fn expect_binary(rt: &ResolvedTree, id: ResolvedNodeId) -> &ResolvedBinaryExpression {
+        match rt.node(id) {
+            ResolvedExpression::Binary(b) => b,
+            other => panic!("expected Binary, got: {:?}", other),
+        }
+    }
+
+    fn expect_logical(rt: &ResolvedTree, id: ResolvedNodeId) -> &ResolvedLogicalExpression {
+        match rt.node(id) {
+            ResolvedExpression::Logical(l) => l,
+            other => panic!("expected Logical, got: {:?}", other),
+        }
+    }
+
+    fn expect_unary(rt: &ResolvedTree, id: ResolvedNodeId) -> &ResolvedUnaryExpression {
+        match rt.node(id) {
+            ResolvedExpression::Unary(u) => u,
+            other => panic!("expected Unary, got: {:?}", other),
+        }
+    }
+
+    fn expect_cast(rt: &ResolvedTree, id: ResolvedNodeId) -> &ResolvedCast {
+        match rt.node(id) {
+            ResolvedExpression::Cast(c) => c,
+            other => panic!("expected Cast, got: {:?}", other),
+        }
+    }
+
+    fn expect_select(rt: &ResolvedTree, idx: usize) -> &ResolvedSelectStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::Select(s) => s,
+            other => panic!("expected Select statement, got: {:?}", other),
+        }
+    }
+
     // Expressions
 
     #[test]
@@ -799,35 +892,17 @@ mod tests {
             .resolve_expression(bin_node)
             .expect("binary expression should resolve");
 
-        match analyzer.resolved_tree.node(resolved_id) {
-            ResolvedExpression::Binary(b) => {
-                assert_eq!(b.ty, Type::F64);
+        let b = expect_binary(&analyzer.resolved_tree, resolved_id);
+        assert_eq!(b.ty, Type::F64);
 
-                match analyzer.resolved_tree.node(b.left) {
-                    ResolvedExpression::Cast(c) => {
-                        assert_eq!(c.new_ty, Type::F64);
+        let c = expect_cast(&analyzer.resolved_tree, b.left);
+        assert_eq!(c.new_ty, Type::F64);
 
-                        match analyzer.resolved_tree.node(c.child) {
-                            ResolvedExpression::Literal(ResolvedLiteral::Float32(value)) => {
-                                assert_eq!(*value, 1.5);
-                            }
-                            other => {
-                                panic!("expected child to be Float32 literal, got: {:?}", other)
-                            }
-                        }
-                    }
-                    other => panic!("expected left to be Cast, got: {:?}", other),
-                }
+        let left_value = expect_literal_f32(&analyzer.resolved_tree, c.child);
+        assert_eq!(left_value, 1.5f32);
 
-                match analyzer.resolved_tree.node(b.right) {
-                    ResolvedExpression::Literal(ResolvedLiteral::Float64(value)) => {
-                        assert_eq!(*value, f32_max_05);
-                    }
-                    other => panic!("expected right to be Float64 literal, got: {:?}", other),
-                }
-            }
-            other => panic!("expected Binary resolved expression, got: {:?}", other),
-        }
+        let right_value = expect_literal_f64(&analyzer.resolved_tree, b.right);
+        assert_eq!(right_value, f32_max_05);
     }
 
     #[test]
@@ -911,20 +986,12 @@ mod tests {
             .resolve_expression(logical_node)
             .expect("logical expression should resolve");
 
-        match analyzer.resolved_tree.node(resolved_id) {
-            ResolvedExpression::Logical(l) => {
-                match analyzer.resolved_tree.node(l.left) {
-                    ResolvedExpression::Literal(ResolvedLiteral::Bool(true)) => {}
-                    other => panic!("expected left bool literal true, got: {:?}", other),
-                }
-                match analyzer.resolved_tree.node(l.right) {
-                    ResolvedExpression::Literal(ResolvedLiteral::Bool(false)) => {}
-                    other => panic!("expected right bool literal false, got: {:?}", other),
-                }
-                assert!(matches!(l.op, LogicalOperator::And));
-            }
-            other => panic!("expected Logical resolved expression, got: {:?}", other),
-        }
+        let l = expect_logical(&analyzer.resolved_tree, resolved_id);
+        let left_bool = expect_literal_bool(&analyzer.resolved_tree, l.left);
+        let right_bool = expect_literal_bool(&analyzer.resolved_tree, l.right);
+        assert!(matches!(l.op, LogicalOperator::And));
+        assert_eq!(left_bool, true);
+        assert_eq!(right_bool, false);
     }
 
     #[test]
@@ -976,22 +1043,14 @@ mod tests {
         let int_res = analyzer
             .resolve_expression(int_node)
             .expect("int literal resolve");
-        match analyzer.resolved_tree.node(int_res) {
-            ResolvedExpression::Literal(ResolvedLiteral::Int64(v)) => {
-                assert_eq!(*v, int_max);
-            }
-            other => panic!("expected Int64 literal, got: {:?}", other),
-        }
+        let int_v = expect_literal_i64(&analyzer.resolved_tree, int_res);
+        assert_eq!(int_v, int_max);
 
         let float_res = analyzer
             .resolve_expression(float_node)
             .expect("float literal resolve");
-        match analyzer.resolved_tree.node(float_res) {
-            ResolvedExpression::Literal(ResolvedLiteral::Float64(v)) => {
-                assert_eq!(*v, float_edge);
-            }
-            other => panic!("expected Float64 literal, got: {:?}", other),
-        }
+        let float_v = expect_literal_f64(&analyzer.resolved_tree, float_res);
+        assert_eq!(float_v, float_edge);
     }
 
     #[test]
@@ -1022,34 +1081,20 @@ mod tests {
         let neg_five_res = analyzer
             .resolve_expression(neg_five)
             .expect("unary int resolve");
-        match analyzer.resolved_tree.node(neg_five_res) {
-            ResolvedExpression::Unary(u) => {
-                assert_eq!(u.ty, Type::I32);
-                assert!(matches!(u.op, UnaryOperator::Minus));
-                match analyzer.resolved_tree.node(u.expression) {
-                    ResolvedExpression::Literal(ResolvedLiteral::Int32(v)) => assert_eq!(*v, 5),
-                    other => panic!("expected Int32 literal child, got: {:?}", other),
-                }
-            }
-            other => panic!("expected Unary resolved expression, got: {:?}", other),
-        }
+        let u = expect_unary(&analyzer.resolved_tree, neg_five_res);
+        assert_eq!(u.ty, Type::I32);
+        assert!(matches!(u.op, UnaryOperator::Minus));
+        let child_i32 = expect_literal_i32(&analyzer.resolved_tree, u.expression);
+        assert_eq!(child_i32, 5);
 
         let neg_float_res = analyzer
             .resolve_expression(neg_float)
             .expect("unary float resolve");
-        match analyzer.resolved_tree.node(neg_float_res) {
-            ResolvedExpression::Unary(u) => {
-                assert_eq!(u.ty, Type::F32);
-                assert!(matches!(u.op, UnaryOperator::Minus));
-                match analyzer.resolved_tree.node(u.expression) {
-                    ResolvedExpression::Literal(ResolvedLiteral::Float32(v)) => {
-                        assert_eq!(*v, 1.5f32)
-                    }
-                    other => panic!("expected Float32 literal child, got: {:?}", other),
-                }
-            }
-            other => panic!("expected Unary resolved expression, got: {:?}", other),
-        }
+        let uf = expect_unary(&analyzer.resolved_tree, neg_float_res);
+        assert_eq!(uf.ty, Type::F32);
+        assert!(matches!(uf.op, UnaryOperator::Minus));
+        let child_f32 = expect_literal_f32(&analyzer.resolved_tree, uf.expression);
+        assert_eq!(child_f32, 1.5f32);
     }
 
     #[test]
@@ -1069,17 +1114,11 @@ mod tests {
         let res = analyzer
             .resolve_expression(not_t)
             .expect("unary bang resolve");
-        match analyzer.resolved_tree.node(res) {
-            ResolvedExpression::Unary(u) => {
-                assert_eq!(u.ty, Type::Bool);
-                assert!(matches!(u.op, UnaryOperator::Bang));
-                match analyzer.resolved_tree.node(u.expression) {
-                    ResolvedExpression::Literal(ResolvedLiteral::Bool(v)) => assert_eq!(*v, true),
-                    other => panic!("expected Bool literal child, got: {:?}", other),
-                }
-            }
-            other => panic!("expected Unary resolved expression, got: {:?}", other),
-        }
+        let u = expect_unary(&analyzer.resolved_tree, res);
+        assert_eq!(u.ty, Type::Bool);
+        assert!(matches!(u.op, UnaryOperator::Bang));
+        let v = expect_literal_bool(&analyzer.resolved_tree, u.expression);
+        assert_eq!(v, true);
     }
 
     #[test]
@@ -1117,38 +1156,30 @@ mod tests {
 
         assert_eq!(resolved_tree.statements.len(), 1);
 
-        match &resolved_tree.statements[0] {
-            ResolvedStatement::Select(select) => {
-                // Table node
-                let table_node = resolved_tree.node(select.table);
-                match table_node {
-                    ResolvedExpression::TableRef(tbl) => {
-                        assert_eq!(tbl.name, "users");
-                        assert_eq!(tbl.primary_key_name, "id");
-                    }
-                    _ => panic!("Expected TableRef"),
-                }
+        let select = expect_select(&resolved_tree, 0);
 
-                assert_eq!(select.columns.len(), 2);
-                assert_column(
-                    &resolved_tree,
-                    select.columns[0],
-                    "id",
-                    Type::I32,
-                    select.table,
-                    0,
-                );
-                assert_column(
-                    &resolved_tree,
-                    select.columns[1],
-                    "name",
-                    Type::String,
-                    select.table,
-                    1,
-                );
-            }
-            _ => panic!("expected select"),
-        }
+        // Table node
+        let tbl = expect_table(&resolved_tree, select.table);
+        assert_eq!(tbl.name, "users");
+        assert_eq!(tbl.primary_key_name, "id");
+
+        assert_eq!(select.columns.len(), 2);
+        assert_column(
+            &resolved_tree,
+            select.columns[0],
+            "id",
+            Type::I32,
+            select.table,
+            0,
+        );
+        assert_column(
+            &resolved_tree,
+            select.columns[1],
+            "name",
+            Type::String,
+            select.table,
+            1,
+        );
     }
 
     #[test]
@@ -1176,28 +1207,29 @@ mod tests {
 
         assert_eq!(resolved_tree.statements.len(), 1);
 
-        match &resolved_tree.statements[0] {
-            ResolvedStatement::Select(select) => {
-                assert_eq!(select.columns.len(), 2);
-                assert_column(
-                    &resolved_tree,
-                    select.columns[0],
-                    "id",
-                    Type::I32,
-                    select.table,
-                    0,
-                );
-                assert_column(
-                    &resolved_tree,
-                    select.columns[1],
-                    "name",
-                    Type::String,
-                    select.table,
-                    1,
-                );
-            }
-            _ => panic!("expected select"),
-        }
+        let select = expect_select(&resolved_tree, 0);
+
+        let tbl = expect_table(&resolved_tree, select.table);
+        assert_eq!(tbl.name, "users");
+        assert_eq!(tbl.primary_key_name, "id");
+
+        assert_eq!(select.columns.len(), 2);
+        assert_column(
+            &resolved_tree,
+            select.columns[0],
+            "id",
+            Type::I32,
+            select.table,
+            0,
+        );
+        assert_column(
+            &resolved_tree,
+            select.columns[1],
+            "name",
+            Type::String,
+            select.table,
+            1,
+        );
     }
 
     #[test]
@@ -1377,137 +1409,51 @@ mod tests {
         let analyzer = Analyzer::new(&ast, catalog);
         let resolved_tree = analyzer.analyze().expect("analyze should succeed");
 
-        match &resolved_tree.statements[0] {
-            ResolvedStatement::Select(select) => {
-                let where_id = select.where_clause.expect("where clause resolved");
-                match resolved_tree.node(where_id) {
-                    ResolvedExpression::Logical(top_or) => {
-                        assert!(matches!(top_or.op, LogicalOperator::Or));
+        assert_eq!(resolved_tree.statements.len(), 1);
 
-                        // left side: (id > 0 AND name == "coDB")
-                        match resolved_tree.node(top_or.left) {
-                            ResolvedExpression::Logical(left_and_res) => {
-                                assert!(matches!(left_and_res.op, LogicalOperator::And));
+        let select = expect_select(&resolved_tree, 0);
 
-                                // id > 0
-                                match resolved_tree.node(left_and_res.left) {
-                                    ResolvedExpression::Binary(b) => {
-                                        assert!(matches!(b.op, BinaryOperator::Greater));
-                                        match resolved_tree.node(b.left) {
-                                            ResolvedExpression::ColumnRef(c) => {
-                                                assert_eq!(c.name, "id");
-                                            }
-                                            other => panic!(
-                                                "expected ColumnRef for id, got: {:?}",
-                                                other
-                                            ),
-                                        }
-                                        match resolved_tree.node(b.right) {
-                                            ResolvedExpression::Literal(
-                                                ResolvedLiteral::Int32(v),
-                                            ) => {
-                                                assert_eq!(*v, 0);
-                                            }
-                                            other => {
-                                                panic!("expected Int32 literal 0, got: {:?}", other)
-                                            }
-                                        }
-                                    }
-                                    other => panic!("expected Binary for id > 0, got: {:?}", other),
-                                }
+        let where_id = select.where_clause.expect("where clause resolved");
 
-                                // name == "coDB"
-                                match resolved_tree.node(left_and_res.right) {
-                                    ResolvedExpression::Binary(b) => {
-                                        assert!(matches!(b.op, BinaryOperator::Equal));
-                                        match resolved_tree.node(b.left) {
-                                            ResolvedExpression::ColumnRef(c) => {
-                                                assert_eq!(c.name, "name");
-                                            }
-                                            other => panic!(
-                                                "expected ColumnRef for name, got: {:?}",
-                                                other
-                                            ),
-                                        }
-                                        match resolved_tree.node(b.right) {
-                                            ResolvedExpression::Literal(
-                                                ResolvedLiteral::String(s),
-                                            ) => {
-                                                assert_eq!(s, "coDB");
-                                            }
-                                            other => panic!(
-                                                "expected String literal \"coDB\", got: {:?}",
-                                                other
-                                            ),
-                                        }
-                                    }
-                                    other => panic!(
-                                        "expected Binary for name == \"coDB\", got: {:?}",
-                                        other
-                                    ),
-                                }
-                            }
-                            other => panic!("expected Logical (AND) on left, got: {:?}", other),
-                        }
+        // top-level OR
+        let top_or = expect_logical(&resolved_tree, where_id);
+        assert!(matches!(top_or.op, LogicalOperator::Or));
 
-                        // right side: (id < 1000 AND id > 300)
-                        match resolved_tree.node(top_or.right) {
-                            ResolvedExpression::Logical(right_and_res) => {
-                                assert!(matches!(right_and_res.op, LogicalOperator::And));
+        // left side: (id > 0 AND name == "coDB")
+        let left_and_res = expect_logical(&resolved_tree, top_or.left);
+        assert!(matches!(left_and_res.op, LogicalOperator::And));
 
-                                // id < 1000
-                                match resolved_tree.node(right_and_res.left) {
-                                    ResolvedExpression::Binary(b) => {
-                                        assert!(matches!(b.op, BinaryOperator::Less));
-                                        match resolved_tree.node(b.right) {
-                                            ResolvedExpression::Literal(
-                                                ResolvedLiteral::Int32(v),
-                                            ) => {
-                                                assert_eq!(*v, 1000);
-                                            }
-                                            other => panic!(
-                                                "expected Int32 literal 1000, got: {:?}",
-                                                other
-                                            ),
-                                        }
-                                    }
-                                    other => {
-                                        panic!("expected Binary for id < 1000, got: {:?}", other)
-                                    }
-                                }
+        // id > 0
+        let b1 = expect_binary(&resolved_tree, left_and_res.left);
+        assert!(matches!(b1.op, BinaryOperator::Greater));
+        let c1 = expect_column(&resolved_tree, b1.left);
+        assert_eq!(c1.name, "id");
+        let v0 = expect_literal_i32(&resolved_tree, b1.right);
+        assert_eq!(v0, 0);
 
-                                // id > 300
-                                match resolved_tree.node(right_and_res.right) {
-                                    ResolvedExpression::Binary(b) => {
-                                        assert!(matches!(b.op, BinaryOperator::Greater));
-                                        match resolved_tree.node(b.right) {
-                                            ResolvedExpression::Literal(
-                                                ResolvedLiteral::Int32(v),
-                                            ) => {
-                                                assert_eq!(*v, 300);
-                                            }
-                                            other => panic!(
-                                                "expected Int32 literal 300, got: {:?}",
-                                                other
-                                            ),
-                                        }
-                                    }
-                                    other => {
-                                        panic!("expected Binary for id > 300, got: {:?}", other)
-                                    }
-                                }
-                            }
-                            other => panic!("expected Logical (AND) on right, got: {:?}", other),
-                        }
-                    }
-                    other => panic!(
-                        "expected top-level Logical (OR) in where clause, got: {:?}",
-                        other
-                    ),
-                }
-            }
-            _ => panic!("expected select"),
-        }
+        // name == "coDB"
+        let b2 = expect_binary(&resolved_tree, left_and_res.right);
+        assert!(matches!(b2.op, BinaryOperator::Equal));
+        let c2 = expect_column(&resolved_tree, b2.left);
+        assert_eq!(c2.name, "name");
+        let s = expect_literal_string(&resolved_tree, b2.right);
+        assert_eq!(s, "coDB");
+
+        // right side: (id < 1000 AND id > 300)
+        let right_and_res = expect_logical(&resolved_tree, top_or.right);
+        assert!(matches!(right_and_res.op, LogicalOperator::And));
+
+        // id < 1000
+        let b3 = expect_binary(&resolved_tree, right_and_res.left);
+        assert!(matches!(b3.op, BinaryOperator::Less));
+        let v1000 = expect_literal_i32(&resolved_tree, b3.right);
+        assert_eq!(v1000, 1000);
+
+        // id > 300
+        let b4 = expect_binary(&resolved_tree, right_and_res.right);
+        assert!(matches!(b4.op, BinaryOperator::Greater));
+        let v300 = expect_literal_i32(&resolved_tree, b4.right);
+        assert_eq!(v300, 300);
     }
 
     #[test]
@@ -1553,28 +1499,25 @@ mod tests {
         let analyzer = Analyzer::new(&ast, catalog);
         let resolved_tree = analyzer.analyze().expect("analyze should succeed");
 
-        match &resolved_tree.statements[0] {
-            ResolvedStatement::Select(select) => {
-                assert_eq!(select.columns.len(), 2);
-                assert_column(
-                    &resolved_tree,
-                    select.columns[0],
-                    "id",
-                    Type::I32,
-                    select.table,
-                    0,
-                );
-                assert_column(
-                    &resolved_tree,
-                    select.columns[1],
-                    "name",
-                    Type::String,
-                    select.table,
-                    1,
-                );
-            }
-            _ => panic!("expected select"),
-        }
+        let select = expect_select(&resolved_tree, 0);
+
+        assert_eq!(select.columns.len(), 2);
+        assert_column(
+            &resolved_tree,
+            select.columns[0],
+            "id",
+            Type::I32,
+            select.table,
+            0,
+        );
+        assert_column(
+            &resolved_tree,
+            select.columns[1],
+            "name",
+            Type::String,
+            select.table,
+            1,
+        );
     }
 
     #[test]
