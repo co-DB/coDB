@@ -763,16 +763,17 @@ mod tests {
     // Expressions
 
     #[test]
-    fn resolve_binary_add_int_and_float_coercion() {
+    fn resolve_binary_add_f32_and_f64_coercion() {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
 
-        // 1 + 1.5
+        // 1.5 + (f32::MAX + 0.5)
         let int_node = ast.add_node(Expression::Literal(LiteralNode {
-            value: Literal::Int(1),
-        }));
-        let float_node = ast.add_node(Expression::Literal(LiteralNode {
             value: Literal::Float(1.5),
+        }));
+        let f32_max_05 = f32::MAX as f64 + 0.5;
+        let float_node = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Float(f32_max_05),
         }));
         let bin_node = ast.add_node(Expression::Binary(BinaryExpressionNode {
             left_id: int_node,
@@ -787,27 +788,27 @@ mod tests {
 
         match analyzer.resolved_tree.node(resolved_id) {
             ResolvedExpression::Binary(b) => {
-                assert_eq!(b.ty, Type::F32);
+                assert_eq!(b.ty, Type::F64);
 
                 match analyzer.resolved_tree.node(b.left) {
                     ResolvedExpression::Cast(c) => {
-                        assert_eq!(c.new_ty, Type::F32);
+                        assert_eq!(c.new_ty, Type::F64);
 
                         match analyzer.resolved_tree.node(c.child) {
-                            ResolvedExpression::Literal(ResolvedLiteral::Int32(value)) => {
-                                assert_eq!(*value, 1);
+                            ResolvedExpression::Literal(ResolvedLiteral::Float32(value)) => {
+                                assert_eq!(*value, 1.5);
                             }
-                            other => panic!("expected child to be Int32 literal, got: {:?}", other),
+                            other => panic!("expected child to be Float32 literal, got: {:?}", other),
                         }
                     }
                     other => panic!("expected left to be Cast, got: {:?}", other),
                 }
 
                 match analyzer.resolved_tree.node(b.right) {
-                    ResolvedExpression::Literal(ResolvedLiteral::Float32(value)) => {
-                        assert_eq!(*value, 1.5);
+                    ResolvedExpression::Literal(ResolvedLiteral::Float64(value)) => {
+                        assert_eq!(*value, f32_max_05);
                     }
-                    other => panic!("expected right to be Float32 literal, got: {:?}", other),
+                    other => panic!("expected right to be Float64 literal, got: {:?}", other),
                 }
             }
             other => panic!("expected Binary resolved expression, got: {:?}", other),

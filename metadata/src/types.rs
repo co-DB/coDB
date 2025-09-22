@@ -36,27 +36,10 @@ impl Type {
             return Some(*lhs);
         }
 
-        if lhs.level() == u8::MAX || rhs.level() == u8::MAX {
-            return None;
-        }
-
-        if lhs.level() < rhs.level() {
-            Some(*rhs)
-        } else {
-            Some(*lhs)
-        }
-    }
-
-    fn level(&self) -> u8 {
-        match self {
-            Type::String => u8::MAX,
-            Type::F32 => 2,
-            Type::F64 => 3,
-            Type::I32 => 0,
-            Type::I64 => 1,
-            Type::Bool => u8::MAX,
-            Type::Date => u8::MAX,
-            Type::DateTime => u8::MAX,
+        match (lhs, rhs) {
+            (Type::I32, Type::I64) | (Type::I64, Type::I32) => Some(Type::I64),
+            (Type::F32, Type::F64) | (Type::F64, Type::F32) => Some(Type::F64),
+            _ => None,
         }
     }
 }
@@ -124,24 +107,9 @@ mod tests {
         let t2 = Type::I64;
         assert_coercion(&t1, &t2, Type::I64);
 
-        let t1 = Type::F32;
-        let t2 = Type::I32;
-        assert_coercion(&t1, &t2, Type::F32);
-
-        let t1 = Type::F64;
-        let t2 = Type::I32;
-        assert_coercion(&t1, &t2, Type::F64);
-    }
-
-    #[test]
-    fn type_coercion_i64() {
-        let t1 = Type::F32;
-        let t2 = Type::I64;
-        assert_coercion(&t1, &t2, Type::F32);
-
         let t1 = Type::I64;
-        let t2 = Type::F64;
-        assert_coercion(&t1, &t2, Type::F64);
+        let t2 = Type::I32;
+        assert_coercion(&t1, &t2, Type::I64);
     }
 
     #[test]
