@@ -33,9 +33,9 @@ pub(crate) enum AnalyzerError {
     #[error("type '{ty}' cannot be used with operator '{op}'")]
     TypeNotSupportedByOperator { op: String, ty: String },
     #[error("column '{column}' found in more than one table")]
-    AmbigousColumn { column: String },
+    AmbiguousColumn { column: String },
     #[error("table alias '{table_alias}' used for more than one table")]
-    AmbigousTableAlias { table_alias: String },
+    AmbiguousTableAlias { table_alias: String },
     #[error("no table with alias '{table_alias}' was found")]
     TableWithAliasNotFound { table_alias: String },
     #[error("unexpected type: expected {expected}, got {got}")]
@@ -113,6 +113,8 @@ impl StatementContext {
         self.inserted_columns.insert(column_ref, column_id);
     }
 
+    /// Adds new table to current context.
+    /// It should be preferred way of adding new table to context, as it ensures sync between [`StatementContext`] fields.
     fn add_new_table(
         &mut self,
         table_name: &str,
@@ -128,7 +130,7 @@ impl StatementContext {
                 .insert(ta.clone(), table_name.into())
                 .is_some();
             if is_duplicate {
-                return Err(AnalyzerError::AmbigousTableAlias { table_alias: ta });
+                return Err(AnalyzerError::AmbiguousTableAlias { table_alias: ta });
             }
         }
         Ok(())
@@ -166,9 +168,6 @@ impl<'a> Analyzer<'a> {
         }
         Ok(self.resolved_tree)
     }
-
-    /// Clears (resets to default) [`Analyzer`] statement-level fields.
-    /// Should be called before analyzing statement.
 
     /// Analyzes statement. If statement was successfully analyzed then its resolved version ([`ResolvedStatement`]) is added to [`Analyzer::resolved_tree`].
     /// When analyzing statement it's important to make sure that tables identifiers are resolved first,
@@ -208,7 +207,7 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    /// Resolves list of collumns.
+    /// Resolves list of columns.
     fn resolve_columns(
         &mut self,
         columns: &[NodeId],
@@ -286,7 +285,7 @@ impl<'a> Analyzer<'a> {
             }
             Expression::Literal(literal_node) => Ok(self.resolve_literal(literal_node)),
             Expression::Identifier(_) => {
-                unreachable!("IdentifierNode should never be reached from `resolve_expression`")
+                unreachable!("IdentifierNode should never be reached from 'resolve_expression'")
             }
             Expression::TableIdentifier(table_identifier_node) => {
                 self.resolve_table_identifier(table_identifier_node)
@@ -428,11 +427,15 @@ impl<'a> Analyzer<'a> {
                 .statement_context
                 .alias_to_table(&ta)
                 .ok_or(AnalyzerError::TableWithAliasNotFound { table_alias: ta })?;
+            // This clone is needed, becasue `Analyzer::resolve_column_from_table`
+            // takes `&mut self` and `table_name` is borrowed from `self`.
             return self.resolve_column_from_table(&table_name.clone(), &column_name);
         }
         self.resolve_column_identifier_without_alias(&column_name)
     }
 
+    /// Resolves column by searching for it in every table used in current statement.
+    /// It will fail if such column is found in more than one table.
     fn resolve_column_identifier_without_alias(
         &mut self,
         column_name: &str,
@@ -441,6 +444,8 @@ impl<'a> Analyzer<'a> {
         self.resolve_column_from_table(&table_name, &column_name)
     }
 
+    /// Resolves column once its table is known.
+    /// Other functions that resolve columns should fallback to this once they know column's table.
     fn resolve_column_from_table(
         &mut self,
         table_name: &str,
@@ -464,7 +469,7 @@ impl<'a> Analyzer<'a> {
         let resolved_table_id = self
             .statement_context
             .inserted_table(table_name)
-            .expect("'inserted_table' ouf of sync");
+            .expect("'inserted_table' out of sync");
         let resolved_column = ResolvedColumn {
             table: *resolved_table_id,
             name: cm.name().into(),
@@ -480,8 +485,8 @@ impl<'a> Analyzer<'a> {
         table_identifier: &TableIdentifierNode,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
         let table_name = self.get_identifier_value(table_identifier.identifier)?;
-        if let Some(alread_inserted) = self.statement_context.inserted_table(&table_name) {
-            return Ok(*alread_inserted);
+        if let Some(already_inserted) = self.statement_context.inserted_table(&table_name) {
+            return Ok(*already_inserted);
         }
         let table_metadata = self.get_table_metadata(&table_name)?;
         let resolved = ResolvedTable {
@@ -510,6 +515,8 @@ impl<'a> Analyzer<'a> {
             .add_node(ResolvedExpression::Cast(resolved)))
     }
 
+    /// Adds `resolved_table` to both [`Analyzer::resolved_tree`] and [`Analyzer::statement_context`].
+    /// Tables should always be added via this function to enforce sync between analyzer fields.
     fn add_resolved_table(
         &mut self,
         table_alias: Option<String>,
@@ -520,6 +527,8 @@ impl<'a> Analyzer<'a> {
         let resolved_node_id = self
             .resolved_tree
             .add_node(ResolvedExpression::TableRef(resolved_table));
+        // If this fails then we end up with dangling pointer in an ast, but we don't care
+        // about this as we won't use the ast anyway in case of any error.
         self.statement_context.add_new_table(
             table_name,
             table_metadata,
@@ -529,6 +538,8 @@ impl<'a> Analyzer<'a> {
         Ok(resolved_node_id)
     }
 
+    /// Adds `resolved_column` to both [`Analyzer::resolved_tree`] and [`Analyzer::statement_context`].
+    /// Columns should always be added via this function to enfore sync between analyzer fields.
     fn add_resolved_column(
         &mut self,
         key: InsertedColumnRef,
@@ -542,6 +553,7 @@ impl<'a> Analyzer<'a> {
         resolved_column_id
     }
 
+    /// Gets [`TableMetadata`] from [`Analyzer::catalog`] and wraps it in proper error if needed.
     fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, AnalyzerError> {
         match self.catalog.read().table(table_name) {
             Ok(tm) => Ok(tm),
@@ -552,6 +564,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Gets [`ColumnMetadata`] from provided [`TableMetadata`] and wraps it in proper error if needed.
     fn get_column_metadata(
         &self,
         table_metadata: &TableMetadata,
@@ -597,7 +610,7 @@ impl<'a> Analyzer<'a> {
         for (table_name, tm) in &self.statement_context.tables_metadata {
             if tm.column(column_name).is_ok() {
                 if found.is_some() {
-                    return Err(AnalyzerError::AmbigousColumn {
+                    return Err(AnalyzerError::AmbiguousColumn {
                         column: column_name.into(),
                     });
                 }
@@ -798,7 +811,9 @@ mod tests {
                             ResolvedExpression::Literal(ResolvedLiteral::Float32(value)) => {
                                 assert_eq!(*value, 1.5);
                             }
-                            other => panic!("expected child to be Float32 literal, got: {:?}", other),
+                            other => {
+                                panic!("expected child to be Float32 literal, got: {:?}", other)
+                            }
                         }
                     }
                     other => panic!("expected left to be Cast, got: {:?}", other),
