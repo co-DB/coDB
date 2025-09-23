@@ -6,7 +6,7 @@ use thiserror::Error;
 /// Helper trait meant for structs implementing SlottedPageHeader trait. Making implementing it
 /// compulsory should help remind to use #[repr(C)] for those structs (there is no way to ensure
 /// that it is used otherwise)
-unsafe trait ReprC {}
+pub(crate) unsafe trait ReprC {}
 
 /// Struct responsible for storing metadata of a free block. Stored at the start of each free
 /// block.
@@ -271,20 +271,9 @@ impl<P: PageRead> SlottedPage<P> {
         Ok(&slots[slot_idx as usize])
     }
 
-    /// Reads the record data for a given slot. Doesn't check if the record is deleted (since
-    /// we use deleted records in binary search for b-tree). For safe access use read_valid_record
-    pub fn read_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
-        let slot = self.get_slot(slot_idx)?;
-
-        let record_start = slot.offset as usize;
-        let record_end = record_start + slot.len as usize;
-
-        Ok(&self.page.data()[record_start..record_end])
-    }
-
     /// Reads the record data for a given slot. Checks if the record is deleted . Safe version of
     /// read_record
-    pub fn read_valid_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
+    pub fn read_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
         let slot = self.get_slot(slot_idx)?;
 
         if slot.is_deleted() {
@@ -948,7 +937,7 @@ mod tests {
         let result = page.insert(data).unwrap();
 
         assert!(matches!(result, InsertResult::Success(0)));
-        assert_eq!(page.read_valid_record(0).unwrap(), data);
+        assert_eq!(page.read_record(0).unwrap(), data);
         assert_eq!(page.num_slots().unwrap(), 1);
     }
 
@@ -961,7 +950,7 @@ mod tests {
         for (i, record) in records.iter().enumerate() {
             let result = page.insert(*record).unwrap();
             assert!(matches!(result, InsertResult::Success(_)));
-            assert_eq!(page.read_valid_record(i as u16).unwrap(), *record);
+            assert_eq!(page.read_record(i as u16).unwrap(), *record);
         }
 
         assert_eq!(page.num_slots().unwrap(), 3);
@@ -975,7 +964,7 @@ mod tests {
         let result = page.insert(&large_data).unwrap();
 
         assert!(matches!(result, InsertResult::Success(0)));
-        assert_eq!(page.read_valid_record(0).unwrap(), large_data.as_slice());
+        assert_eq!(page.read_record(0).unwrap(), large_data.as_slice());
     }
 
     #[test]
@@ -987,8 +976,8 @@ mod tests {
         let result = page.insert_at(b"first", 0).unwrap();
         assert!(matches!(result, InsertResult::Success(0)));
 
-        assert_eq!(page.read_valid_record(0).unwrap(), b"first");
-        assert_eq!(page.read_valid_record(1).unwrap(), b"second");
+        assert_eq!(page.read_record(0).unwrap(), b"first");
+        assert_eq!(page.read_record(1).unwrap(), b"second");
         assert_eq!(page.num_slots().unwrap(), 2);
     }
 
@@ -1002,9 +991,9 @@ mod tests {
         let result = page.insert_at(b"second", 1).unwrap();
         assert!(matches!(result, InsertResult::Success(1)));
 
-        assert_eq!(page.read_valid_record(0).unwrap(), b"first");
-        assert_eq!(page.read_valid_record(1).unwrap(), b"second");
-        assert_eq!(page.read_valid_record(2).unwrap(), b"third");
+        assert_eq!(page.read_record(0).unwrap(), b"first");
+        assert_eq!(page.read_record(1).unwrap(), b"second");
+        assert_eq!(page.read_record(2).unwrap(), b"third");
     }
 
     #[test]
@@ -1016,7 +1005,7 @@ mod tests {
         let result = page.insert_at(b"second", 1).unwrap();
         assert!(matches!(result, InsertResult::Success(1)));
 
-        assert_eq!(page.read_valid_record(1).unwrap(), b"second");
+        assert_eq!(page.read_record(1).unwrap(), b"second");
     }
 
     #[test]
@@ -1065,7 +1054,7 @@ mod tests {
         let mut page = create_test_page(PAGE_SIZE);
         let result = page.insert(b"").unwrap();
         assert!(matches!(result, InsertResult::Success(0)));
-        assert_eq!(page.read_valid_record(0).unwrap(), b"");
+        assert_eq!(page.read_record(0).unwrap(), b"");
     }
 
     #[test]
@@ -1083,7 +1072,7 @@ mod tests {
     fn test_read_out_of_bounds() {
         let page = create_test_page(PAGE_SIZE);
 
-        let result = page.read_valid_record(0);
+        let result = page.read_record(0);
         assert!(matches!(
             result,
             Err(SlottedPageError::SlotIndexOutOfBounds {
@@ -1221,10 +1210,7 @@ mod tests {
         assert_eq!(final_header.free_space_start(), expected_free_space_start);
 
         for (slot_id, expected_data) in inserted {
-            assert_eq!(
-                page.read_valid_record(slot_id).unwrap(),
-                expected_data.as_bytes()
-            );
+            assert_eq!(page.read_record(slot_id).unwrap(), expected_data.as_bytes());
         }
     }
     #[test]
@@ -1440,11 +1426,11 @@ mod tests {
 
         page.compact_records().unwrap();
 
-        assert_eq!(page.read_valid_record(0).unwrap(), b"firstt");
-        assert_eq!(page.read_valid_record(3).unwrap(), b"fourth");
+        assert_eq!(page.read_record(0).unwrap(), b"firstt");
+        assert_eq!(page.read_record(3).unwrap(), b"fourth");
 
-        assert!(page.read_valid_record(1).is_err());
-        assert!(page.read_valid_record(2).is_err());
+        assert!(page.read_record(1).is_err());
+        assert!(page.read_record(2).is_err());
     }
 
     #[test]
@@ -1504,9 +1490,9 @@ mod tests {
 
         assert_eq!(page.num_slots().unwrap(), 3);
 
-        assert_eq!(page.read_valid_record(0).unwrap(), b"keep1");
-        assert_eq!(page.read_valid_record(1).unwrap(), b"keep2");
-        assert_eq!(page.read_valid_record(2).unwrap(), b"keep3");
+        assert_eq!(page.read_record(0).unwrap(), b"keep1");
+        assert_eq!(page.read_record(1).unwrap(), b"keep2");
+        assert_eq!(page.read_record(2).unwrap(), b"keep3");
     }
 
     #[test]
@@ -1561,9 +1547,9 @@ mod tests {
 
         page.compact_slots().unwrap();
 
-        assert_eq!(page.read_valid_record(0).unwrap(), b"first2");
-        assert_eq!(page.read_valid_record(1).unwrap(), b"third2");
-        assert_eq!(page.read_valid_record(2).unwrap(), b"fifth2");
+        assert_eq!(page.read_record(0).unwrap(), b"first2");
+        assert_eq!(page.read_record(1).unwrap(), b"third2");
+        assert_eq!(page.read_record(2).unwrap(), b"fifth2");
     }
 
     #[test]
@@ -1588,7 +1574,7 @@ mod tests {
         let slot = page.get_slot(0).unwrap();
         assert_eq!(slot.len, b"small".len() as u16);
 
-        let record = page.read_valid_record(0).unwrap();
+        let record = page.read_record(0).unwrap();
         assert_eq!(record, b"small");
 
         let expected_free_space =
@@ -1609,7 +1595,7 @@ mod tests {
         let slot = page.get_slot(0).unwrap();
         assert_eq!(slot.len, b"0riginal".len() as u16);
 
-        let record = page.read_valid_record(0).unwrap();
+        let record = page.read_record(0).unwrap();
         assert_eq!(record, b"0riginal");
 
         assert_eq!(page.free_space().unwrap(), old_total_free_space);
@@ -1661,7 +1647,7 @@ mod tests {
             SlottedPageBaseHeader::NO_FREE_BLOCKS
         );
 
-        assert_eq!(page.read_valid_record(0).unwrap(), new_record);
+        assert_eq!(page.read_record(0).unwrap(), new_record);
     }
 
     #[test]
@@ -1679,7 +1665,7 @@ mod tests {
 
         assert!(matches!(result, UpdateResult::NeedsDefragmentation));
 
-        assert_eq!(page.read_valid_record(0).unwrap(), b"record1");
+        assert_eq!(page.read_record(0).unwrap(), b"record1");
     }
     #[test]
     fn test_update_deleted_record_error() {
