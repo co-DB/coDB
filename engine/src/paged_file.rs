@@ -10,8 +10,24 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
 
-/// Type representing page id, should be used instead of using bare `u64`.
-pub type PageId = u64;
+/// Type representing page id, should be used instead of bare `u32`.
+pub type PageId = u32;
+
+trait ReadPageId: io::Read {
+    fn read_page_id(&mut self) -> Result<PageId, io::Error> {
+        self.read_u32::<LittleEndian>()
+    }
+}
+
+impl<T> ReadPageId for T where T: io::Read {}
+
+trait WritePageId: io::Write {
+    fn write_page_id(&mut self, page_id: PageId) -> Result<(), io::Error> {
+        self.write_u32::<LittleEndian>(page_id)
+    }
+}
+
+impl<T> WritePageId for T where T: io::Write {}
 
 /// Size of each page in [`PagedFile`].
 const PAGE_SIZE: usize = 4096; // 4 kB
@@ -184,7 +200,8 @@ impl PagedFile {
 
     /// Seeks underlying file handle to the start of the page with `page_id`.
     fn seek_page(&mut self, page_id: PageId) -> Result<(), PagedFileError> {
-        let start = PAGE_SIZE as u64 * page_id;
+        // u64 is used to make sure that this does not overflow
+        let start = PAGE_SIZE as u64 * page_id as u64;
         self.handle.seek(io::SeekFrom::Start(start))?;
         Ok(())
     }
@@ -207,7 +224,8 @@ impl PagedFile {
 
     /// Updates size of underlying file to hold `next_page_id * PAGE_SIZE` bytes
     fn update_size(&mut self) -> Result<(), PagedFileError> {
-        let new_size = self.metadata.next_page_id * PAGE_SIZE as u64;
+        // u64 is used to make sure that this does not overflow
+        let new_size = self.metadata.next_page_id as u64 * PAGE_SIZE as u64;
         self.handle.set_len(new_size)?;
         Ok(())
     }
@@ -252,10 +270,10 @@ impl Drop for PagedFile {
 ///
 /// Format of the first page in the file is as follows:
 /// - `magic_number` (4 bytes) - only to verify if it's our file, no need to load it to [`FileMetadata`] as it is constant
-/// - `root_page_id` (8 bytes) - 0 when `None`, as it cannot be first page (first page is reserved for metadata)
-/// - `next_page_id` (8 bytes)
+/// - `root_page_id` (4 bytes) - 0 when `None`, as it cannot be first page (first page is reserved for metadata)
+/// - `next_page_id` (4 bytes)
 /// - `free_pages_length` (4 bytes)
-/// - `free_pages` (`free_pages_length` * 8 bytes) - should be skipped when `free_pages_length = 0`
+/// - `free_pages` (`free_pages_length` * 4 bytes) - should be skipped when `free_pages_length = 0`
 struct FileMetadata {
     /// id of root page
     root_page_id: Option<PageId>,
@@ -271,7 +289,7 @@ impl FileMetadata {
 
     /// Default next page id set when creating new [`FileMetadata`] instance.
     // TODO: after some tests we can adjust this value
-    const DEFAULT_NEXT_PAGE_ID: u64 = 4;
+    const DEFAULT_NEXT_PAGE_ID: PageId = 4;
 }
 
 /// Should be used to deserialize [`FileMetadata`] from [`Page`].
@@ -285,16 +303,16 @@ impl TryFrom<Page> for FileMetadata {
         if magic_number != Self::CODB_MAGIC_NUMBER {
             return Err(PagedFileError::InvalidFileFormat("invalid magic number"));
         }
-        let root_page_value = cursor.read_u64::<LittleEndian>()?;
+        let root_page_value = cursor.read_page_id()?;
         let root_page_id = match root_page_value {
             0 => None,
             _ => Some(root_page_value),
         };
-        let next_page_id = cursor.read_u64::<LittleEndian>()?;
+        let next_page_id = cursor.read_page_id()?;
         let free_pages_length = cursor.read_u32::<LittleEndian>()? as _;
         let mut free_pages = HashSet::with_capacity(free_pages_length);
         for _ in 0..free_pages_length {
-            let free_page_id = cursor.read_u64::<LittleEndian>()?;
+            let free_page_id = cursor.read_page_id()?;
             free_pages.insert(free_page_id);
         }
         Ok(FileMetadata {
@@ -313,11 +331,11 @@ impl TryFrom<&FileMetadata> for Page {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
         buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
         let root_page_id = value.root_page_id.unwrap_or(0);
-        buffer.write_u64::<LittleEndian>(root_page_id)?;
-        buffer.write_u64::<LittleEndian>(value.next_page_id)?;
+        buffer.write_page_id(root_page_id)?;
+        buffer.write_page_id(value.next_page_id)?;
         buffer.write_u32::<LittleEndian>(value.free_pages.len() as _)?;
         for free_page_id in &value.free_pages {
-            buffer.write_u64::<LittleEndian>(*free_page_id)?;
+            buffer.write_page_id(*free_page_id)?;
         }
         buffer.resize(PAGE_SIZE, 0);
         // We can unwrap here as we are sure that buffer size is `PAGE_SIZE`.
@@ -349,21 +367,19 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn create_metadata_page(
-        root_page_id: Option<u64>,
-        next_page_id: u64,
-        free_pages: &[u64],
+        root_page_id: Option<PageId>,
+        next_page_id: PageId,
+        free_pages: &[PageId],
     ) -> Page {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
         buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
-        buffer
-            .write_u64::<LittleEndian>(root_page_id.unwrap_or(0))
-            .unwrap();
-        buffer.write_u64::<LittleEndian>(next_page_id).unwrap();
+        buffer.write_page_id(root_page_id.unwrap_or(0)).unwrap();
+        buffer.write_page_id(next_page_id).unwrap();
         buffer
             .write_u32::<LittleEndian>(free_pages.len() as u32)
             .unwrap();
         for id in free_pages {
-            buffer.write_u64::<LittleEndian>(*id).unwrap();
+            buffer.write_page_id(*id).unwrap();
         }
         buffer.resize(PAGE_SIZE, 0);
         buffer.try_into().unwrap()
@@ -384,9 +400,9 @@ mod tests {
     }
 
     fn setup_file_with_metadata_and_n_pages(
-        root_page_id: Option<u64>,
-        next_page_id: u64,
-        free_pages: &[u64],
+        root_page_id: Option<PageId>,
+        next_page_id: PageId,
+        free_pages: &[PageId],
         page_patterns: &[u8],
     ) -> (tempfile::NamedTempFile, Vec<[u8; PAGE_SIZE]>) {
         let metadata_page = create_metadata_page(root_page_id, next_page_id, free_pages);
@@ -431,7 +447,7 @@ mod tests {
         let metadata = std::fs::metadata(&file_path).unwrap();
         assert_eq!(
             metadata.len(),
-            FileMetadata::DEFAULT_NEXT_PAGE_ID * PAGE_SIZE as u64
+            FileMetadata::DEFAULT_NEXT_PAGE_ID as u64 * PAGE_SIZE as u64
         );
 
         // and the metadata on disk matches
@@ -482,9 +498,9 @@ mod tests {
     fn paged_file_from_file_valid_metadata_cases() {
         struct TestCase {
             name: &'static str,
-            root: Option<u64>,
-            next: u64,
-            free: Vec<u64>,
+            root: Option<PageId>,
+            next: PageId,
+            free: Vec<PageId>,
         }
 
         let test_cases = [
