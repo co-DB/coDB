@@ -10,7 +10,7 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
 
-/// Type representing page id, should be used instead bare `u32`.
+/// Type representing page id, should be used instead of bare `u32`.
 pub type PageId = u32;
 
 /// Size of each page in [`PagedFile`].
