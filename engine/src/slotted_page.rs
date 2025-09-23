@@ -1,21 +1,12 @@
 ﻿use crate::cache::{PageRead, PageWrite};
-use crate::paged_file::PAGE_SIZE;
 use crate::slotted_page::SlottedPageError::ForbiddenSlotCompaction;
-use bitflags::bitflags;
 use bytemuck::{Pod, PodCastError, Zeroable};
-use std::marker::PhantomData;
 use thiserror::Error;
 
 /// Helper trait meant for structs implementing SlottedPageHeader trait. Making implementing it
 /// compulsory should help remind to use #[repr(C)] for those structs (there is no way to ensure
 /// that it is used otherwise)
 pub(crate) unsafe trait ReprC {}
-
-/// Magic number for assuring the page is initialized
-pub(crate) const CO_DB_MAGIC_NUMBER: u16 = 0xC0DB;
-
-/// Type alias for clarity
-pub(crate) type SlotId = u16;
 
 /// Struct responsible for storing metadata of a free block. Stored at the start of each free
 /// block.
@@ -35,7 +26,6 @@ pub(crate) struct FreeBlock {
     /// the actual offset is odd we need to move the free block to the next even offset
     actual_offset: u16,
 }
-
 impl FreeBlock {
     /// A minimal size needed for a free block to be created. If there is less empty space leftover
     /// than this value we don't create a free block and don't use this space until it is reclaimed
@@ -58,8 +48,6 @@ pub(crate) trait SlottedPageHeader: Pod + ReprC {
 #[derive(Pod, Zeroable, Copy, Clone)]
 #[repr(C)]
 pub(crate) struct SlottedPageBaseHeader {
-    /// Magic number that indicates whether the page is initialized for CODB usage
-    co_db_magic_number: u16,
     /// Total free space inside slotted page. Is equal to the sum of space inside free blocks and
     /// contiguous free space.
     total_free_space: u16,
@@ -73,11 +61,9 @@ pub(crate) struct SlottedPageBaseHeader {
     /// Offset of the first free block in the free blocks linked list.
     first_free_block_offset: u16,
     /// Index of the first free slot in the slot directory, which we can reuse during inserts.
-    first_free_slot: SlotId,
+    first_free_slot: u16,
     /// Total number of slots in the slots directory (including used and free slots).
     num_slots: u16,
-    /// Flags for storing page type (for now)
-    flags: SlottedPageHeaderFlags,
 }
 
 impl SlottedPageBaseHeader {
@@ -96,25 +82,6 @@ impl SlottedPageBaseHeader {
     pub fn has_free_block(&self) -> bool {
         self.first_free_block_offset != Self::NO_FREE_SLOTS
     }
-
-    pub fn new(header_size: u16, page_type: PageType) -> Self {
-        assert!(
-            header_size as usize >= size_of::<SlottedPageBaseHeader>(),
-            "header_size must be at least {} bytes",
-            size_of::<SlottedPageBaseHeader>()
-        );
-        Self {
-            co_db_magic_number: CO_DB_MAGIC_NUMBER,
-            total_free_space: PAGE_SIZE as u16,
-            contiguous_free_space: PAGE_SIZE as u16 - header_size,
-            record_area_offset: PAGE_SIZE as u16,
-            header_size,
-            first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
-            first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
-            num_slots: 0,
-            flags: SlottedPageHeaderFlags::from(page_type),
-        }
-    }
 }
 
 impl SlottedPageHeader for SlottedPageBaseHeader {
@@ -123,60 +90,12 @@ impl SlottedPageHeader for SlottedPageBaseHeader {
     }
 }
 
-impl Default for SlottedPageBaseHeader {
-    fn default() -> Self {
-        let header_size = size_of::<SlottedPageBaseHeader>() as u16;
-        Self {
-            co_db_magic_number: CO_DB_MAGIC_NUMBER,
-            total_free_space: PAGE_SIZE as u16,
-            contiguous_free_space: (PAGE_SIZE as u16 - header_size),
-            record_area_offset: PAGE_SIZE as u16,
-            header_size,
-            first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
-            first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
-            num_slots: 0,
-            flags: SlottedPageHeaderFlags::GENERIC_PAGE,
-        }
-    }
-}
-
 unsafe impl ReprC for SlottedPageBaseHeader {}
-
-bitflags! {
-    #[repr(transparent)]
-    #[derive(Pod, Zeroable, Copy, Clone, Debug)]
-    struct SlottedPageHeaderFlags : u16 {
-        const GENERIC_PAGE   = 0b0000_0000;
-        const HEAP_PAGE      = 0b0000_0001;
-        const BTREE_LEAF     = 0b0000_0010;
-        const BTREE_INTERNAL = 0b0000_0011;
-        const OVERFLOW_PAGE  = 0b0000_0100;
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum PageType {
-    Heap,
-    BTreeLeaf,
-    BTreeInternal,
-    Overflow,
-}
-
-impl From<PageType> for SlottedPageHeaderFlags {
-    fn from(page_type: PageType) -> Self {
-        match page_type {
-            PageType::Heap => SlottedPageHeaderFlags::HEAP_PAGE,
-            PageType::BTreeLeaf => SlottedPageHeaderFlags::BTREE_LEAF,
-            PageType::BTreeInternal => SlottedPageHeaderFlags::BTREE_INTERNAL,
-            PageType::Overflow => SlottedPageHeaderFlags::OVERFLOW_PAGE,
-        }
-    }
-}
 
 /// Enum representing possible outcomes of an insert operation.
 pub(crate) enum InsertResult {
     /// The insert succeeded and id of the slot referencing the inserted record is returned.
-    Success(SlotId),
+    Success(u16),
     /// There is not enough space in neither free blocks nor contiguous free space, but if the
     /// page was defragmented the record would fit.
     NeedsDefragmentation,
@@ -193,22 +112,19 @@ pub(crate) enum UpdateResult {
     /// The page is full and won't fit a record of this length.
     PageFull,
 }
-
 #[derive(Debug, Error)]
 pub enum SlottedPageError {
-    #[error("tried to use uninitialized page")]
-    UninitializedPage,
     #[error(
         "tried to access slot at index {out_of_bounds_index} while there were only {num_slots} records"
     )]
     SlotIndexOutOfBounds {
         num_slots: u16,
-        out_of_bounds_index: SlotId,
+        out_of_bounds_index: u16,
     },
     #[error("tried to modify slot at position {position} while there were only {num_slots} slots")]
-    InvalidPosition { num_slots: u16, position: SlotId },
+    InvalidPosition { num_slots: u16, position: u16 },
     #[error("tried to access deleted record with slot index {slot_index}")]
-    ForbiddenDeletedRecordAccess { slot_index: SlotId },
+    ForbiddenDeletedRecordAccess { slot_index: u16 },
     #[error("tried to compact slots even though allow_slot_compaction was set to false")]
     ForbiddenSlotCompaction,
     #[error("casting data from bytes failed for the following reason: {reason}")]
@@ -265,14 +181,14 @@ impl Slot {
     }
 
     /// Sets the index of the next free slot in the lower 15 bits of `flags`.
-    pub fn set_next_free_slot(&mut self, next_free_slot_index: SlotId) {
+    pub fn set_next_free_slot(&mut self, next_free_slot_index: u16) {
         let next = next_free_slot_index & Self::SLOT_INDEX_MASK;
         let deleted_flag = self.flags & Self::SLOT_DELETED;
         self.flags = deleted_flag | next;
     }
 
     /// Returns the index of the next free slot (lower 15 bits of `flags`).
-    pub fn next_free_slot(&self) -> SlotId {
+    pub fn next_free_slot(&self) -> u16 {
         self.flags & Self::SLOT_INDEX_MASK
     }
 }
@@ -283,40 +199,29 @@ impl Slot {
 ///
 /// A visual for how a slotted page looks can be seen in slotted_page.png in docs directory of this
 /// crate.
-pub(crate) struct SlottedPage<P, H: SlottedPageHeader> {
+pub(crate) struct SlottedPage<P> {
     /// The underlying page, with which the slotted page interacts.
     page: P,
     /// Controls whether slots within the page can be compacted to reclaim space after deletions.
     /// Safeguards the compact_slots method which should not be called by some higher level abstractions
     /// (e.g. heap file slotted pages).
     allow_slot_compaction: bool,
-    /// We need to tie a SlottedPage to specific header type, but since there is no sensible field of
-    /// type H that we can create, we need to use PhantomData just to mark that we are using this
-    /// type.
-    _header_marker: PhantomData<H>,
 }
 
 /// Implementation for read-only slotted page
-impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
+impl<P: PageRead> SlottedPage<P> {
     /// Creates a new SlottedPage wrapper around a page
-    pub fn new(page: P, allow_slot_compaction: bool) -> Result<Self, SlottedPageError> {
-        let data = page.data();
-        let magic_number = u16::from_le_bytes([data[0], data[1]]);
-        if magic_number != CO_DB_MAGIC_NUMBER {
-            return Err(SlottedPageError::UninitializedPage);
-        }
-
-        let page = Self {
+    pub fn new(page: P, allow_slot_compaction: bool) -> Self {
+        Self {
             page,
             allow_slot_compaction,
-            _header_marker: PhantomData,
-        };
-        Ok(page)
+        }
     }
+
     /// Generic method to cast page header to any type implementing SlottedPageHeader
     ///
     /// Caller must ensure T matches the actual header type stored in the page
-    fn get_generic_header<T>(&self) -> Result<&T, SlottedPageError>
+    pub fn get_header<T>(&self) -> Result<&T, SlottedPageError>
     where
         T: SlottedPageHeader,
     {
@@ -325,14 +230,9 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         )?)
     }
 
-    /// Gets a reference to the header
-    pub fn get_header(&self) -> Result<&H, SlottedPageError> {
-        self.get_generic_header::<H>()
-    }
-
     /// Gets a reference to the base header (common to all slotted pages).
-    pub fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
-        self.get_generic_header::<SlottedPageBaseHeader>()
+    fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
+        self.get_header::<SlottedPageBaseHeader>()
     }
 
     /// Returns the total number of slots (both used and unused) in this page
@@ -357,28 +257,28 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// Gets a reference to a specific slot by index
-    fn get_slot(&self, slot_id: SlotId) -> Result<&Slot, SlottedPageError> {
+    fn get_slot(&self, slot_idx: u16) -> Result<&Slot, SlottedPageError> {
         let header = self.get_base_header()?;
 
-        if slot_id >= header.num_slots {
+        if slot_idx >= header.num_slots {
             return Err(SlottedPageError::SlotIndexOutOfBounds {
                 num_slots: header.num_slots,
-                out_of_bounds_index: slot_id,
+                out_of_bounds_index: slot_idx,
             });
         }
 
         let slots = self.get_slots()?;
-        Ok(&slots[slot_id as usize])
+        Ok(&slots[slot_idx as usize])
     }
 
     /// Reads the record data for a given slot. Checks if the record is deleted . Safe version of
     /// read_record
-    pub fn read_record(&self, slot_id: SlotId) -> Result<&[u8], SlottedPageError> {
-        let slot = self.get_slot(slot_id)?;
+    pub fn read_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
+        let slot = self.get_slot(slot_idx)?;
 
         if slot.is_deleted() {
             return Err(SlottedPageError::ForbiddenDeletedRecordAccess {
-                slot_index: slot_id,
+                slot_index: slot_idx,
             });
         }
 
@@ -389,28 +289,11 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 }
 
-impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
-    pub fn initialize_with_header(page: P, allow_slot_compaction: bool, header: H) -> Self {
-        let mut page = page;
-        page.data_mut()[0..size_of::<H>()].copy_from_slice(bytemuck::bytes_of(&header));
-        Self {
-            page,
-            allow_slot_compaction,
-            _header_marker: PhantomData,
-        }
-    }
-
-    pub fn initialize_default(page: P, allow_slot_compaction: bool) -> Self
-    where
-        H: Default,
-    {
-        Self::initialize_with_header(page, allow_slot_compaction, H::default())
-    }
-
+impl<P: PageWrite + PageRead> SlottedPage<P> {
     /// Generic method to cast page header to any type implementing SlottedPageHeader
     ///
     /// Caller must ensure T matches the actual header type stored in the page
-    fn get_generic_header_mut<T>(&mut self) -> Result<&mut T, SlottedPageError>
+    pub fn get_header_mut<T>(&mut self) -> Result<&mut T, SlottedPageError>
     where
         T: SlottedPageHeader,
     {
@@ -419,19 +302,15 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         )?)
     }
 
-    pub fn get_header_mut(&mut self) -> Result<&mut H, SlottedPageError> {
-        self.get_generic_header_mut::<H>()
-    }
-
     /// Gets a mutable reference to base header (common to all slotted pages).
-    pub fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
-        self.get_generic_header_mut::<SlottedPageBaseHeader>()
+    fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
+        self.get_header_mut::<SlottedPageBaseHeader>()
     }
 
     /// Updates the record at given position.
     pub fn update(
         &mut self,
-        slot_id: SlotId,
+        slot_id: u16,
         updated_record: &[u8],
     ) -> Result<UpdateResult, SlottedPageError> {
         let slot = self.get_slot(slot_id)?;
@@ -491,7 +370,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     /// be used when update doesn't succeed with NeedsDefragmentation result.
     pub fn defragment_and_update(
         &mut self,
-        slot_id: SlotId,
+        slot_id: u16,
         updated_record: &[u8],
     ) -> Result<UpdateResult, SlottedPageError> {
         let slot = self.get_slot_mut(slot_id)?;
@@ -525,7 +404,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// Deletes the record from the given position.
-    pub fn delete(&mut self, slot_id: SlotId) -> Result<(), SlottedPageError> {
+    pub fn delete(&mut self, slot_id: u16) -> Result<(), SlottedPageError> {
         let next_free_slot = self.get_base_header()?.first_free_slot;
         let slot = self.get_slot_mut(slot_id)?;
         if slot.is_deleted() {
@@ -592,7 +471,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     pub fn insert_at(
         &mut self,
         record: &[u8],
-        position: SlotId,
+        position: u16,
     ) -> Result<InsertResult, SlottedPageError> {
         let header = self.get_base_header()?;
 
@@ -637,7 +516,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// Writes a slot to the slot directory at a given position.
-    fn write_slot_at(&mut self, position: SlotId, slot: Slot) -> Result<(), SlottedPageError> {
+    fn write_slot_at(&mut self, position: u16, slot: Slot) -> Result<(), SlottedPageError> {
         let header_size = self.get_base_header()?.header_size as usize;
         let page = self.page.data_mut();
 
@@ -652,7 +531,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     /// Shifts slots to the right starting from a given position.
     ///
     /// Used when inserting into the middle of the slot directory.
-    fn shift_slots_right(&mut self, position: SlotId) -> Result<(), SlottedPageError> {
+    fn shift_slots_right(&mut self, position: u16) -> Result<(), SlottedPageError> {
         let header = self.get_base_header()?;
 
         let shifted_slots_num = header.num_slots - position;
@@ -671,7 +550,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
     /// Walks the free slot linked list and removes slot with slot_id from it, updating the
     /// previous slot's next pointer or the header's first_free_slot.
-    fn remove_from_free_slot_chain(&mut self, slot_id: SlotId) -> Result<(), SlottedPageError> {
+    fn remove_from_free_slot_chain(&mut self, slot_id: u16) -> Result<(), SlottedPageError> {
         let target_slot = self.get_slot(slot_id)?;
 
         if !target_slot.is_deleted() {
@@ -735,7 +614,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// Appends a slot at the end of the slot directory.\
-    fn append_slot(&mut self, slot: Slot) -> Result<SlotId, SlottedPageError> {
+    fn append_slot(&mut self, slot: Slot) -> Result<u16, SlottedPageError> {
         let num_slots = self.get_base_header()?.num_slots;
         self.write_slot_at(num_slots, slot)?;
         let header = self.get_base_header_mut()?;
@@ -747,7 +626,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// If a free slot exists, reuses it. Otherwise, appends a new slot.
-    fn reuse_or_append_slot(&mut self, slot: Slot) -> Result<SlotId, SlottedPageError> {
+    fn reuse_or_append_slot(&mut self, slot: Slot) -> Result<u16, SlottedPageError> {
         let header = self.get_base_header()?;
 
         if !header.has_free_slot() {
@@ -907,9 +786,9 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// Returns a mutable reference to a specific slot.
-    fn get_slot_mut(&mut self, slot_id: SlotId) -> Result<&mut Slot, SlottedPageError> {
+    fn get_slot_mut(&mut self, slot_idx: u16) -> Result<&mut Slot, SlottedPageError> {
         let header = self.get_base_header()?;
-        let start = header.header_size as usize + slot_id as usize * Slot::SIZE;
+        let start = header.header_size as usize + slot_idx as usize * Slot::SIZE;
         let end = start + Slot::SIZE;
         Ok(bytemuck::try_from_bytes_mut(
             &mut self.page.data_mut()[start..end],
@@ -1031,11 +910,10 @@ mod tests {
     }
 
     // Helper to create initialized slotted page
-    fn create_test_page(size: usize) -> SlottedPage<TestPage, SlottedPageBaseHeader> {
+    fn create_test_page(size: usize) -> SlottedPage<TestPage> {
         let mut page = TestPage::new(size);
 
         let header = SlottedPageBaseHeader {
-            co_db_magic_number: CO_DB_MAGIC_NUMBER,
             total_free_space: (size - size_of::<SlottedPageBaseHeader>()) as u16,
             contiguous_free_space: (size - size_of::<SlottedPageBaseHeader>()) as u16,
             record_area_offset: size as u16,
@@ -1043,13 +921,12 @@ mod tests {
             first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
             first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
             num_slots: 0,
-            flags: SlottedPageHeaderFlags::GENERIC_PAGE,
         };
 
         page.data_mut()[..size_of::<SlottedPageBaseHeader>()]
             .copy_from_slice(bytemuck::bytes_of(&header));
 
-        SlottedPage::new(page, true).unwrap()
+        SlottedPage::new(page, true)
     }
 
     #[test]
@@ -1070,10 +947,10 @@ mod tests {
 
         let records = [b"first", b"secon", b"third"];
 
-        for (i, &record) in records.iter().enumerate() {
-            let result = page.insert(record).unwrap();
+        for (i, record) in records.iter().enumerate() {
+            let result = page.insert(*record).unwrap();
             assert!(matches!(result, InsertResult::Success(_)));
-            assert_eq!(page.read_record(i as SlotId).unwrap(), record);
+            assert_eq!(page.read_record(i as u16).unwrap(), *record);
         }
 
         assert_eq!(page.num_slots().unwrap(), 3);
@@ -1222,34 +1099,26 @@ mod tests {
             }
         }
 
-        impl Default for CustomHeader {
-            fn default() -> Self {
-                Self {
-                    base: SlottedPageBaseHeader {
-                        co_db_magic_number: CO_DB_MAGIC_NUMBER,
-                        total_free_space: (PAGE_SIZE - size_of::<CustomHeader>()) as u16,
-                        contiguous_free_space: (PAGE_SIZE - size_of::<CustomHeader>()) as u16,
-                        record_area_offset: PAGE_SIZE as u16,
-                        header_size: size_of::<CustomHeader>() as u16,
-                        first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
-                        first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
-                        num_slots: 0,
-                        flags: SlottedPageHeaderFlags::GENERIC_PAGE,
-                    },
-                    custom_field: 42,
-                }
-            }
-        }
-
         let mut page = TestPage::new(PAGE_SIZE);
-        let custom_header = CustomHeader::default();
+        let custom_header = CustomHeader {
+            base: SlottedPageBaseHeader {
+                total_free_space: (PAGE_SIZE - size_of::<CustomHeader>()) as u16,
+                contiguous_free_space: (PAGE_SIZE - size_of::<CustomHeader>()) as u16,
+                record_area_offset: PAGE_SIZE as u16,
+                header_size: size_of::<CustomHeader>() as u16,
+                first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
+                first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
+                num_slots: 0,
+            },
+            custom_field: 42,
+        };
 
         page.data_mut()[..size_of::<CustomHeader>()]
             .copy_from_slice(bytemuck::bytes_of(&custom_header));
 
-        let slotted_page = SlottedPage::<TestPage, CustomHeader>::new(page, true).unwrap();
+        let slotted_page = SlottedPage::new(page, true);
 
-        let header: &CustomHeader = slotted_page.get_generic_header().unwrap();
+        let header: &CustomHeader = slotted_page.get_header().unwrap();
         assert_eq!(header.custom_field, 42);
     }
 
@@ -1459,9 +1328,7 @@ mod tests {
         // Checking free block list - should look like header -> slot id 2 offset -> slot id 0 offset
         assert_eq!(
             header.first_free_block_offset,
-            SlottedPage::<TestPage, SlottedPageBaseHeader>::calculate_free_block_aligned_offset(
-                deleted_slot_2.offset
-            )
+            SlottedPage::<TestPage>::calculate_free_block_aligned_offset(deleted_slot_2.offset)
         );
 
         let range = header.first_free_block_offset as usize
@@ -1470,15 +1337,13 @@ mod tests {
         let free_block = bytemuck::from_bytes::<FreeBlock>(first_free_block);
         assert_eq!(
             free_block.next_block_offset,
-            SlottedPage::<TestPage, SlottedPageBaseHeader>::calculate_free_block_aligned_offset(
-                deleted_slot_1.offset
-            )
+            SlottedPage::<TestPage>::calculate_free_block_aligned_offset(deleted_slot_1.offset)
         );
     }
 
     #[test]
     fn test_record_defragmentation() {
-        let mut page = create_test_page(132);
+        let mut page = create_test_page(128);
 
         let free_space = page.free_space().unwrap();
 
@@ -1662,8 +1527,7 @@ mod tests {
     #[test]
     fn test_slot_compaction_forbidden_when_disabled() {
         let page = TestPage::new(PAGE_SIZE);
-        let mut slotted_page =
-            SlottedPage::<TestPage, SlottedPageBaseHeader>::initialize_default(page, false); // slot compaction disabled
+        let mut slotted_page = SlottedPage::new(page, false); // slot compaction disabled
 
         let result = slotted_page.compact_slots();
         assert!(matches!(result, Err(ForbiddenSlotCompaction)));
@@ -1819,7 +1683,7 @@ mod tests {
 
     #[test]
     fn test_defragment_and_update_actually_needs_defrag() {
-        let mut page = create_test_page(290); // Much smaller page
+        let mut page = create_test_page(280); // Much smaller page
 
         // Fill most of the page with records
         let records = [
