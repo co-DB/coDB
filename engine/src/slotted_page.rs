@@ -8,6 +8,9 @@ use thiserror::Error;
 /// that it is used otherwise)
 pub(crate) unsafe trait ReprC {}
 
+/// Type alias for clarity
+pub(crate) type SlotId = u16;
+
 /// Struct responsible for storing metadata of a free block. Stored at the start of each free
 /// block.
 ///
@@ -61,7 +64,7 @@ pub(crate) struct SlottedPageBaseHeader {
     /// Offset of the first free block in the free blocks linked list.
     first_free_block_offset: u16,
     /// Index of the first free slot in the slot directory, which we can reuse during inserts.
-    first_free_slot: u16,
+    first_free_slot: SlotId,
     /// Total number of slots in the slots directory (including used and free slots).
     num_slots: u16,
 }
@@ -95,7 +98,7 @@ unsafe impl ReprC for SlottedPageBaseHeader {}
 /// Enum representing possible outcomes of an insert operation.
 pub(crate) enum InsertResult {
     /// The insert succeeded and id of the slot referencing the inserted record is returned.
-    Success(u16),
+    Success(SlotId),
     /// There is not enough space in neither free blocks nor contiguous free space, but if the
     /// page was defragmented the record would fit.
     NeedsDefragmentation,
@@ -119,12 +122,12 @@ pub enum SlottedPageError {
     )]
     SlotIndexOutOfBounds {
         num_slots: u16,
-        out_of_bounds_index: u16,
+        out_of_bounds_index: SlotId,
     },
     #[error("tried to modify slot at position {position} while there were only {num_slots} slots")]
-    InvalidPosition { num_slots: u16, position: u16 },
+    InvalidPosition { num_slots: u16, position: SlotId },
     #[error("tried to access deleted record with slot index {slot_index}")]
-    ForbiddenDeletedRecordAccess { slot_index: u16 },
+    ForbiddenDeletedRecordAccess { slot_index: SlotId },
     #[error("tried to compact slots even though allow_slot_compaction was set to false")]
     ForbiddenSlotCompaction,
     #[error("casting data from bytes failed for the following reason: {reason}")]
@@ -181,14 +184,14 @@ impl Slot {
     }
 
     /// Sets the index of the next free slot in the lower 15 bits of `flags`.
-    pub fn set_next_free_slot(&mut self, next_free_slot_index: u16) {
+    pub fn set_next_free_slot(&mut self, next_free_slot_index: SlotId) {
         let next = next_free_slot_index & Self::SLOT_INDEX_MASK;
         let deleted_flag = self.flags & Self::SLOT_DELETED;
         self.flags = deleted_flag | next;
     }
 
     /// Returns the index of the next free slot (lower 15 bits of `flags`).
-    pub fn next_free_slot(&self) -> u16 {
+    pub fn next_free_slot(&self) -> SlotId {
         self.flags & Self::SLOT_INDEX_MASK
     }
 }
@@ -257,28 +260,28 @@ impl<P: PageRead> SlottedPage<P> {
     }
 
     /// Gets a reference to a specific slot by index
-    fn get_slot(&self, slot_idx: u16) -> Result<&Slot, SlottedPageError> {
+    fn get_slot(&self, slot_id: SlotId) -> Result<&Slot, SlottedPageError> {
         let header = self.get_base_header()?;
 
-        if slot_idx >= header.num_slots {
+        if slot_id >= header.num_slots {
             return Err(SlottedPageError::SlotIndexOutOfBounds {
                 num_slots: header.num_slots,
-                out_of_bounds_index: slot_idx,
+                out_of_bounds_index: slot_id,
             });
         }
 
         let slots = self.get_slots()?;
-        Ok(&slots[slot_idx as usize])
+        Ok(&slots[slot_id as usize])
     }
 
     /// Reads the record data for a given slot. Checks if the record is deleted . Safe version of
     /// read_record
-    pub fn read_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
-        let slot = self.get_slot(slot_idx)?;
+    pub fn read_record(&self, slot_id: SlotId) -> Result<&[u8], SlottedPageError> {
+        let slot = self.get_slot(slot_id)?;
 
         if slot.is_deleted() {
             return Err(SlottedPageError::ForbiddenDeletedRecordAccess {
-                slot_index: slot_idx,
+                slot_index: slot_id,
             });
         }
 
@@ -310,7 +313,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     /// Updates the record at given position.
     pub fn update(
         &mut self,
-        slot_id: u16,
+        slot_id: SlotId,
         updated_record: &[u8],
     ) -> Result<UpdateResult, SlottedPageError> {
         let slot = self.get_slot(slot_id)?;
@@ -370,7 +373,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     /// be used when update doesn't succeed with NeedsDefragmentation result.
     pub fn defragment_and_update(
         &mut self,
-        slot_id: u16,
+        slot_id: SlotId,
         updated_record: &[u8],
     ) -> Result<UpdateResult, SlottedPageError> {
         let slot = self.get_slot_mut(slot_id)?;
@@ -404,7 +407,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     }
 
     /// Deletes the record from the given position.
-    pub fn delete(&mut self, slot_id: u16) -> Result<(), SlottedPageError> {
+    pub fn delete(&mut self, slot_id: SlotId) -> Result<(), SlottedPageError> {
         let next_free_slot = self.get_base_header()?.first_free_slot;
         let slot = self.get_slot_mut(slot_id)?;
         if slot.is_deleted() {
@@ -471,7 +474,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     pub fn insert_at(
         &mut self,
         record: &[u8],
-        position: u16,
+        position: SlotId,
     ) -> Result<InsertResult, SlottedPageError> {
         let header = self.get_base_header()?;
 
@@ -516,7 +519,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     }
 
     /// Writes a slot to the slot directory at a given position.
-    fn write_slot_at(&mut self, position: u16, slot: Slot) -> Result<(), SlottedPageError> {
+    fn write_slot_at(&mut self, position: SlotId, slot: Slot) -> Result<(), SlottedPageError> {
         let header_size = self.get_base_header()?.header_size as usize;
         let page = self.page.data_mut();
 
@@ -531,7 +534,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     /// Shifts slots to the right starting from a given position.
     ///
     /// Used when inserting into the middle of the slot directory.
-    fn shift_slots_right(&mut self, position: u16) -> Result<(), SlottedPageError> {
+    fn shift_slots_right(&mut self, position: SlotId) -> Result<(), SlottedPageError> {
         let header = self.get_base_header()?;
 
         let shifted_slots_num = header.num_slots - position;
@@ -550,7 +553,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
 
     /// Walks the free slot linked list and removes slot with slot_id from it, updating the
     /// previous slot's next pointer or the header's first_free_slot.
-    fn remove_from_free_slot_chain(&mut self, slot_id: u16) -> Result<(), SlottedPageError> {
+    fn remove_from_free_slot_chain(&mut self, slot_id: SlotId) -> Result<(), SlottedPageError> {
         let target_slot = self.get_slot(slot_id)?;
 
         if !target_slot.is_deleted() {
@@ -614,7 +617,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     }
 
     /// Appends a slot at the end of the slot directory.\
-    fn append_slot(&mut self, slot: Slot) -> Result<u16, SlottedPageError> {
+    fn append_slot(&mut self, slot: Slot) -> Result<SlotId, SlottedPageError> {
         let num_slots = self.get_base_header()?.num_slots;
         self.write_slot_at(num_slots, slot)?;
         let header = self.get_base_header_mut()?;
@@ -626,7 +629,7 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     }
 
     /// If a free slot exists, reuses it. Otherwise, appends a new slot.
-    fn reuse_or_append_slot(&mut self, slot: Slot) -> Result<u16, SlottedPageError> {
+    fn reuse_or_append_slot(&mut self, slot: Slot) -> Result<SlotId, SlottedPageError> {
         let header = self.get_base_header()?;
 
         if !header.has_free_slot() {
@@ -786,9 +789,9 @@ impl<P: PageWrite + PageRead> SlottedPage<P> {
     }
 
     /// Returns a mutable reference to a specific slot.
-    fn get_slot_mut(&mut self, slot_idx: u16) -> Result<&mut Slot, SlottedPageError> {
+    fn get_slot_mut(&mut self, slot_id: SlotId) -> Result<&mut Slot, SlottedPageError> {
         let header = self.get_base_header()?;
-        let start = header.header_size as usize + slot_idx as usize * Slot::SIZE;
+        let start = header.header_size as usize + slot_id as usize * Slot::SIZE;
         let end = start + Slot::SIZE;
         Ok(bytemuck::try_from_bytes_mut(
             &mut self.page.data_mut()[start..end],
@@ -947,10 +950,10 @@ mod tests {
 
         let records = [b"first", b"secon", b"third"];
 
-        for (i, record) in records.iter().enumerate() {
-            let result = page.insert(*record).unwrap();
+        for (i, &record) in records.iter().enumerate() {
+            let result = page.insert(record).unwrap();
             assert!(matches!(result, InsertResult::Success(_)));
-            assert_eq!(page.read_record(i as u16).unwrap(), *record);
+            assert_eq!(page.read_record(i as SlotId).unwrap(), record);
         }
 
         assert_eq!(page.num_slots().unwrap(), 3);
