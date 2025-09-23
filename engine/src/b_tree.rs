@@ -2,7 +2,7 @@
 use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::paged_file::PageId;
 use crate::slotted_page::{
-    ReprC, SlottedPage, SlottedPageBaseHeader, SlottedPageError, SlottedPageHeader,
+    ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError, SlottedPageHeader,
 };
 use bytemuck::{Pod, Zeroable};
 use std::cmp::{Ordering, PartialEq};
@@ -37,7 +37,7 @@ pub(crate) enum SearchResult {
     Found { record_ptr: RecordPointer },
 
     /// Leaf node: key not found, but insertion point identified
-    NotFoundLeaf { insert_slot_id: u16 },
+    NotFoundLeaf { insert_slot_id: SlotId },
 
     /// Internal node: follow this child
     FollowChild { child_ptr: PageId },
@@ -47,7 +47,7 @@ pub(crate) enum SearchResult {
 /// leaf nodes of the b-tree.
 pub(crate) struct RecordPointer {
     page_id: PageId,
-    slot_id: u16,
+    slot_id: SlotId,
 }
 
 impl DbSerializable for RecordPointer {
@@ -58,7 +58,7 @@ impl DbSerializable for RecordPointer {
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
         let (page_id, rest) = PageId::deserialize(buffer)?;
-        let (slot_id, rest) = u16::deserialize(rest)?;
+        let (slot_id, rest) = SlotId::deserialize(rest)?;
         let record_ptr = Self { page_id, slot_id };
         Ok((record_ptr, rest))
     }
@@ -79,10 +79,6 @@ impl BTreePageHeader {
 
     pub fn is_leaf(&self) -> bool {
         self.page_type() == PageType::Leaf
-    }
-
-    pub fn is_internal(&self) -> bool {
-        self.page_type() == PageType::Internal
     }
 }
 
@@ -167,13 +163,13 @@ where
         Ok(SearchResult::FollowChild { child_ptr })
     }
 
-    fn get_key(&self, slot_id: u16) -> Result<Key, BTreeError> {
+    fn get_key(&self, slot_id: SlotId) -> Result<Key, BTreeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
         let (key, _) = Key::deserialize(record_bytes)?;
         Ok(key)
     }
 
-    fn get_child_ptr(&self, slot_id: u16) -> Result<PageId, BTreeError> {
+    fn get_child_ptr(&self, slot_id: SlotId) -> Result<PageId, BTreeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
         let (_, child_ptr_bytes) = Key::deserialize(record_bytes)?;
         let (child_ptr, _) = PageId::deserialize(child_ptr_bytes)?;
