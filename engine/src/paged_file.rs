@@ -13,6 +13,22 @@ use thiserror::Error;
 /// Type representing page id, should be used instead of bare `u32`.
 pub type PageId = u32;
 
+trait ReadPageId: io::Read {
+    fn read_page_id(&mut self) -> Result<PageId, io::Error> {
+        self.read_u32::<LittleEndian>()
+    }
+}
+
+impl<T> ReadPageId for T where T: io::Read {}
+
+trait WritePageId: io::Write {
+    fn write_page_id(&mut self, page_id: PageId) -> Result<(), io::Error> {
+        self.write_u32::<LittleEndian>(page_id)
+    }
+}
+
+impl<T> WritePageId for T where T: io::Write {}
+
 /// Size of each page in [`PagedFile`].
 const PAGE_SIZE: usize = 4096; // 4 kB
 
@@ -287,16 +303,16 @@ impl TryFrom<Page> for FileMetadata {
         if magic_number != Self::CODB_MAGIC_NUMBER {
             return Err(PagedFileError::InvalidFileFormat("invalid magic number"));
         }
-        let root_page_value = cursor.read_u32::<LittleEndian>()?;
+        let root_page_value = cursor.read_page_id()?;
         let root_page_id = match root_page_value {
             0 => None,
             _ => Some(root_page_value),
         };
-        let next_page_id = cursor.read_u32::<LittleEndian>()?;
+        let next_page_id = cursor.read_page_id()?;
         let free_pages_length = cursor.read_u32::<LittleEndian>()? as _;
         let mut free_pages = HashSet::with_capacity(free_pages_length);
         for _ in 0..free_pages_length {
-            let free_page_id = cursor.read_u32::<LittleEndian>()?;
+            let free_page_id = cursor.read_page_id()?;
             free_pages.insert(free_page_id);
         }
         Ok(FileMetadata {
@@ -315,11 +331,11 @@ impl TryFrom<&FileMetadata> for Page {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
         buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
         let root_page_id = value.root_page_id.unwrap_or(0);
-        buffer.write_u32::<LittleEndian>(root_page_id)?;
-        buffer.write_u32::<LittleEndian>(value.next_page_id)?;
+        buffer.write_page_id(root_page_id)?;
+        buffer.write_page_id(value.next_page_id)?;
         buffer.write_u32::<LittleEndian>(value.free_pages.len() as _)?;
         for free_page_id in &value.free_pages {
-            buffer.write_u32::<LittleEndian>(*free_page_id)?;
+            buffer.write_page_id(*free_page_id)?;
         }
         buffer.resize(PAGE_SIZE, 0);
         // We can unwrap here as we are sure that buffer size is `PAGE_SIZE`.
@@ -357,15 +373,13 @@ mod tests {
     ) -> Page {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
         buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
-        buffer
-            .write_u32::<LittleEndian>(root_page_id.unwrap_or(0))
-            .unwrap();
-        buffer.write_u32::<LittleEndian>(next_page_id).unwrap();
+        buffer.write_page_id(root_page_id.unwrap_or(0)).unwrap();
+        buffer.write_page_id(next_page_id).unwrap();
         buffer
             .write_u32::<LittleEndian>(free_pages.len() as u32)
             .unwrap();
         for id in free_pages {
-            buffer.write_u32::<LittleEndian>(*id).unwrap();
+            buffer.write_page_id(*id).unwrap();
         }
         buffer.resize(PAGE_SIZE, 0);
         buffer.try_into().unwrap()
