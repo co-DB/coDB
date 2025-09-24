@@ -76,7 +76,7 @@ struct StatementContext {
 }
 
 impl StatementContext {
-    /// Clears all data of [`StatementContext`]. Should be used when new statement is being analyzed.
+    /// Clears all data of [`StatementContext`]. Should be used when a new statement is being analyzed.
     fn clear(&mut self) {
         self.tables_metadata.clear();
         self.inserted_tables.clear();
@@ -141,9 +141,9 @@ impl StatementContext {
 pub(crate) struct Analyzer<'a> {
     /// [`Ast`] being analyzed.
     ast: &'a Ast,
-    /// Reference to database catalog, which provides table and column metadatas.
+    /// Reference to the database catalog, which provides table and column metadatas.
     catalog: Arc<RwLock<Catalog>>,
-    /// [`ResolvedTree`] being built - ouput of [`Analyzer`] work.
+    /// [`ResolvedTree`] being built - ouput of the [`Analyzer`]'s work.
     resolved_tree: ResolvedTree,
     /// Details about currently analyzed statement (e.g. already resolved tables and columns).
     statement_context: StatementContext,
@@ -169,9 +169,9 @@ impl<'a> Analyzer<'a> {
         Ok(self.resolved_tree)
     }
 
-    /// Analyzes statement. If statement was successfully analyzed then its resolved version ([`ResolvedStatement`]) is added to [`Analyzer::resolved_tree`].
-    /// When analyzing statement it's important to make sure that tables identifiers are resolved first,
-    /// as resolving column identifiers require information from their tables.
+    /// Analyzes a statement. If statement is successfully analyzed then its resolved version ([`ResolvedStatement`]) is added to [`Analyzer::resolved_tree`].
+    /// When analyzing a statement, it's important to make sure that table identifiers are resolved first,
+    /// as resolving column identifiers requires information from their tables.
     fn analyze_statement(&mut self, statement: &Statement) -> Result<(), AnalyzerError> {
         match statement {
             Statement::Select(select) => self.analyze_select_statement(select),
@@ -427,7 +427,7 @@ impl<'a> Analyzer<'a> {
                 .statement_context
                 .alias_to_table(&ta)
                 .ok_or(AnalyzerError::TableWithAliasNotFound { table_alias: ta })?;
-            // This clone is needed, becasue `Analyzer::resolve_column_from_table`
+            // This clone is needed, because `Analyzer::resolve_column_from_table`
             // takes `&mut self` and `table_name` is borrowed from `self`.
             return self.resolve_column_from_table(&table_name.clone(), &column_name);
         }
@@ -445,7 +445,7 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Resolves column once its table is known.
-    /// Other functions that resolve columns should fallback to this once they know column's table.
+    /// Other functions that resolve columns should fall back to this once they know column's table.
     fn resolve_column_from_table(
         &mut self,
         table_name: &str,
@@ -527,8 +527,8 @@ impl<'a> Analyzer<'a> {
         let resolved_node_id = self
             .resolved_tree
             .add_node(ResolvedExpression::TableRef(resolved_table));
-        // If this fails then we end up with dangling pointer in an ast, but we don't care
-        // about this as we won't use the ast anyway in case of any error.
+        // If this fails, we may end up with a dangling pointer in the AST, but we don't care
+        // because we won't use the AST in case of an error.
         self.statement_context.add_new_table(
             table_name,
             table_metadata,
@@ -539,7 +539,7 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Adds `resolved_column` to both [`Analyzer::resolved_tree`] and [`Analyzer::statement_context`].
-    /// Columns should always be added via this function to enfore sync between analyzer fields.
+    /// Columns should always be added via this function to enforce sync between analyzer fields.
     fn add_resolved_column(
         &mut self,
         key: InsertedColumnRef,
@@ -553,7 +553,7 @@ impl<'a> Analyzer<'a> {
         resolved_column_id
     }
 
-    /// Gets [`TableMetadata`] from [`Analyzer::catalog`] and wraps it in proper error if needed.
+    /// Gets [`TableMetadata`] from [`Analyzer::catalog`] and wraps it in an appropriate error if needed.
     fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, AnalyzerError> {
         match self.catalog.read().table(table_name) {
             Ok(tm) => Ok(tm),
@@ -564,7 +564,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// Gets [`ColumnMetadata`] from provided [`TableMetadata`] and wraps it in proper error if needed.
+    /// Gets [`ColumnMetadata`] from provided [`TableMetadata`] and wraps it in an appropriate error if needed.
     fn get_column_metadata(
         &self,
         table_metadata: &TableMetadata,
@@ -594,17 +594,17 @@ impl<'a> Analyzer<'a> {
         })
     }
 
-    /// Returns identifier as string.
-    /// Returns error when node with `identifier_id` is not [`IndetifierNode`].
+    /// Returns the identifier as a string.
+    /// Returns an error when the node with `identifier_id` is not an [`IdentifierNode`].
     fn get_identifier_value(&self, identifier_id: NodeId) -> Result<String, AnalyzerError> {
         let node = self.ast.identifier(identifier_id)?;
         Ok(node.value.clone())
     }
 
-    /// Finds for column with `column_name` in all tables in current [`Analyzer::statement_context`].
-    /// Returns an error when no column is found or more than one column matches the name.
+    /// Finds the table that contains the column named `column_name` in the current [`Analyzer::statement_context`].
+    /// Returns an error when no column is found or when more than one column matches the name.
     ///
-    /// It should be used only when column does not use table alias.
+    /// It should be used only when the column does not use a table alias.
     fn find_table_for_column(&self, column_name: &str) -> Result<String, AnalyzerError> {
         let mut found: Option<String> = None;
         for (table_name, tm) in &self.statement_context.tables_metadata {
@@ -622,7 +622,7 @@ impl<'a> Analyzer<'a> {
         })
     }
 
-    /// Checks if node pointed by `id` has the same [`ResolvedType`] as `expected_type`.
+    /// Checks if the node pointed to by `id` has the same [`ResolvedType`] as `expected_type`.
     fn assert_resolved_type(
         &self,
         id: ResolvedNodeId,
@@ -651,8 +651,8 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    /// Checks if node pointed by `id` has [`ResolvedType`] that is not [`ResolvedType::TableRef`].
-    /// In such case underlying [`ResolvedType::LiteralType`] is returned.
+    /// Checks if the node pointed to by `id` has a [`ResolvedType`] that is not [`ResolvedType::TableRef`].
+    /// In such a case, the underlying [`ResolvedType::LiteralType`] is returned.
     fn assert_not_table_ref(&self, id: ResolvedNodeId) -> Result<Type, AnalyzerError> {
         let resolved_type = self.resolved_tree.node(id).resolved_type();
         match resolved_type {
