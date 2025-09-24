@@ -389,7 +389,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn resolve_float_literal(&mut self, value: f64) -> ResolvedNodeId {
-        let can_fit_in_f32 = value > f32::MIN as f64 && value < f32::MAX as f64;
+        let can_fit_in_f32 = value >= f32::MIN as f64 && value <= f32::MAX as f64;
         let resolved = if can_fit_in_f32 {
             ResolvedLiteral::Float32(value as f32)
         } else {
@@ -400,7 +400,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn resolve_int_literal(&mut self, value: i64) -> ResolvedNodeId {
-        let can_fit_in_i32 = value > i32::MIN as i64 && value < i32::MAX as i64;
+        let can_fit_in_i32 = value >= i32::MIN as i64 && value <= i32::MAX as i64;
         let resolved = if can_fit_in_i32 {
             ResolvedLiteral::Int32(value as i32)
         } else {
@@ -873,13 +873,13 @@ mod tests {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
 
-        // 1.5 + (f32::MAX + 0.5)
+        // 1.5 + (1.5 * f32::MAX)
         let int_node = ast.add_node(Expression::Literal(LiteralNode {
             value: Literal::Float(1.5),
         }));
-        let f32_max_05 = f32::MAX as f64 + 0.5;
+        let f32_times_1_5 = f32::MAX as f64 * 1.5;
         let float_node = ast.add_node(Expression::Literal(LiteralNode {
-            value: Literal::Float(f32_max_05),
+            value: Literal::Float(f32_times_1_5),
         }));
         let bin_node = ast.add_node(Expression::Binary(BinaryExpressionNode {
             left_id: int_node,
@@ -902,7 +902,7 @@ mod tests {
         assert_eq!(left_value, 1.5f32);
 
         let right_value = expect_literal_f64(&analyzer.resolved_tree, b.right);
-        assert_eq!(right_value, f32_max_05);
+        assert_eq!(right_value, f32_times_1_5);
     }
 
     #[test]
@@ -1026,31 +1026,55 @@ mod tests {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
 
-        // int boundary: i32::MAX should become Int64
+        // int boundary: i32::MAX should become Int32
         let int_max = i32::MAX as i64;
-        let int_node = ast.add_node(Expression::Literal(LiteralNode {
+        let int_max_node = ast.add_node(Expression::Literal(LiteralNode {
             value: Literal::Int(int_max),
         }));
 
-        // float boundary: f32::MAX should become Float64
-        let float_edge = std::f32::MAX as f64;
-        let float_node = ast.add_node(Expression::Literal(LiteralNode {
-            value: Literal::Float(float_edge),
+        // int boundary: i32::MIN should become Int32
+        let int_min = i32::MIN as i64;
+        let int_min_node = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(int_min),
+        }));
+
+        // float boundary: f32::MAX should become Float32
+        let float_max = f32::MAX as f64;
+        let float_max_node = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Float(float_max),
+        }));
+
+        // float boundary: f32::MIN should become Float32
+        let float_min = f32::MIN as f64;
+        let float_min_node = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Float(float_min),
         }));
 
         let mut analyzer = Analyzer::new(&ast, catalog);
 
-        let int_res = analyzer
-            .resolve_expression(int_node)
-            .expect("int literal resolve");
-        let int_v = expect_literal_i64(&analyzer.resolved_tree, int_res);
-        assert_eq!(int_v, int_max);
+        let int_max_res = analyzer
+            .resolve_expression(int_max_node)
+            .expect("int32 max literal resolve");
+        let int_v = expect_literal_i32(&analyzer.resolved_tree, int_max_res);
+        assert_eq!(int_v, int_max as i32);
 
-        let float_res = analyzer
-            .resolve_expression(float_node)
-            .expect("float literal resolve");
-        let float_v = expect_literal_f64(&analyzer.resolved_tree, float_res);
-        assert_eq!(float_v, float_edge);
+        let int_min_res = analyzer
+            .resolve_expression(int_min_node)
+            .expect("int32 min literal resolve");
+        let int_v = expect_literal_i32(&analyzer.resolved_tree, int_min_res);
+        assert_eq!(int_v, int_min as i32);
+
+        let float_max_res = analyzer
+            .resolve_expression(float_max_node)
+            .expect("float32 max literal resolve");
+        let float_v = expect_literal_f32(&analyzer.resolved_tree, float_max_res);
+        assert_eq!(float_v, float_max as f32);
+
+        let float_min_res = analyzer
+            .resolve_expression(float_min_node)
+            .expect("float32 min literal resolve");
+        let float_v = expect_literal_f32(&analyzer.resolved_tree, float_min_res);
+        assert_eq!(float_v, float_min as f32);
     }
 
     #[test]
