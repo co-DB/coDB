@@ -6,7 +6,7 @@ use thiserror::Error;
 /// Helper trait meant for structs implementing SlottedPageHeader trait. Making implementing it
 /// compulsory should help remind to use #[repr(C)] for those structs (there is no way to ensure
 /// that it is used otherwise)
-unsafe trait ReprC {}
+pub(crate) unsafe trait ReprC {}
 
 /// Struct responsible for storing metadata of a free block. Stored at the start of each free
 /// block.

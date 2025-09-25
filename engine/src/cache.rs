@@ -24,8 +24,8 @@ use crate::{
 /// Structure for referring to single page in the file.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub(crate) struct FilePageRef {
-    page_id: PageId,
-    file_key: FileKey,
+    pub(crate) page_id: PageId,
+    pub(crate) file_key: FileKey,
 }
 
 /// Wrapper around the [`Page`] and its metadata used for concurrent usage.
