@@ -182,7 +182,7 @@ impl Cache {
             frames: DashMap::with_capacity(capacity),
             lru: Arc::new(RwLock::new(LruCache::new(NonZero::new(capacity).unwrap()))),
             files,
-            capacity: capacity,
+            capacity,
         })
     }
 
