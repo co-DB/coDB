@@ -155,14 +155,14 @@ pub(crate) enum CacheError {
 /// Responsible for caching [`Page`]s and distributing it to other threads.
 /// Threads that use [`Cache`] should not have to worry about multithreading problems - all of them should be handled by [`Cache`].
 /// [`Cache`] must be used per-database, as it depends on [`FilesManager`] which works that way.
-pub(crate) struct Cache<const N: usize> {
+pub(crate) struct Cache {
     /// List of the [`PageFrame`]s currently stored in cache. This is the source of truth from [`Cache`]'s point of view.
     ///
     /// It is guaranteed that:
     /// - any page that is used by at least one thread will not be removed from the [`Cache`].
     /// - any frame that is selected for eviction and is dirty will have its page flushed to disk.
     ///
-    /// [`Cache`] tries to keep the size of it <= [`Cache::CACHE_CAPACITY`], but it is not always true.  
+    /// [`Cache`] tries to keep the size of it <= [`Cache::capacity`], but it is not always true.  
     /// Check [`Cache::get_pinned_frame`] and [`Cache::try_evict_frame`] for more details.
     frames: DashMap<FilePageRef, Arc<PageFrame>>,
     /// LRU list of the [`FilePageRef`]s used for deciding which [`PageFrame`] is best candidate for eviction (it does not mean it will always be picked as the victim - check [`Cache::try_evict_frame`] for details).
@@ -172,28 +172,27 @@ pub(crate) struct Cache<const N: usize> {
     lru: Arc<RwLock<LruCache<FilePageRef, ()>>>,
     /// Pointer to [`FilesManager`], used for file operations when page must be loaded from/flushed to disk.
     files: Arc<FilesManager>,
+    capacity: usize,
 }
 
-impl<const N: usize> Cache<N> {
-    const CACHE_CAPACITY: usize = N;
-
+impl Cache {
     /// Creates new [`Cache`] that handles frames for single database.
-    pub(crate) fn new(files: Arc<FilesManager>) -> Arc<Self> {
+    pub(crate) fn new(capacity: usize, files: Arc<FilesManager>) -> Arc<Self> {
         Arc::new(Self {
-            frames: DashMap::with_capacity(Self::CACHE_CAPACITY),
-            lru: Arc::new(RwLock::new(LruCache::new(
-                NonZero::new(Self::CACHE_CAPACITY).unwrap(),
-            ))),
+            frames: DashMap::with_capacity(capacity),
+            lru: Arc::new(RwLock::new(LruCache::new(NonZero::new(capacity).unwrap()))),
             files,
+            capacity,
         })
     }
 
     /// Creates new [`Cache`] that handles frames for single database and its [`BackgroundCacheCleaner`]'s handle.
     pub(crate) fn with_background_cleaner(
+        capacity: usize,
         files: Arc<FilesManager>,
         cleanup_interval: Duration,
     ) -> (Arc<Self>, BackgroundWorkerHandle) {
-        let cache = Self::new(files);
+        let cache = Self::new(capacity, files);
         let cleaner = BackgroundCacheCleaner::start(BackgroundCacheCleanerParams {
             cache: cache.clone(),
             cleanup_interval,
@@ -331,7 +330,7 @@ impl<const N: usize> Cache<N> {
                 new_frame.pin();
                 vacant_entry.insert(new_frame.clone());
 
-                if self.frames.len() > Self::CACHE_CAPACITY && !self.try_evict_frame()? {
+                if self.frames.len() > self.capacity && !self.try_evict_frame()? {
                     warn!(
                         "Cache: cannot evict frame - every frame in cache is pinned or lru is empty."
                     );
@@ -348,7 +347,7 @@ impl<const N: usize> Cache<N> {
     /// If frame is selected to be evicted (using LRU), but its pin count is greater than 0, it will not be evicted and instead its key is updated in [`Cache::lru`] (making it MRU). In that case the next LRU is picked and so on.
     /// Returns `false` if could not evict any page - every page in cache is pinned or LRU is empty.
     fn try_evict_frame(&self) -> Result<bool, CacheError> {
-        let max_attempts = Self::CACHE_CAPACITY;
+        let max_attempts = self.capacity;
 
         for _ in 0..max_attempts {
             let victim_id = {
@@ -464,26 +463,26 @@ impl<const N: usize> Cache<N> {
     }
 }
 
-impl<const N: usize> Drop for Cache<N> {
+impl Drop for Cache {
     fn drop(&mut self) {
         self.flush_all_frames();
     }
 }
 
 /// Responsible for periodically scanning [`Cache`] and removing [`PageFrame`]s from it that are in [`Cache::frames`] but not in [`Cache::lru`].
-struct BackgroundCacheCleaner<const N: usize> {
-    cache: Arc<Cache<N>>,
+struct BackgroundCacheCleaner {
+    cache: Arc<Cache>,
     cleanup_interval: Duration,
     shutdown: mpsc::Receiver<()>,
 }
 
-struct BackgroundCacheCleanerParams<const N: usize> {
-    cache: Arc<Cache<N>>,
+struct BackgroundCacheCleanerParams {
+    cache: Arc<Cache>,
     cleanup_interval: Duration,
 }
 
-impl<const N: usize> BackgroundWorker for BackgroundCacheCleaner<N> {
-    type BackgroundWorkerParams = BackgroundCacheCleanerParams<N>;
+impl BackgroundWorker for BackgroundCacheCleaner {
+    type BackgroundWorkerParams = BackgroundCacheCleanerParams;
 
     fn start(params: Self::BackgroundWorkerParams) -> BackgroundWorkerHandle {
         let (tx, rx) = mpsc::channel();
@@ -499,7 +498,7 @@ impl<const N: usize> BackgroundWorker for BackgroundCacheCleaner<N> {
     }
 }
 
-impl<const N: usize> BackgroundCacheCleaner<N> {
+impl BackgroundCacheCleaner {
     fn run(self) {
         loop {
             match self.shutdown.recv_timeout(self.cleanup_interval) {
@@ -561,8 +560,8 @@ mod tests {
     }
 
     /// Spawns a thread that pins `id` from `cache`, reads the first 8 bytes and asserts it equals `expected`.
-    fn spawn_check_page<const N: usize>(
-        cache: Arc<Cache<N>>,
+    fn spawn_check_page(
+        cache: Arc<Cache>,
         id: FilePageRef,
         expected: u64,
     ) -> thread::JoinHandle<()> {
@@ -578,7 +577,7 @@ mod tests {
     }
 
     /// Asserts that `id` is present frames map.
-    fn assert_cached<const N: usize>(cache: &Arc<Cache<N>>, id: &FilePageRef) {
+    fn assert_cached(cache: &Arc<Cache>, id: &FilePageRef) {
         assert!(
             cache.frames.contains_key(id),
             "expected frame present in frames for {id:?}",
@@ -586,7 +585,7 @@ mod tests {
     }
 
     /// Asserts that `id` is present in both frames map and LRU.
-    fn assert_cached_and_in_lru<const N: usize>(cache: &Arc<Cache<N>>, id: &FilePageRef) {
+    fn assert_cached_and_in_lru(cache: &Arc<Cache>, id: &FilePageRef) {
         assert_cached(cache, id);
         let lru_guard = cache.lru.read();
         assert!(
@@ -596,7 +595,7 @@ mod tests {
     }
 
     /// Assert that every frame in the cache is currently unpinned (pin_count == 0).
-    fn assert_all_frames_unpinned<const N: usize>(cache: &Arc<Cache<N>>) {
+    fn assert_all_frames_unpinned(cache: &Arc<Cache>) {
         for entry in cache.frames.iter() {
             let frame = entry.value();
             assert!(
@@ -627,7 +626,7 @@ mod tests {
         let file_key = FileKey::data("table1");
         let page_id = alloc_page_with_u64(&files, &file_key, 7);
 
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
 
         let id = FilePageRef {
             page_id,
@@ -648,7 +647,7 @@ mod tests {
         let file_key = FileKey::data("table1");
         let page_id = alloc_page_with_u64(&files, &file_key, 7);
 
-        let cache = Cache::<2>::new(files.clone());
+        let cache = Cache::new(2, files.clone());
 
         let id = FilePageRef {
             page_id,
@@ -679,7 +678,7 @@ mod tests {
         let page_id2 = alloc_page_with_u64(&files, &file_key, 2);
         let page_id3 = alloc_page_with_u64(&files, &file_key, 3);
 
-        let cache = Cache::<3>::new(files.clone());
+        let cache = Cache::new(3, files.clone());
 
         let id1 = FilePageRef {
             page_id: page_id1,
@@ -723,7 +722,7 @@ mod tests {
         let page_id2 = alloc_page_with_u64(&files, &file_key, 2);
         let page_id3 = alloc_page_with_u64(&files, &file_key, 3);
 
-        let cache = Cache::<3>::new(files.clone());
+        let cache = Cache::new(3, files.clone());
 
         let id1 = FilePageRef {
             page_id: page_id1,
@@ -762,7 +761,7 @@ mod tests {
         let file_key = FileKey::data("table1");
         let page_id = alloc_page_with_u64(&files, &file_key, 0xdeadbeefu64);
 
-        let cache = Cache::<2>::new(files.clone());
+        let cache = Cache::new(2, files.clone());
 
         let id = FilePageRef {
             page_id,
@@ -822,7 +821,7 @@ mod tests {
         let id2 = alloc_page_with_u64(&files, &file_key, 102);
         let id3 = alloc_page_with_u64(&files, &file_key, 103);
 
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
 
         let fp1 = FilePageRef {
             page_id: id1,
@@ -916,7 +915,7 @@ mod tests {
         let files = create_files_manager();
         let file_key = FileKey::data("table1");
         let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
         let id = FilePageRef {
             page_id: pid,
             file_key: file_key.clone(),
@@ -954,7 +953,7 @@ mod tests {
             page_id: pid,
             file_key: fk.clone(),
         };
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
 
         let writers = 4;
         let start = Arc::new(Barrier::new(writers + 1));
@@ -1001,7 +1000,7 @@ mod tests {
         let files = create_files_manager();
         let file_key = FileKey::data("table_alloc");
 
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
 
         let mut pinned = cache
             .allocate_page(&file_key)
@@ -1037,7 +1036,7 @@ mod tests {
             file_key: fk.clone(),
         };
 
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
 
         {
             let h = spawn_check_page(cache.clone(), id.clone(), 0xAA);
@@ -1062,7 +1061,7 @@ mod tests {
             file_key: fk.clone(),
         };
 
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
 
         // pin for read and hold it
         let pinned = cache.pin_read(&id).expect("pin_read failed (holder)");
@@ -1098,7 +1097,7 @@ mod tests {
             file_key: fk.clone(),
         };
 
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
 
         // pin for write and hold it
         let mut pinned_w = cache.pin_write(&id).expect("pin_write failed (holder)");
@@ -1133,7 +1132,7 @@ mod tests {
         let pid2 = alloc_page_with_u64(&files, &file_key, 2);
         let pid3 = alloc_page_with_u64(&files, &file_key, 3);
 
-        let cache = Cache::<2>::new(files.clone());
+        let cache = Cache::new(2, files.clone());
 
         let fp1 = FilePageRef {
             page_id: pid1,
@@ -1185,7 +1184,7 @@ mod tests {
 
         // start cache with a short cleanup interval
         let (cache, mut cleaner) =
-            Cache::<2>::with_background_cleaner(files.clone(), Duration::from_millis(50));
+            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50));
 
         // create a frame and insert it directly into frames map WITHOUT adding to LRU
         let page: Page = [0u8; 4096];
@@ -1222,7 +1221,7 @@ mod tests {
         };
 
         let (cache, mut cleaner) =
-            Cache::<2>::with_background_cleaner(files.clone(), Duration::from_millis(50));
+            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50));
 
         let page: Page = [0u8; 4096];
         let frame = Arc::new(PageFrame::new(id.clone(), page));
@@ -1268,7 +1267,7 @@ mod tests {
         };
 
         let (cache, mut cleaner) =
-            Cache::<3>::with_background_cleaner(files.clone(), Duration::from_millis(50));
+            Cache::with_background_cleaner(3, files.clone(), Duration::from_millis(50));
 
         let page: Page = [0u8; 4096];
 
@@ -1316,7 +1315,7 @@ mod tests {
             file_key: file_key.clone(),
         };
 
-        let cache = Cache::<1>::new(files.clone());
+        let cache = Cache::new(1, files.clone());
 
         {
             let mut w = cache.pin_write(&id).expect("pin_write failed");
