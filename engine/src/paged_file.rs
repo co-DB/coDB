@@ -14,7 +14,7 @@ use thiserror::Error;
 pub type PageId = u64;
 
 /// Size of each page in [`PagedFile`].
-const PAGE_SIZE: usize = 4096; // 4 kB
+pub(crate) const PAGE_SIZE: usize = 4096; // 4 kB
 
 /// Type representing page, should be used instead of bare array of bytes.
 pub type Page = [u8; PAGE_SIZE];
