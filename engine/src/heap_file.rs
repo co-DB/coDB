@@ -6,7 +6,6 @@ use thiserror::Error;
 
 use crate::{
     cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedWritePage},
-    consts::CACHE_SIZE,
     files_manager::FileKey,
     paged_file::{PAGE_SIZE, PageId},
     slotted_page::{
@@ -37,7 +36,7 @@ use crate::{
 /// The map is rebuilt from page headers when the heap file is opened.
 struct FreeSpaceMap<const BUCKETS_COUNT: usize> {
     buckets: [SegQueue<PageId>; BUCKETS_COUNT],
-    cache: Arc<Cache<CACHE_SIZE>>,
+    cache: Arc<Cache>,
     file_key: FileKey,
 }
 
