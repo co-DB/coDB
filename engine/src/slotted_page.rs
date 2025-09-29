@@ -330,7 +330,7 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// Gets a reference to the base header (common to all slotted pages).
-    fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
+    pub fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
         self.get_generic_header::<SlottedPageBaseHeader>()
     }
 
@@ -389,15 +389,18 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 }
 
 impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
-    pub fn initialize(page: P, allow_slot_compaction: bool) -> Self {
+    pub fn initialize_with_header(page: P, allow_slot_compaction: bool, header: H) -> Self {
         let mut page = page;
-        let header = H::default();
         page.data_mut()[0..size_of::<H>()].copy_from_slice(bytemuck::bytes_of(&header));
         Self {
             page,
             allow_slot_compaction,
             _header_marker: PhantomData,
         }
+    }
+
+    pub fn initialize_default(page: P, allow_slot_compaction: bool) -> Self {
+        Self::initialize_with_header(page, allow_slot_compaction, H::default())
     }
 
     /// Generic method to cast page header to any type implementing SlottedPageHeader
@@ -410,12 +413,12 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         )?)
     }
 
-    fn get_header_mut(&mut self) -> Result<&mut H, SlottedPageError> {
+    pub fn get_header_mut(&mut self) -> Result<&mut H, SlottedPageError> {
         self.get_generic_header_mut::<H>()
     }
 
     /// Gets a mutable reference to base header (common to all slotted pages).
-    fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
+    pub fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
         self.get_generic_header_mut::<SlottedPageBaseHeader>()
     }
 
@@ -1654,7 +1657,7 @@ mod tests {
     fn test_slot_compaction_forbidden_when_disabled() {
         let page = TestPage::new(PAGE_SIZE);
         let mut slotted_page =
-            SlottedPage::<TestPage, SlottedPageBaseHeader>::initialize(page, false); // slot compaction disabled
+            SlottedPage::<TestPage, SlottedPageBaseHeader>::initialize_default(page, false); // slot compaction disabled
 
         let result = slotted_page.compact_slots();
         assert!(matches!(result, Err(ForbiddenSlotCompaction)));
