@@ -1,8 +1,9 @@
-﻿use crate::cache::PageRead;
+﻿use crate::cache::{PageRead, PageWrite};
 use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::paged_file::PageId;
 use crate::slotted_page::{
-    ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError, SlottedPageHeader,
+    PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
+    SlottedPageHeader,
 };
 use bytemuck::{Pod, Zeroable};
 use std::cmp::{Ordering, PartialEq};
@@ -19,14 +20,16 @@ pub(crate) enum BTreeError {
     CorruptNode { reason: String },
 }
 
-/// BTree page header that every b-tree node page contains. Is composed of base slotted page header
-/// plus b-tree specific fields.
+/// Type aliases for making things a little more readable
+pub(crate) type BTreeLeafNode<Page, Key> = BTreeNode<Page, BTreeLeafHeader, Key>;
+pub(crate) type BTreeInternalNode<Page, Key> = BTreeNode<Page, BTreeInternalHeader, Key>;
+
+/// Header of internal B-Tree nodes,
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
-pub(crate) struct BTreePageHeader {
+struct BTreeInternalHeader {
     base_header: SlottedPageBaseHeader,
-    /// Whether the page is leaf or internal.
-    page_type: u16,
+    padding: u16,
     /// Stores the page id of the child node with keys lesser than the smallest one in
     /// this node. We store this here, because a btree node with n keys needs n+1 child
     /// pointers and storing the first pointer here is easier than storing it in a
@@ -34,13 +37,61 @@ pub(crate) struct BTreePageHeader {
     leftmost_child_pointer: PageId,
 }
 
-/// Enum representing possible page types.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum PageType {
-    Leaf,
-    Internal,
+impl BTreeInternalHeader {
+    const NO_LEFTMOST_CHILD_POINTER: u32 = PageId::MAX;
+}
+impl SlottedPageHeader for BTreeInternalHeader {
+    fn base(&self) -> &SlottedPageBaseHeader {
+        &self.base_header
+    }
 }
 
+unsafe impl ReprC for BTreeInternalHeader {}
+impl Default for BTreeInternalHeader {
+    fn default() -> Self {
+        BTreeInternalHeader {
+            base_header: SlottedPageBaseHeader::new(
+                size_of::<BTreeInternalHeader>() as u16,
+                PageType::BTreeInternal,
+            ),
+            padding: 0,
+            leftmost_child_pointer: Self::NO_LEFTMOST_CHILD_POINTER,
+        }
+    }
+}
+
+/// Header of leaf B-Tree nodes,
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone)]
+struct BTreeLeafHeader {
+    base_header: SlottedPageBaseHeader,
+    padding: u16,
+    next_leaf_pointer: PageId,
+}
+impl BTreeLeafHeader {
+    const NO_NEXT_LEAF: u32 = PageId::MAX;
+}
+impl SlottedPageHeader for BTreeLeafHeader {
+    fn base(&self) -> &SlottedPageBaseHeader {
+        &self.base_header
+    }
+}
+
+unsafe impl ReprC for BTreeLeafHeader {}
+impl Default for BTreeLeafHeader {
+    fn default() -> Self {
+        BTreeLeafHeader {
+            base_header: SlottedPageBaseHeader::new(
+                size_of::<BTreeLeafHeader>() as u16,
+                PageType::BTreeLeaf,
+            ),
+            padding: 0,
+            next_leaf_pointer: Self::NO_NEXT_LEAF,
+        }
+    }
+}
+
+#[derive(Debug)]
 /// Enum representing possible outcomes of a search operation.
 pub(crate) enum SearchResult {
     /// Leaf node: exact match found.
@@ -53,6 +104,7 @@ pub(crate) enum SearchResult {
     FollowChild { child_ptr: PageId },
 }
 
+#[derive(Debug)]
 /// A struct containing all the information necessary to get the actual record data from a heap file.
 /// Stored inside leaf nodes of the b-tree.
 pub(crate) struct RecordPointer {
@@ -79,87 +131,75 @@ impl DbSerializable for RecordPointer {
 /// Helper trait that every key of a b-tree must implement.
 pub(crate) trait BTreeKey: DbSerializable + Ord + Clone {}
 
-impl BTreePageHeader {
-    const LEAF_PAGE: u16 = 0;
-    const INTERNAL_PAGE: u16 = 1;
-
-    fn page_type(&self) -> PageType {
-        match self.page_type {
-            Self::LEAF_PAGE => PageType::Leaf,
-            Self::INTERNAL_PAGE => PageType::Internal,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn is_leaf(&self) -> bool {
-        self.page_type() == PageType::Leaf
-    }
-}
-
-unsafe impl ReprC for BTreePageHeader {}
-impl SlottedPageHeader for BTreePageHeader {
-    fn base(&self) -> &SlottedPageBaseHeader {
-        &self.base_header
-    }
-}
-
 /// Struct representing a B-Tree node. It is a wrapper on a slotted page, that uses its api for
 /// lower level operations.
-pub(crate) struct BTreeNode<Page, Key>
+pub(crate) struct BTreeNode<Page, Header, Key>
 where
     Key: BTreeKey,
+    Header: SlottedPageHeader,
 {
     /// Slotted page whose operations B-Tree node depends on.
-    slotted_page: SlottedPage<Page>,
+    slotted_page: SlottedPage<Page, Header>,
     /// We need to tie a B-Tree node to specific key type, but since there is no sensible field of
     /// type Key that we can create, we need to use PhantomData just to mark that we are using this
     /// type.
     _key_marker: PhantomData<Key>,
 }
 
-impl<Page: PageRead, Key: BTreeKey> BTreeNode<Page, Key> {
-    /// Creates a new B-Tree node out of a Page.
-    pub fn new(page: Page) -> Self {
-        Self {
-            // Here allow_slot_compaction is true since in B-Trees only the order of the nodes matter
-            // and not the actual ids, thus we can compact the slots (which changes those ids).
-            slotted_page: SlottedPage::new(page, true),
+impl<Page, Header, Key> BTreeNode<Page, Header, Key>
+where
+    Page: PageRead,
+    Header: SlottedPageHeader,
+    Key: BTreeKey,
+{
+    pub fn new(page: Page) -> Result<Self, BTreeError> {
+        Ok(Self {
+            slotted_page: SlottedPage::new(page, true)?,
             _key_marker: PhantomData,
-        }
+        })
     }
 
-    /// Gets a reference to B-Tree header.
-    fn get_btree_header(&self) -> Result<&BTreePageHeader, BTreeError> {
-        Ok(self.slotted_page.get_header::<BTreePageHeader>()?)
+    fn get_btree_header(&self) -> Result<&Header, BTreeError> {
+        Ok(self.slotted_page.get_header()?)
     }
 
-    /// Gets a reference to the base header that every slotted page has.
     fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, BTreeError> {
         Ok(self.get_btree_header()?.base())
     }
 
-    /// Searches for the given key inside the node and returns:
-    /// 1) For internal nodes the id of the child page which must be followed to find the leaf with
-    ///    the given key.
-    /// 2) For leaf nodes:
-    ///    a) If the key is there the result is the record pointer which stores the actual position
-    ///    of the record with the given key.
-    ///    b) If the key is not there we return the position (slot_id) at which a new record with
-    ///    the given key should be inserted.
-    pub fn search(&self, target_key: &Key) -> Result<SearchResult, BTreeError> {
-        if self.is_leaf()? {
-            self.search_leaf(target_key)
-        } else {
-            self.search_internal(target_key)
-        }
+    /// Gets the key stored in the given slot.
+    fn get_key(&self, slot_id: SlotId) -> Result<Key, BTreeError> {
+        let record_bytes = self.slotted_page.read_record(slot_id)?;
+        let (key, _) = Key::deserialize(record_bytes)?;
+        Ok(key)
     }
+}
 
-    /// Search function for internal nodes.
-    fn search_internal(&self, target_key: &Key) -> Result<SearchResult, BTreeError> {
+impl<Page, Header, Key> BTreeNode<Page, Header, Key>
+where
+    Page: PageRead + PageWrite,
+    Header: SlottedPageHeader,
+    Key: BTreeKey,
+{
+    fn get_btree_header_mut(&mut self) -> Result<&mut Header, BTreeError> {
+        Ok(self.slotted_page.get_header_mut()?)
+    }
+}
+
+impl<Page, Key> BTreeNode<Page, BTreeInternalHeader, Key>
+where
+    Page: PageRead,
+    Key: BTreeKey,
+{
+    /// Internal nodes only: search returns which child to follow.
+    pub fn search(&self, target_key: &Key) -> Result<SearchResult, BTreeError> {
         let num_slots = self.slotted_page.num_slots()?;
 
         if num_slots == 0 {
-            return Ok(SearchResult::NotFoundLeaf { insert_slot_id: 0 });
+            // Edge case: empty internal node (corruption? root?)
+            return Err(BTreeError::CorruptNode {
+                reason: "internal node has no slots".into(),
+            });
         }
 
         let mut left = 0;
@@ -171,9 +211,7 @@ impl<Page: PageRead, Key: BTreeKey> BTreeNode<Page, Key> {
             let (key, child_page_id_bytes) = Key::deserialize(record_bytes)?;
 
             match key.cmp(target_key) {
-                Ordering::Less => {
-                    left = mid + 1;
-                }
+                Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
                     let (child_page_id, _) = PageId::deserialize(child_page_id_bytes)?;
                     return Ok(SearchResult::FollowChild {
@@ -181,59 +219,75 @@ impl<Page: PageRead, Key: BTreeKey> BTreeNode<Page, Key> {
                     });
                 }
                 Ordering::Greater => {
+                    if mid == 0 {
+                        break;
+                    }
                     right = mid - 1;
                 }
             }
         }
 
-        // Att this point left contains the position of the first key bigger than target_key. If the
-        // position is 0 then target_key is smaller than all keys in the node, and thus we need to
-        // use the leftmost child pointer from header.
+        let header = self.get_btree_header()?;
         let child_ptr = if left == 0 {
-            self.get_btree_header()?.leftmost_child_pointer
+            header.leftmost_child_pointer
         } else {
-            // We use left - 1, because we want to go to the child containing values lesser than the
-            // key at position left. Since slot[pos] hold keys >= key[pos] (meaning slot[left] holds
-            // keys >= key[left]) we need to use the one before.
             self.get_child_ptr(left - 1)?
         };
+
         Ok(SearchResult::FollowChild { child_ptr })
     }
 
-    /// Gets the key stored in the given slot.
-    fn get_key(&self, slot_id: SlotId) -> Result<Key, BTreeError> {
-        let record_bytes = self.slotted_page.read_record(slot_id)?;
-        let (key, _) = Key::deserialize(record_bytes)?;
-        Ok(key)
-    }
-
-    /// Gets the child pointer stored in the given slot. Only applicable for internal nodes.
     fn get_child_ptr(&self, slot_id: SlotId) -> Result<PageId, BTreeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
         let (_, child_ptr_bytes) = Key::deserialize(record_bytes)?;
         let (child_ptr, _) = PageId::deserialize(child_ptr_bytes)?;
         Ok(child_ptr)
     }
+}
 
-    /// Search function for leaf nodes.
-    fn search_leaf(&self, target_key: &Key) -> Result<SearchResult, BTreeError> {
+impl<Page, Key> BTreeNode<Page, BTreeInternalHeader, Key>
+where
+    Page: PageWrite + PageRead,
+    Key: BTreeKey,
+{
+    pub fn initialize(page: Page) -> Self {
+        let slotted_page = SlottedPage::initialize_default(page, true);
+        Self {
+            slotted_page,
+            _key_marker: PhantomData,
+        }
+    }
+}
+impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
+where
+    Page: PageRead,
+    Key: BTreeKey,
+{
+    /// Leaf nodes only: search either finds record or insert slot.
+    pub fn search(&self, target_key: &Key) -> Result<SearchResult, BTreeError> {
+        let num_slots = self.slotted_page.num_slots()?;
+        if num_slots == 0 {
+            return Ok(SearchResult::NotFoundLeaf { insert_slot_id: 0 });
+        }
+
         let mut left = 0;
-        let mut right = self.slotted_page.num_slots()? - 1;
+        let mut right = num_slots - 1;
 
         while left <= right {
             let mid = (left + right) / 2;
             let record_bytes = self.slotted_page.read_record(mid)?;
-            let (key, child_page_id_bytes) = Key::deserialize(record_bytes)?;
+            let (key, record_ptr_bytes) = Key::deserialize(record_bytes)?;
 
             match key.cmp(target_key) {
-                Ordering::Less => {
-                    left = mid + 1;
-                }
+                Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
-                    let (record_ptr, _) = RecordPointer::deserialize(child_page_id_bytes)?;
+                    let (record_ptr, _) = RecordPointer::deserialize(record_ptr_bytes)?;
                     return Ok(SearchResult::Found { record_ptr });
                 }
                 Ordering::Greater => {
+                    if mid == 0 {
+                        break;
+                    }
                     right = mid - 1;
                 }
             }
@@ -243,9 +297,196 @@ impl<Page: PageRead, Key: BTreeKey> BTreeNode<Page, Key> {
             insert_slot_id: left,
         })
     }
+}
 
-    /// Returns whether the node is a leaf.
-    fn is_leaf(&self) -> Result<bool, BTreeError> {
-        Ok(self.get_btree_header()?.is_leaf())
+impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
+where
+    Page: PageWrite + PageRead,
+    Key: BTreeKey,
+{
+    pub fn initialize(page: Page, next_leaf: Option<PageId>) -> Self {
+        let header = BTreeLeafHeader {
+            base_header: SlottedPageBaseHeader::new(
+                size_of::<BTreeLeafHeader>() as u16,
+                PageType::BTreeLeaf,
+            ),
+            padding: 0,
+            next_leaf_pointer: next_leaf.unwrap_or(BTreeLeafHeader::NO_NEXT_LEAF),
+        };
+        let slotted_page = SlottedPage::initialize_with_header(page, true, header);
+        Self {
+            slotted_page,
+            _key_marker: PhantomData,
+        }
+    }
+}
+mod test {
+    use super::*;
+    use crate::cache::{PageRead, PageWrite};
+    use crate::slotted_page::InsertResult;
+
+    const PAGE_SIZE: usize = 4096;
+
+    struct TestPage {
+        data: Vec<u8>,
+    }
+
+    impl TestPage {
+        fn new(size: usize) -> Self {
+            Self {
+                data: vec![0; size],
+            }
+        }
+    }
+
+    impl PageRead for TestPage {
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl PageWrite for TestPage {
+        fn data_mut(&mut self) -> &mut [u8] {
+            &mut self.data
+        }
+    }
+
+    impl BTreeKey for u32 {}
+
+    type LeafNode = BTreeNode<TestPage, BTreeLeafHeader, u32>;
+    type InternalNode = BTreeNode<TestPage, BTreeInternalHeader, u32>;
+
+    fn make_leaf_node(keys: &[u32], record_ptrs: &[RecordPointer]) -> LeafNode {
+        assert_eq!(keys.len(), record_ptrs.len());
+
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None);
+
+        for (k, rec) in keys.iter().zip(record_ptrs.iter()) {
+            let mut buf = Vec::new();
+            k.serialize(&mut buf);
+            rec.serialize(&mut buf);
+            node.slotted_page.insert(&buf).unwrap();
+        }
+
+        node
+    }
+
+    fn make_internal_node(keys: &[u32], child_ptrs: &[PageId]) -> InternalNode {
+        assert_eq!(keys.len() + 1, child_ptrs.len());
+
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = InternalNode::initialize(page);
+
+        let header: &mut BTreeInternalHeader = node.get_btree_header_mut().unwrap();
+        header.leftmost_child_pointer = child_ptrs[0];
+
+        for (i, k) in keys.iter().enumerate() {
+            let mut buf = Vec::new();
+            k.serialize(&mut buf);
+            child_ptrs[i + 1].serialize(&mut buf);
+            let result = node.slotted_page.insert(&buf).unwrap();
+            match result {
+                InsertResult::Success(_) => {}
+                _ => panic!("insert failed"),
+            }
+        }
+
+        node
+    }
+
+    #[test]
+    fn test_leaf_search_empty_node() {
+        let page = TestPage::new(PAGE_SIZE);
+        let node = LeafNode::initialize(page, None);
+
+        let res = node.search(&10).unwrap();
+        match res {
+            SearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 0),
+            _ => panic!("expected NotFoundLeaf"),
+        }
+    }
+
+    #[test]
+    fn test_leaf_search_found_and_not_found() {
+        let keys = vec![10u32, 20u32, 30u32];
+        let recs = vec![
+            RecordPointer {
+                page_id: 1,
+                slot_id: 1,
+            },
+            RecordPointer {
+                page_id: 1,
+                slot_id: 2,
+            },
+            RecordPointer {
+                page_id: 2,
+                slot_id: 3,
+            },
+        ];
+
+        let node = make_leaf_node(&keys, &recs);
+
+        for (k, rec) in keys.iter().zip(recs.iter()) {
+            let res = node.search(k).unwrap();
+            match res {
+                SearchResult::Found { record_ptr } => {
+                    assert_eq!(record_ptr.page_id, rec.page_id);
+                    assert_eq!(record_ptr.slot_id, rec.slot_id);
+                }
+                _ => panic!("expected Found got {:?}", res),
+            }
+        }
+
+        let res = node.search(&15).unwrap();
+        match res {
+            SearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 1),
+            _ => panic!("expected NotFoundLeaf"),
+        }
+
+        let res = node.search(&5).unwrap();
+        match res {
+            SearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 0),
+            _ => panic!("expected NotFoundLeaf"),
+        }
+
+        let res = node.search(&40).unwrap();
+        match res {
+            SearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 3),
+            _ => panic!("expected NotFoundLeaf"),
+        }
+    }
+
+    #[test]
+    fn test_internal_search_follow_child() {
+        let keys = vec![10u32, 20u32, 30u32];
+        let children = vec![100, 200, 300, 400]; // 4 child pointers
+
+        let node = make_internal_node(&keys, &children);
+
+        let res = node.search(&5).unwrap();
+        match res {
+            SearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 100),
+            _ => panic!("expected FollowChild, got {:?}", res),
+        }
+
+        let res = node.search(&10).unwrap();
+        match res {
+            SearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 200),
+            _ => panic!("expected FollowChild, got {:?}", res),
+        }
+
+        let res = node.search(&15).unwrap();
+        match res {
+            SearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 200),
+            _ => panic!("expected FollowChild, got {:?}", res),
+        }
+
+        // For key > 30, should go to last child
+        let res = node.search(&35).unwrap();
+        match res {
+            SearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 400),
+            _ => panic!("expected FollowChild, got {:?}", res),
+        }
     }
 }
