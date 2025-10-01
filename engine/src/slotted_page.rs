@@ -49,7 +49,7 @@ impl FreeBlock {
 
 /// In the future add B-tree and heap file implementations of this
 /// The structs implementing this trait must use #[repr(C)]
-pub(crate) trait SlottedPageHeader: Pod + ReprC + Default {
+pub(crate) trait SlottedPageHeader: Pod + ReprC {
     fn base(&self) -> &SlottedPageBaseHeader;
 }
 
@@ -59,7 +59,6 @@ pub(crate) trait SlottedPageHeader: Pod + ReprC + Default {
 #[repr(C)]
 pub(crate) struct SlottedPageBaseHeader {
     /// Magic number that indicates whether the page is initialized for CODB usage
-    /// Magic number - used for checking if file is (has high chances to be) codb file.
     co_db_magic_number: u16,
     /// Total free space inside slotted page. Is equal to the sum of space inside free blocks and
     /// contiguous free space.
@@ -315,6 +314,8 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(page)
     }
     /// Generic method to cast page header to any type implementing SlottedPageHeader
+    ///
+    /// Caller must ensure T matches the actual header type stored in the page
     fn get_generic_header<T>(&self) -> Result<&T, SlottedPageError>
     where
         T: SlottedPageHeader,
@@ -326,7 +327,7 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
     /// Gets a reference to the header
     pub fn get_header(&self) -> Result<&H, SlottedPageError> {
-        Ok(self.get_generic_header::<H>()?)
+        self.get_generic_header::<H>()
     }
 
     /// Gets a reference to the base header (common to all slotted pages).
@@ -399,11 +400,16 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         }
     }
 
-    pub fn initialize_default(page: P, allow_slot_compaction: bool) -> Self {
+    pub fn initialize_default(page: P, allow_slot_compaction: bool) -> Self
+    where
+        H: Default,
+    {
         Self::initialize_with_header(page, allow_slot_compaction, H::default())
     }
 
     /// Generic method to cast page header to any type implementing SlottedPageHeader
+    ///
+    /// Caller must ensure T matches the actual header type stored in the page
     fn get_generic_header_mut<T>(&mut self) -> Result<&mut T, SlottedPageError>
     where
         T: SlottedPageHeader,
