@@ -38,7 +38,7 @@ struct BTreeInternalHeader {
 }
 
 impl BTreeInternalHeader {
-    const NO_LEFTMOST_CHILD_POINTER: u32 = PageId::MAX;
+    const NO_LEFTMOST_CHILD_POINTER: PageId = PageId::MAX;
 }
 impl SlottedPageHeader for BTreeInternalHeader {
     fn base(&self) -> &SlottedPageBaseHeader {
@@ -66,10 +66,11 @@ impl Default for BTreeInternalHeader {
 struct BTreeLeafHeader {
     base_header: SlottedPageBaseHeader,
     padding: u16,
+    /// Pointer to the right sibling leaf node (for range queries)
     next_leaf_pointer: PageId,
 }
 impl BTreeLeafHeader {
-    const NO_NEXT_LEAF: u32 = PageId::MAX;
+    const NO_NEXT_LEAF: PageId = PageId::MAX;
 }
 impl SlottedPageHeader for BTreeLeafHeader {
     fn base(&self) -> &SlottedPageBaseHeader {
@@ -104,6 +105,7 @@ pub(crate) enum SearchResult {
     FollowChild { child_ptr: PageId },
 }
 
+// TODO: Use the heap file record ptr
 #[derive(Debug)]
 /// A struct containing all the information necessary to get the actual record data from a heap file.
 /// Stored inside leaf nodes of the b-tree.
@@ -130,6 +132,7 @@ impl DbSerializable for RecordPointer {
 
 /// Helper trait that every key of a b-tree must implement.
 pub(crate) trait BTreeKey: DbSerializable + Ord + Clone {}
+impl<T> BTreeKey for T where T: DbSerializable + Ord + Clone {}
 
 /// Struct representing a B-Tree node. It is a wrapper on a slotted page, that uses its api for
 /// lower level operations.
@@ -191,7 +194,7 @@ where
     Page: PageRead,
     Key: BTreeKey,
 {
-    /// Internal nodes only: search returns which child to follow.
+    /// Search returns which child to follow.
     pub fn search(&self, target_key: &Key) -> Result<SearchResult, BTreeError> {
         let num_slots = self.slotted_page.num_slots()?;
 
@@ -263,7 +266,7 @@ where
     Page: PageRead,
     Key: BTreeKey,
 {
-    /// Leaf nodes only: search either finds record or insert slot.
+    /// Search either finds record or insert slot.
     pub fn search(&self, target_key: &Key) -> Result<SearchResult, BTreeError> {
         let num_slots = self.slotted_page.num_slots()?;
         if num_slots == 0 {
@@ -350,8 +353,6 @@ mod test {
             &mut self.data
         }
     }
-
-    impl BTreeKey for u32 {}
 
     type LeafNode = BTreeNode<TestPage, BTreeLeafHeader, u32>;
     type InternalNode = BTreeNode<TestPage, BTreeInternalHeader, u32>;
@@ -460,7 +461,7 @@ mod test {
     #[test]
     fn test_internal_search_follow_child() {
         let keys = vec![10u32, 20u32, 30u32];
-        let children = vec![100, 200, 300, 400]; // 4 child pointers
+        let children = vec![100, 200, 300, 400];
 
         let node = make_internal_node(&keys, &children);
 
@@ -482,7 +483,6 @@ mod test {
             _ => panic!("expected FollowChild, got {:?}", res),
         }
 
-        // For key > 30, should go to last child
         let res = node.search(&35).unwrap();
         match res {
             SearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 400),
