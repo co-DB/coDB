@@ -30,7 +30,7 @@ trait WritePageId: io::Write {
 impl<T> WritePageId for T where T: io::Write {}
 
 /// Size of each page in [`PagedFile`].
-const PAGE_SIZE: usize = 4096; // 4 kB
+pub(crate) const PAGE_SIZE: usize = 4096; // 4 kB
 
 /// Type representing page, should be used instead of bare array of bytes.
 pub type Page = [u8; PAGE_SIZE];
