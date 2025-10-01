@@ -282,8 +282,8 @@ impl<P: PageRead> SlottedPage<P> {
         Ok(&self.page.data()[record_start..record_end])
     }
 
-    /// Reads the record data for a given slot. Checks if the record is deleted . Safe version of
-    /// read_record
+    /// Reads the record data for a given slot. Checks if the record is deleted. Safe version of
+    /// read_record.
     pub fn read_valid_record(&self, slot_idx: u16) -> Result<&[u8], SlottedPageError> {
         let slot = self.get_slot(slot_idx)?;
 
@@ -297,6 +297,19 @@ impl<P: PageRead> SlottedPage<P> {
         let record_end = record_start + slot.len as usize;
 
         Ok(&self.page.data()[record_start..record_end])
+    }
+
+    /// Reads all records from page that are not marked as deleted.
+    pub fn read_all_valid_records(&self) -> Result<impl Iterator<Item = &[u8]>, SlottedPageError> {
+        let slots = self.get_slots()?;
+        Ok(slots.iter().filter_map(|slot| {
+            if slot.is_deleted() {
+                return None;
+            }
+            let record_start = slot.offset as usize;
+            let record_end = record_start + slot.len as usize;
+            Some(&self.page.data()[record_start..record_end])
+        }))
     }
 }
 
@@ -1358,8 +1371,6 @@ mod tests {
     #[test]
     fn test_record_defragmentation() {
         let mut page = create_test_page(128);
-
-        let free_space = page.free_space().unwrap();
 
         let record_1 = [1u8; 50];
         let record_2 = [2u8; 50];

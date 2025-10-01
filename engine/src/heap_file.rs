@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use crossbeam::queue::SegQueue;
@@ -43,14 +43,12 @@ struct FreeSpaceMap<const BUCKETS_COUNT: usize> {
 impl<const BUCKETS_COUNT: usize> FreeSpaceMap<BUCKETS_COUNT> {
     /// Finds a page that has at least `needed_space` bytes free.
     ///
-    /// Returns a guard that pins the page for writing and will update the [`FreeSpaceMap`]
-    /// when dropped. Buckets are only hints: candidates are popped from buckets and the
-    /// page header is read to confirm actual free space. If a candidate is stale the
+    /// If a candidate is stale the
     /// search continues. Returns `Ok(None)` if no suitable page is found.
-    fn page_with_free_space<'f>(
-        &'f self,
+    fn page_with_free_space(
+        &self,
         needed_space: usize,
-    ) -> Result<Option<FsmPageGuard<'f, BUCKETS_COUNT>>, HeapFileError> {
+    ) -> Result<Option<SlottedPage<PinnedWritePage>>, HeapFileError> {
         let start_bucket_idx = self.bucket_for_space(needed_space);
         for b in start_bucket_idx..BUCKETS_COUNT {
             while let Some(page_id) = self.buckets[b].pop() {
@@ -59,12 +57,7 @@ impl<const BUCKETS_COUNT: usize> FreeSpaceMap<BUCKETS_COUNT> {
                 let slotted_page = SlottedPage::new(page, true);
                 let actual_free_space = slotted_page.free_space()?;
                 if actual_free_space >= needed_space as _ {
-                    let fpg = FsmPageGuard {
-                        page: slotted_page,
-                        page_id,
-                        fsm: &self,
-                    };
-                    return Ok(Some(fpg));
+                    return Ok(Some(slotted_page));
                 }
             }
         }
@@ -99,30 +92,10 @@ impl<const BUCKETS_COUNT: usize> FreeSpaceMap<BUCKETS_COUNT> {
     }
 }
 
-/// Guard that wraps a pinned-write [`SlottedPage`].
-///
-/// While held the guard gives exclusive write access to the page. On `Drop` it reads
-/// the page's free-space from the header and updates the [`FreeSpaceMap`] (re-inserts the
-/// page id into the appropriate bucket) so the map stays a best-effort hint.
-struct FsmPageGuard<'f, const BUCKETS_COUNT: usize> {
-    page: SlottedPage<PinnedWritePage>,
-    page_id: PageId,
-    fsm: &'f FreeSpaceMap<BUCKETS_COUNT>,
-}
-
-impl<'f, const BUCKETS_COUNT: usize> Drop for FsmPageGuard<'f, BUCKETS_COUNT> {
-    fn drop(&mut self) {
-        if let Ok(free_space) = self.page.free_space() {
-            self.fsm
-                .update_page_bucket(self.page_id, free_space as usize);
-        }
-    }
-}
-
 /// Logical pointer to a record in a [`HeapFile`].
 ///
 /// It should only be used for referencing start of the record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordPtr {
     page_id: PageId,
     slot: u16,
@@ -265,12 +238,87 @@ impl<P: PageRead + PageWrite> HeapPageMetadata<P> {
     }
 }
 
-struct HeapPageRecord<'p, P> {
-    page: &'p SlottedPage<P>,
+struct HeapPageRecord<P> {
+    page: SlottedPage<P>,
 }
 
-struct HeapPageOverflow<'p, P> {
-    page: &'p SlottedPage<P>,
+struct RecordFragment<'d> {
+    data: &'d [u8],
+    next_fragment: Option<RecordPtr>,
+}
+
+/// Tag preceding record payload that describes whether a RecordPtr follows.
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordTag {
+    Final = 0x0000,
+    HasContinuation = 0xffff,
+}
+
+impl RecordTag {
+    // TODO:
+    // helper for reading from bytes
+}
+
+impl TryFrom<u16> for RecordTag {
+    type Error = HeapFileError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            v if v == RecordTag::Final as u16 => Ok(RecordTag::Final),
+            v if v == RecordTag::HasContinuation as u16 => Ok(RecordTag::HasContinuation)
+            _ => Err(HeapFileError::CorruptedRecordEntry { error: format!("unexpected record tag: 0x{:04x}", value) })
+        }
+    }
+}
+
+impl<P> HeapPageRecord<P>
+where
+    P: PageRead,
+{
+    fn record_at<'d>(&'d self, slot_idx: u16) -> Result<RecordFragment<'d>, HeapFileError> {
+        let bytes = self.page.read_valid_record(slot_idx)?;
+        self.bytes_to_record(bytes)
+    }
+
+    fn all_records<'d>(&'d self) -> Result<Vec<RecordFragment<'d>>, HeapFileError> {
+        let all_bytes = self.page.read_all_valid_records()?;
+        all_bytes
+            .map(|bytes| self.bytes_to_record(bytes))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn bytes_to_record<'d>(&'d self, bytes: &'d [u8]) -> Result<RecordFragment<'d>, HeapFileError> {
+        let ptr_size = mem::size_of::<RecordPtr>();
+        if bytes.len() < ptr_size {
+            return Err(HeapFileError::RecordPayloadTooSmall {
+                min: ptr_size,
+                actual: bytes.len(),
+            });
+        }
+
+        let (ptr_bytes, data) = bytes.split_at(ptr_size);
+        let record_ptr = *bytemuck::try_from_bytes::<RecordPtr>(ptr_bytes).map_err(|e| {
+            HeapFileError::CorruptedRecordEntry {
+                error: e.to_string(),
+            }
+        })?;
+
+        let next_fragment = if record_ptr.page_id == Self::NO_NEXT_FRAGMENT_PAGE_ID {
+            None
+        } else {
+            Some(record_ptr)
+        };
+
+        Ok(RecordFragment {
+            data,
+            next_fragment,
+        })
+    }
+}
+
+struct HeapPageOverflow<P> {
+    page: SlottedPage<P>,
 }
 
 #[derive(Debug, Error)]
@@ -279,6 +327,10 @@ pub(crate) enum HeapFileError {
     CorruptedHeapPageHeader { error: String },
     #[error("invalid metadata page: {error}")]
     InvalidMetadataPage { error: String },
+    #[error("record payload was to small (got {actual}, wanted at least {min}")]
+    RecordPayloadTooSmall { min: usize, actual: usize },
+    #[error("failed to deserialize record entry: {error}")]
+    CorruptedRecordEntry { error: String },
     #[error("cache error occured: {0}")]
     CacheError(#[from] CacheError),
     #[error("slotted page error occured: {0}")]
