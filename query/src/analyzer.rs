@@ -10,14 +10,15 @@ use thiserror::Error;
 use crate::{
     ast::{
         Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, Expression, FunctionCallNode,
-        Literal, LiteralNode, LogicalExpressionNode, NodeId, SelectStatement, Statement,
-        TableIdentifierNode, UnaryExpressionNode,
+        InsertStatement, Literal, LiteralNode, LogicalExpressionNode, NodeId, SelectStatement,
+        Statement, TableIdentifierNode, UnaryExpressionNode,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedExpression,
-        ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement,
-        ResolvedStatement, ResolvedTable, ResolvedTree, ResolvedType, ResolvedUnaryExpression,
+        ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId,
+        ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree, ResolvedType,
+        ResolvedUnaryExpression,
     },
 };
 
@@ -38,6 +39,13 @@ pub(crate) enum AnalyzerError {
     AmbiguousTableAlias { table_alias: String },
     #[error("no table with alias '{table_alias}' was found")]
     TableWithAliasNotFound { table_alias: String },
+    #[error("number of columns ('{columns}') and number of values ('{values}') are not equal")]
+    InsertColumnsAndValuesLenNotEqual { columns: usize, values: usize },
+    #[error("cannot use type '{value_type}' for column '{column_type}'")]
+    ColumnAndValueTypeDontMatch {
+        column_type: String,
+        value_type: String,
+    },
     #[error("unexpected type: expected {expected}, got {got}")]
     UnexpectedType { expected: String, got: String },
     #[error("unexpected catalog error: {0}")]
@@ -54,7 +62,7 @@ enum ResolveIdentifierHint {
     ExpectedTable,
 }
 
-/// Used as a key type for [`Analyzer::inserted_columns`].
+/// Used as a key type for [`StatementContext::inserted_columns`].
 #[derive(Debug, Hash, PartialEq, Eq)]
 struct InsertedColumnRef {
     table_name: String,
@@ -70,7 +78,7 @@ struct StatementContext {
     inserted_tables: HashMap<String, ResolvedNodeId>,
     /// Maps table alias to its name.
     alias_to_table: HashMap<String, String>,
-    /// Same as [`Analyzer::inserted_tables`] - used to avoid duplicating nodes.
+    /// Same as [`StatementContext::inserted_tables`] - used to avoid duplicating nodes.
     /// It should be used only per statement, as [`ColumnMetadata`] can be changed between statements.
     inserted_columns: HashMap<InsertedColumnRef, ResolvedNodeId>,
 }
@@ -143,7 +151,7 @@ pub(crate) struct Analyzer<'a> {
     ast: &'a Ast,
     /// Reference to the database catalog, which provides table and column metadatas.
     catalog: Arc<RwLock<Catalog>>,
-    /// [`ResolvedTree`] being built - ouput of the [`Analyzer`]'s work.
+    /// [`ResolvedTree`] being built - output of the [`Analyzer`]'s work.
     resolved_tree: ResolvedTree,
     /// Details about currently analyzed statement (e.g. already resolved tables and columns).
     statement_context: StatementContext,
@@ -175,7 +183,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_statement(&mut self, statement: &Statement) -> Result<(), AnalyzerError> {
         match statement {
             Statement::Select(select) => self.analyze_select_statement(select),
-            Statement::Insert(insert) => todo!(),
+            Statement::Insert(insert) => self.analyze_insert_statement(insert),
             Statement::Update(update) => todo!(),
             Statement::Delete(delete) => todo!(),
             Statement::Create(create) => todo!(),
@@ -207,6 +215,36 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
+    /// Analyzes insert statement.
+    /// If successful [`ResolvedInsertStatement`] is added to [`Analyzer::resolved_tree`].
+    fn analyze_insert_statement(&mut self, insert: &InsertStatement) -> Result<(), AnalyzerError> {
+        let resolved_table = self.resolve_expression(insert.table_name)?;
+        let resolved_columns = match &insert.columns {
+            Some(columns) => self.resolve_columns(columns)?,
+            None => self.resolve_all_columns_from_table(resolved_table)?,
+        };
+        let resolved_values = self.resolve_expressions(&insert.values)?;
+        if resolved_columns.len() != resolved_values.len() {
+            return Err(AnalyzerError::InsertColumnsAndValuesLenNotEqual {
+                columns: resolved_columns.len(),
+                values: resolved_values.len(),
+            });
+        }
+        let resolved_values = resolved_columns
+            .iter()
+            .zip(resolved_values.iter())
+            .map(|(&column, &value)| self.cast_value_to_column(column, value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let insert_statement = ResolvedInsertStatement {
+            table: resolved_table,
+            columns: resolved_columns,
+            values: resolved_values,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::Insert(insert_statement));
+        Ok(())
+    }
+
     /// Resolves list of columns.
     fn resolve_columns(
         &mut self,
@@ -221,7 +259,7 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Resolves all columns from table with `table_id`.
-    /// If successful updates [`Analyzer::inserted_columns`].
+    /// If successful updates [`StatementContext::inserted_columns`].
     fn resolve_all_columns_from_table(
         &mut self,
         table_id: ResolvedNodeId,
@@ -294,6 +332,18 @@ impl<'a> Analyzer<'a> {
                 self.resolve_column_identifier(column_identifier_node)
             }
         }
+    }
+
+    /// Resolves list of [`Expression`]s.
+    /// Returns list of [`ResolvedNodeId`]s of matching [`ResolvedExpression`]s or first error that was returned.
+    fn resolve_expressions(
+        &mut self,
+        expressions: &[NodeId],
+    ) -> Result<Vec<ResolvedNodeId>, AnalyzerError> {
+        expressions
+            .iter()
+            .map(|&value| self.resolve_expression(value))
+            .collect::<Result<Vec<_>, _>>()
     }
 
     fn resolve_logical_expression(
@@ -678,6 +728,46 @@ impl<'a> Analyzer<'a> {
         }
         Ok(())
     }
+
+    /// Tries to cast value to column creating new [`ResolvedCast`] if needed.
+    fn cast_value_to_column(
+        &mut self,
+        column: ResolvedNodeId,
+        value: ResolvedNodeId,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        let column_type = self.assert_not_table_ref(column)?;
+        let value_type = self.assert_not_table_ref(value)?;
+
+        // No cast is needed
+        if column_type == value_type {
+            return Ok(value);
+        }
+
+        let common_type = Type::coercion(&column_type, &value_type).ok_or(
+            AnalyzerError::ColumnAndValueTypeDontMatch {
+                column_type: column_type.to_string(),
+                value_type: value_type.to_string(),
+            },
+        )?;
+
+        // It means that column_type can be casted to value_type, but in this case
+        // we only allow value_type to be casted.
+        if column_type != common_type {
+            return Err(AnalyzerError::ColumnAndValueTypeDontMatch {
+                column_type: column_type.to_string(),
+                value_type: value_type.to_string(),
+            });
+        }
+
+        // We need to cast value to new type
+        let resolved_cast = ResolvedCast {
+            child: value,
+            new_ty: common_type,
+        };
+        Ok(self
+            .resolved_tree
+            .add_node(ResolvedExpression::Cast(resolved_cast)))
+    }
 }
 
 #[cfg(test)]
@@ -688,6 +778,7 @@ mod tests {
     use metadata::catalog::Catalog;
     use metadata::types::Type;
     use parking_lot::RwLock;
+    use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -863,6 +954,13 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::Select(s) => s,
             other => panic!("expected Select statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_insert(rt: &ResolvedTree, idx: usize) -> &ResolvedInsertStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::Insert(i) => i,
+            other => panic!("expected Insert statement, got: {:?}", other),
         }
     }
 
@@ -1584,6 +1682,380 @@ mod tests {
                 assert_eq!(table_alias, "k");
             }
             other => panic!("expected TableWithAliasNotFound, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_simple_insert_with_columns() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // columns
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let col_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
+        }));
+
+        // values
+        let val_id = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1),
+        }));
+        let val_name = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("bob ferguson".into()),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: Some(vec![col_id, col_name]),
+            values: vec![val_id, val_name],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+        let insert = expect_insert(&rt, 0);
+
+        // table
+        let tbl = expect_table(&rt, insert.table);
+        assert_eq!(tbl.name, "users");
+        assert_eq!(tbl.primary_key_name, "id");
+
+        // columns
+        assert_eq!(insert.columns.len(), 2);
+        assert_column(&rt, insert.columns[0], "id", Type::I32, insert.table, 0);
+        assert_column(
+            &rt,
+            insert.columns[1],
+            "name",
+            Type::String,
+            insert.table,
+            1,
+        );
+
+        // values
+        let v0 = expect_literal_i32(&rt, insert.values[0]);
+        assert_eq!(v0, 1);
+        let v1 = expect_literal_string(&rt, insert.values[1]);
+        assert_eq!(v1, "bob ferguson");
+    }
+
+    #[test]
+    fn analyze_insert_with_column_but_without_primary_key_provided() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // columns (only name)
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let col_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
+        }));
+
+        // values
+        let val_name = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("bob".into()),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: Some(vec![col_name]),
+            values: vec![val_name],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let insert = expect_insert(&rt, 0);
+
+        // table
+        let tbl = expect_table(&rt, insert.table);
+        assert_eq!(tbl.name, "users");
+
+        // columns
+        assert_eq!(insert.columns.len(), 1);
+        assert_column(
+            &rt,
+            insert.columns[0],
+            "name",
+            Type::String,
+            insert.table,
+            1,
+        );
+
+        // values
+        let v0 = expect_literal_string(&rt, insert.values[0]);
+        assert_eq!(v0, "bob");
+    }
+
+    #[test]
+    fn analyze_insert_values_only_auto_analyzed_columns() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // values
+        // must be in the exact order as in metadata (user should assert it)
+        let val_id = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(2),
+        }));
+        let val_name = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("ferguson".into()),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: None,
+            values: vec![val_id, val_name],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let insert = expect_insert(&rt, 0);
+
+        // table
+        let tbl = expect_table(&rt, insert.table);
+        assert_eq!(tbl.name, "users");
+
+        // columns
+        assert_eq!(insert.columns.len(), 2);
+        assert_column(&rt, insert.columns[0], "id", Type::I32, insert.table, 0);
+        assert_column(
+            &rt,
+            insert.columns[1],
+            "name",
+            Type::String,
+            insert.table,
+            1,
+        );
+
+        // values
+        let v0 = expect_literal_i32(&rt, insert.values[0]);
+        assert_eq!(v0, 2);
+        let v1 = expect_literal_string(&rt, insert.values[1]);
+        assert_eq!(v1, "ferguson");
+    }
+
+    #[test]
+    fn analyze_insert_cast_value_to_column_type() {
+        let tmp = TempDir::new().unwrap();
+        let db_file = tmp.path().join("testdb");
+        let json = r#"
+        {
+            "tables": [
+                {
+                    "name": "numbers",
+                    "columns": [
+                        { "name": "id", "ty": "I64", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+                    ],
+                    "primary_key_column_name": "id"
+                }
+            ]
+        }
+        "#;
+        fs::write(&db_file, json).unwrap();
+        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let catalog = Arc::new(RwLock::new(catalog));
+
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "numbers".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let val_small = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: Some(vec![col_id]),
+            values: vec![val_small],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        let insert = expect_insert(&rt, 0);
+
+        let c = expect_cast(&rt, insert.values[0]);
+        assert_eq!(c.new_ty, Type::I64);
+        let child = expect_literal_i32(&rt, c.child);
+        assert_eq!(child, 1);
+    }
+
+    #[test]
+    fn analyze_insert_value_cast_disallowed_f64_to_f32() {
+        let tmp = TempDir::new().unwrap();
+        let db_file = tmp.path().join("testdb");
+        let json = r#"
+        {
+            "tables": [
+                {
+                    "name": "floats",
+                    "columns": [
+                        { "name": "v", "ty": "F32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 }
+                    ],
+                    "primary_key_column_name": "v"
+                }
+            ]
+        }
+        "#;
+        fs::write(&db_file, json).unwrap();
+        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let catalog = Arc::new(RwLock::new(catalog));
+
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "floats".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let v_ident = ast.add_node(Expression::Identifier(IdentifierNode { value: "v".into() }));
+        let col_v = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: v_ident,
+            table_alias: None,
+        }));
+
+        let big_double = f32::MAX as f64 * 2.0;
+        let val_big = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Float(big_double),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: Some(vec![col_v]),
+            values: vec![val_big],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::ColumnAndValueTypeDontMatch {
+                column_type,
+                value_type,
+            } => {
+                assert_eq!(column_type, "Float32");
+                assert_eq!(value_type, "Float64");
+            }
+            other => panic!("expected ColumnAndValueTypeDontMatch, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_insert_more_values_than_columns() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // one column
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        // two values
+        let val_id = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1),
+        }));
+        let val_name = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("extra".into()),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: Some(vec![col_id]),
+            values: vec![val_id, val_name],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::InsertColumnsAndValuesLenNotEqual { columns, values } => {
+                assert_eq!(columns, 1);
+                assert_eq!(values, 2);
+            }
+            other => panic!(
+                "expected InsertColumnsAndValuesLenNotEqual, got: {:?}",
+                other
+            ),
         }
     }
 }

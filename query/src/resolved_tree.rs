@@ -43,7 +43,7 @@ impl ResolvedTree {
 
 /// [`ResolvedNodeId`] is used for indexing nodes and statements inside [`ResolvedTree`].
 ///
-/// Works similiary to [`NodeId`].
+/// Works similarly to [`NodeId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedNodeId(usize);
 
@@ -56,6 +56,7 @@ impl ResolvedNodeId {
 #[derive(Debug)]
 pub(crate) enum ResolvedStatement {
     Select(ResolvedSelectStatement),
+    Insert(ResolvedInsertStatement),
 }
 
 #[derive(Debug)]
@@ -63,6 +64,13 @@ pub(crate) struct ResolvedSelectStatement {
     pub(crate) table: ResolvedNodeId,
     pub(crate) columns: Vec<ResolvedNodeId>,
     pub(crate) where_clause: Option<ResolvedNodeId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedInsertStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) columns: Vec<ResolvedNodeId>,
+    pub(crate) values: Vec<ResolvedNodeId>,
 }
 
 #[derive(Debug)]
@@ -138,7 +146,7 @@ pub(crate) enum ResolvedLiteral {
     DateTime(PrimitiveDateTime),
 }
 
-/// User for one-to-one mapping between [`ResolvedLiteral`] and [`Type`].
+/// Used for one-to-one mapping between [`ResolvedLiteral`] and [`Type`].
 impl From<&ResolvedLiteral> for Type {
     fn from(value: &ResolvedLiteral) -> Self {
         match value {
