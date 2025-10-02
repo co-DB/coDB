@@ -60,6 +60,7 @@ pub(crate) enum ResolvedStatement {
     Update(ResolvedUpdateStatement),
     Delete(ResolvedDeleteStatement),
     Truncate(ResolvedTruncateStatement),
+    Drop(ResolvedDropStatement),
 }
 
 #[derive(Debug)]
@@ -92,6 +93,11 @@ pub(crate) struct ResolvedDeleteStatement {
 
 #[derive(Debug)]
 pub(crate) struct ResolvedTruncateStatement {
+    pub(crate) table: ResolvedNodeId,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedDropStatement {
     pub(crate) table: ResolvedNodeId,
 }
 

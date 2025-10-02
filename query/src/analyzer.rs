@@ -9,17 +9,18 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, DeleteStatement, Expression,
-        FunctionCallNode, InsertStatement, Literal, LiteralNode, LogicalExpressionNode, NodeId,
-        SelectStatement, Statement, TableIdentifierNode, TruncateStatement, UnaryExpressionNode,
-        UpdateStatement,
+        Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, DeleteStatement, DropStatement,
+        Expression, FunctionCallNode, InsertStatement, Literal, LiteralNode, LogicalExpressionNode,
+        NodeId, SelectStatement, Statement, TableIdentifierNode, TruncateStatement,
+        UnaryExpressionNode, UpdateStatement,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedDeleteStatement,
-        ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression,
-        ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
-        ResolvedTruncateStatement, ResolvedType, ResolvedUnaryExpression, ResolvedUpdateStatement,
+        ResolvedDropStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral,
+        ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
+        ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
+        ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
 
@@ -190,7 +191,7 @@ impl<'a> Analyzer<'a> {
             Statement::Create(create) => todo!(),
             Statement::Alter(alter) => todo!(),
             Statement::Truncate(truncate) => self.analyze_truncate_statement(truncate),
-            Statement::Drop(drop) => todo!(),
+            Statement::Drop(drop) => self.analyze_drop_statement(drop),
         }
     }
 
@@ -306,6 +307,18 @@ impl<'a> Analyzer<'a> {
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Truncate(truncate_statement));
+        Ok(())
+    }
+
+    /// Analyzes drop statement.
+    /// If successful [`ResolvedDropStatement`] is added to [`Analyzer::resolved_tree`].
+    fn analyze_drop_statement(&mut self, drop: &DropStatement) -> Result<(), AnalyzerError> {
+        let resolved_table = self.resolve_expression(drop.table_name)?;
+        let drop_statement = ResolvedDropStatement {
+            table: resolved_table,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::Drop(drop_statement));
         Ok(())
     }
 
@@ -1046,6 +1059,13 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::Truncate(t) => t,
             other => panic!("expected Truncate statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_drop_table(rt: &ResolvedTree, idx: usize) -> &ResolvedDropStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::Drop(d) => d,
+            other => panic!("expected Drop statement, got: {:?}", other),
         }
     }
 
@@ -2366,6 +2386,34 @@ mod tests {
 
         let truncate = expect_truncate(&rt, 0);
         let tbl = expect_table(&rt, truncate.table);
+        assert_eq!(tbl.name, "users");
+        assert_eq!(tbl.primary_key_name, "id");
+    }
+
+    #[test]
+    fn analyze_drop_table() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let drop = DropStatement { table_name };
+        ast.add_statement(Statement::Drop(drop));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let drop = expect_drop_table(&rt, 0);
+
+        let tbl = expect_table(&rt, drop.table);
         assert_eq!(tbl.name, "users");
         assert_eq!(tbl.primary_key_name, "id");
     }
