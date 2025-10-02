@@ -11,14 +11,15 @@ use crate::{
     ast::{
         Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, DeleteStatement, Expression,
         FunctionCallNode, InsertStatement, Literal, LiteralNode, LogicalExpressionNode, NodeId,
-        SelectStatement, Statement, TableIdentifierNode, UnaryExpressionNode, UpdateStatement,
+        SelectStatement, Statement, TableIdentifierNode, TruncateStatement, UnaryExpressionNode,
+        UpdateStatement,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedDeleteStatement,
         ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression,
         ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
-        ResolvedType, ResolvedUnaryExpression, ResolvedUpdateStatement,
+        ResolvedTruncateStatement, ResolvedType, ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
 
@@ -188,7 +189,7 @@ impl<'a> Analyzer<'a> {
             Statement::Delete(delete) => self.analyze_delete_statement(delete),
             Statement::Create(create) => todo!(),
             Statement::Alter(alter) => todo!(),
-            Statement::Truncate(truncate) => todo!(),
+            Statement::Truncate(truncate) => self.analyze_truncate_statement(truncate),
             Statement::Drop(drop) => todo!(),
         }
     }
@@ -290,6 +291,21 @@ impl<'a> Analyzer<'a> {
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Delete(delete_statement));
+        Ok(())
+    }
+
+    /// Analyzes truncate statement.
+    /// If successful [`ResolvedTruncateStatement`] is added to [`Analyzer::resolved_tree`].
+    fn analyze_truncate_statement(
+        &mut self,
+        truncate: &TruncateStatement,
+    ) -> Result<(), AnalyzerError> {
+        let resolved_table = self.resolve_expression(truncate.table_name)?;
+        let truncate_statement = ResolvedTruncateStatement {
+            table: resolved_table,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::Truncate(truncate_statement));
         Ok(())
     }
 
@@ -1023,6 +1039,13 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::Delete(d) => d,
             other => panic!("expected Delete statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_truncate(rt: &ResolvedTree, idx: usize) -> &ResolvedTruncateStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::Truncate(t) => t,
+            other => panic!("expected Truncate statement, got: {:?}", other),
         }
     }
 
@@ -2318,5 +2341,32 @@ mod tests {
         let tbl = expect_table(&rt, delete.table);
         assert_eq!(tbl.name, "users");
         assert!(delete.where_clause.is_none());
+    }
+
+    #[test]
+    fn analyze_truncate_table() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let truncate = TruncateStatement { table_name };
+        ast.add_statement(Statement::Truncate(truncate));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let truncate = expect_truncate(&rt, 0);
+        let tbl = expect_table(&rt, truncate.table);
+        assert_eq!(tbl.name, "users");
+        assert_eq!(tbl.primary_key_name, "id");
     }
 }

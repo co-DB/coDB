@@ -59,6 +59,7 @@ pub(crate) enum ResolvedStatement {
     Insert(ResolvedInsertStatement),
     Update(ResolvedUpdateStatement),
     Delete(ResolvedDeleteStatement),
+    Truncate(ResolvedTruncateStatement),
 }
 
 #[derive(Debug)]
@@ -87,6 +88,11 @@ pub(crate) struct ResolvedUpdateStatement {
 pub(crate) struct ResolvedDeleteStatement {
     pub(crate) table: ResolvedNodeId,
     pub(crate) where_clause: Option<ResolvedNodeId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedTruncateStatement {
+    pub(crate) table: ResolvedNodeId,
 }
 
 #[derive(Debug)]
