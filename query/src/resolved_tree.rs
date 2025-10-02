@@ -1,4 +1,4 @@
-use std::fmt;
+use std::fmt::{self, Display};
 
 use metadata::types::Type;
 use time::{Date, PrimitiveDateTime};
@@ -59,6 +59,7 @@ pub(crate) enum ResolvedStatement {
     Insert(ResolvedInsertStatement),
     Update(ResolvedUpdateStatement),
     Delete(ResolvedDeleteStatement),
+    Create(ResolvedCreateStatement),
     Truncate(ResolvedTruncateStatement),
     Drop(ResolvedDropStatement),
 }
@@ -92,6 +93,12 @@ pub(crate) struct ResolvedDeleteStatement {
 }
 
 #[derive(Debug)]
+pub(crate) struct ResolvedCreateStatement {
+    pub(crate) table_name: String,
+    pub(crate) columns: Vec<ResolvedCreateColumnDescriptor>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ResolvedTruncateStatement {
     pub(crate) table: ResolvedNodeId,
 }
@@ -99,6 +106,37 @@ pub(crate) struct ResolvedTruncateStatement {
 #[derive(Debug)]
 pub(crate) struct ResolvedDropStatement {
     pub(crate) table: ResolvedNodeId,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedCreateColumnDescriptor {
+    pub(crate) name: String,
+    pub(crate) ty: Type,
+    pub(crate) addon: ResolvedCreateColumnAddon,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub enum ResolvedCreateColumnAddon {
+    PrimaryKey,
+    None,
+}
+
+impl ResolvedCreateColumnAddon {
+    pub(crate) fn unique_per_table(&self) -> bool {
+        match self {
+            ResolvedCreateColumnAddon::PrimaryKey => true,
+            ResolvedCreateColumnAddon::None => false,
+        }
+    }
+}
+
+impl Display for ResolvedCreateColumnAddon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResolvedCreateColumnAddon::PrimaryKey => write!(f, "PRIMARY_KEY"),
+            ResolvedCreateColumnAddon::None => write!(f, "<EMPTY_ADDON>"),
+        }
+    }
 }
 
 #[derive(Debug)]

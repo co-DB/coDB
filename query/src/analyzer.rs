@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    sync::Arc,
+};
 
 use metadata::{
     catalog::{Catalog, CatalogError, ColumnMetadata, TableMetadata, TableMetadataError},
@@ -9,14 +13,15 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, DeleteStatement, DropStatement,
-        Expression, FunctionCallNode, InsertStatement, Literal, LiteralNode, LogicalExpressionNode,
-        NodeId, SelectStatement, Statement, TableIdentifierNode, TruncateStatement,
-        UnaryExpressionNode, UpdateStatement,
+        Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, CreateColumnAddon,
+        CreateStatement, DeleteStatement, DropStatement, Expression, FunctionCallNode,
+        InsertStatement, Literal, LiteralNode, LogicalExpressionNode, NodeId, SelectStatement,
+        Statement, TableIdentifierNode, TruncateStatement, UnaryExpressionNode, UpdateStatement,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
-        ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedDeleteStatement,
+        ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedCreateColumnAddon,
+        ResolvedCreateColumnDescriptor, ResolvedCreateStatement, ResolvedDeleteStatement,
         ResolvedDropStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral,
         ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
         ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
@@ -48,6 +53,10 @@ pub(crate) enum AnalyzerError {
         column_type: String,
         value_type: String,
     },
+    #[error("create column addon '{addon}' can only be used once in create table statement")]
+    UniqueAddonUsedMoreThanOnce { addon: String },
+    #[error("table '{table}' already exists")]
+    TableAlreadyExists { table: String },
     #[error("unexpected type: expected {expected}, got {got}")]
     UnexpectedType { expected: String, got: String },
     #[error("unexpected catalog error: {0}")]
@@ -188,7 +197,7 @@ impl<'a> Analyzer<'a> {
             Statement::Insert(insert) => self.analyze_insert_statement(insert),
             Statement::Update(update) => self.analyze_update_statement(update),
             Statement::Delete(delete) => self.analyze_delete_statement(delete),
-            Statement::Create(create) => todo!(),
+            Statement::Create(create) => self.analyze_create_statement(create),
             Statement::Alter(alter) => todo!(),
             Statement::Truncate(truncate) => self.analyze_truncate_statement(truncate),
             Statement::Drop(drop) => self.analyze_drop_statement(drop),
@@ -292,6 +301,49 @@ impl<'a> Analyzer<'a> {
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Delete(delete_statement));
+        Ok(())
+    }
+
+    /// Analyzes create statement.
+    /// If successful [`ResolvedCreateStatement`] is added to [`Analyzer::resolved_tree`].
+    fn analyze_create_statement(&mut self, create: &CreateStatement) -> Result<(), AnalyzerError> {
+        let table_name = self.get_identifier_value(create.table_name)?;
+
+        let table_exists = self.get_table_metadata(&table_name).is_ok();
+        if table_exists {
+            return Err(AnalyzerError::TableAlreadyExists { table: table_name });
+        }
+
+        let mut already_used_unique_addons = HashSet::new();
+
+        let columns = create
+            .columns
+            .iter()
+            .map(|c| {
+                let addon = self.transform_addon(&c.addon);
+                if addon.unique_per_table() {
+                    if already_used_unique_addons.contains(&addon) {
+                        return Err(AnalyzerError::UniqueAddonUsedMoreThanOnce {
+                            addon: addon.to_string(),
+                        });
+                    }
+                    already_used_unique_addons.insert(addon);
+                }
+                let resolved = ResolvedCreateColumnDescriptor {
+                    name: self.get_identifier_value(c.name)?,
+                    ty: c.ty,
+                    addon: addon,
+                };
+                Ok(resolved)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let create_statement = ResolvedCreateStatement {
+            table_name,
+            columns,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::Create(create_statement));
         Ok(())
     }
 
@@ -845,12 +897,22 @@ impl<'a> Analyzer<'a> {
             .resolved_tree
             .add_node(ResolvedExpression::Cast(resolved_cast)))
     }
+
+    /// Helper for transforming create column addon from [`Ast`] version into [`ResolvedTree`] version.
+    fn transform_addon(&self, from_ast: &CreateColumnAddon) -> ResolvedCreateColumnAddon {
+        match from_ast {
+            CreateColumnAddon::PrimaryKey => ResolvedCreateColumnAddon::PrimaryKey,
+            CreateColumnAddon::None => ResolvedCreateColumnAddon::None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Ast, Expression, IdentifierNode, SelectStatement, Statement};
+    use crate::ast::{
+        Ast, CreateColumnDescriptor, Expression, IdentifierNode, SelectStatement, Statement,
+    };
     use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
     use metadata::catalog::Catalog;
     use metadata::types::Type;
@@ -1052,6 +1114,13 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::Delete(d) => d,
             other => panic!("expected Delete statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_create(rt: &ResolvedTree, idx: usize) -> &ResolvedCreateStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::Create(c) => c,
+            other => panic!("expected Create statement, got: {:?}", other),
         }
     }
 
@@ -2416,5 +2485,130 @@ mod tests {
         let tbl = expect_table(&rt, drop.table);
         assert_eq!(tbl.name, "users");
         assert_eq!(tbl.primary_key_name, "id");
+    }
+
+    #[test]
+    fn analyze_create_statement_success() {
+        let tmp = TempDir::new().unwrap();
+        let db_file = tmp.path().join("testdb");
+        // no tables
+        fs::write(&db_file, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let catalog = Arc::new(RwLock::new(catalog));
+
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "my_table".into(),
+        }));
+
+        let col_a_ident =
+            ast.add_node(Expression::Identifier(IdentifierNode { value: "a".into() }));
+        let col_b_ident =
+            ast.add_node(Expression::Identifier(IdentifierNode { value: "b".into() }));
+
+        let col_a = CreateColumnDescriptor {
+            name: col_a_ident,
+            ty: Type::I32,
+            addon: CreateColumnAddon::PrimaryKey,
+        };
+        let col_b = CreateColumnDescriptor {
+            name: col_b_ident,
+            ty: Type::String,
+            addon: CreateColumnAddon::None,
+        };
+
+        let create = CreateStatement {
+            table_name: table_ident,
+            columns: vec![col_a, col_b],
+        };
+        ast.add_statement(Statement::Create(create));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("create analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let create = expect_create(&rt, 0);
+        assert_eq!(create.table_name, "my_table");
+        assert_eq!(create.columns.len(), 2);
+        assert_eq!(create.columns[0].name, "a");
+        assert_eq!(create.columns[0].ty, Type::I32);
+        assert_eq!(
+            create.columns[0].addon,
+            ResolvedCreateColumnAddon::PrimaryKey
+        );
+        assert_eq!(create.columns[1].name, "b");
+        assert_eq!(create.columns[1].ty, Type::String);
+        assert_eq!(create.columns[1].addon, ResolvedCreateColumnAddon::None);
+    }
+
+    #[test]
+    fn analyze_create_table_already_exists() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+
+        let create = CreateStatement {
+            table_name: table_ident,
+            columns: vec![],
+        };
+        ast.add_statement(Statement::Create(create));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::TableAlreadyExists { table } => assert_eq!(table, "users"),
+            other => panic!("expected TableAlreadyExists, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_create_duplicate_primary_key() {
+        let tmp = TempDir::new().unwrap();
+        let db_file = tmp.path().join("testdb");
+        fs::write(&db_file, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let catalog = Arc::new(RwLock::new(catalog));
+
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "dup_pk".into(),
+        }));
+
+        let col_x_ident =
+            ast.add_node(Expression::Identifier(IdentifierNode { value: "x".into() }));
+        let col_y_ident =
+            ast.add_node(Expression::Identifier(IdentifierNode { value: "y".into() }));
+
+        let col_x = CreateColumnDescriptor {
+            name: col_x_ident,
+            ty: Type::I32,
+            addon: CreateColumnAddon::PrimaryKey,
+        };
+        let col_y = CreateColumnDescriptor {
+            name: col_y_ident,
+            ty: Type::I64,
+            addon: CreateColumnAddon::PrimaryKey,
+        };
+
+        let create = CreateStatement {
+            table_name: table_ident,
+            columns: vec![col_x, col_y],
+        };
+        ast.add_statement(Statement::Create(create));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::UniqueAddonUsedMoreThanOnce { addon } => {
+                assert_eq!(addon, ResolvedCreateColumnAddon::PrimaryKey.to_string());
+            }
+            other => panic!("expected UniqueAddonUsedMoreThanOnce, got: {:?}", other),
+        }
     }
 }
