@@ -11,14 +11,14 @@ use crate::{
     ast::{
         Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, Expression, FunctionCallNode,
         InsertStatement, Literal, LiteralNode, LogicalExpressionNode, NodeId, SelectStatement,
-        Statement, TableIdentifierNode, UnaryExpressionNode,
+        Statement, TableIdentifierNode, UnaryExpressionNode, UpdateStatement,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedExpression,
         ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId,
         ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree, ResolvedType,
-        ResolvedUnaryExpression,
+        ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
 
@@ -184,7 +184,7 @@ impl<'a> Analyzer<'a> {
         match statement {
             Statement::Select(select) => self.analyze_select_statement(select),
             Statement::Insert(insert) => self.analyze_insert_statement(insert),
-            Statement::Update(update) => todo!(),
+            Statement::Update(update) => self.analyze_update_statement(update),
             Statement::Delete(delete) => todo!(),
             Statement::Create(create) => todo!(),
             Statement::Alter(alter) => todo!(),
@@ -242,6 +242,37 @@ impl<'a> Analyzer<'a> {
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Insert(insert_statement));
+        Ok(())
+    }
+
+    /// Analyzes update statement.
+    /// If successful [`ResolvedUpdateStatement`] is added to [`Analyzer::resolved_tree`].
+    fn analyze_update_statement(&mut self, update: &UpdateStatement) -> Result<(), AnalyzerError> {
+        let resolved_table = self.resolve_expression(update.table_name)?;
+        let resolved_column_setters = update
+            .column_setters
+            .iter()
+            .map(|&(column, value)| {
+                let resolved_column = self.resolve_expression(column)?;
+                let resolved_value = self.resolve_expression(value)?;
+                let casted_value = self.cast_value_to_column(resolved_column, resolved_value)?;
+                Ok((resolved_column, casted_value))
+            })
+            .collect::<Result<Vec<_>, AnalyzerError>>()?;
+        let (resolved_columns, resolved_values): (Vec<_>, Vec<_>) =
+            resolved_column_setters.into_iter().unzip();
+        let resolved_where_clause = update
+            .where_clause
+            .map(|node_id| self.resolve_expression(node_id))
+            .transpose()?;
+        let update_statement = ResolvedUpdateStatement {
+            table: resolved_table,
+            columns: resolved_columns,
+            values: resolved_values,
+            where_clause: resolved_where_clause,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::Update(update_statement));
         Ok(())
     }
 
@@ -961,6 +992,13 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::Insert(i) => i,
             other => panic!("expected Insert statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_update(rt: &ResolvedTree, idx: usize) -> &ResolvedUpdateStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::Update(u) => u,
+            other => panic!("expected Update statement, got: {:?}", other),
         }
     }
 
@@ -2056,6 +2094,118 @@ mod tests {
                 "expected InsertColumnsAndValuesLenNotEqual, got: {:?}",
                 other
             ),
+        }
+    }
+
+    #[test]
+    fn analyze_update_successful() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // column
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let col_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
+        }));
+
+        // value
+        let val_updated = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("updated".into()),
+        }));
+
+        let update = UpdateStatement {
+            table_name,
+            column_setters: vec![(col_name, val_updated)],
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Update(update));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let update = expect_update(&rt, 0);
+
+        // table
+        let tbl = expect_table(&rt, update.table);
+        assert_eq!(tbl.name, "users");
+
+        // columns
+        assert_eq!(update.columns.len(), 1);
+        assert_column(
+            &rt,
+            update.columns[0],
+            "name",
+            Type::String,
+            update.table,
+            1,
+        );
+
+        // value
+        let v0 = expect_literal_string(&rt, update.values[0]);
+        assert_eq!(v0, "updated");
+    }
+
+    #[test]
+    fn analyze_update_type_mismatch_errors() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // column (i32)
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        // value (f64)
+        let big_double = f32::MAX as f64 * 2.0;
+        let val_big = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Float(big_double),
+        }));
+
+        let update = UpdateStatement {
+            table_name,
+            column_setters: vec![(col_id, val_big)],
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Update(update));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::ColumnAndValueTypeDontMatch {
+                column_type,
+                value_type,
+            } => {
+                assert_eq!(column_type, "Int32");
+                assert_eq!(value_type, "Float64");
+            }
+            other => panic!("expected ColumnAndValueTypeDontMatch, got: {:?}", other),
         }
     }
 }
