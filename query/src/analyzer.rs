@@ -9,16 +9,16 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, Expression, FunctionCallNode,
-        InsertStatement, Literal, LiteralNode, LogicalExpressionNode, NodeId, SelectStatement,
-        Statement, TableIdentifierNode, UnaryExpressionNode, UpdateStatement,
+        Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, DeleteStatement, Expression,
+        FunctionCallNode, InsertStatement, Literal, LiteralNode, LogicalExpressionNode, NodeId,
+        SelectStatement, Statement, TableIdentifierNode, UnaryExpressionNode, UpdateStatement,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
-        ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedExpression,
-        ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId,
-        ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree, ResolvedType,
-        ResolvedUnaryExpression, ResolvedUpdateStatement,
+        ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedDeleteStatement,
+        ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression,
+        ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
+        ResolvedType, ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
 
@@ -185,7 +185,7 @@ impl<'a> Analyzer<'a> {
             Statement::Select(select) => self.analyze_select_statement(select),
             Statement::Insert(insert) => self.analyze_insert_statement(insert),
             Statement::Update(update) => self.analyze_update_statement(update),
-            Statement::Delete(delete) => todo!(),
+            Statement::Delete(delete) => self.analyze_delete_statement(delete),
             Statement::Create(create) => todo!(),
             Statement::Alter(alter) => todo!(),
             Statement::Truncate(truncate) => todo!(),
@@ -273,6 +273,23 @@ impl<'a> Analyzer<'a> {
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Update(update_statement));
+        Ok(())
+    }
+
+    /// Analyzes delete statement.
+    /// If successful [`ResolvedDeleteStatement`] is added to [`Analyzer::resolved_tree`].
+    fn analyze_delete_statement(&mut self, delete: &DeleteStatement) -> Result<(), AnalyzerError> {
+        let resolved_table = self.resolve_expression(delete.table_name)?;
+        let resolved_where_clause = delete
+            .where_clause
+            .map(|node_id| self.resolve_expression(node_id))
+            .transpose()?;
+        let delete_statement = ResolvedDeleteStatement {
+            table: resolved_table,
+            where_clause: resolved_where_clause,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::Delete(delete_statement));
         Ok(())
     }
 
@@ -999,6 +1016,13 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::Update(u) => u,
             other => panic!("expected Update statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_delete(rt: &ResolvedTree, idx: usize) -> &ResolvedDeleteStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::Delete(d) => d,
+            other => panic!("expected Delete statement, got: {:?}", other),
         }
     }
 
@@ -2207,5 +2231,92 @@ mod tests {
             }
             other => panic!("expected ColumnAndValueTypeDontMatch, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn analyze_delete_with_where_clause() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // where id == 1
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let id_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+        let lit_1 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1),
+        }));
+        let cond = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: id_col,
+            right_id: lit_1,
+            op: BinaryOperator::Equal,
+        }));
+
+        let delete = DeleteStatement {
+            table_name,
+            where_clause: Some(cond),
+        };
+        ast.add_statement(Statement::Delete(delete));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let delete = expect_delete(&rt, 0);
+
+        let tbl = expect_table(&rt, delete.table);
+        assert_eq!(tbl.name, "users");
+
+        let where_id = delete.where_clause.expect("where clause resolved");
+        let b = expect_binary(&rt, where_id);
+        assert!(matches!(b.op, BinaryOperator::Equal));
+        let c = expect_column(&rt, b.left);
+        assert_eq!(c.name, "id");
+        let v = expect_literal_i32(&rt, b.right);
+        assert_eq!(v, 1);
+    }
+
+    #[test]
+    fn analyze_delete_without_where_clause() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let delete = DeleteStatement {
+            table_name,
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Delete(delete));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let delete = expect_delete(&rt, 0);
+
+        let tbl = expect_table(&rt, delete.table);
+        assert_eq!(tbl.name, "users");
+        assert!(delete.where_clause.is_none());
     }
 }
