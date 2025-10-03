@@ -16,18 +16,18 @@ use crate::{
         AddAlterAction, AlterAction, AlterStatement, Ast, AstError, BinaryExpressionNode,
         ColumnIdentifierNode, CreateColumnAddon, CreateStatement, DeleteStatement, DropStatement,
         Expression, FunctionCallNode, InsertStatement, Literal, LiteralNode, LogicalExpressionNode,
-        NodeId, RenameColumnAlterAction, SelectStatement, Statement, TableIdentifierNode,
-        TruncateStatement, UnaryExpressionNode, UpdateStatement,
+        NodeId, RenameColumnAlterAction, RenameTableAlterAction, SelectStatement, Statement,
+        TableIdentifierNode, TruncateStatement, UnaryExpressionNode, UpdateStatement,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
         ResolvedAlterAddColumnStatement, ResolvedAlterRenameColumnStatement,
-        ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedCreateColumnAddon,
-        ResolvedCreateColumnDescriptor, ResolvedCreateStatement, ResolvedDeleteStatement,
-        ResolvedDropStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral,
-        ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
-        ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
-        ResolvedUnaryExpression, ResolvedUpdateStatement,
+        ResolvedAlterRenameTableStatement, ResolvedBinaryExpression, ResolvedCast, ResolvedColumn,
+        ResolvedCreateColumnAddon, ResolvedCreateColumnDescriptor, ResolvedCreateStatement,
+        ResolvedDeleteStatement, ResolvedDropStatement, ResolvedExpression,
+        ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId,
+        ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
+        ResolvedTruncateStatement, ResolvedType, ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
 
@@ -361,7 +361,8 @@ impl<'a> Analyzer<'a> {
             }
             AlterAction::RenameColumn(rename_column_alter_action) => self
                 .analyze_alter_rename_column_statement(resolved_table, rename_column_alter_action),
-            AlterAction::RenameTable(rename_table_alter_action) => todo!(),
+            AlterAction::RenameTable(rename_table_alter_action) => self
+                .analyzer_alter_rename_table_statement(resolved_table, rename_table_alter_action),
             AlterAction::Drop(drop_alter_action) => todo!(),
         }
     }
@@ -409,6 +410,27 @@ impl<'a> Analyzer<'a> {
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::AlterRenameColumn(resolved_rename));
+        Ok(())
+    }
+
+    fn analyzer_alter_rename_table_statement(
+        &mut self,
+        resolved_table: ResolvedNodeId,
+        rename: &RenameTableAlterAction,
+    ) -> Result<(), AnalyzerError> {
+        let new_name = self.get_identifier_value(rename.new_name)?;
+
+        let table_exists = self.get_table_metadata(&new_name).is_ok();
+        if table_exists {
+            return Err(AnalyzerError::TableAlreadyExists { table: new_name });
+        }
+
+        let resolved_rename = ResolvedAlterRenameTableStatement {
+            table: resolved_table,
+            new_name,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::AlterRenameTable(resolved_rename));
         Ok(())
     }
 
@@ -1218,6 +1240,16 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::AlterRenameColumn(a) => a,
             other => panic!("expected AlterRenameColumn statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_alter_rename_table(
+        rt: &ResolvedTree,
+        idx: usize,
+    ) -> &ResolvedAlterRenameTableStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::AlterRenameTable(a) => a,
+            other => panic!("expected AlterRenameTable statement, got: {:?}", other),
         }
     }
 
@@ -2888,6 +2920,109 @@ mod tests {
                 assert_eq!(column, "name");
             }
             other => panic!("expected ColumnAlreadyExists, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_alter_rename_table_successful() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let new_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "accounts".into(),
+        }));
+
+        let rename_action = RenameTableAlterAction {
+            new_name: new_ident,
+        };
+
+        let alter = AlterStatement {
+            table_name,
+            action: AlterAction::RenameTable(rename_action),
+        };
+        ast.add_statement(Statement::Alter(alter));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let rename = expect_alter_rename_table(&rt, 0);
+        let tbl = expect_table(&rt, rename.table);
+        assert_eq!(tbl.name, "users");
+        assert_eq!(rename.new_name, "accounts");
+    }
+
+    #[test]
+    fn analyze_alter_rename_table_new_name_already_exists() {
+        // create a catalog containing both "users" and "accounts"
+        let tmp = TempDir::new().unwrap();
+        let db_file = tmp.path().join("testdb");
+        let json = r#"
+        {
+            "tables": [
+                {
+                    "name": "users",
+                    "columns": [
+                        { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
+                        { "name": "name", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
+                    ],
+                    "primary_key_column_name": "id"
+                },
+                {
+                    "name": "accounts",
+                    "columns": [
+                        { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
+                        { "name": "owner", "ty": "String", "pos": 1, "base_offset": 4, "base_offset_pos": 1 }
+                    ],
+                    "primary_key_column_name": "id"
+                }
+            ]
+        }
+        "#;
+        fs::write(&db_file, json).unwrap();
+        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let catalog = Arc::new(RwLock::new(catalog));
+
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let new_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "accounts".into(),
+        }));
+
+        let rename_action = RenameTableAlterAction {
+            new_name: new_ident,
+        };
+
+        let alter = AlterStatement {
+            table_name,
+            action: AlterAction::RenameTable(rename_action),
+        };
+        ast.add_statement(Statement::Alter(alter));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::TableAlreadyExists { table } => {
+                assert_eq!(table, "accounts");
+            }
+            other => panic!("expected TableAlreadyExists, got: {:?}", other),
         }
     }
 }
