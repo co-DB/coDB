@@ -61,6 +61,7 @@ pub(crate) enum ResolvedStatement {
     Delete(ResolvedDeleteStatement),
     Create(ResolvedCreateStatement),
     AlterAddColumn(ResolvedAlterAddColumnStatement),
+    AlterRenameColumn(ResolvedAlterRenameColumnStatement),
     Truncate(ResolvedTruncateStatement),
     Drop(ResolvedDropStatement),
 }
