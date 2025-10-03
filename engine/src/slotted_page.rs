@@ -118,8 +118,8 @@ impl SlottedPageBaseHeader {
             flags: SlottedPageHeaderFlags::NO_FLAGS,
         }
     }
-    
-    pub fn page_type(&self) -> Result<PageType,SlottedPageError> {
+
+    pub fn page_type(&self) -> Result<PageType, SlottedPageError> {
         PageType::try_from(self.page_type)
     }
 }
