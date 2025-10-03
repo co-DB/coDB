@@ -14,20 +14,22 @@ use thiserror::Error;
 use crate::{
     ast::{
         AddAlterAction, AlterAction, AlterStatement, Ast, AstError, BinaryExpressionNode,
-        ColumnIdentifierNode, CreateColumnAddon, CreateStatement, DeleteStatement, DropStatement,
-        Expression, FunctionCallNode, InsertStatement, Literal, LiteralNode, LogicalExpressionNode,
-        NodeId, RenameColumnAlterAction, RenameTableAlterAction, SelectStatement, Statement,
-        TableIdentifierNode, TruncateStatement, UnaryExpressionNode, UpdateStatement,
+        ColumnIdentifierNode, CreateColumnAddon, CreateStatement, DeleteStatement, DropAlterAction,
+        DropStatement, Expression, FunctionCallNode, InsertStatement, Literal, LiteralNode,
+        LogicalExpressionNode, NodeId, RenameColumnAlterAction, RenameTableAlterAction,
+        SelectStatement, Statement, TableIdentifierNode, TruncateStatement, UnaryExpressionNode,
+        UpdateStatement,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
-        ResolvedAlterAddColumnStatement, ResolvedAlterRenameColumnStatement,
-        ResolvedAlterRenameTableStatement, ResolvedBinaryExpression, ResolvedCast, ResolvedColumn,
-        ResolvedCreateColumnAddon, ResolvedCreateColumnDescriptor, ResolvedCreateStatement,
-        ResolvedDeleteStatement, ResolvedDropStatement, ResolvedExpression,
-        ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId,
-        ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
-        ResolvedTruncateStatement, ResolvedType, ResolvedUnaryExpression, ResolvedUpdateStatement,
+        ResolvedAlterAddColumnStatement, ResolvedAlterDropColumnStatement,
+        ResolvedAlterRenameColumnStatement, ResolvedAlterRenameTableStatement,
+        ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedCreateColumnAddon,
+        ResolvedCreateColumnDescriptor, ResolvedCreateStatement, ResolvedDeleteStatement,
+        ResolvedDropStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral,
+        ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
+        ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
+        ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
 
@@ -61,6 +63,8 @@ pub(crate) enum AnalyzerError {
     TableAlreadyExists { table: String },
     #[error("column '{column}' already exists")]
     ColumnAlreadyExists { column: String },
+    #[error("column '{column}' cannot be dropped")]
+    ColumnCannotBeDropped { column: String },
     #[error("unexpected type: expected {expected}, got {got}")]
     UnexpectedType { expected: String, got: String },
     #[error("unexpected catalog error: {0}")]
@@ -363,7 +367,9 @@ impl<'a> Analyzer<'a> {
                 .analyze_alter_rename_column_statement(resolved_table, rename_column_alter_action),
             AlterAction::RenameTable(rename_table_alter_action) => self
                 .analyzer_alter_rename_table_statement(resolved_table, rename_table_alter_action),
-            AlterAction::Drop(drop_alter_action) => todo!(),
+            AlterAction::Drop(drop_alter_action) => {
+                self.analyzer_alter_drop_column_statement(resolved_table, drop_alter_action)
+            }
         }
     }
 
@@ -431,6 +437,29 @@ impl<'a> Analyzer<'a> {
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::AlterRenameTable(resolved_rename));
+        Ok(())
+    }
+
+    fn analyzer_alter_drop_column_statement(
+        &mut self,
+        resolved_table: ResolvedNodeId,
+        drop: &DropAlterAction,
+    ) -> Result<(), AnalyzerError> {
+        let column = self.resolve_expression(drop.column_name)?;
+
+        let can_be_dropped = self.column_can_be_dropped_from_table(column, resolved_table)?;
+        if !can_be_dropped {
+            return Err(AnalyzerError::ColumnCannotBeDropped {
+                column: self.get_column_name(column)?,
+            });
+        }
+
+        let resolved_drop = ResolvedAlterDropColumnStatement {
+            table: resolved_table,
+            column,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::AlterDropColumn(resolved_drop));
         Ok(())
     }
 
@@ -870,6 +899,18 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Returns name of already resolved column.
+    fn get_column_name(&self, resolved_column: ResolvedNodeId) -> Result<String, AnalyzerError> {
+        let column_node = self.resolved_tree.node(resolved_column);
+        match column_node {
+            ResolvedExpression::ColumnRef(column) => Ok(column.name.clone()),
+            _ => Err(AnalyzerError::UnexpectedType {
+                expected: "ColumnRef".into(),
+                got: column_node.resolved_type().to_string(),
+            }),
+        }
+    }
+
     /// Finds the table that contains the column named `column_name` in the current [`Analyzer::statement_context`].
     /// Returns an error when no column is found or when more than one column matches the name.
     ///
@@ -1006,6 +1047,22 @@ impl<'a> Analyzer<'a> {
         let tm = self.get_table_metadata(&table_name)?;
         let column_exists = self.get_column_metadata(&tm, &column_name).is_ok();
         Ok(column_exists)
+    }
+
+    /// Returns true if column can be dropped from table
+    fn column_can_be_dropped_from_table(
+        &self,
+        column: ResolvedNodeId,
+        table: ResolvedNodeId,
+    ) -> Result<bool, AnalyzerError> {
+        let column_name = self.get_column_name(column)?;
+        let table_name = self.get_table_name(table)?;
+        let tm = self.get_table_metadata(&table_name)?;
+        let pk = tm.primary_key_column_name();
+        if column_name == pk {
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -1250,6 +1307,16 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::AlterRenameTable(a) => a,
             other => panic!("expected AlterRenameTable statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_alter_drop_column(
+        rt: &ResolvedTree,
+        idx: usize,
+    ) -> &ResolvedAlterDropColumnStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::AlterDropColumn(a) => a,
+            other => panic!("expected AlterDropColumn statement, got: {:?}", other),
         }
     }
 
@@ -3023,6 +3090,93 @@ mod tests {
                 assert_eq!(table, "accounts");
             }
             other => panic!("expected TableAlreadyExists, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_alter_drop_column_successful() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // drop existing non-primary column "name"
+        let col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let col_node = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: col_ident,
+            table_alias: None,
+        }));
+
+        let drop_action = DropAlterAction {
+            column_name: col_node,
+        };
+
+        let alter = AlterStatement {
+            table_name,
+            action: AlterAction::Drop(drop_action),
+        };
+        ast.add_statement(Statement::Alter(alter));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+        let drop = expect_alter_drop_column(&rt, 0);
+        let tbl = expect_table(&rt, drop.table);
+        assert_eq!(tbl.name, "users");
+
+        let col = expect_column(&rt, drop.column);
+        assert_eq!(col.name, "name");
+        assert_eq!(col.ty, Type::String);
+    }
+
+    #[test]
+    fn analyze_alter_drop_column_cannot_drop_primary_key() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // try to drop primary key column "id"
+        let col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_node = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: col_ident,
+            table_alias: None,
+        }));
+
+        let drop_action = DropAlterAction {
+            column_name: col_node,
+        };
+
+        let alter = AlterStatement {
+            table_name,
+            action: AlterAction::Drop(drop_action),
+        };
+        ast.add_statement(Statement::Alter(alter));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::ColumnCannotBeDropped { column } => {
+                assert_eq!(column, "id");
+            }
+            other => panic!("expected ColumnCannotBeDropped, got: {:?}", other),
         }
     }
 }
