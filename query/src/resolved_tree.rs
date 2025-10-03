@@ -60,6 +60,7 @@ pub(crate) enum ResolvedStatement {
     Update(ResolvedUpdateStatement),
     Delete(ResolvedDeleteStatement),
     Create(ResolvedCreateStatement),
+    AlterAddColumn(ResolvedAlterAddColumnStatement),
     Truncate(ResolvedTruncateStatement),
     Drop(ResolvedDropStatement),
 }
@@ -96,6 +97,32 @@ pub(crate) struct ResolvedDeleteStatement {
 pub(crate) struct ResolvedCreateStatement {
     pub(crate) table_name: String,
     pub(crate) columns: Vec<ResolvedCreateColumnDescriptor>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAlterAddColumnStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) column_name: String,
+    pub(crate) column_type: Type,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAlterRenameColumnStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) column: ResolvedNodeId,
+    pub(crate) new_name: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAlterRenameTableStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) new_name: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAlterDropColumnStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) column: ResolvedNodeId,
 }
 
 #[derive(Debug)]

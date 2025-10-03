@@ -13,19 +13,20 @@ use thiserror::Error;
 
 use crate::{
     ast::{
-        Ast, AstError, BinaryExpressionNode, ColumnIdentifierNode, CreateColumnAddon,
-        CreateStatement, DeleteStatement, DropStatement, Expression, FunctionCallNode,
-        InsertStatement, Literal, LiteralNode, LogicalExpressionNode, NodeId, SelectStatement,
-        Statement, TableIdentifierNode, TruncateStatement, UnaryExpressionNode, UpdateStatement,
+        AddAlterAction, AlterAction, AlterStatement, Ast, AstError, BinaryExpressionNode,
+        ColumnIdentifierNode, CreateColumnAddon, CreateStatement, DeleteStatement, DropStatement,
+        Expression, FunctionCallNode, InsertStatement, Literal, LiteralNode, LogicalExpressionNode,
+        NodeId, SelectStatement, Statement, TableIdentifierNode, TruncateStatement,
+        UnaryExpressionNode, UpdateStatement,
     },
     operators::{BinaryOperator, SupportsType},
     resolved_tree::{
-        ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedCreateColumnAddon,
-        ResolvedCreateColumnDescriptor, ResolvedCreateStatement, ResolvedDeleteStatement,
-        ResolvedDropStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral,
-        ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
-        ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
-        ResolvedUnaryExpression, ResolvedUpdateStatement,
+        ResolvedAlterAddColumnStatement, ResolvedBinaryExpression, ResolvedCast, ResolvedColumn,
+        ResolvedCreateColumnAddon, ResolvedCreateColumnDescriptor, ResolvedCreateStatement,
+        ResolvedDeleteStatement, ResolvedDropStatement, ResolvedExpression,
+        ResolvedInsertStatement, ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId,
+        ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
+        ResolvedTruncateStatement, ResolvedType, ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
 
@@ -57,6 +58,8 @@ pub(crate) enum AnalyzerError {
     UniqueAddonUsedMoreThanOnce { addon: String },
     #[error("table '{table}' already exists")]
     TableAlreadyExists { table: String },
+    #[error("column '{column}' already exists")]
+    ColumnAlreadyExists { column: String },
     #[error("unexpected type: expected {expected}, got {got}")]
     UnexpectedType { expected: String, got: String },
     #[error("unexpected catalog error: {0}")]
@@ -198,7 +201,7 @@ impl<'a> Analyzer<'a> {
             Statement::Update(update) => self.analyze_update_statement(update),
             Statement::Delete(delete) => self.analyze_delete_statement(delete),
             Statement::Create(create) => self.analyze_create_statement(create),
-            Statement::Alter(alter) => todo!(),
+            Statement::Alter(alter) => self.analyze_alter_statement(alter),
             Statement::Truncate(truncate) => self.analyze_truncate_statement(truncate),
             Statement::Drop(drop) => self.analyze_drop_statement(drop),
         }
@@ -347,6 +350,46 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
+    /// Analyzes alter statement.
+    /// If successful proper variant of resolved alter statement is added to [`Analyzer::resolved_tree`].
+    fn analyze_alter_statement(&mut self, alter: &AlterStatement) -> Result<(), AnalyzerError> {
+        let resolved_table = self.resolve_expression(alter.table_name)?;
+        match &alter.action {
+            AlterAction::Add(add_alter_action) => {
+                self.analyze_alter_add_column_statement(resolved_table, add_alter_action)
+            }
+            AlterAction::RenameColumn(rename_column_alter_action) => todo!(),
+            AlterAction::RenameTable(rename_table_alter_action) => todo!(),
+            AlterAction::Drop(drop_alter_action) => todo!(),
+        }
+    }
+
+    fn analyze_alter_add_column_statement(
+        &mut self,
+        resolved_table: ResolvedNodeId,
+        add: &AddAlterAction,
+    ) -> Result<(), AnalyzerError> {
+        let column_name = self.get_identifier_value(add.column_name)?;
+
+        let table_name = self.get_table_name(resolved_table)?;
+        let tm = self.get_table_metadata(&table_name)?;
+        let column_exists = self.get_column_metadata(&tm, &column_name).is_ok();
+        if column_exists {
+            return Err(AnalyzerError::ColumnAlreadyExists {
+                column: column_name,
+            });
+        }
+
+        let resolved_add = ResolvedAlterAddColumnStatement {
+            table: resolved_table,
+            column_name,
+            column_type: add.column_type,
+        };
+        self.resolved_tree
+            .add_statement(ResolvedStatement::AlterAddColumn(resolved_add));
+        Ok(())
+    }
+
     /// Analyzes truncate statement.
     /// If successful [`ResolvedTruncateStatement`] is added to [`Analyzer::resolved_tree`].
     fn analyze_truncate_statement(
@@ -393,16 +436,7 @@ impl<'a> Analyzer<'a> {
         &mut self,
         table_id: ResolvedNodeId,
     ) -> Result<Vec<ResolvedNodeId>, AnalyzerError> {
-        let table_node = self.resolved_tree.node(table_id);
-        let table_name = match table_node {
-            ResolvedExpression::TableRef(table) => table.name.clone(),
-            _ => {
-                return Err(AnalyzerError::UnexpectedType {
-                    expected: "TableRef".into(),
-                    got: table_node.resolved_type().to_string(),
-                });
-            }
-        };
+        let table_name = self.get_table_name(table_id)?;
         let tm = self
             .statement_context
             .table_metadata(&table_name)
@@ -780,6 +814,18 @@ impl<'a> Analyzer<'a> {
         Ok(node.value.clone())
     }
 
+    /// Returns name of already resolved table.
+    fn get_table_name(&self, resolved_table: ResolvedNodeId) -> Result<String, AnalyzerError> {
+        let table_node = self.resolved_tree.node(resolved_table);
+        match table_node {
+            ResolvedExpression::TableRef(table) => Ok(table.name.clone()),
+            _ => Err(AnalyzerError::UnexpectedType {
+                expected: "TableRef".into(),
+                got: table_node.resolved_type().to_string(),
+            }),
+        }
+    }
+
     /// Finds the table that contains the column named `column_name` in the current [`Analyzer::statement_context`].
     /// Returns an error when no column is found or when more than one column matches the name.
     ///
@@ -1121,6 +1167,13 @@ mod tests {
         match &rt.statements[idx] {
             ResolvedStatement::Create(c) => c,
             other => panic!("expected Create statement, got: {:?}", other),
+        }
+    }
+
+    fn expect_alter_add_column(rt: &ResolvedTree, idx: usize) -> &ResolvedAlterAddColumnStatement {
+        match &rt.statements[idx] {
+            ResolvedStatement::AlterAddColumn(a) => a,
+            other => panic!("expected AlterAddColumn statement, got: {:?}", other),
         }
     }
 
@@ -2609,6 +2662,84 @@ mod tests {
                 assert_eq!(addon, ResolvedCreateColumnAddon::PrimaryKey.to_string());
             }
             other => panic!("expected UniqueAddonUsedMoreThanOnce, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_alter_add_column_successful() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let new_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "age".into(),
+        }));
+
+        let add_action = AddAlterAction {
+            column_name: new_col_ident,
+            column_type: Type::I32,
+        };
+
+        let alter = AlterStatement {
+            table_name,
+            action: AlterAction::Add(add_action),
+        };
+        ast.add_statement(Statement::Alter(alter));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+
+        let add = expect_alter_add_column(&rt, 0);
+        let tbl = expect_table(&rt, add.table);
+        assert_eq!(tbl.name, "users");
+        assert_eq!(add.column_name, "age");
+        assert_eq!(add.column_type, Type::I32);
+    }
+
+    #[test]
+    fn analyze_alter_add_column_column_exists() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let existing_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+
+        let add_action = AddAlterAction {
+            column_name: existing_col_ident,
+            column_type: Type::String,
+        };
+
+        let alter = AlterStatement {
+            table_name,
+            action: AlterAction::Add(add_action),
+        };
+        ast.add_statement(Statement::Alter(alter));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let err = analyzer.analyze().unwrap_err();
+        match err {
+            AnalyzerError::ColumnAlreadyExists { column } => {
+                assert_eq!(column, "name");
+            }
+            other => panic!("expected ColumnAlreadyExists, got: {:?}", other),
         }
     }
 }
