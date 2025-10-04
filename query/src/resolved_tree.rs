@@ -1,4 +1,4 @@
-use std::fmt;
+use std::fmt::{self, Display};
 
 use metadata::types::Type;
 use time::{Date, PrimitiveDateTime};
@@ -57,6 +57,15 @@ impl ResolvedNodeId {
 pub(crate) enum ResolvedStatement {
     Select(ResolvedSelectStatement),
     Insert(ResolvedInsertStatement),
+    Update(ResolvedUpdateStatement),
+    Delete(ResolvedDeleteStatement),
+    Create(ResolvedCreateStatement),
+    AlterAddColumn(ResolvedAlterAddColumnStatement),
+    AlterRenameColumn(ResolvedAlterRenameColumnStatement),
+    AlterRenameTable(ResolvedAlterRenameTableStatement),
+    AlterDropColumn(ResolvedAlterDropColumnStatement),
+    Truncate(ResolvedTruncateStatement),
+    Drop(ResolvedDropStatement),
 }
 
 #[derive(Debug)]
@@ -71,6 +80,93 @@ pub(crate) struct ResolvedInsertStatement {
     pub(crate) table: ResolvedNodeId,
     pub(crate) columns: Vec<ResolvedNodeId>,
     pub(crate) values: Vec<ResolvedNodeId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedUpdateStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) columns: Vec<ResolvedNodeId>,
+    pub(crate) values: Vec<ResolvedNodeId>,
+    pub(crate) where_clause: Option<ResolvedNodeId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedDeleteStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) where_clause: Option<ResolvedNodeId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedCreateStatement {
+    pub(crate) table_name: String,
+    pub(crate) columns: Vec<ResolvedCreateColumnDescriptor>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAlterAddColumnStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) column_name: String,
+    pub(crate) column_type: Type,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAlterRenameColumnStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) column: ResolvedNodeId,
+    pub(crate) new_name: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAlterRenameTableStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) new_name: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAlterDropColumnStatement {
+    pub(crate) table: ResolvedNodeId,
+    pub(crate) column: ResolvedNodeId,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedTruncateStatement {
+    pub(crate) table: ResolvedNodeId,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedDropStatement {
+    pub(crate) table: ResolvedNodeId,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedCreateColumnDescriptor {
+    pub(crate) name: String,
+    pub(crate) ty: Type,
+    pub(crate) addon: ResolvedCreateColumnAddon,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub enum ResolvedCreateColumnAddon {
+    PrimaryKey,
+    None,
+}
+
+impl ResolvedCreateColumnAddon {
+    pub(crate) fn unique_per_table(&self) -> bool {
+        match self {
+            ResolvedCreateColumnAddon::PrimaryKey => true,
+            ResolvedCreateColumnAddon::None => false,
+        }
+    }
+}
+
+impl Display for ResolvedCreateColumnAddon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResolvedCreateColumnAddon::PrimaryKey => write!(f, "PRIMARY_KEY"),
+            ResolvedCreateColumnAddon::None => write!(f, "<EMPTY_ADDON>"),
+        }
+    }
 }
 
 #[derive(Debug)]
