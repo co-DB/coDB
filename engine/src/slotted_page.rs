@@ -163,7 +163,7 @@ impl TryFrom<PageTypeRepr> for PageType {
             3 => Ok(PageType::BTreeInternal),
             4 => Ok(PageType::Overflow),
             _ => Err(Self::Error::Corrupted {
-                reason: "invalid flag was encountered".to_string(),
+                reason: "invalid page was encountered".to_string(),
             }),
         }
     }
@@ -341,6 +341,9 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         self.get_generic_header::<SlottedPageBaseHeader>()
     }
 
+    /// Gets a reference to the base header from the given page without creating an instance of
+    /// the slotted page struct. Can be used for e.g. getting the page type before creating a
+    /// specific slotted page wrapper like B-Tree internal or leaf node.
     pub fn static_get_base_header(page: &P) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
         Ok(bytemuck::try_from_bytes(
             &page.data()[..size_of::<SlottedPageBaseHeader>()],
