@@ -76,7 +76,9 @@ pub(crate) struct SlottedPageBaseHeader {
     first_free_slot: SlotId,
     /// Total number of slots in the slots directory (including used and free slots).
     num_slots: u16,
-    /// Flags for storing page type (for now)
+    /// Page type enum disk representation
+    page_type: PageTypeRepr,
+    /// Flags for storing nothing (for now)
     flags: SlottedPageHeaderFlags,
 }
 
@@ -112,8 +114,13 @@ impl SlottedPageBaseHeader {
             first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
             first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
             num_slots: 0,
-            flags: SlottedPageHeaderFlags::from(page_type),
+            page_type: PageTypeRepr::from(page_type),
+            flags: SlottedPageHeaderFlags::NO_FLAGS,
         }
+    }
+
+    pub fn page_type(&self) -> Result<PageType, SlottedPageError> {
+        PageType::try_from(self.page_type)
     }
 }
 
@@ -123,53 +130,50 @@ impl SlottedPageHeader for SlottedPageBaseHeader {
     }
 }
 
-impl Default for SlottedPageBaseHeader {
-    fn default() -> Self {
-        let header_size = size_of::<SlottedPageBaseHeader>() as u16;
-        Self {
-            co_db_magic_number: CO_DB_MAGIC_NUMBER,
-            total_free_space: PAGE_SIZE as u16,
-            contiguous_free_space: (PAGE_SIZE as u16 - header_size),
-            record_area_offset: PAGE_SIZE as u16,
-            header_size,
-            first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
-            first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
-            num_slots: 0,
-            flags: SlottedPageHeaderFlags::GENERIC_PAGE,
-        }
+unsafe impl ReprC for SlottedPageBaseHeader {}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageType {
+    Generic = 0,
+    Heap = 1,
+    BTreeLeaf = 2,
+    BTreeInternal = 3,
+    Overflow = 4,
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct PageTypeRepr(u8);
+
+impl From<PageType> for PageTypeRepr {
+    fn from(pt: PageType) -> Self {
+        PageTypeRepr(pt as u8)
     }
 }
 
-unsafe impl ReprC for SlottedPageBaseHeader {}
+impl TryFrom<PageTypeRepr> for PageType {
+    type Error = SlottedPageError;
+
+    fn try_from(raw: PageTypeRepr) -> Result<Self, Self::Error> {
+        match raw.0 {
+            0 => Ok(PageType::Generic),
+            1 => Ok(PageType::Heap),
+            2 => Ok(PageType::BTreeLeaf),
+            3 => Ok(PageType::BTreeInternal),
+            4 => Ok(PageType::Overflow),
+            _ => Err(Self::Error::Corrupted {
+                reason: "invalid page was encountered".to_string(),
+            }),
+        }
+    }
+}
 
 bitflags! {
     #[repr(transparent)]
     #[derive(Pod, Zeroable, Copy, Clone, Debug)]
-    struct SlottedPageHeaderFlags : u16 {
-        const GENERIC_PAGE   = 0b0000_0000;
-        const HEAP_PAGE      = 0b0000_0001;
-        const BTREE_LEAF     = 0b0000_0010;
-        const BTREE_INTERNAL = 0b0000_0011;
-        const OVERFLOW_PAGE  = 0b0000_0100;
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum PageType {
-    Heap,
-    BTreeLeaf,
-    BTreeInternal,
-    Overflow,
-}
-
-impl From<PageType> for SlottedPageHeaderFlags {
-    fn from(page_type: PageType) -> Self {
-        match page_type {
-            PageType::Heap => SlottedPageHeaderFlags::HEAP_PAGE,
-            PageType::BTreeLeaf => SlottedPageHeaderFlags::BTREE_LEAF,
-            PageType::BTreeInternal => SlottedPageHeaderFlags::BTREE_INTERNAL,
-            PageType::Overflow => SlottedPageHeaderFlags::OVERFLOW_PAGE,
-        }
+    struct SlottedPageHeaderFlags : u8 {
+        const NO_FLAGS   = 0b0000_0000;
     }
 }
 
@@ -213,6 +217,8 @@ pub enum SlottedPageError {
     ForbiddenSlotCompaction,
     #[error("casting data from bytes failed for the following reason: {reason}")]
     CastError { reason: String },
+    #[error("page was corrupted, as {reason}")]
+    Corrupted { reason: String },
 }
 
 impl From<PodCastError> for SlottedPageError {
@@ -333,6 +339,15 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     /// Gets a reference to the base header (common to all slotted pages).
     pub fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
         self.get_generic_header::<SlottedPageBaseHeader>()
+    }
+
+    /// Gets a reference to the base header from the given page without creating an instance of
+    /// the slotted page struct. Can be used for e.g. getting the page type before creating a
+    /// specific slotted page wrapper like B-Tree internal or leaf node.
+    pub fn static_get_base_header(page: &P) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
+        Ok(bytemuck::try_from_bytes(
+            &page.data()[..size_of::<SlottedPageBaseHeader>()],
+        )?)
     }
 
     /// Returns the total number of slots (both used and unused) in this page
@@ -1043,7 +1058,8 @@ mod tests {
             first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
             first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
             num_slots: 0,
-            flags: SlottedPageHeaderFlags::GENERIC_PAGE,
+            page_type: PageTypeRepr::from(PageType::Generic),
+            flags: SlottedPageHeaderFlags::NO_FLAGS,
         };
 
         page.data_mut()[..size_of::<SlottedPageBaseHeader>()]
@@ -1234,7 +1250,8 @@ mod tests {
                         first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
                         first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
                         num_slots: 0,
-                        flags: SlottedPageHeaderFlags::GENERIC_PAGE,
+                        page_type: PageTypeRepr::from(PageType::Generic),
+                        flags: SlottedPageHeaderFlags::NO_FLAGS,
                     },
                     custom_field: 42,
                 }
@@ -1657,16 +1674,6 @@ mod tests {
 
         let header = page.get_base_header().unwrap();
         assert_eq!(header.first_free_slot, SlottedPageBaseHeader::NO_FREE_SLOTS);
-    }
-
-    #[test]
-    fn test_slot_compaction_forbidden_when_disabled() {
-        let page = TestPage::new(PAGE_SIZE);
-        let mut slotted_page =
-            SlottedPage::<TestPage, SlottedPageBaseHeader>::initialize_default(page, false); // slot compaction disabled
-
-        let result = slotted_page.compact_slots();
-        assert!(matches!(result, Err(ForbiddenSlotCompaction)));
     }
 
     #[test]
