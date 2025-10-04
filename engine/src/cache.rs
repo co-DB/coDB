@@ -297,23 +297,6 @@ impl Cache {
         }
     }
 
-    /// Returns root page id of the file. Refer to [`PagedFile`] for more details.
-    pub(crate) fn root_page_id(&self, file: &FileKey) -> Result<Option<PageId>, CacheError> {
-        let pf = self.files.get_or_open_new_file(file)?;
-        Ok(pf.lock().root_page_id())
-    }
-
-    /// Sets root page id of the file. Refer to [`PagedFile`] for more details.
-    pub(crate) fn set_root_page_id(
-        &self,
-        file: &FileKey,
-        page_id: PageId,
-    ) -> Result<(), CacheError> {
-        let pf = self.files.get_or_open_new_file(file)?;
-        pf.lock().set_root_page_id(page_id)?;
-        Ok(())
-    }
-
     /// Returns [`Arc<PageFrame>`] and pinnes the underlying [`PageFrame`].
     /// It first looks for frame in [`Cache::frames`]. If it's found there then its key in [`Cache::lru`] is updated (making it MRU).
     /// Otherwise [`PageFrame`] is loaded from disk using [`FilesManager`] and frame's key is inserted into [`Cache::lru`].
