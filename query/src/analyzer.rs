@@ -188,12 +188,18 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Analyzes [`Ast`] and returns resolved version of it - [`ResolvedTree`].
-    pub(crate) fn analyze(mut self) -> Result<ResolvedTree, AnalyzerError> {
+    pub(crate) fn analyze(mut self) -> Result<ResolvedTree, Vec<AnalyzerError>> {
+        let mut errors = vec![];
         for statement in self.ast.statements() {
             self.statement_context.clear();
-            self.analyze_statement(statement)?;
+            if let Err(e) = self.analyze_statement(statement) {
+                errors.push(e);
+            }
         }
-        Ok(self.resolved_tree)
+        match errors.is_empty() {
+            true => Ok(self.resolved_tree),
+            false => Err(errors),
+        }
     }
 
     /// Analyzes a statement. If statement is successfully analyzed then its resolved version ([`ResolvedStatement`]) is added to [`Analyzer::resolved_tree`].
@@ -1748,7 +1754,9 @@ mod tests {
         ast.add_statement(Statement::Select(select));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::TableNotFound { table } => assert_eq!(table, "nonexistent"),
             _ => panic!("Expected TableNotFound"),
@@ -1791,7 +1799,9 @@ mod tests {
         ast.add_statement(Statement::Select(select));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::ColumnNotFound { column } => {
                 assert_eq!(column, "doesnotexist");
@@ -2046,7 +2056,9 @@ mod tests {
         ast.add_statement(Statement::Select(select));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::TableWithAliasNotFound { table_alias } => {
                 assert_eq!(table_alias, "k");
@@ -2364,7 +2376,9 @@ mod tests {
         ast.add_statement(Statement::Insert(insert));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::ColumnAndValueTypeDontMatch {
                 column_type,
@@ -2416,11 +2430,13 @@ mod tests {
         ast.add_statement(Statement::Insert(insert));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::InsertColumnsAndValuesLenNotEqual { columns, values } => {
-                assert_eq!(columns, 1);
-                assert_eq!(values, 2);
+                assert_eq!(*columns, 1);
+                assert_eq!(*values, 2);
             }
             other => panic!(
                 "expected InsertColumnsAndValuesLenNotEqual, got: {:?}",
@@ -2528,7 +2544,9 @@ mod tests {
         ast.add_statement(Statement::Update(update));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::ColumnAndValueTypeDontMatch {
                 column_type,
@@ -2755,7 +2773,9 @@ mod tests {
         ast.add_statement(Statement::Create(create));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::TableAlreadyExists { table } => assert_eq!(table, "users"),
             other => panic!("expected TableAlreadyExists, got: {:?}", other),
@@ -2799,10 +2819,12 @@ mod tests {
         ast.add_statement(Statement::Create(create));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::UniqueAddonUsedMoreThanOnce { addon } => {
-                assert_eq!(addon, ResolvedCreateColumnAddon::PrimaryKey.to_string());
+                assert_eq!(*addon, ResolvedCreateColumnAddon::PrimaryKey.to_string());
             }
             other => panic!("expected UniqueAddonUsedMoreThanOnce, got: {:?}", other),
         }
@@ -2877,7 +2899,9 @@ mod tests {
         ast.add_statement(Statement::Alter(alter));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::ColumnAlreadyExists { column } => {
                 assert_eq!(column, "name");
@@ -2981,7 +3005,9 @@ mod tests {
         ast.add_statement(Statement::Alter(alter));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::ColumnAlreadyExists { column } => {
                 assert_eq!(column, "name");
@@ -3084,7 +3110,9 @@ mod tests {
         ast.add_statement(Statement::Alter(alter));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::TableAlreadyExists { table } => {
                 assert_eq!(table, "accounts");
@@ -3171,12 +3199,89 @@ mod tests {
         ast.add_statement(Statement::Alter(alter));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let err = analyzer.analyze().unwrap_err();
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
         match err {
             AnalyzerError::ColumnCannotBeDropped { column } => {
                 assert_eq!(column, "id");
             }
             other => panic!("expected ColumnCannotBeDropped, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_multiple_statements_error_collection() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // first statement (table not found)
+        let t1_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "nonexistent".into(),
+        }));
+        let t1 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t1_ident,
+            alias: None,
+        }));
+        let s1 = SelectStatement {
+            table_name: t1,
+            columns: None,
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Select(s1));
+
+        // second statement (without an error)
+        let t2_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t2 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t2_ident,
+            alias: None,
+        }));
+        let s2 = SelectStatement {
+            table_name: t2,
+            columns: None,
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Select(s2));
+
+        // third statement (adding existing column "name")
+        let t3_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t3 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t3_ident,
+            alias: None,
+        }));
+        let existing_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let add_action = AddAlterAction {
+            column_name: existing_col_ident,
+            column_type: Type::String,
+        };
+        let alter = AlterStatement {
+            table_name: t3,
+            action: AlterAction::Add(add_action),
+        };
+        ast.add_statement(Statement::Alter(alter));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+
+        assert_eq!(errs.len(), 2);
+
+        match &errs[0] {
+            AnalyzerError::TableNotFound { table } => assert_eq!(table, "nonexistent"),
+            other => panic!("expected TableNotFound as first error, got: {:?}", other),
+        }
+
+        match &errs[1] {
+            AnalyzerError::ColumnAlreadyExists { column } => assert_eq!(column, "name"),
+            other => panic!(
+                "expected ColumnAlreadyExists as second error, got: {:?}",
+                other
+            ),
         }
     }
 }
