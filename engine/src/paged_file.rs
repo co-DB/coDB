@@ -184,20 +184,6 @@ impl PagedFile {
         Ok(())
     }
 
-    /// Returns id of root page. Can be `None` if `root_page_id` was not set yet (it's not set automatically when new file is created).
-    pub fn root_page_id(&self) -> Option<PageId> {
-        self.metadata.root_page_id
-    }
-
-    /// Sets new root page id. `page_id` must be already pointing to allocated page. Can fail if `page_id` is not valid.
-    pub fn set_root_page_id(&mut self, page_id: PageId) -> Result<(), PagedFileError> {
-        if self.is_invalid_page_id(page_id) {
-            return Err(PagedFileError::InvalidPageId(page_id));
-        }
-        self.metadata.root_page_id = Some(page_id);
-        self.sync_metadata()
-    }
-
     /// Seeks underlying file handle to the start of the page with `page_id`.
     fn seek_page(&mut self, page_id: PageId) -> Result<(), PagedFileError> {
         // u64 is used to make sure that this does not overflow
@@ -270,13 +256,10 @@ impl Drop for PagedFile {
 ///
 /// Format of the first page in the file is as follows:
 /// - `magic_number` (4 bytes) - only to verify if it's our file, no need to load it to [`FileMetadata`] as it is constant
-/// - `root_page_id` (4 bytes) - 0 when `None`, as it cannot be first page (first page is reserved for metadata)
 /// - `next_page_id` (4 bytes)
 /// - `free_pages_length` (4 bytes)
 /// - `free_pages` (`free_pages_length` * 4 bytes) - should be skipped when `free_pages_length = 0`
 struct FileMetadata {
-    /// id of root page
-    root_page_id: Option<PageId>,
     /// id of next page
     next_page_id: PageId,
     /// set of free pages (already allocated, but not used)
@@ -303,11 +286,6 @@ impl TryFrom<Page> for FileMetadata {
         if magic_number != Self::CODB_MAGIC_NUMBER {
             return Err(PagedFileError::InvalidFileFormat("invalid magic number"));
         }
-        let root_page_value = cursor.read_page_id()?;
-        let root_page_id = match root_page_value {
-            0 => None,
-            _ => Some(root_page_value),
-        };
         let next_page_id = cursor.read_page_id()?;
         let free_pages_length = cursor.read_u32::<LittleEndian>()? as _;
         let mut free_pages = HashSet::with_capacity(free_pages_length);
@@ -316,7 +294,6 @@ impl TryFrom<Page> for FileMetadata {
             free_pages.insert(free_page_id);
         }
         Ok(FileMetadata {
-            root_page_id,
             next_page_id,
             free_pages,
         })
@@ -330,8 +307,6 @@ impl TryFrom<&FileMetadata> for Page {
     fn try_from(value: &FileMetadata) -> Result<Self, Self::Error> {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
         buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
-        let root_page_id = value.root_page_id.unwrap_or(0);
-        buffer.write_page_id(root_page_id)?;
         buffer.write_page_id(value.next_page_id)?;
         buffer.write_u32::<LittleEndian>(value.free_pages.len() as _)?;
         for free_page_id in &value.free_pages {
@@ -352,7 +327,6 @@ impl Default for FileMetadata {
             free_pages.insert(i);
         }
         Self {
-            root_page_id: None,
             next_page_id,
             free_pages,
         }
@@ -366,14 +340,9 @@ mod tests {
     use std::collections::HashSet;
     use tempfile::NamedTempFile;
 
-    fn create_metadata_page(
-        root_page_id: Option<PageId>,
-        next_page_id: PageId,
-        free_pages: &[PageId],
-    ) -> Page {
+    fn create_metadata_page(next_page_id: PageId, free_pages: &[PageId]) -> Page {
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
         buffer.extend_from_slice(&FileMetadata::CODB_MAGIC_NUMBER);
-        buffer.write_page_id(root_page_id.unwrap_or(0)).unwrap();
         buffer.write_page_id(next_page_id).unwrap();
         buffer
             .write_u32::<LittleEndian>(free_pages.len() as u32)
@@ -400,12 +369,11 @@ mod tests {
     }
 
     fn setup_file_with_metadata_and_n_pages(
-        root_page_id: Option<PageId>,
         next_page_id: PageId,
         free_pages: &[PageId],
         page_patterns: &[u8],
     ) -> (tempfile::NamedTempFile, Vec<[u8; PAGE_SIZE]>) {
-        let metadata_page = create_metadata_page(root_page_id, next_page_id, free_pages);
+        let metadata_page = create_metadata_page(next_page_id, free_pages);
         let mut file_content = Vec::new();
         file_content.extend_from_slice(&metadata_page);
 
@@ -434,7 +402,6 @@ mod tests {
         assert!(file_path.exists());
 
         // and metadata is initialized as expected
-        assert_eq!(paged_file.root_page_id(), None);
         assert_eq!(
             paged_file.metadata.next_page_id,
             FileMetadata::DEFAULT_NEXT_PAGE_ID
@@ -452,7 +419,6 @@ mod tests {
 
         // and the metadata on disk matches
         let disk_metadata = read_metadata_from_disk(&file_path);
-        assert_eq!(disk_metadata.root_page_id, None);
         assert_eq!(
             disk_metadata.next_page_id,
             FileMetadata::DEFAULT_NEXT_PAGE_ID
@@ -498,7 +464,6 @@ mod tests {
     fn paged_file_from_file_valid_metadata_cases() {
         struct TestCase {
             name: &'static str,
-            root: Option<PageId>,
             next: PageId,
             free: Vec<PageId>,
         }
@@ -506,25 +471,21 @@ mod tests {
         let test_cases = [
             TestCase {
                 name: "empty root, empty free",
-                root: None,
                 next: 1,
                 free: vec![],
             },
             TestCase {
                 name: "some root, empty free",
-                root: Some(42),
                 next: 2,
                 free: vec![],
             },
             TestCase {
                 name: "empty root, some free",
-                root: None,
                 next: 3,
                 free: vec![10, 20, 30],
             },
             TestCase {
                 name: "some root, some free",
-                root: Some(111),
                 next: 4,
                 free: vec![40, 50, 60],
             },
@@ -532,18 +493,13 @@ mod tests {
 
         for case in test_cases {
             // given valid metadata page
-            let page = create_metadata_page(case.root, case.next, &case.free);
+            let page = create_metadata_page(case.next, &case.free);
             let temp_file = write_temp_file_with_content(&page);
 
             // when try to load `PagedFile` from it
             let paged_file = PagedFile::new(temp_file.path()).unwrap();
 
             // then `PagedFile` instance is returned
-            assert_eq!(
-                paged_file.metadata.root_page_id, case.root,
-                "root_page_id failed for case '{}'",
-                case.name
-            );
             assert_eq!(
                 paged_file.metadata.next_page_id, case.next,
                 "next_page_id failed for case '{}'",
@@ -561,7 +517,7 @@ mod tests {
     #[test]
     fn paged_file_read_page_metadata_page() {
         // given a file with a valid metadata page and one data page
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(2, &[], &[1]);
 
         // when loading PagedFile and reading page 0 (metadata)
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -574,7 +530,7 @@ mod tests {
     #[test]
     fn paged_file_read_page_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(3, &[2], &[1, 2]);
 
         // when loading PagedFile and reading page 2 (free)
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -587,7 +543,7 @@ mod tests {
     #[test]
     fn paged_file_read_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(2, &[], &[1]);
 
         // when loading PagedFile and reading page 2 (unallocated)
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -600,7 +556,7 @@ mod tests {
     #[test]
     fn paged_file_read_page_valid_page() {
         // given a file with a valid metadata page and one data page
-        let (temp_file, pages) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[42]);
+        let (temp_file, pages) = setup_file_with_metadata_and_n_pages(2, &[], &[42]);
 
         // when loading PagedFile and reading page 1
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -613,7 +569,7 @@ mod tests {
     #[test]
     fn paged_file_write_page_metadata_page() {
         // given a file with a valid metadata page and one data page
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(2, &[], &[1]);
 
         // when loading PagedFile and writing to page 0 (metadata)
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -627,7 +583,7 @@ mod tests {
     #[test]
     fn paged_file_write_page_free_page() {
         // given a file with a valid metadata page and page 2 marked as free
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(3, &[2], &[1, 2]);
 
         // when loading PagedFile and writing to page 2 (free)
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -641,7 +597,7 @@ mod tests {
     #[test]
     fn paged_file_write_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(2, &[], &[1]);
 
         // when loading PagedFile and writing to page 2 (unallocated)
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -655,7 +611,7 @@ mod tests {
     #[test]
     fn paged_file_write_page_valid_page() {
         // given a file with a valid metadata page and one data page
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(2, &[], &[1]);
 
         // when loading PagedFile and writing new data to page 1
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -673,7 +629,7 @@ mod tests {
     #[test]
     fn paged_file_allocate_page_new_page() {
         // given a file with a valid metadata page and one data page, no free pages
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(2, &[], &[1]);
 
         // when loading PagedFile and allocating a new page
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -695,7 +651,7 @@ mod tests {
     #[test]
     fn paged_file_allocate_page_from_free_list() {
         // given a file with a valid metadata page and page 2 marked as free
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(3, &[2], &[1, 2]);
 
         // when loading PagedFile and allocating a page
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -718,7 +674,7 @@ mod tests {
     #[test]
     fn paged_file_allocate_page_multiple() {
         // given a file with a valid metadata page and two free pages
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 4, &[2, 3], &[1, 2, 3]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(4, &[2, 3], &[1, 2, 3]);
 
         // when loading PagedFile and allocating two pages
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -738,66 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn paged_file_set_root_page_id_metadata_page() {
-        // given a file with a valid metadata page and one data page
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
-
-        // when loading PagedFile and setting root page id to 0 (metadata)
-        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
-        let result = paged_file.set_root_page_id(0);
-
-        // then error is returned
-        assert!(matches!(result, Err(PagedFileError::InvalidPageId(0))));
-    }
-
-    #[test]
-    fn paged_file_set_root_page_id_free_page() {
-        // given a file with a valid metadata page and page 2 marked as free
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
-
-        // when loading PagedFile and setting root page id to 2 (free)
-        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
-        let result = paged_file.set_root_page_id(2);
-
-        // then error is returned
-        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
-    }
-
-    #[test]
-    fn paged_file_set_root_page_id_unallocated_page() {
-        // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
-
-        // when loading PagedFile and setting root page id to 2 (unallocated)
-        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
-        let result = paged_file.set_root_page_id(2);
-
-        // then error is returned
-        assert!(matches!(result, Err(PagedFileError::InvalidPageId(2))));
-    }
-
-    #[test]
-    fn paged_file_set_root_page_id_valid() {
-        // given a file with a valid metadata page and one data page
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
-
-        // when loading PagedFile and setting root page id to 1
-        let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
-        paged_file.set_root_page_id(1).unwrap();
-        paged_file.flush().unwrap();
-
-        // then root_page_id is updated in memory
-        assert_eq!(paged_file.root_page_id(), Some(1));
-
-        // and metadata on disk is updated
-        let disk_metadata = read_metadata_from_disk(temp_file.path());
-        assert_eq!(disk_metadata.root_page_id, Some(1));
-    }
-
-    #[test]
     fn paged_file_free_page_metadata_page() {
         // given a file with a valid metadata page and one data page
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(2, &[], &[1]);
 
         // when loading PagedFile and freeing page 0 (metadata)
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -810,7 +709,7 @@ mod tests {
     #[test]
     fn paged_file_free_page_free_page() {
         // given a file with a valid metadata page and page 2 already free
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[2], &[1, 2]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(3, &[2], &[1, 2]);
 
         // when loading PagedFile and freeing page 2 again
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -823,7 +722,7 @@ mod tests {
     #[test]
     fn paged_file_free_page_unallocated_page() {
         // given a file with a valid metadata page and next_page_id = 2 (only page 1 is allocated)
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 2, &[], &[1]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(2, &[], &[1]);
 
         // when loading PagedFile and freeing page 2 (unallocated)
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -836,7 +735,7 @@ mod tests {
     #[test]
     fn paged_file_free_page_valid() {
         // given a file with a valid metadata page and two data pages
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[], &[1, 2]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(3, &[], &[1, 2]);
 
         // when loading PagedFile and freeing page 2
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -854,7 +753,7 @@ mod tests {
     #[test]
     fn paged_file_truncate_removes_free_pages_at_end() {
         // given a file with 4 pages, pages 3 and 4 are free
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 5, &[3, 4], &[1, 2, 3, 4]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(5, &[3, 4], &[1, 2, 3, 4]);
 
         // when loading PagedFile and truncating
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -878,7 +777,7 @@ mod tests {
     #[test]
     fn paged_file_truncate_no_free_pages_at_end() {
         // given a file with 4 pages, only page 2 is free (not at the end)
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 5, &[2], &[1, 2, 3, 4]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(5, &[2], &[1, 2, 3, 4]);
 
         // when loading PagedFile and truncating
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
@@ -901,7 +800,7 @@ mod tests {
     #[test]
     fn paged_file_truncate_all_pages_free() {
         // given a file with 3 pages, all data pages are free
-        let (temp_file, _) = setup_file_with_metadata_and_n_pages(None, 3, &[1, 2], &[1, 2]);
+        let (temp_file, _) = setup_file_with_metadata_and_n_pages(3, &[1, 2], &[1, 2]);
 
         // when loading PagedFile and truncating
         let mut paged_file = PagedFile::new(temp_file.path()).unwrap();
