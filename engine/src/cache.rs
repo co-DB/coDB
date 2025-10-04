@@ -28,6 +28,12 @@ pub(crate) struct FilePageRef {
     pub(crate) file_key: FileKey,
 }
 
+impl FilePageRef {
+    pub fn new(page_id: PageId, file_key: FileKey) -> Self {
+        Self { page_id, file_key }
+    }
+}
+
 /// Wrapper around the [`Page`] and its metadata used for concurrent usage.
 pub(crate) struct PageFrame {
     /// Page id and file identifier - unique per frame.
@@ -136,6 +142,17 @@ impl PageRead for PinnedWritePage {
         self.page()
     }
 }
+impl<T: PageRead> PageRead for &T {
+    fn data(&self) -> &[u8] {
+        (*self).data()
+    }
+}
+
+impl<T: PageWrite> PageWrite for &mut T {
+    fn data_mut(&mut self) -> &mut [u8] {
+        (*self).data_mut()
+    }
+}
 
 impl PageWrite for PinnedWritePage {
     fn data_mut(&mut self) -> &mut [u8] {
@@ -162,7 +179,7 @@ pub(crate) struct Cache {
     /// - any page that is used by at least one thread will not be removed from the [`Cache`].
     /// - any frame that is selected for eviction and is dirty will have its page flushed to disk.
     ///
-    /// [`Cache`] tries to keep the size of it <= [`Cache::capacity`], but it is not always true.  
+    /// [`Cache`] tries to keep the size of it <= [`Cache::capacity`], but it is not always true.
     /// Check [`Cache::get_pinned_frame`] and [`Cache::try_evict_frame`] for more details.
     frames: DashMap<FilePageRef, Arc<PageFrame>>,
     /// LRU list of the [`FilePageRef`]s used for deciding which [`PageFrame`] is best candidate for eviction (it does not mean it will always be picked as the victim - check [`Cache::try_evict_frame`] for details).

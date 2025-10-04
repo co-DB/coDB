@@ -18,7 +18,7 @@ macro_rules! impl_db_serializable_for {
     };
 }
 
-impl_db_serializable_for!(i32, i64, u16, u32, f32, f64);
+impl_db_serializable_for!(i32, i64, u16, u32, u64, f32, f64);
 
 /// A trait for types that can be serialized to and deserialized from bytes
 /// for database storage.

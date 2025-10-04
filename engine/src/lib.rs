@@ -1,3 +1,4 @@
+mod b_tree;
 pub mod background_worker;
 pub mod cache;
 mod consts;
