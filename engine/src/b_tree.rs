@@ -25,18 +25,18 @@ pub(crate) struct BTree<Key: BTreeKey> {
     root_page_id: PageId,
 }
 
-#[derive(Debug)]
-/// Enum representing possible outcomes of a search operation.
-pub(crate) enum TreeSearchResult {
-    /// Leaf node: exact match found.
-    Found { record_ptr: RecordPointer },
-
-    /// Leaf node: key not found, but insertion point identified.
-    NotFound { insert_slot_id: SlotId },
-}
-
 impl<Key: BTreeKey> BTree<Key> {
-    fn search(&self, key: &Key) -> Result<TreeSearchResult, BTreeError> {
+    //TODO: Implement a way to read/write metadata (separate struct?)
+    fn new(cache: Arc<Cache>, root_page_id: PageId, file_key: FileKey) -> Self {
+        Self {
+            cache,
+            file_key,
+            root_page_id,
+            _key_marker: PhantomData,
+        }
+    }
+
+    pub fn search(&self, key: &Key) -> Result<Option<RecordPointer>, BTreeError> {
         let mut current_page_id = self.root_page_id;
 
         loop {
@@ -58,10 +58,10 @@ impl<Key: BTreeKey> BTree<Key> {
                     let node = BTreeLeafNode::<PinnedReadPage, Key>::new(page)?;
                     match node.search(key)? {
                         NodeSearchResult::Found { record_ptr } => {
-                            return Ok(TreeSearchResult::Found { record_ptr });
+                            return Ok(Some(record_ptr));
                         }
-                        NodeSearchResult::NotFoundLeaf { insert_slot_id } => {
-                            return Ok(TreeSearchResult::NotFound { insert_slot_id });
+                        NodeSearchResult::NotFoundLeaf { .. } => {
+                            return Ok(None);
                         }
                         _ => unreachable!(),
                     }
