@@ -1,15 +1,18 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, mem, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use crossbeam::queue::SegQueue;
+use metadata::catalog::ColumnMetadata;
 use thiserror::Error;
 
 use crate::{
-    cache::{Cache, CacheError, FilePageRef, PinnedWritePage},
+    cache::{Cache, CacheError, FilePageRef, PageRead, PinnedReadPage, PinnedWritePage},
+    data_types::DbSerializable,
     files_manager::FileKey,
     paged_file::{PAGE_SIZE, PageId},
+    record::{Record, RecordError},
     slotted_page::{
-        ReprC, SlottedPage, SlottedPageBaseHeader, SlottedPageError, SlottedPageHeader,
+        ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError, SlottedPageHeader,
     },
 };
 
@@ -46,8 +49,8 @@ struct FreeSpaceMap<const BUCKETS_COUNT: usize, H: SlottedPageHeader> {
 impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUNT, H> {
     /// Finds a page that has at least `needed_space` bytes free.
     ///
-    /// If a candidate is stale the
-    /// search continues. Returns `Ok(None)` if no suitable page is found.
+    /// If a candidate is stale the search continues.
+    /// Returns `Ok(None)` if no suitable page is found.
     fn page_with_free_space(
         &self,
         needed_space: usize,
@@ -62,6 +65,9 @@ impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUN
                 if actual_free_space >= needed_space as _ {
                     return Ok(Some(slotted_page));
                 }
+                // Note that if the `actual_free_space` is different than we expected it means that other thread
+                // already modified this page. We don't need to insert this page to it's actual bucket, as it was done by
+                // this other thread that modified it.
             }
         }
         Ok(None)
@@ -101,9 +107,26 @@ impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUN
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordPtr {
     page_id: PageId,
-    slot: u16,
+    slot: SlotId,
 }
 
+impl RecordPtr {
+    /// Reads [`RecordPtr`] from buffer and returns the rest of the buffer.
+    fn read_from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), HeapFileError> {
+        let (page_id, bytes) =
+            PageId::deserialize(bytes).map_err(|err| HeapFileError::CorruptedRecordEntry {
+                error: err.to_string(),
+            })?;
+        let (slot, bytes) =
+            SlotId::deserialize(bytes).map_err(|err| HeapFileError::CorruptedRecordEntry {
+                error: err.to_string(),
+            })?;
+        let ptr = RecordPtr { page_id, slot };
+        Ok((ptr, bytes))
+    }
+}
+
+/// Metadata of [`HeapFile`]. It's stored using bare [`PagedFile`].
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Metadata {
@@ -111,35 +134,66 @@ struct Metadata {
     first_overflow_page: PageId,
 }
 
-struct RecordFragment<'d> {
-    data: &'d [u8],
-    next_fragment: Option<RecordPtr>,
-}
-
 /// Tag preceding record payload that describes whether a RecordPtr follows.
-#[repr(u16)]
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordTag {
-    Final = 0x0000,
-    HasContinuation = 0xffff,
+    Final = 0x00,
+    HasContinuation = 0xff,
 }
 
 impl RecordTag {
-    // TODO:
-    // helper for reading from bytes
+    /// Reads [`RecordTag`] from buffer and returns the rest of the buffer.
+    fn read_from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), HeapFileError> {
+        let (value, rest) =
+            u8::deserialize(bytes).map_err(|err| HeapFileError::CorruptedRecordEntry {
+                error: err.to_string(),
+            })?;
+        let record_tag = RecordTag::try_from(value)?;
+        Ok((record_tag, rest))
+    }
 }
 
-impl TryFrom<u16> for RecordTag {
+impl TryFrom<u8> for RecordTag {
     type Error = HeapFileError;
 
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            v if v == RecordTag::Final as u16 => Ok(RecordTag::Final),
-            v if v == RecordTag::HasContinuation as u16 => Ok(RecordTag::HasContinuation),
+            v if v == RecordTag::Final as u8 => Ok(RecordTag::Final),
+            v if v == RecordTag::HasContinuation as u8 => Ok(RecordTag::HasContinuation),
             _ => Err(HeapFileError::CorruptedRecordEntry {
-                error: format!("unexpected record tag: 0x{:04x}", value),
+                error: format!("unexpected record tag: 0x{:02x}", value),
             }),
         }
+    }
+}
+
+/// [`Record`] is stored across pages using [`RecordFragment`].
+/// The first fragment is stored in record page, all next fragments are stored on overflow pages.
+struct RecordFragment<'d> {
+    /// Part of record from single page.
+    data: &'d [u8],
+    /// Pointer to the next fragment of record.
+    next_fragment: Option<RecordPtr>,
+}
+
+impl<'d> RecordFragment<'d> {
+    /// Reads [`RecordFragment`] from buffer.
+    /// It is assumed that fragment takes the whole buffer.
+    fn read_from_bytes(bytes: &'d [u8]) -> Result<Self, HeapFileError> {
+        let (tag, bytes) = RecordTag::read_from_bytes(bytes)?;
+        let (next_fragment, bytes) = match tag {
+            RecordTag::Final => (None, bytes),
+            RecordTag::HasContinuation => {
+                let (ptr, bytes) = RecordPtr::read_from_bytes(bytes)?;
+                (Some(ptr), bytes)
+            }
+        };
+        let fragment = RecordFragment {
+            data: bytes,
+            next_fragment,
+        };
+        Ok(fragment)
     }
 }
 
@@ -173,20 +227,48 @@ impl SlottedPageHeader for OverflowPageHeader {
     }
 }
 
+struct HeapPage<P, H: SlottedPageHeader> {
+    page: SlottedPage<P, H>,
+}
+
+impl<P, H> HeapPage<P, H>
+where
+    H: SlottedPageHeader,
+{
+    fn new(page: SlottedPage<P, H>) -> Self {
+        HeapPage { page }
+    }
+}
+
+impl<P, H> HeapPage<P, H>
+where
+    P: PageRead,
+    H: SlottedPageHeader,
+{
+    /// Reads [`RecordFragment`] with `record_id`.
+    fn record_fragment<'d>(
+        &'d self,
+        record_id: SlotId,
+    ) -> Result<RecordFragment<'d>, HeapFileError> {
+        let bytes = self.page.read_record(record_id)?;
+        RecordFragment::read_from_bytes(bytes)
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum HeapFileError {
     #[error("corrupted header of heap file's page: {error}")]
     CorruptedHeapPageHeader { error: String },
     #[error("invalid metadata page: {error}")]
     InvalidMetadataPage { error: String },
-    #[error("record payload was to small (got {actual}, wanted at least {min}")]
-    RecordPayloadTooSmall { min: usize, actual: usize },
     #[error("failed to deserialize record entry: {error}")]
     CorruptedRecordEntry { error: String },
-    #[error("cache error occured: {0}")]
+    #[error("cache error occurred: {0}")]
     CacheError(#[from] CacheError),
-    #[error("slotted page error occured: {0}")]
+    #[error("slotted page error occurred: {0}")]
     SlottedPageError(#[from] SlottedPageError),
+    #[error("failed to serialize/deserialize record: {0}")]
+    RecordSerializationHeader(#[from] RecordError),
 }
 
 pub(crate) struct HeapFile<const BUCKETS_COUNT: usize> {
@@ -194,9 +276,64 @@ pub(crate) struct HeapFile<const BUCKETS_COUNT: usize> {
     metadata: Metadata,
     record_pages_fsm: FreeSpaceMap<BUCKETS_COUNT, RecordPageHeader>,
     overflow_pages_fsm: FreeSpaceMap<BUCKETS_COUNT, OverflowPageHeader>,
+    cache: Arc<Cache>,
+    columns_metadata: Vec<ColumnMetadata>,
 }
 
 impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
+    pub(crate) fn new(
+        file_key: FileKey,
+        cache: Arc<Cache>,
+        columns_metadata: Vec<ColumnMetadata>,
+    ) -> Result<Self, HeapFileError> {
+        todo!()
+    }
+
+    /// Reads [`Record`] located at `ptr` and deserializes it.
+    pub(crate) fn record(&self, ptr: &RecordPtr) -> Result<Record, HeapFileError> {
+        let first_page = self.read_record_page(ptr.page_id)?;
+        let fragment = first_page.record_fragment(ptr.slot)?;
+        if fragment.next_fragment.is_some() {
+            todo!("record with overflow pages not supported yet");
+        }
+        let record = Record::deserialize(&self.columns_metadata, fragment.data)?;
+        Ok(record)
+    }
+
+    /// Helper for reading [`HeapFile`]'s pages.
+    fn read_page<H>(&self, page_id: PageId) -> Result<HeapPage<PinnedReadPage, H>, HeapFileError>
+    where
+        H: SlottedPageHeader,
+    {
+        let file_page_ref = self.file_page_ref(page_id);
+        let page = self.cache.pin_read(&file_page_ref)?;
+        let slotted_page = SlottedPage::new(page, false)?;
+        let heap_node = HeapPage::new(slotted_page);
+        Ok(heap_node)
+    }
+
+    fn read_record_page(
+        &self,
+        page_id: PageId,
+    ) -> Result<HeapPage<PinnedReadPage, RecordPageHeader>, HeapFileError> {
+        self.read_page::<RecordPageHeader>(page_id)
+    }
+
+    fn read_overflow_page(
+        &self,
+        page_id: PageId,
+    ) -> Result<HeapPage<PinnedReadPage, OverflowPageHeader>, HeapFileError> {
+        self.read_page::<OverflowPageHeader>(page_id)
+    }
+
+    /// Creates a `FilePageRef` for `page_id` using heap file key.
+    fn file_page_ref(&self, page_id: PageId) -> FilePageRef {
+        FilePageRef {
+            page_id,
+            file_key: self.file_key.clone(),
+        }
+    }
+
     fn first_record_page(&self) -> PageId {
         self.metadata.first_record_page
     }
