@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, mem, sync::Arc};
+use std::{marker::PhantomData, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use crossbeam::queue::SegQueue;
@@ -9,7 +9,7 @@ use crate::{
     cache::{Cache, CacheError, FilePageRef, PageRead, PinnedReadPage, PinnedWritePage},
     data_types::DbSerializable,
     files_manager::FileKey,
-    paged_file::{PAGE_SIZE, PageId},
+    paged_file::{PAGE_SIZE, Page, PageId},
     record::{Record, RecordError},
     slotted_page::{
         ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError, SlottedPageHeader,
@@ -47,6 +47,17 @@ struct FreeSpaceMap<const BUCKETS_COUNT: usize, H: SlottedPageHeader> {
 }
 
 impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUNT, H> {
+    fn new(cache: Arc<Cache>, file_key: FileKey) -> Self {
+        let buckets: [SegQueue<PageId>; BUCKETS_COUNT] = std::array::from_fn(|_| SegQueue::new());
+
+        FreeSpaceMap {
+            buckets,
+            cache,
+            file_key,
+            _page_type_marker: PhantomData::<H>,
+        }
+    }
+
     /// Finds a page that has at least `needed_space` bytes free.
     ///
     /// If a candidate is stale the search continues.
@@ -134,6 +145,16 @@ struct Metadata {
     first_overflow_page: PageId,
 }
 
+impl Metadata {
+    fn load_from_page(page: &Page) -> Result<Self, HeapFileError> {
+        let metadata =
+            bytemuck::try_from_bytes(page).map_err(|err| HeapFileError::InvalidMetadataPage {
+                error: err.to_string(),
+            })?;
+        Ok(*metadata)
+    }
+}
+
 /// Tag preceding record payload that describes whether a RecordPtr follows.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +222,12 @@ impl<'d> RecordFragment<'d> {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RecordPageHeader {
     base: SlottedPageBaseHeader,
-    // TODO:
+    _padding: u16,
+    next_page: PageId,
+}
+
+impl RecordPageHeader {
+    const NO_NEXT_PAGE: PageId = 0;
 }
 
 unsafe impl ReprC for RecordPageHeader {}
@@ -216,7 +242,12 @@ impl SlottedPageHeader for RecordPageHeader {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct OverflowPageHeader {
     base: SlottedPageBaseHeader,
-    // TODO:
+    _padding: u16,
+    next_page: PageId,
+}
+
+impl OverflowPageHeader {
+    const NO_NEXT_PAGE: PageId = 0;
 }
 
 unsafe impl ReprC for OverflowPageHeader {}
@@ -281,23 +312,20 @@ pub(crate) struct HeapFile<const BUCKETS_COUNT: usize> {
 }
 
 impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
-    pub(crate) fn new(
-        file_key: FileKey,
-        cache: Arc<Cache>,
-        columns_metadata: Vec<ColumnMetadata>,
-    ) -> Result<Self, HeapFileError> {
-        todo!()
-    }
+    const METADATA_PAGE_ID: PageId = 1;
 
     /// Reads [`Record`] located at `ptr` and deserializes it.
     pub(crate) fn record(&self, ptr: &RecordPtr) -> Result<Record, HeapFileError> {
         let first_page = self.read_record_page(ptr.page_id)?;
         let fragment = first_page.record_fragment(ptr.slot)?;
-        if fragment.next_fragment.is_some() {
-            todo!("record with overflow pages not supported yet");
+
+        // Whole record is on single page
+        if fragment.next_fragment.is_none() {
+            let record = Record::deserialize(&self.columns_metadata, fragment.data)?;
+            return Ok(record);
         }
-        let record = Record::deserialize(&self.columns_metadata, fragment.data)?;
-        Ok(record)
+
+        todo!("record with overflow pages not supported yet");
     }
 
     /// Helper for reading [`HeapFile`]'s pages.
@@ -340,5 +368,102 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
     fn first_overflow_page(&self) -> PageId {
         self.metadata.first_overflow_page
+    }
+}
+
+/// Factory responsible for creating and loading existing [`HeapFile`].
+struct HeapFileFactory<const BUCKETS_COUNT: usize> {
+    file_key: FileKey,
+    cache: Arc<Cache>,
+    columns_metadata: Vec<ColumnMetadata>,
+}
+
+impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
+    pub(crate) fn new(
+        file_key: FileKey,
+        cache: Arc<Cache>,
+        columns_metadata: Vec<ColumnMetadata>,
+    ) -> Self {
+        HeapFileFactory {
+            file_key,
+            cache,
+            columns_metadata,
+        }
+    }
+
+    pub(crate) fn create_heap_file(self) -> Result<HeapFile<BUCKETS_COUNT>, HeapFileError> {
+        self.load_existing_heap_file()
+    }
+
+    fn load_existing_heap_file(self) -> Result<HeapFile<BUCKETS_COUNT>, HeapFileError> {
+        let metadata = self.load_metadata()?;
+
+        let record_pages_fsm = self.load_record_fsm(metadata.first_record_page)?;
+        let overflow_pages_fsm = self.load_overflow_fsm(metadata.first_overflow_page)?;
+
+        let heap_file = HeapFile {
+            cache: self.cache,
+            columns_metadata: self.columns_metadata,
+            file_key: self.file_key,
+            metadata,
+            record_pages_fsm,
+            overflow_pages_fsm,
+        };
+        Ok(heap_file)
+    }
+
+    fn load_metadata(&self) -> Result<Metadata, HeapFileError> {
+        let key = self.file_page_ref(HeapFile::<BUCKETS_COUNT>::METADATA_PAGE_ID);
+        let page = self.cache.pin_read(&key)?;
+        let metadata = Metadata::load_from_page(page.page())?;
+        Ok(metadata)
+    }
+
+    fn load_record_fsm(
+        &self,
+        first_page: PageId,
+    ) -> Result<FreeSpaceMap<BUCKETS_COUNT, RecordPageHeader>, HeapFileError> {
+        let fsm = FreeSpaceMap::<BUCKETS_COUNT, RecordPageHeader>::new(
+            self.cache.clone(),
+            self.file_key.clone(),
+        );
+        let mut current_page_id = first_page;
+        while current_page_id != RecordPageHeader::NO_NEXT_PAGE {
+            let key = self.file_page_ref(current_page_id);
+            let page = self.cache.pin_read(&key)?;
+            let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page, false)?;
+            let free_space = slotted_page.free_space()?;
+            fsm.update_page_bucket(current_page_id, free_space as _);
+            current_page_id = slotted_page.get_header()?.next_page;
+        }
+        Ok(fsm)
+    }
+
+    fn load_overflow_fsm(
+        &self,
+        first_page: PageId,
+    ) -> Result<FreeSpaceMap<BUCKETS_COUNT, OverflowPageHeader>, HeapFileError> {
+        let fsm = FreeSpaceMap::<BUCKETS_COUNT, OverflowPageHeader>::new(
+            self.cache.clone(),
+            self.file_key.clone(),
+        );
+        let mut current_page_id = first_page;
+        while current_page_id != OverflowPageHeader::NO_NEXT_PAGE {
+            let key = self.file_page_ref(current_page_id);
+            let page = self.cache.pin_read(&key)?;
+            let slotted_page = SlottedPage::<_, OverflowPageHeader>::new(page, false)?;
+            let free_space = slotted_page.free_space()?;
+            fsm.update_page_bucket(current_page_id, free_space as _);
+            current_page_id = slotted_page.get_header()?.next_page;
+        }
+        Ok(fsm)
+    }
+
+    /// Creates a `FilePageRef` for `page_id` using heap file key.
+    fn file_page_ref(&self, page_id: PageId) -> FilePageRef {
+        FilePageRef {
+            page_id,
+            file_key: self.file_key.clone(),
+        }
     }
 }
