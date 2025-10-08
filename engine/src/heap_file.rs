@@ -467,3 +467,340 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, thread};
+
+    use tempfile::tempdir;
+
+    use crate::{files_manager::FilesManager, slotted_page::PageType};
+
+    use super::*;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    struct TestPageHeader {
+        base: SlottedPageBaseHeader,
+    }
+
+    unsafe impl ReprC for TestPageHeader {}
+
+    impl SlottedPageHeader for TestPageHeader {
+        fn base(&self) -> &SlottedPageBaseHeader {
+            &self.base
+        }
+    }
+
+    impl Default for TestPageHeader {
+        fn default() -> Self {
+            Self {
+                base: SlottedPageBaseHeader::new(
+                    size_of::<TestPageHeader>() as u16,
+                    PageType::Generic,
+                ),
+            }
+        }
+    }
+
+    /// Creates a test cache and files manager in a temporary directory
+    fn setup_test_cache() -> (Arc<Cache>, Arc<FilesManager>, FileKey) {
+        let temp_dir = tempdir().unwrap();
+        let db_dir = temp_dir.path().join("test_db");
+        fs::create_dir_all(&db_dir).unwrap();
+
+        let files_manager = Arc::new(FilesManager::new(temp_dir.path(), "test_db").unwrap());
+        let cache = Cache::new(100, files_manager.clone());
+        let file_key = FileKey::data("test_heap");
+        (cache, files_manager, file_key)
+    }
+
+    /// Creates a new FSM for testing
+    fn create_test_fsm<const BUCKETS: usize>(
+        cache: Arc<Cache>,
+        file_key: FileKey,
+    ) -> FreeSpaceMap<BUCKETS, TestPageHeader> {
+        FreeSpaceMap::new(cache, file_key)
+    }
+
+    /// Allocates a page and initializes it with a slotted page header with specific free space
+    fn create_page_with_free_space(
+        cache: &Arc<Cache>,
+        file_key: &FileKey,
+        free_space: usize,
+    ) -> PageId {
+        let (pinned_page, page_id) = cache.allocate_page(file_key).unwrap();
+
+        // Initialize the page with a slotted page structure
+        let mut slotted = SlottedPage::<_, TestPageHeader>::initialize_default(pinned_page, false);
+
+        // Fill the page to achieve desired free space
+        // It will actually have a little less space, as some space will be taken by the slot itself.
+        let current_free = slotted.free_space().unwrap();
+
+        if current_free as usize > free_space {
+            let fill_size = current_free as usize - free_space;
+            let dummy_data = vec![0u8; fill_size];
+            let _ = slotted.insert(&dummy_data);
+        }
+
+        page_id
+    }
+
+    fn bucket_contains_page<const BUCKETS: usize>(
+        fsm: &FreeSpaceMap<BUCKETS, TestPageHeader>,
+        bucket_id: usize,
+        page_id: PageId,
+    ) -> bool {
+        let mut found = false;
+        let mut pages = Vec::new();
+
+        // We need to do it like that because SeqQueue does not have method `contains`.
+        while let Some(id) = fsm.buckets[bucket_id].pop() {
+            if id == page_id {
+                found = true;
+            }
+            pages.push(id);
+        }
+
+        // Restore the pages
+        for id in pages.into_iter().rev() {
+            fsm.buckets[bucket_id].push(id);
+        }
+
+        found
+    }
+
+    // FSM
+
+    #[test]
+    fn fsm_bucket_for_space_empty_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache, file_key);
+
+        // Empty page (100% free) should go to last bucket
+        let bucket = fsm.bucket_for_space(PAGE_SIZE);
+        assert_eq!(bucket, 3);
+    }
+
+    #[test]
+    fn fsm_bucket_for_space_full_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache, file_key);
+
+        // Full page (0% free) should go to first bucket
+        let bucket = fsm.bucket_for_space(0);
+        assert_eq!(bucket, 0);
+    }
+
+    #[test]
+    fn fsm_bucket_for_space_quarter_ranges() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache, file_key);
+
+        // [0%, 25%) -> bucket 0
+        assert_eq!(fsm.bucket_for_space(0), 0);
+        assert_eq!(fsm.bucket_for_space(PAGE_SIZE / 4 - 1), 0);
+
+        // [25%, 50%) -> bucket 1
+        assert_eq!(fsm.bucket_for_space(PAGE_SIZE / 4), 1);
+        assert_eq!(fsm.bucket_for_space(PAGE_SIZE / 2 - 1), 1);
+
+        // [50%, 75%) -> bucket 2
+        assert_eq!(fsm.bucket_for_space(PAGE_SIZE / 2), 2);
+        assert_eq!(fsm.bucket_for_space(PAGE_SIZE * 3 / 4 - 1), 2);
+
+        // [75%, 100%] -> bucket 3
+        assert_eq!(fsm.bucket_for_space(PAGE_SIZE * 3 / 4), 3);
+        assert_eq!(fsm.bucket_for_space(PAGE_SIZE), 3);
+    }
+
+    #[test]
+    fn fsm_update_page_bucket_adds_to_correct_bucket() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+
+        let (_, page_id) = cache.allocate_page(&file_key).unwrap();
+
+        // Add page with 30% free space (should go to bucket 1)
+        let free_space = PAGE_SIZE * 30 / 100;
+        fsm.update_page_bucket(page_id, free_space);
+
+        let bucket_idx = fsm.bucket_for_space(free_space);
+        assert_eq!(bucket_idx, 1);
+        assert!(bucket_contains_page(&fsm, bucket_idx, page_id));
+    }
+
+    #[test]
+    fn fsm_update_page_bucket_multiple_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+
+        // Create pages with different free space amounts
+        let pages_and_spaces = vec![
+            (PAGE_SIZE * 10 / 100, 0), // 10% -> bucket 0
+            (PAGE_SIZE * 35 / 100, 1), // 35% -> bucket 1
+            (PAGE_SIZE * 60 / 100, 2), // 60% -> bucket 2
+            (PAGE_SIZE * 90 / 100, 3), // 90% -> bucket 3
+        ];
+
+        for (free_space, expected_bucket) in pages_and_spaces {
+            let (_, page_id) = cache.allocate_page(&file_key).unwrap();
+            fsm.update_page_bucket(page_id, free_space);
+            assert!(bucket_contains_page(&fsm, expected_bucket, page_id));
+        }
+    }
+
+    #[test]
+    fn fsm_page_with_free_space_empty_fsm() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache, file_key);
+
+        // Should return None when FSM is empty
+        let result = fsm.page_with_free_space(100).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fsm_page_with_free_space_finds_suitable_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+
+        // Create a page with 2000 bytes free
+        let free_space = 2000;
+        let page_id = create_page_with_free_space(&cache, &file_key, free_space);
+        fsm.update_page_bucket(page_id, free_space);
+
+        // Request page with 1500 bytes free - should find just created page
+        let result = fsm.page_with_free_space(1500).unwrap();
+        assert!(result.is_some());
+
+        let found_page = result.unwrap();
+        let actual_free = found_page.free_space().unwrap() as usize;
+        assert!(actual_free > 1500);
+    }
+
+    #[test]
+    fn fsm_page_with_free_space_skips_insufficient_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+
+        // Create pages with different free space amounts
+        let small_free = 500;
+        let large_free = 2000;
+
+        let small_page_id = create_page_with_free_space(&cache, &file_key, small_free);
+        let large_page_id = create_page_with_free_space(&cache, &file_key, large_free);
+
+        fsm.update_page_bucket(small_page_id, small_free);
+        fsm.update_page_bucket(large_page_id, large_free);
+
+        // Request 1500 bytes - should skip small page and find large page
+        let result = fsm.page_with_free_space(1500).unwrap();
+        assert!(result.is_some());
+
+        let found_page = result.unwrap();
+        let actual_free = found_page.free_space().unwrap() as usize;
+        assert!(actual_free > 1500);
+    }
+
+    #[test]
+    fn fsm_page_with_free_space_searches_higher_buckets() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+
+        // Add page to bucket 3 (high free space)
+        let free_space = PAGE_SIZE * 90 / 100;
+        let page_id = create_page_with_free_space(&cache, &file_key, free_space);
+        fsm.update_page_bucket(page_id, free_space);
+
+        // Request space that maps to bucket 1, should search up to bucket 3
+        let needed = PAGE_SIZE * 30 / 100;
+        let result = fsm.page_with_free_space(needed).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn fsm_page_with_free_space_no_suitable_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+
+        // Add page with small free space
+        let free_space = 100;
+        let page_id = create_page_with_free_space(&cache, &file_key, free_space);
+        fsm.update_page_bucket(page_id, free_space);
+
+        // Request more space than available
+        let result = fsm.page_with_free_space(3000).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fsm_handles_stale_entries() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+
+        // Create page with initial free space
+        let initial_free = 2000;
+        let page_id = create_page_with_free_space(&cache, &file_key, initial_free);
+        fsm.update_page_bucket(page_id, initial_free);
+
+        // Modify the page to reduce free space
+        {
+            let file_page_ref = FilePageRef {
+                page_id,
+                file_key: file_key.clone(),
+            };
+            let pinned = cache.pin_write(&file_page_ref).unwrap();
+            let mut slotted = SlottedPage::<_, TestPageHeader>::new(pinned, false).unwrap();
+            let dummy_data = vec![0u8; 1500];
+            slotted.insert(&dummy_data).unwrap();
+        }
+
+        let result = fsm.page_with_free_space(1800).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fsm_concurrent_updates_same_bucket() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = Arc::new(create_test_fsm::<4>(cache.clone(), file_key.clone()));
+
+        let mut handles = vec![];
+
+        // Spawn multiple threads adding pages to similar buckets
+        for i in 0..10 {
+            let fsm_clone = fsm.clone();
+            let cache_clone = cache.clone();
+            let file_key_clone = file_key.clone();
+
+            let handle = thread::spawn(move || {
+                let (pinned_page, page_id) = cache_clone.allocate_page(&file_key_clone).unwrap();
+
+                // Initialize the page with slotted page header
+                let slotted =
+                    SlottedPage::<_, TestPageHeader>::initialize_default(pinned_page, false);
+                // Drop the slotted page to release the write lock
+                drop(slotted);
+
+                // Use dummy free space value
+                let free_space = PAGE_SIZE * (50 + i) / 100;
+                fsm_clone.update_page_bucket(page_id, free_space);
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for _ in 0..10 {
+            let result = fsm.page_with_free_space(1000).unwrap();
+            assert!(result.is_some());
+        }
+
+        let result = fsm.page_with_free_space(1000).unwrap();
+        assert!(result.is_none());
+    }
+}
