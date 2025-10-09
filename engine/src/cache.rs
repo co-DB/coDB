@@ -24,8 +24,8 @@ use crate::{
 /// Structure for referring to single page in the file.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub(crate) struct FilePageRef {
-    page_id: PageId,
-    file_key: FileKey,
+    pub(crate) page_id: PageId,
+    pub(crate) file_key: FileKey,
 }
 
 impl FilePageRef {
@@ -255,16 +255,19 @@ impl Cache {
         })
     }
 
-    /// Allocates new page in `file` and returns exclusive lock to that page.
+    /// Allocates new page in `file` and returns exclusive lock to that page and its id.
     /// In case if lock is not needed the return value should not be assigned, so that lock lives as little as needed.
-    pub(crate) fn allocate_page(&self, file: &FileKey) -> Result<PinnedWritePage, CacheError> {
+    pub(crate) fn allocate_page(
+        &self,
+        file: &FileKey,
+    ) -> Result<(PinnedWritePage, PageId), CacheError> {
         let pf = self.files.get_or_open_new_file(file)?;
         let page_id = pf.lock().allocate_page()?;
         let id = FilePageRef {
             file_key: file.clone(),
             page_id,
         };
-        self.pin_write(&id)
+        Ok((self.pin_write(&id)?, page_id))
     }
 
     /// Remove page from file. If there is a lock on the frame this will block
@@ -275,7 +278,7 @@ impl Cache {
             Entry::Occupied(occupied_entry) => {
                 // We hold exclusive lock on the key and remove it from the dashmap,
                 // so no other thread can get this key.
-                // Additionaly, we get exclusive lock on the page in the frame to wait until all other threads stop working with the frame.
+                // Additionally, we get exclusive lock on the page in the frame to wait until all other threads stop working with the frame.
                 let frame = occupied_entry.remove();
                 let w = frame.write();
                 // We can drop it right away as now we are sure no other thread can access it now. We do not need to flush it first, as it will be discarded anyway (the page will be freed).
@@ -1002,7 +1005,7 @@ mod tests {
 
         let cache = Cache::new(1, files.clone());
 
-        let mut pinned = cache
+        let (mut pinned, _) = cache
             .allocate_page(&file_key)
             .expect("allocate_page failed");
 
