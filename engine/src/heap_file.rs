@@ -351,7 +351,20 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             return Ok(record);
         }
 
-        todo!("record with overflow pages not supported yet");
+        // Record is saved across many pages - we need to load it fragment by fragment
+        let mut full_record_bytes = Vec::with_capacity(fragment.data.len());
+        full_record_bytes.extend_from_slice(fragment.data);
+
+        let mut next_ptr = fragment.next_fragment;
+        while let Some(next) = next_ptr {
+            let next_fragment_page = self.read_overflow_page(next.page_id)?;
+            let fragment = next_fragment_page.record_fragment(next.slot)?;
+            full_record_bytes.extend_from_slice(fragment.data);
+            next_ptr = fragment.next_fragment;
+        }
+
+        let record = Record::deserialize(&self.columns_metadata, &full_record_bytes)?;
+        return Ok(record);
     }
 
     /// Helper for reading [`HeapFile`]'s pages.
@@ -1394,5 +1407,324 @@ mod tests {
             result.unwrap_err(),
             HeapFileError::CorruptedRecordEntry { .. }
         ));
+    }
+
+    // Heap file reading multi-fragment records
+
+    #[test]
+    fn heap_file_read_record_two_fragments() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, first_overflow_page_id) =
+            setup_heap_file_structure(&cache, &file_key);
+
+        // Create a record split into two fragments
+        let full_record = create_custom_record_data(1, "test_record");
+
+        let split_point = full_record.len() / 2;
+        let first_part = &full_record[..split_point];
+        let second_part = &full_record[split_point..];
+
+        let second_slot =
+            insert_record_fragment(&cache, &file_key, first_overflow_page_id, second_part, None)
+                .unwrap();
+
+        let continuation_ptr = RecordPtr {
+            page_id: first_overflow_page_id,
+            slot: second_slot,
+        };
+        let first_slot = insert_record_fragment(
+            &cache,
+            &file_key,
+            first_record_page_id,
+            first_part,
+            Some(continuation_ptr),
+        )
+        .unwrap();
+
+        // Read the record
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: first_slot,
+        };
+
+        let record = heap_file.record(&ptr).unwrap();
+
+        assert_eq!(record.fields.len(), 2);
+        assert_i32(1, &record.fields[0]);
+        assert_string("test_record", &record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_read_record_three_fragments() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, first_overflow_page_id) =
+            setup_heap_file_structure(&cache, &file_key);
+
+        // Create a second overflow page
+        let (second_overflow_page, second_overflow_page_id) =
+            cache.allocate_page(&file_key).unwrap();
+        SlottedPage::<_, OverflowPageHeader>::initialize_default(second_overflow_page, false);
+
+        let full_record = create_custom_record_data(42, "fragmented_record");
+
+        let first_split = full_record.len() / 3;
+        let second_split = 2 * full_record.len() / 3;
+
+        let first_part = &full_record[..first_split];
+        let second_part = &full_record[first_split..second_split];
+        let third_part = &full_record[second_split..];
+
+        let third_slot =
+            insert_record_fragment(&cache, &file_key, second_overflow_page_id, third_part, None)
+                .unwrap();
+
+        let third_ptr = RecordPtr {
+            page_id: second_overflow_page_id,
+            slot: third_slot,
+        };
+        let second_slot = insert_record_fragment(
+            &cache,
+            &file_key,
+            first_overflow_page_id,
+            second_part,
+            Some(third_ptr),
+        )
+        .unwrap();
+
+        let second_ptr = RecordPtr {
+            page_id: first_overflow_page_id,
+            slot: second_slot,
+        };
+        let first_slot = insert_record_fragment(
+            &cache,
+            &file_key,
+            first_record_page_id,
+            first_part,
+            Some(second_ptr),
+        )
+        .unwrap();
+
+        // Read the record
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: first_slot,
+        };
+
+        let record = heap_file.record(&ptr).unwrap();
+
+        assert_eq!(record.fields.len(), 2);
+        assert_i32(42, &record.fields[0]);
+        assert_string("fragmented_record", &record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_read_fragmented_large_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, first_overflow_page_id) =
+            setup_heap_file_structure(&cache, &file_key);
+
+        let large_string = "x".repeat(300);
+        let full_record = create_custom_record_data(999, &large_string);
+
+        let split1 = full_record.len() / 3;
+        let split2 = 2 * full_record.len() / 3;
+
+        let (second_overflow_page, second_overflow_page_id) =
+            cache.allocate_page(&file_key).unwrap();
+        SlottedPage::<_, OverflowPageHeader>::initialize_default(second_overflow_page, false);
+
+        let third_slot = insert_record_fragment(
+            &cache,
+            &file_key,
+            second_overflow_page_id,
+            &full_record[split2..],
+            None,
+        )
+        .unwrap();
+
+        let second_slot = insert_record_fragment(
+            &cache,
+            &file_key,
+            first_overflow_page_id,
+            &full_record[split1..split2],
+            Some(RecordPtr {
+                page_id: second_overflow_page_id,
+                slot: third_slot,
+            }),
+        )
+        .unwrap();
+
+        let first_slot = insert_record_fragment(
+            &cache,
+            &file_key,
+            first_record_page_id,
+            &full_record[..split1],
+            Some(RecordPtr {
+                page_id: first_overflow_page_id,
+                slot: second_slot,
+            }),
+        )
+        .unwrap();
+
+        // Read the record
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: first_slot,
+        };
+
+        let record = heap_file.record(&ptr).unwrap();
+
+        assert_eq!(record.fields.len(), 2);
+        assert_i32(999, &record.fields[0]);
+        assert_string(&large_string, &record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_read_fragmented_invalid_continuation_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        let record = create_custom_record_data(1, "test");
+        let split = record.len() / 2;
+
+        // Insert first fragment with invalid continuation pointer
+        let invalid_ptr = RecordPtr {
+            page_id: 9999,
+            slot: 0,
+        };
+        let first_slot = insert_record_fragment(
+            &cache,
+            &file_key,
+            first_record_page_id,
+            &record[..split],
+            Some(invalid_ptr),
+        )
+        .unwrap();
+
+        // Try to read the record
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: first_slot,
+        };
+
+        let result = heap_file.record(&ptr);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), HeapFileError::CacheError(_)));
+    }
+
+    #[test]
+    fn heap_file_read_fragmented_invalid_continuation_slot() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, first_overflow_page_id) =
+            setup_heap_file_structure(&cache, &file_key);
+
+        let record = create_custom_record_data(1, "test");
+        let split = record.len() / 2;
+
+        // Insert first fragment with invalid slot in continuation
+        let invalid_ptr = RecordPtr {
+            page_id: first_overflow_page_id,
+            slot: 999,
+        };
+        let first_slot = insert_record_fragment(
+            &cache,
+            &file_key,
+            first_record_page_id,
+            &record[..split],
+            Some(invalid_ptr),
+        )
+        .unwrap();
+
+        // Try to read the record
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: first_slot,
+        };
+
+        let result = heap_file.record(&ptr);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HeapFileError::SlottedPageError(_)
+        ));
+    }
+
+    #[test]
+    fn heap_file_concurrent_read_fragmented_records() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, first_overflow_page_id) =
+            setup_heap_file_structure(&cache, &file_key);
+
+        // Create multiple fragmented records
+        let mut record_ptrs = Vec::new();
+
+        for i in 0..5 {
+            let record = create_custom_record_data(i, &format!("fragmented_{}", i));
+            let split = record.len() / 2;
+
+            let second_slot = insert_record_fragment(
+                &cache,
+                &file_key,
+                first_overflow_page_id,
+                &record[split..],
+                None,
+            )
+            .unwrap();
+
+            let first_slot = insert_record_fragment(
+                &cache,
+                &file_key,
+                first_record_page_id,
+                &record[..split],
+                Some(RecordPtr {
+                    page_id: first_overflow_page_id,
+                    slot: second_slot,
+                }),
+            )
+            .unwrap();
+
+            record_ptrs.push((
+                RecordPtr {
+                    page_id: first_record_page_id,
+                    slot: first_slot,
+                },
+                i,
+            ));
+        }
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = Arc::new(factory.create_heap_file().unwrap());
+
+        // Spawn multiple threads to read fragmented records concurrently
+        let mut handles = vec![];
+        for (ptr, expected_id) in record_ptrs {
+            let hf = heap_file.clone();
+            let handle = thread::spawn(move || {
+                let record = hf.record(&ptr).unwrap();
+                assert_eq!(record.fields.len(), 2);
+                assert_i32(expected_id, &record.fields[0]);
+                assert_string(&format!("fragmented_{}", expected_id), &record.fields[1]);
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }
