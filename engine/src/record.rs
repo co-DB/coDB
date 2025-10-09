@@ -42,6 +42,7 @@ impl RecordError {
 /// A record is a collection of fields that correspond to the columns
 /// defined in a table schema. Records can be serialized to bytes for
 /// storage and deserialized back to their structured form.
+#[derive(Debug)]
 pub(crate) struct Record {
     pub fields: Vec<Field>,
 }

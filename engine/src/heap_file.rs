@@ -325,7 +325,7 @@ pub(crate) enum HeapFileError {
     #[error("slotted page error occurred: {0}")]
     SlottedPageError(#[from] SlottedPageError),
     #[error("failed to serialize/deserialize record: {0}")]
-    RecordSerializationHeader(#[from] RecordError),
+    RecordSerializationError(#[from] RecordError),
 }
 
 pub(crate) struct HeapFile<const BUCKETS_COUNT: usize> {
@@ -506,6 +506,7 @@ mod tests {
 
     use crate::{
         files_manager::FilesManager,
+        record::Field,
         slotted_page::{InsertResult, PageType},
     };
 
@@ -533,6 +534,26 @@ mod tests {
                     PageType::Generic,
                 ),
             }
+        }
+    }
+
+    /// Helpers for asserting field type
+
+    fn assert_string(expected: &str, actual: &Field) {
+        match actual {
+            Field::String(s) => {
+                assert_eq!(expected, s);
+            }
+            _ => panic!("expected String, got {:?}", actual),
+        }
+    }
+
+    fn assert_i32(expected: i32, actual: &Field) {
+        match actual {
+            Field::Int32(i) => {
+                assert_eq!(expected, *i);
+            }
+            _ => panic!("expected Int32, got {:?}", actual),
         }
     }
 
@@ -643,8 +664,8 @@ mod tests {
     /// Creates a heap file factory with minimal column metadata for testing
     fn create_test_heap_file_factory(cache: Arc<Cache>, file_key: FileKey) -> HeapFileFactory<4> {
         let columns_metadata = vec![
-            ColumnMetadata::new("id".into(), Type::I64, 0, 0, 0).unwrap(),
-            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i64>(), 1).unwrap(),
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
         ];
 
         HeapFileFactory::new(file_key, cache, columns_metadata)
@@ -688,29 +709,17 @@ mod tests {
 
     /// Helper to create a simple serialized record for testing
     fn create_test_record_data() -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Serialize a simple record with id=42, name="test"
-        data.extend_from_slice(&42i32.to_le_bytes());
-
-        let name = b"test";
-        data.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        data.extend_from_slice(name);
-
-        data
+        create_custom_record_data(42, "name")
     }
 
     /// Helper to create a record with specific values
     fn create_custom_record_data(id: i32, name: &str) -> Vec<u8> {
-        let mut data = Vec::new();
+        let id_field = Field::Int32(id);
+        let name_field = Field::String(name.into());
 
-        data.extend_from_slice(&id.to_le_bytes());
+        let record = Record::new(vec![id_field, name_field]);
 
-        let name_bytes = name.as_bytes();
-        data.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        data.extend_from_slice(name_bytes);
-
-        data
+        record.serialize()
     }
 
     // FSM
@@ -1017,5 +1026,373 @@ mod tests {
         assert!(result2.is_some());
     }
 
+    #[test]
+    fn heap_file_factory_invalid_metadata_page() {
+        let (cache, _, file_key) = setup_test_cache();
+
+        // Allocate metadata page but write garbage to it
+        let (mut metadata_pinned, metadata_page_id) = cache.allocate_page(&file_key).unwrap();
+        assert_eq!(metadata_page_id, HeapFile::<4>::METADATA_PAGE_ID);
+
+        metadata_pinned.page_mut()[..8].copy_from_slice(&[0xffu8; 8]);
+
+        drop(metadata_pinned);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let result = factory.create_heap_file();
+
+        // Should succeed but metadata values might be nonsensical
+        // The actual error will occur when trying to read from invalid page IDs
+        if let Ok(heap_file) = result {
+            let invalid_ptr = RecordPtr {
+                page_id: heap_file.first_record_page(),
+                slot: 0,
+            };
+            let read_result = heap_file.record(&invalid_ptr);
+            assert!(read_result.is_err());
+        }
+    }
+
+    #[test]
+    fn heap_file_factory_loads_corrupted_record_page_list() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create a second record page with invalid next_page pointer
+        let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
+        let mut slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+        let header = slotted.get_header_mut().unwrap();
+        header.next_page = 9999; // Invalid page id
+        drop(slotted);
+
+        // Link first page to second page
+        {
+            let file_page_ref = FilePageRef {
+                page_id: first_record_page_id,
+                file_key: file_key.clone(),
+            };
+            let pinned = cache.pin_write(&file_page_ref).unwrap();
+            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned, false).unwrap();
+            let header = slotted.get_header_mut().unwrap();
+            header.next_page = second_page_id;
+        }
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let result = factory.create_heap_file();
+
+        // Should fail when trying to load invalid page
+        assert!(result.is_err());
+    }
+
     // Heap file reading
+
+    #[test]
+    fn heap_file_read_simple_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Insert a record
+        let record_data = create_test_record_data();
+        let slot_id =
+            insert_record_fragment(&cache, &file_key, first_record_page_id, &record_data, None)
+                .unwrap();
+
+        // Create heap file and read the record
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let record_ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: slot_id,
+        };
+
+        let record = heap_file.record(&record_ptr).unwrap();
+
+        // Verify the record data
+        assert_eq!(record.fields.len(), 2);
+        assert_i32(42, &record.fields[0]);
+        assert_string("name", &record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_read_multiple_records_same_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Insert multiple records
+        let record1_data = create_custom_record_data(1, "first");
+        let record2_data = create_custom_record_data(2, "second");
+        let record3_data = create_custom_record_data(3, "third");
+
+        let slot1 =
+            insert_record_fragment(&cache, &file_key, first_record_page_id, &record1_data, None)
+                .unwrap();
+
+        let slot2 =
+            insert_record_fragment(&cache, &file_key, first_record_page_id, &record2_data, None)
+                .unwrap();
+
+        let slot3 =
+            insert_record_fragment(&cache, &file_key, first_record_page_id, &record3_data, None)
+                .unwrap();
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Read all records
+        let ptr1 = RecordPtr {
+            page_id: first_record_page_id,
+            slot: slot1,
+        };
+        let ptr2 = RecordPtr {
+            page_id: first_record_page_id,
+            slot: slot2,
+        };
+        let ptr3 = RecordPtr {
+            page_id: first_record_page_id,
+            slot: slot3,
+        };
+
+        let rec1 = heap_file.record(&ptr1).unwrap();
+        let rec2 = heap_file.record(&ptr2).unwrap();
+        let rec3 = heap_file.record(&ptr3).unwrap();
+
+        // Verify all records were read correctly
+        assert_eq!(rec1.fields.len(), 2);
+        assert_i32(1, &rec1.fields[0]);
+        assert_string("first", &rec1.fields[1]);
+
+        assert_eq!(rec2.fields.len(), 2);
+        assert_i32(2, &rec2.fields[0]);
+        assert_string("second", &rec2.fields[1]);
+
+        assert_eq!(rec3.fields.len(), 2);
+        assert_i32(3, &rec3.fields[0]);
+        assert_string("third", &rec3.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_read_records_from_different_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create a second record page
+        let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
+        SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+
+        // Insert records in both pages
+        let record1_data = create_custom_record_data(1, "page1");
+        let record2_data = create_custom_record_data(2, "page2");
+
+        let slot1 =
+            insert_record_fragment(&cache, &file_key, first_record_page_id, &record1_data, None)
+                .unwrap();
+
+        let slot2 =
+            insert_record_fragment(&cache, &file_key, second_page_id, &record2_data, None).unwrap();
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Read records from different pages
+        let ptr1 = RecordPtr {
+            page_id: first_record_page_id,
+            slot: slot1,
+        };
+        let ptr2 = RecordPtr {
+            page_id: second_page_id,
+            slot: slot2,
+        };
+
+        let rec1 = heap_file.record(&ptr1).unwrap();
+        let rec2 = heap_file.record(&ptr2).unwrap();
+
+        // Verify both records
+        assert_eq!(rec1.fields.len(), 2);
+        assert_i32(1, &rec1.fields[0]);
+        assert_string("page1", &rec1.fields[1]);
+
+        assert_eq!(rec2.fields.len(), 2);
+        assert_i32(2, &rec2.fields[0]);
+        assert_string("page2", &rec2.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_read_large_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create a large record (but still fits in one page)
+        let large_name = "x".repeat(500);
+        let record_data = create_custom_record_data(999, &large_name);
+
+        let slot_id =
+            insert_record_fragment(&cache, &file_key, first_record_page_id, &record_data, None)
+                .unwrap();
+
+        // Create heap file and read the record
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let record_ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: slot_id,
+        };
+
+        let record = heap_file.record(&record_ptr).unwrap();
+
+        // Verify the large record was read correctly
+        assert_eq!(record.fields.len(), 2);
+        assert_i32(999, &record.fields[0]);
+        assert_string(&large_name, &record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_concurrent_reads() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Insert multiple records
+        let mut record_ptrs = Vec::new();
+        for i in 0..10 {
+            let record_data = create_custom_record_data(i, &format!("record_{}", i));
+            let slot_id =
+                insert_record_fragment(&cache, &file_key, first_record_page_id, &record_data, None)
+                    .unwrap();
+            record_ptrs.push((
+                RecordPtr {
+                    page_id: first_record_page_id,
+                    slot: slot_id,
+                },
+                i,
+            ));
+        }
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = Arc::new(factory.create_heap_file().unwrap());
+
+        // Spawn multiple threads to read records concurrently
+        let mut handles = vec![];
+        for (ptr, expected_id) in record_ptrs {
+            let hf = heap_file.clone();
+            let handle = thread::spawn(move || {
+                let record = hf.record(&ptr).unwrap();
+                assert_eq!(record.fields.len(), 2);
+                assert_i32(expected_id, &record.fields[0]);
+                assert_string(&format!("record_{}", expected_id), &record.fields[1]);
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn heap_file_read_invalid_page_id() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Try to read from a non-existent page
+        let invalid_ptr = RecordPtr {
+            page_id: 9999,
+            slot: 0,
+        };
+
+        let result = heap_file.record(&invalid_ptr);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), HeapFileError::CacheError(_)));
+    }
+
+    #[test]
+    fn heap_file_read_invalid_slot_id() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Try to read from a non-existent slot
+        let invalid_ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: 999,
+        };
+
+        let result = heap_file.record(&invalid_ptr);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HeapFileError::SlottedPageError(_)
+        ));
+    }
+
+    #[test]
+    fn heap_file_read_uninitialized_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Allocate a page but don't initialize it with slotted page header
+        let (_, uninitialized_page_id) = cache.allocate_page(&file_key).unwrap();
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let ptr = RecordPtr {
+            page_id: uninitialized_page_id,
+            slot: 0,
+        };
+
+        let result = heap_file.record(&ptr);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HeapFileError::SlottedPageError(SlottedPageError::UninitializedPage)
+        ));
+    }
+
+    #[test]
+    fn heap_file_read_corrupted_record_tag() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Insert record with invalid tag
+        let mut corrupted_data = vec![0x42u8];
+        corrupted_data.extend_from_slice(&create_test_record_data());
+
+        let slot_id = {
+            let file_page_ref = FilePageRef {
+                page_id: first_record_page_id,
+                file_key: file_key.clone(),
+            };
+            let pinned = cache.pin_write(&file_page_ref).unwrap();
+            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned, false).unwrap();
+            match slotted.insert(&corrupted_data).unwrap() {
+                InsertResult::Success(slot_id) => slot_id,
+                _ => panic!(),
+            }
+        };
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let ptr = RecordPtr {
+            page_id: first_record_page_id,
+            slot: slot_id,
+        };
+
+        let result = heap_file.record(&ptr);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HeapFileError::CorruptedRecordEntry { .. }
+        ));
+    }
 }
