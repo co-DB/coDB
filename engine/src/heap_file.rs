@@ -12,7 +12,8 @@ use crate::{
     paged_file::{PAGE_SIZE, Page, PageId},
     record::{Record, RecordError},
     slotted_page::{
-        ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError, SlottedPageHeader,
+        PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
+        SlottedPageHeader,
     },
 };
 
@@ -147,10 +148,12 @@ struct Metadata {
 
 impl Metadata {
     fn load_from_page(page: &Page) -> Result<Self, HeapFileError> {
-        let metadata =
-            bytemuck::try_from_bytes(page).map_err(|err| HeapFileError::InvalidMetadataPage {
+        let metadata_size = size_of::<Metadata>();
+        let metadata = bytemuck::try_from_bytes(&page[..metadata_size]).map_err(|err| {
+            HeapFileError::InvalidMetadataPage {
                 error: err.to_string(),
-            })?;
+            }
+        })?;
         Ok(*metadata)
     }
 }
@@ -230,6 +233,16 @@ impl RecordPageHeader {
     const NO_NEXT_PAGE: PageId = 0;
 }
 
+impl Default for RecordPageHeader {
+    fn default() -> Self {
+        Self {
+            base: SlottedPageBaseHeader::new(size_of::<RecordPageHeader>() as _, PageType::Heap),
+            _padding: Default::default(),
+            next_page: Self::NO_NEXT_PAGE,
+        }
+    }
+}
+
 unsafe impl ReprC for RecordPageHeader {}
 
 impl SlottedPageHeader for RecordPageHeader {
@@ -248,6 +261,19 @@ struct OverflowPageHeader {
 
 impl OverflowPageHeader {
     const NO_NEXT_PAGE: PageId = 0;
+}
+
+impl Default for OverflowPageHeader {
+    fn default() -> Self {
+        Self {
+            base: SlottedPageBaseHeader::new(
+                size_of::<OverflowPageHeader>() as _,
+                PageType::Overflow,
+            ),
+            _padding: Default::default(),
+            next_page: Self::NO_NEXT_PAGE,
+        }
+    }
 }
 
 unsafe impl ReprC for OverflowPageHeader {}
@@ -470,11 +496,18 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, thread};
+    use std::{
+        fs, thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
+    use metadata::types::Type;
     use tempfile::tempdir;
 
-    use crate::{files_manager::FilesManager, slotted_page::PageType};
+    use crate::{
+        files_manager::FilesManager,
+        slotted_page::{InsertResult, PageType},
+    };
 
     use super::*;
 
@@ -511,7 +544,16 @@ mod tests {
 
         let files_manager = Arc::new(FilesManager::new(temp_dir.path(), "test_db").unwrap());
         let cache = Cache::new(100, files_manager.clone());
-        let file_key = FileKey::data("test_heap");
+
+        // Use a unique file name for each test to avoid conflicts
+        let file_key = FileKey::data(&format!(
+            "test_heap_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
         (cache, files_manager, file_key)
     }
 
@@ -569,6 +611,106 @@ mod tests {
         }
 
         found
+    }
+
+    /// Sets up a complete heap file with metadata page and initial record/overflow pages
+    fn setup_heap_file_structure(cache: &Arc<Cache>, file_key: &FileKey) -> (PageId, PageId) {
+        // Allocate pages
+        let (mut metadata_pinned, metadata_page_id) = cache.allocate_page(file_key).unwrap();
+        assert_eq!(metadata_page_id, HeapFile::<4>::METADATA_PAGE_ID);
+
+        let (record_pinned, first_record_page_id) = cache.allocate_page(file_key).unwrap();
+
+        let (overflow_pinned, first_overflow_page_id) = cache.allocate_page(file_key).unwrap();
+
+        // Initialize pages
+        SlottedPage::<_, RecordPageHeader>::initialize_default(record_pinned, false);
+
+        SlottedPage::<_, OverflowPageHeader>::initialize_default(overflow_pinned, false);
+
+        // Write metadata
+        let metadata = Metadata {
+            first_record_page: first_record_page_id,
+            first_overflow_page: first_overflow_page_id,
+        };
+
+        let metadata_bytes = bytemuck::bytes_of(&metadata);
+        metadata_pinned.page_mut()[..metadata_bytes.len()].copy_from_slice(metadata_bytes);
+
+        (first_record_page_id, first_overflow_page_id)
+    }
+
+    /// Creates a heap file factory with minimal column metadata for testing
+    fn create_test_heap_file_factory(cache: Arc<Cache>, file_key: FileKey) -> HeapFileFactory<4> {
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I64, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i64>(), 1).unwrap(),
+        ];
+
+        HeapFileFactory::new(file_key, cache, columns_metadata)
+    }
+
+    /// Helper to insert a record fragment into a page and return the slot id
+    fn insert_record_fragment(
+        cache: &Arc<Cache>,
+        file_key: &FileKey,
+        page_id: PageId,
+        data: &[u8],
+        next_fragment: Option<RecordPtr>,
+    ) -> Result<SlotId, HeapFileError> {
+        let file_page_ref = FilePageRef {
+            page_id,
+            file_key: file_key.clone(),
+        };
+        let pinned = cache.pin_write(&file_page_ref)?;
+        let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned, false)?;
+
+        let mut fragment_data = Vec::new();
+
+        match next_fragment {
+            None => {
+                fragment_data.push(RecordTag::Final as u8);
+            }
+            Some(ptr) => {
+                fragment_data.push(RecordTag::HasContinuation as u8);
+                fragment_data.extend_from_slice(&ptr.page_id.to_le_bytes());
+                fragment_data.extend_from_slice(&ptr.slot.to_le_bytes());
+            }
+        }
+        fragment_data.extend_from_slice(data);
+
+        let result = slotted.insert(&fragment_data)?;
+        match result {
+            InsertResult::Success(slot_id) => Ok(slot_id),
+            _ => panic!(),
+        }
+    }
+
+    /// Helper to create a simple serialized record for testing
+    fn create_test_record_data() -> Vec<u8> {
+        let mut data = Vec::new();
+
+        // Serialize a simple record with id=42, name="test"
+        data.extend_from_slice(&42i32.to_le_bytes());
+
+        let name = b"test";
+        data.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        data.extend_from_slice(name);
+
+        data
+    }
+
+    /// Helper to create a record with specific values
+    fn create_custom_record_data(id: i32, name: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+
+        data.extend_from_slice(&id.to_le_bytes());
+
+        let name_bytes = name.as_bytes();
+        data.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        data.extend_from_slice(name_bytes);
+
+        data
     }
 
     // FSM
@@ -777,13 +919,10 @@ mod tests {
             let handle = thread::spawn(move || {
                 let (pinned_page, page_id) = cache_clone.allocate_page(&file_key_clone).unwrap();
 
-                // Initialize the page with slotted page header
                 let slotted =
                     SlottedPage::<_, TestPageHeader>::initialize_default(pinned_page, false);
-                // Drop the slotted page to release the write lock
                 drop(slotted);
 
-                // Use dummy free space value
                 let free_space = PAGE_SIZE * (50 + i) / 100;
                 fsm_clone.update_page_bucket(page_id, free_space);
             });
@@ -803,4 +942,80 @@ mod tests {
         let result = fsm.page_with_free_space(1000).unwrap();
         assert!(result.is_none());
     }
+
+    // Heap file factory
+
+    #[test]
+    fn heap_file_factory_loads_metadata() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Verify metadata was loaded
+        assert_ne!(heap_file.first_record_page(), 0);
+        assert_ne!(heap_file.first_overflow_page(), 0);
+    }
+
+    #[test]
+    fn heap_file_factory_loads_record_pages_fsm() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Verify FSMs have the pages
+        let result = heap_file
+            .record_pages_fsm
+            .page_with_free_space(100)
+            .unwrap();
+        assert!(result.is_some());
+
+        let result = heap_file
+            .overflow_pages_fsm
+            .page_with_free_space(100)
+            .unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn heap_file_factory_loads_multiple_record_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create a second record page linked to the first
+        let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
+        SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+
+        // Link first page to second page
+        {
+            let file_page_ref = FilePageRef {
+                page_id: first_record_page_id,
+                file_key: file_key.clone(),
+            };
+            let pinned = cache.pin_write(&file_page_ref).unwrap();
+            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned, false).unwrap();
+            let header = slotted.get_header_mut().unwrap();
+            header.next_page = second_page_id;
+        }
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Both pages should be in FSM
+        let result1 = heap_file
+            .record_pages_fsm
+            .page_with_free_space(100)
+            .unwrap();
+        assert!(result1.is_some());
+        let result2 = heap_file
+            .record_pages_fsm
+            .page_with_free_space(100)
+            .unwrap();
+        assert!(result2.is_some());
+    }
+
+    // Heap file reading
 }
