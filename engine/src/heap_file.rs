@@ -27,7 +27,7 @@ use crate::{
 /// Buckets split the page free-space range [0, PAGE_SIZE] into BUCKETS_COUNT equal
 /// intervals. For BUCKETS_COUNT = 4 the mapping is:
 ///
-///   ```
+///   ```text
 ///   bucket 0 -> [0%, 25%) free
 ///   bucket 1 -> [25%, 50%) free
 ///   bucket 2 -> [50%, 75%) free
