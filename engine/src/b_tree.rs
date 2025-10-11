@@ -69,4 +69,11 @@ impl<Key: BTreeKey> BTree<Key> {
             }
         }
     }
+
+    /// Insert strategy:
+    ///
+    /// 1) Optimistic:
+    /// First we go down the tree using only read latches and after reaching the leaf we try to upgrade
+    /// the latch to write. This can fail
+    pub(crate) fn insert() {}
 }

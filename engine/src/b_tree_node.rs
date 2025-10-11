@@ -190,6 +190,24 @@ where
         let (key, _) = Key::deserialize(record_bytes)?;
         Ok(key)
     }
+
+    /// Finds a new mid for binary search in the case where the slot in the base mid (left + right / 2)
+    /// is deleted. Can return None if every node is deleted.
+    fn find_new_mid(&self, mid: u16, left: u16, right: u16) -> Result<Option<u16>, BTreeNodeError> {
+        for i in (left..mid).rev() {
+            if !self.slotted_page.is_slot_deleted(i)? {
+                return Ok(Some(i));
+            }
+        }
+
+        for i in (mid + 1)..=right {
+            if !self.slotted_page.is_slot_deleted(i)? {
+                return Ok(Some(i));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 impl<Page, Header, Key> BTreeNode<Page, Header, Key>
@@ -223,7 +241,19 @@ where
         let mut right = num_slots - 1;
 
         while left <= right {
-            let mid = (left + right) / 2;
+            let mut mid = (left + right) / 2;
+            if self.slotted_page.is_slot_deleted(mid)? {
+                match self.find_new_mid(mid, left, right)? {
+                    None => {
+                        return Ok(NodeSearchResult::NotFoundLeaf {
+                            insert_slot_id: left,
+                        });
+                    }
+                    Some(new_mid) => {
+                        mid = new_mid;
+                    }
+                }
+            }
             let record_bytes = self.slotted_page.read_record(mid)?;
             let (key, child_page_id_bytes) = Key::deserialize(record_bytes)?;
 
@@ -291,7 +321,19 @@ where
         let mut right = num_slots - 1;
 
         while left <= right {
-            let mid = (left + right) / 2;
+            let mut mid = (left + right) / 2;
+            if self.slotted_page.is_slot_deleted(mid)? {
+                match self.find_new_mid(mid, left, right)? {
+                    None => {
+                        return Ok(NodeSearchResult::NotFoundLeaf {
+                            insert_slot_id: left,
+                        });
+                    }
+                    Some(new_mid) => {
+                        mid = new_mid;
+                    }
+                }
+            }
             let record_bytes = self.slotted_page.read_record(mid)?;
             let (key, record_ptr_bytes) = Key::deserialize(record_bytes)?;
 
@@ -384,6 +426,14 @@ mod test {
             node.slotted_page.insert(&buf).unwrap();
         }
 
+        let mut buf = Vec::new();
+        let key = 1;
+        key.serialize(&mut buf);
+        let insert_result = node.slotted_page.insert(&buf).unwrap();
+        match insert_result {
+            InsertResult::Success(slot) => node.slotted_page.delete(slot).unwrap(),
+            _ => panic!(),
+        };
         node
     }
 

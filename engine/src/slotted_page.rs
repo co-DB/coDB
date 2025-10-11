@@ -411,6 +411,21 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(&slots[slot_id as usize])
     }
 
+    /// Reads the slot at position [`slot_id`] and returns whether it is deleted
+    pub fn is_slot_deleted(&self, slot_id: SlotId) -> Result<bool, SlottedPageError> {
+        let header = self.get_base_header()?;
+
+        if slot_id >= header.num_slots {
+            return Err(SlottedPageError::SlotIndexOutOfBounds {
+                num_slots: header.num_slots,
+                out_of_bounds_index: slot_id,
+            });
+        }
+
+        let slots = self.get_slots()?;
+        Ok(slots[slot_id as usize].is_deleted())
+    }
+
     /// Reads the record data for a given slot. Checks if the record is deleted . Safe version of
     /// read_record
     pub fn read_record(&self, slot_id: SlotId) -> Result<&[u8], SlottedPageError> {
