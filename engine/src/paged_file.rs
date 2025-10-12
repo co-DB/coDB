@@ -11,13 +11,13 @@ use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
 /// Type representing page id, should be used instead of bare `u32`.
-pub type PageId = u32;
+pub(crate) type PageId = u32;
 
 /// Size of each page in [`PagedFile`].
 pub(crate) const PAGE_SIZE: usize = 4096; // 4 kB
 
 /// Type representing page, should be used instead of bare array of bytes.
-pub type Page = [u8; PAGE_SIZE];
+pub(crate) type Page = [u8; PAGE_SIZE];
 
 /// Responsible for managing a single on-disk file.
 /// Only this structure should be responsible for directly communicating with disk.
@@ -26,7 +26,7 @@ pub type Page = [u8; PAGE_SIZE];
 ///
 /// Page 0 (first page) is a special page that should be used by [`PagedFile`] for storing metadata ([`FileMetadata`]). It means that each file will be at least one page long, even when they have no other content, but this is a trade-off for better pages alignment. For more details about structure of the first page look at [`FileMetadata`].
 /// Pages from 1 to N have no defined format from [PagedFile]'s perspective - its sole responsibility is to allow reading, writing and allocating pages.
-pub struct PagedFile {
+pub(crate) struct PagedFile {
     /// Handle to underlying file
     handle: fs::File,
     /// File's metadata
@@ -40,7 +40,7 @@ pub struct PagedFile {
 
 /// Error for [`PagedFile`] related operations.
 #[derive(Error, Debug)]
-pub enum PagedFileError {
+pub(crate) enum PagedFileError {
     /// Provided page id was invalid, e.g. tried to read [`METADATA_PAGE_ID`]
     #[error("invalid page id: {0}")]
     InvalidPageId(PageId),
@@ -58,7 +58,7 @@ impl PagedFile {
 
     /// Creates a new instance of [`PagedFile`]. When `file_path` points to existing file it
     /// tries to load it from there, otherwise it creates new file at `file_path`.
-    pub fn new<P>(file_path: P) -> Result<PagedFile, PagedFileError>
+    pub(crate) fn new<P>(file_path: P) -> Result<PagedFile, PagedFileError>
     where
         P: AsRef<Path>,
     {
@@ -100,7 +100,7 @@ impl PagedFile {
     }
 
     /// Reads page with id equal to `page_id` from underlying file. Can fail if io error occurs or `page_id` is not valid.
-    pub fn read_page(&mut self, page_id: PageId) -> Result<Page, PagedFileError> {
+    pub(crate) fn read_page(&mut self, page_id: PageId) -> Result<Page, PagedFileError> {
         if self.is_invalid_page_id(page_id) {
             return Err(PagedFileError::InvalidPageId(page_id));
         }
@@ -114,7 +114,7 @@ impl PagedFile {
 
     /// Writes new `page` to page with id `page_id`. It does not flush newly written page to disk. For this check [`PagedFile::flush`].
     /// Page with id `page_id` must be allocated before writing to it. Can fail if io error occurs or `page_id` is not valid.
-    pub fn write_page(&mut self, page_id: PageId, page: Page) -> Result<(), PagedFileError> {
+    pub(crate) fn write_page(&mut self, page_id: PageId, page: Page) -> Result<(), PagedFileError> {
         if self.is_invalid_page_id(page_id) {
             return Err(PagedFileError::InvalidPageId(page_id));
         }
@@ -128,7 +128,7 @@ impl PagedFile {
     /// Allocates new page and returns its `PageId`. If there is a free page in metadata free page list then the first page
     /// from that list is used. Returned page id is guaranteed to point to page that is not used.
     /// Can fail if io error occurs.
-    pub fn allocate_page(&mut self) -> Result<PageId, PagedFileError> {
+    pub(crate) fn allocate_page(&mut self) -> Result<PageId, PagedFileError> {
         if self.free_pages.is_empty() {
             let page_id = self.metadata.next_page_id;
             self.metadata.next_page_id += 1;
@@ -143,7 +143,7 @@ impl PagedFile {
 
     /// Frees page with `page_id` so that it can be reused later.
     /// `page_id` is added both to disk-level linked list of [`FreePage`]s and in-memory [`PagedFile::free_pages`].
-    pub fn free_page(&mut self, page_id: PageId) -> Result<(), PagedFileError> {
+    pub(crate) fn free_page(&mut self, page_id: PageId) -> Result<(), PagedFileError> {
         if self.is_invalid_page_id(page_id) {
             return Err(PagedFileError::InvalidPageId(page_id));
         }
@@ -171,7 +171,7 @@ impl PagedFile {
     }
 
     /// Truncates the file - remove unused allocated pages from the end of the file. Can fail if io error occurs.
-    pub fn truncate(&mut self) -> Result<(), PagedFileError> {
+    pub(crate) fn truncate(&mut self) -> Result<(), PagedFileError> {
         while self.free_pages.contains(&(self.metadata.next_page_id - 1)) {
             self.metadata.next_page_id -= 1;
             let free_page_to_be_removed = self.metadata.next_page_id;
@@ -183,7 +183,7 @@ impl PagedFile {
     }
 
     /// Flushes file content to disk ensuring it's synced with in-memory state. Can fail if io error occurs.
-    pub fn flush(&mut self) -> Result<(), PagedFileError> {
+    pub(crate) fn flush(&mut self) -> Result<(), PagedFileError> {
         self.handle.sync_all()?;
         Ok(())
     }
