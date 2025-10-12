@@ -72,7 +72,7 @@ impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUN
             while let Some(page_id) = self.buckets[b].pop() {
                 let key = self.file_page_ref(page_id);
                 let page = self.cache.pin_write(&key)?;
-                let slotted_page = SlottedPage::new(page, true)?;
+                let slotted_page = SlottedPage::new(page, false)?;
                 let actual_free_space = slotted_page.free_space()?;
                 if actual_free_space >= needed_space as _ {
                     return Ok(Some(slotted_page));
