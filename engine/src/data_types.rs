@@ -1,5 +1,4 @@
-﻿use crate::record::{Field, RecordError};
-use thiserror::Error;
+﻿use thiserror::Error;
 use time::{Date, Duration, PrimitiveDateTime, Time};
 
 macro_rules! impl_db_serializable_for {
