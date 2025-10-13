@@ -157,7 +157,7 @@ where
 {
     pub fn new(page: Page) -> Result<Self, BTreeError> {
         Ok(Self {
-            slotted_page: SlottedPage::new(page, true)?,
+            slotted_page: SlottedPage::new(page)?,
             _key_marker: PhantomData,
         })
     }
