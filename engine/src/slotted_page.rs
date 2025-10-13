@@ -143,9 +143,7 @@ pub enum PageType {
 }
 
 impl PageType {
-    /// Returns true if by default given [`PageType`] should allow slot compaction.
-    ///
-    /// It is used by [`SlottedPage::new`]. If you want to specify this yourself you should use [`SlottedPage::with_compaction`].
+    /// Returns true if given [`PageType`] should allow slot compaction.
     fn allow_slot_compaction(&self) -> bool {
         match self {
             // Only heap files shouldn't allow auto compaction, because [`RecordPtr`] is based on slot index.
@@ -333,22 +331,6 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         let ty = base_header.page_type()?;
         let allow_slot_compaction = ty.allow_slot_compaction();
         page.allow_slot_compaction = allow_slot_compaction;
-
-        Ok(page)
-    }
-
-    /// Creates a new SlottedPage with explicit slot compaction control.
-    ///
-    /// Use this when you need to override the default compaction behavior for the page type.
-    pub fn with_compaction(page: P, allow_slot_compaction: bool) -> Result<Self, SlottedPageError> {
-        let data = page.data();
-        Self::validate_magic_number(data)?;
-
-        let page = Self {
-            page,
-            allow_slot_compaction,
-            _header_marker: PhantomData,
-        };
 
         Ok(page)
     }
