@@ -72,7 +72,7 @@ impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUN
             while let Some(page_id) = self.buckets[b].pop() {
                 let key = self.file_page_ref(page_id);
                 let page = self.cache.pin_write(&key)?;
-                let slotted_page = SlottedPage::new(page, false)?;
+                let slotted_page = SlottedPage::new(page)?;
                 let actual_free_space = slotted_page.free_space()?;
                 if actual_free_space >= needed_space as _ {
                     return Ok(Some(slotted_page));
@@ -374,7 +374,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     {
         let file_page_ref = self.file_page_ref(page_id);
         let page = self.cache.pin_read(&file_page_ref)?;
-        let slotted_page = SlottedPage::new(page, false)?;
+        let slotted_page = SlottedPage::new(page)?;
         let heap_node = HeapPage::new(slotted_page);
         Ok(heap_node)
     }
@@ -470,7 +470,7 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
         while current_page_id != RecordPageHeader::NO_NEXT_PAGE {
             let key = self.file_page_ref(current_page_id);
             let page = self.cache.pin_read(&key)?;
-            let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page, false)?;
+            let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page)?;
             let free_space = slotted_page.free_space()?;
             fsm.update_page_bucket(current_page_id, free_space as _);
             current_page_id = slotted_page.get_header()?.next_page;
@@ -490,7 +490,7 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
         while current_page_id != OverflowPageHeader::NO_NEXT_PAGE {
             let key = self.file_page_ref(current_page_id);
             let page = self.cache.pin_read(&key)?;
-            let slotted_page = SlottedPage::<_, OverflowPageHeader>::new(page, false)?;
+            let slotted_page = SlottedPage::<_, OverflowPageHeader>::new(page)?;
             let free_space = slotted_page.free_space()?;
             fsm.update_page_bucket(current_page_id, free_space as _);
             current_page_id = slotted_page.get_header()?.next_page;
@@ -697,7 +697,7 @@ mod tests {
             file_key: file_key.clone(),
         };
         let pinned = cache.pin_write(&file_page_ref)?;
-        let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned, false)?;
+        let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned)?;
 
         let mut fragment_data = Vec::new();
 
@@ -916,7 +916,7 @@ mod tests {
                 file_key: file_key.clone(),
             };
             let pinned = cache.pin_write(&file_page_ref).unwrap();
-            let mut slotted = SlottedPage::<_, TestPageHeader>::new(pinned, false).unwrap();
+            let mut slotted = SlottedPage::<_, TestPageHeader>::new(pinned).unwrap();
             let dummy_data = vec![0u8; 1500];
             slotted.insert(&dummy_data).unwrap();
         }
@@ -1018,7 +1018,7 @@ mod tests {
                 file_key: file_key.clone(),
             };
             let pinned = cache.pin_write(&file_page_ref).unwrap();
-            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned, false).unwrap();
+            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned).unwrap();
             let header = slotted.get_header_mut().unwrap();
             header.next_page = second_page_id;
         }
@@ -1086,7 +1086,7 @@ mod tests {
                 file_key: file_key.clone(),
             };
             let pinned = cache.pin_write(&file_page_ref).unwrap();
-            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned, false).unwrap();
+            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned).unwrap();
             let header = slotted.get_header_mut().unwrap();
             header.next_page = second_page_id;
         }
@@ -1386,7 +1386,7 @@ mod tests {
                 file_key: file_key.clone(),
             };
             let pinned = cache.pin_write(&file_page_ref).unwrap();
-            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned, false).unwrap();
+            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned).unwrap();
             match slotted.insert(&corrupted_data).unwrap() {
                 InsertResult::Success(slot_id) => slot_id,
                 _ => panic!(),
