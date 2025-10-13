@@ -142,6 +142,18 @@ pub enum PageType {
     Overflow = 4,
 }
 
+impl PageType {
+    /// Returns true if given [`PageType`] should allow slot compaction.
+    fn allow_slot_compaction(&self) -> bool {
+        match self {
+            // Only heap files shouldn't allow auto compaction, because [`RecordPtr`] is based on slot index.
+            PageType::Heap => false,
+            PageType::Overflow => false,
+            _ => true,
+        }
+    }
+}
+
 #[repr(transparent)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct PageTypeRepr(u8);
@@ -304,21 +316,34 @@ pub(crate) struct SlottedPage<P, H: SlottedPageHeader> {
 
 /// Implementation for read-only slotted page
 impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
-    /// Creates a new SlottedPage wrapper around a page
-    pub fn new(page: P, allow_slot_compaction: bool) -> Result<Self, SlottedPageError> {
+    /// Creates a new SlottedPage wrapper around a page with default slot compaction settings based on page type.
+    pub fn new(page: P) -> Result<Self, SlottedPageError> {
         let data = page.data();
+        Self::validate_magic_number(data)?;
+
+        let mut page = Self {
+            page,
+            allow_slot_compaction: false,
+            _header_marker: PhantomData,
+        };
+
+        let base_header = page.get_base_header()?;
+        let ty = base_header.page_type()?;
+        let allow_slot_compaction = ty.allow_slot_compaction();
+        page.allow_slot_compaction = allow_slot_compaction;
+
+        Ok(page)
+    }
+
+    /// Checks if `data` starts with CODB magic number.
+    fn validate_magic_number(data: &[u8]) -> Result<(), SlottedPageError> {
         let magic_number = u16::from_le_bytes([data[0], data[1]]);
         if magic_number != CO_DB_MAGIC_NUMBER {
             return Err(SlottedPageError::UninitializedPage);
         }
-
-        let page = Self {
-            page,
-            allow_slot_compaction,
-            _header_marker: PhantomData,
-        };
-        Ok(page)
+        Ok(())
     }
+
     /// Generic method to cast page header to any type implementing SlottedPageHeader
     ///
     /// Caller must ensure T matches the actual header type stored in the page
@@ -1079,7 +1104,7 @@ mod tests {
         page.data_mut()[..size_of::<SlottedPageBaseHeader>()]
             .copy_from_slice(bytemuck::bytes_of(&header));
 
-        SlottedPage::new(page, true).unwrap()
+        SlottedPage::new(page).unwrap()
     }
 
     #[test]
@@ -1321,7 +1346,7 @@ mod tests {
         page.data_mut()[..size_of::<CustomHeader>()]
             .copy_from_slice(bytemuck::bytes_of(&custom_header));
 
-        let slotted_page = SlottedPage::<TestPage, CustomHeader>::new(page, true).unwrap();
+        let slotted_page = SlottedPage::<TestPage, CustomHeader>::new(page).unwrap();
 
         let header: &CustomHeader = slotted_page.get_generic_header().unwrap();
         assert_eq!(header.custom_field, 42);
@@ -1553,8 +1578,6 @@ mod tests {
     #[test]
     fn test_record_defragmentation() {
         let mut page = create_test_page(132);
-
-        let free_space = page.free_space().unwrap();
 
         let record_1 = [1u8; 50];
         let record_2 = [2u8; 50];
