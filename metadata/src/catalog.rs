@@ -73,7 +73,7 @@ impl Catalog {
         self.tables
             .get(table_name)
             .ok_or(CatalogError::TableNotFound(table_name.into()))
-            .map(|t| t.clone())
+            .cloned()
     }
 
     /// Adds `table` to list of tables in the catalog.
@@ -178,10 +178,10 @@ impl Catalog {
                 let path = entry.path();
                 let file_name = path.file_name()?.to_string_lossy();
                 let prefix = format!("{database_name}.tmp-");
-                if file_name.starts_with(&prefix) {
-                    if let Ok(epoch) = file_name[prefix.len()..].parse::<u128>() {
-                        return Some((epoch, path));
-                    }
+                if file_name.starts_with(&prefix)
+                    && let Ok(epoch) = file_name[prefix.len()..].parse::<u128>()
+                {
+                    return Some((epoch, path));
                 }
                 None
             })

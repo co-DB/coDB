@@ -127,7 +127,7 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
             }
             self.update_page_bucket(page_id, space as _);
         }
-        return Ok(None);
+        Ok(None)
     }
 
     /// Loads page with id [`Self::next_page_to_read`] and updates it to the next pointer.
@@ -457,7 +457,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         }
 
         let record = Record::deserialize(&self.columns_metadata, &full_record_bytes)?;
-        return Ok(record);
+        Ok(record)
     }
 
     /// Helper for reading [`HeapFile`]'s pages.
@@ -655,7 +655,7 @@ mod tests {
         let cache = Cache::new(100, files_manager.clone());
 
         // Use a unique file name for each test to avoid conflicts
-        let file_key = FileKey::data(&format!(
+        let file_key = FileKey::data(format!(
             "test_heap_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1169,7 +1169,8 @@ mod tests {
         let (first_page, first_page_id) = cache.allocate_page(&file_key).unwrap();
 
         // Initialize page
-        let _ = SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+        let page = SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+        drop(page);
 
         // Create FSM with empty buckets
         let fsm = create_test_fsm_record_page::<4>(cache.clone(), file_key.clone(), first_page_id);
@@ -1996,7 +1997,8 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // First read of the empty page - should add it to FSM
-        let _ = heap_file.read_record_page(first_record_page_id).unwrap();
+        let page = heap_file.read_record_page(first_record_page_id).unwrap();
+        drop(page);
 
         assert!(bucket_contains_page(
             &heap_file.record_pages_fsm,
@@ -2005,7 +2007,8 @@ mod tests {
         ));
 
         for _ in 0..4 {
-            let _ = heap_file.read_record_page(first_record_page_id).unwrap();
+            let page = heap_file.read_record_page(first_record_page_id).unwrap();
+            drop(page);
         }
 
         // Should still be only one page in last bucket
