@@ -675,6 +675,15 @@ mod tests {
         FreeSpaceMap::new(cache, file_key, first_page_id)
     }
 
+    /// Creates a new FSM for testing with RecordPageHeader
+    fn create_test_fsm_record_page<const BUCKETS: usize>(
+        cache: Arc<Cache>,
+        file_key: FileKey,
+        first_page_id: PageId,
+    ) -> FreeSpaceMap<BUCKETS, RecordPageHeader> {
+        FreeSpaceMap::new(cache, file_key, first_page_id)
+    }
+
     /// Allocates a page and initializes it with a slotted page header with specific free space
     fn create_page_with_free_space(
         cache: &Arc<Cache>,
@@ -699,8 +708,8 @@ mod tests {
         page_id
     }
 
-    fn bucket_contains_page<const BUCKETS: usize>(
-        fsm: &FreeSpaceMap<BUCKETS, TestPageHeader>,
+    fn bucket_contains_page<const BUCKETS: usize, H: BaseHeapPageHeader>(
+        fsm: &FreeSpaceMap<BUCKETS, H>,
         bucket_id: usize,
         page_id: PageId,
     ) -> bool {
@@ -710,6 +719,7 @@ mod tests {
         // We need to do it like that because SeqQueue does not have method `contains`.
         while let Some(id) = fsm.buckets[bucket_id].pop() {
             if id == page_id {
+                // We don't just break here, because in some tests we check the order.
                 found = true;
             }
             pages.push(id);
@@ -1149,6 +1159,159 @@ mod tests {
 
         // page2 should not be in bucket 2 anymore (it was returned)
         assert!(!bucket_contains_page(&fsm, 2, page2));
+    }
+
+    #[test]
+    fn fsm_fallback_to_disk_when_buckets_empty() {
+        let (cache, _, file_key) = setup_test_cache();
+
+        // Create a chain of pages on disk
+        let (first_page, first_page_id) = cache.allocate_page(&file_key).unwrap();
+
+        // Initialize page
+        let _ = SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+
+        // Create FSM with empty buckets
+        let fsm = create_test_fsm_record_page::<4>(cache.clone(), file_key.clone(), first_page_id);
+
+        // Request space that first page should satisfy (but buckets are empty)
+        let needed_space = 2000;
+        let result = fsm.page_with_free_space(needed_space).unwrap();
+
+        assert!(result.is_some());
+        let (found_page_id, found_page) = result.unwrap();
+        assert_eq!(found_page_id, first_page_id);
+        assert!(found_page.free_space().unwrap() as usize >= needed_space);
+    }
+
+    #[test]
+    fn fsm_fallback_scans_multiple_pages_until_suitable_found() {
+        let (cache, _, file_key) = setup_test_cache();
+
+        // Create chain: page1 (small space) -> page2 (small space) -> page3 (large space)
+        let (first_page, first_page_id) = cache.allocate_page(&file_key).unwrap();
+        let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
+        let (third_page, third_page_id) = cache.allocate_page(&file_key).unwrap();
+
+        // Set up chain
+        let mut first_slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+        first_slotted.get_header_mut().unwrap().next_page = second_page_id;
+
+        let mut second_slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+        second_slotted.get_header_mut().unwrap().next_page = third_page_id;
+
+        let mut third_slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(third_page, false);
+        third_slotted.get_header_mut().unwrap().next_page = NO_NEXT_PAGE;
+
+        // Fill first and second pages to have insufficient space
+        let large_dummy = vec![0u8; 3000];
+        first_slotted.insert(&large_dummy).unwrap();
+        second_slotted.insert(&large_dummy).unwrap();
+
+        drop(first_slotted);
+        drop(second_slotted);
+        drop(third_slotted);
+
+        let fsm = create_test_fsm_record_page::<4>(cache.clone(), file_key.clone(), first_page_id);
+
+        // Request space that only third page can satisfy
+        let needed_space = 2500;
+        let result = fsm.page_with_free_space(needed_space).unwrap();
+
+        assert!(result.is_some());
+        let (found_page_id, found_page) = result.unwrap();
+        assert_eq!(found_page_id, third_page_id);
+        assert!(found_page.free_space().unwrap() as usize >= needed_space);
+
+        // Verify that first and second pages were added to FSM during scan
+        assert!(bucket_contains_page(&fsm, 1, first_page_id));
+        assert!(bucket_contains_page(&fsm, 1, second_page_id));
+    }
+
+    #[test]
+    fn fsm_fallback_returns_none_when_no_suitable_page_on_disk() {
+        let (cache, _, file_key) = setup_test_cache();
+
+        // Create pages with insufficient space
+        let (first_page, first_page_id) = cache.allocate_page(&file_key).unwrap();
+        let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
+
+        let mut first_slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+        first_slotted.get_header_mut().unwrap().next_page = second_page_id;
+
+        let mut second_slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+        second_slotted.get_header_mut().unwrap().next_page = NO_NEXT_PAGE;
+
+        // Fill both pages almost completely
+        let large_dummy = vec![0u8; 3500];
+        first_slotted.insert(&large_dummy).unwrap();
+        second_slotted.insert(&large_dummy).unwrap();
+
+        drop(first_slotted);
+        drop(second_slotted);
+
+        let fsm = create_test_fsm_record_page::<4>(cache.clone(), file_key.clone(), first_page_id);
+
+        // Request more space than any page has
+        let needed_space = 3000;
+        let result = fsm.page_with_free_space(needed_space).unwrap();
+
+        assert!(result.is_none());
+
+        // Both pages should have been added to FSM
+        assert!(bucket_contains_page(&fsm, 0, first_page_id));
+        assert!(bucket_contains_page(&fsm, 0, second_page_id));
+    }
+
+    #[test]
+    fn fsm_load_next_page_updates_next_page_pointer() {
+        let (cache, _, file_key) = setup_test_cache();
+
+        let (first_page, first_page_id) = cache.allocate_page(&file_key).unwrap();
+        let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
+        let (third_page, third_page_id) = cache.allocate_page(&file_key).unwrap();
+
+        // Set up chain: first -> second -> third -> NO_NEXT_PAGE
+        let mut first_slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+        first_slotted.get_header_mut().unwrap().next_page = second_page_id;
+
+        let mut second_slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+        second_slotted.get_header_mut().unwrap().next_page = third_page_id;
+
+        let mut third_slotted =
+            SlottedPage::<_, RecordPageHeader>::initialize_default(third_page, false);
+        third_slotted.get_header_mut().unwrap().next_page = NO_NEXT_PAGE;
+
+        drop(first_slotted);
+        drop(second_slotted);
+        drop(third_slotted);
+
+        let fsm = create_test_fsm_record_page::<4>(cache.clone(), file_key.clone(), first_page_id);
+
+        // Load pages one by one
+        let (loaded_id_1, _) = fsm.load_next_page().unwrap().unwrap();
+        assert_eq!(loaded_id_1, first_page_id);
+
+        let (loaded_id_2, _) = fsm.load_next_page().unwrap().unwrap();
+        assert_eq!(loaded_id_2, second_page_id);
+
+        let (loaded_id_3, _) = fsm.load_next_page().unwrap().unwrap();
+        assert_eq!(loaded_id_3, third_page_id);
+
+        // Should return None when reaching end of chain
+        let result = fsm.load_next_page().unwrap();
+        assert!(result.is_none());
+
+        // Subsequent calls should also return None
+        let result2 = fsm.load_next_page().unwrap();
+        assert!(result2.is_none());
     }
 
     // Heap file factory
@@ -1821,5 +1984,36 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn heap_file_fsm_deduplication_on_multiple_reads() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // First read of the empty page - should add it to FSM
+        let _ = heap_file.read_record_page(first_record_page_id).unwrap();
+
+        assert!(bucket_contains_page(
+            &heap_file.record_pages_fsm,
+            3,
+            first_record_page_id
+        ));
+
+        for _ in 0..4 {
+            let _ = heap_file.read_record_page(first_record_page_id).unwrap();
+        }
+
+        // Should still be only one page in last bucket
+        assert!(bucket_contains_page(
+            &heap_file.record_pages_fsm,
+            3,
+            first_record_page_id
+        ));
+        assert_eq!(heap_file.record_pages_fsm.buckets[3].len(), 1);
     }
 }
