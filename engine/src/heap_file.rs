@@ -1,8 +1,10 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{array, marker::PhantomData, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use crossbeam::queue::SegQueue;
+use dashmap::DashSet;
 use metadata::catalog::ColumnMetadata;
+use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::{
@@ -17,7 +19,7 @@ use crate::{
     },
 };
 
-/// Free-space index for a HeapFile.
+/// Free-space map for a HeapFile.
 ///
 /// Tracks PageId values grouped into lock‑free buckets that act as hints about how much
 /// free space each page currently has. Buckets are advisory: whenever a page id is taken
@@ -40,21 +42,28 @@ use crate::{
 /// The map is rebuilt from page headers when the heap file is opened.
 ///
 /// There are two FSMs per each heap file: one for record pages and the other one for overflow pages.
-struct FreeSpaceMap<const BUCKETS_COUNT: usize, H: SlottedPageHeader> {
+struct FreeSpaceMap<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> {
     buckets: [SegQueue<PageId>; BUCKETS_COUNT],
     cache: Arc<Cache>,
     file_key: FileKey,
+    /// [`PageId`] of next page that should be read by fsm in case of not finding suitable page in [`FreeSpaceMap::buckets`].
+    next_page_to_read: Mutex<PageId>,
+    /// Set of all pages that were already read from disk (either directly by FSM or by HeapFile while reading/creating page).
+    /// The purpose of this is to minimize duplicates in FSM.
+    already_read: DashSet<PageId>,
     _page_type_marker: PhantomData<H>,
 }
 
-impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUNT, H> {
-    fn new(cache: Arc<Cache>, file_key: FileKey) -> Self {
-        let buckets: [SegQueue<PageId>; BUCKETS_COUNT] = std::array::from_fn(|_| SegQueue::new());
+impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COUNT, H> {
+    fn new(cache: Arc<Cache>, file_key: FileKey, first_page_id: PageId) -> Self {
+        let buckets: [SegQueue<PageId>; BUCKETS_COUNT] = array::from_fn(|_| SegQueue::new());
 
         FreeSpaceMap {
             buckets,
             cache,
             file_key,
+            next_page_to_read: Mutex::new(first_page_id),
+            already_read: DashSet::new(),
             _page_type_marker: PhantomData::<H>,
         }
     }
@@ -62,27 +71,84 @@ impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUN
     /// Finds a page that has at least `needed_space` bytes free.
     ///
     /// If a candidate is stale the search continues.
+    /// If page was found it is removed from FSM and should be added back once the thread that removed it finished processing it.
     /// Returns `Ok(None)` if no suitable page is found.
     fn page_with_free_space(
         &self,
         needed_space: usize,
-    ) -> Result<Option<SlottedPage<PinnedWritePage, H>>, HeapFileError> {
+    ) -> Result<Option<(PageId, SlottedPage<PinnedWritePage, H>)>, HeapFileError> {
         let start_bucket_idx = self.bucket_for_space(needed_space);
+        let mut insert_back = vec![];
         for b in start_bucket_idx..BUCKETS_COUNT {
+            insert_back.clear();
             while let Some(page_id) = self.buckets[b].pop() {
                 let key = self.file_page_ref(page_id);
                 let page = self.cache.pin_write(&key)?;
                 let slotted_page = SlottedPage::new(page)?;
                 let actual_free_space = slotted_page.free_space()?;
                 if actual_free_space >= needed_space as _ {
-                    return Ok(Some(slotted_page));
+                    for id in insert_back {
+                        self.buckets[b].push(id);
+                    }
+                    return Ok(Some((page_id, slotted_page)));
                 }
-                // Note that if the `actual_free_space` is different than we expected it means that other thread
-                // already modified this page. We don't need to insert this page to it's actual bucket, as it was done by
-                // this other thread that modified it.
+                // If we don't use this page and it still belongs to this bucket we must reinsert it to keep it in FSM.
+                // If it now has different bucket it means that it was edited (other thread made insert/delete) and that thread should put it back in fsm.
+                let actual_bucket = self.bucket_for_space(actual_free_space as usize);
+                if actual_bucket == b {
+                    // We cannot insert it right away, because we would end up in infinity loop
+                    insert_back.push(page_id);
+                }
+            }
+            for id in &insert_back {
+                self.buckets[b].push(*id);
             }
         }
-        Ok(None)
+
+        // We didn't find page in current FSM, we fallback to reading directly from disk
+        self.page_with_free_space_from_disk(needed_space)
+    }
+
+    /// Iterates over pages not yet loaded from disk and returns one that has enough free space.
+    /// If no such page is found then `None` is returned.
+    fn page_with_free_space_from_disk(
+        &self,
+        needed_space: usize,
+    ) -> Result<Option<(PageId, SlottedPage<PinnedWritePage, H>)>, HeapFileError> {
+        while let Some((page_id, slotted_page)) = self.load_next_page()? {
+            // It means this page was already in FSM and we already checked it
+            if self.already_read.contains(&page_id) {
+                continue;
+            }
+            self.already_read.insert(page_id);
+            let space = slotted_page.free_space()?;
+            if space >= needed_space as _ {
+                return Ok(Some((page_id, slotted_page)));
+            }
+            self.update_page_bucket(page_id, space as _);
+        }
+        return Ok(None);
+    }
+
+    /// Loads page with id [`Self::next_page_to_read`] and updates it to the next pointer.
+    /// Returns id and loaded page or `None` if there is no more page to read.
+    fn load_next_page(
+        &self,
+    ) -> Result<Option<(PageId, SlottedPage<PinnedWritePage, H>)>, HeapFileError> {
+        let mut page_id = self.next_page_to_read.lock();
+        if *page_id == NO_NEXT_PAGE {
+            return Ok(None);
+        }
+
+        let key = self.file_page_ref(*page_id);
+        let page = self.cache.pin_write(&key)?;
+        let slotted_page = SlottedPage::<_, H>::new(page)?;
+
+        let read_page_id = *page_id;
+        let next_page = slotted_page.get_header()?.next_page();
+        *page_id = next_page;
+
+        Ok(Some((read_page_id, slotted_page)))
     }
 
     /// Adds a page id to the bucket corresponding to `free_space` (in bytes).
@@ -91,6 +157,20 @@ impl<const BUCKETS_COUNT: usize, H: SlottedPageHeader> FreeSpaceMap<BUCKETS_COUN
     /// bucket so future searches may find it. The authoritative free-space value is in
     /// the page header.
     fn update_page_bucket(&self, page_id: PageId, free_space: usize) {
+        let bucket_idx = self.bucket_for_space(free_space);
+        self.buckets[bucket_idx].push(page_id);
+    }
+
+    /// Same as [`Self::update_page_bucket`], but it also inserts `page_id` into [`Self::already_read`].
+    ///
+    /// It should be used by HeapFile when it reads/creates a page.
+    /// The reason why this is a separate function is that using [`Self::already_read`] might require waiting for lock,
+    /// so we should do it only when really needed.
+    fn update_page_bucket_with_duplicate_check(&self, page_id: PageId, free_space: usize) {
+        if self.already_read.contains(&page_id) {
+            return;
+        }
+        self.already_read.insert(page_id);
         let bucket_idx = self.bucket_for_space(free_space);
         self.buckets[bucket_idx].push(page_id);
     }
@@ -221,6 +301,12 @@ impl<'d> RecordFragment<'d> {
     }
 }
 
+trait BaseHeapPageHeader: SlottedPageHeader {
+    const NO_NEXT_PAGE: PageId = 0;
+
+    fn next_page(&self) -> PageId;
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RecordPageHeader {
@@ -229,8 +315,10 @@ struct RecordPageHeader {
     next_page: PageId,
 }
 
-impl RecordPageHeader {
-    const NO_NEXT_PAGE: PageId = 0;
+impl BaseHeapPageHeader for RecordPageHeader {
+    fn next_page(&self) -> PageId {
+        self.next_page
+    }
 }
 
 impl Default for RecordPageHeader {
@@ -238,7 +326,7 @@ impl Default for RecordPageHeader {
         Self {
             base: SlottedPageBaseHeader::new(size_of::<RecordPageHeader>() as _, PageType::Heap),
             _padding: Default::default(),
-            next_page: Self::NO_NEXT_PAGE,
+            next_page: NO_NEXT_PAGE,
         }
     }
 }
@@ -259,8 +347,10 @@ struct OverflowPageHeader {
     next_page: PageId,
 }
 
-impl OverflowPageHeader {
-    const NO_NEXT_PAGE: PageId = 0;
+impl BaseHeapPageHeader for OverflowPageHeader {
+    fn next_page(&self) -> PageId {
+        self.next_page
+    }
 }
 
 impl Default for OverflowPageHeader {
@@ -271,7 +361,7 @@ impl Default for OverflowPageHeader {
                 PageType::Overflow,
             ),
             _padding: Default::default(),
-            next_page: Self::NO_NEXT_PAGE,
+            next_page: NO_NEXT_PAGE,
         }
     }
 }
@@ -284,13 +374,16 @@ impl SlottedPageHeader for OverflowPageHeader {
     }
 }
 
-struct HeapPage<P, H: SlottedPageHeader> {
+/// Const representing "null" page.
+const NO_NEXT_PAGE: PageId = 0;
+
+struct HeapPage<P, H: BaseHeapPageHeader> {
     page: SlottedPage<P, H>,
 }
 
 impl<P, H> HeapPage<P, H>
 where
-    H: SlottedPageHeader,
+    H: BaseHeapPageHeader,
 {
     fn new(page: SlottedPage<P, H>) -> Self {
         HeapPage { page }
@@ -300,7 +393,7 @@ where
 impl<P, H> HeapPage<P, H>
 where
     P: PageRead,
-    H: SlottedPageHeader,
+    H: BaseHeapPageHeader,
 {
     /// Reads [`RecordFragment`] with `record_id`.
     fn record_fragment<'d>(
@@ -370,7 +463,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Helper for reading [`HeapFile`]'s pages.
     fn read_page<H>(&self, page_id: PageId) -> Result<HeapPage<PinnedReadPage, H>, HeapFileError>
     where
-        H: SlottedPageHeader,
+        H: BaseHeapPageHeader,
     {
         let file_page_ref = self.file_page_ref(page_id);
         let page = self.cache.pin_read(&file_page_ref)?;
@@ -383,14 +476,22 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         &self,
         page_id: PageId,
     ) -> Result<HeapPage<PinnedReadPage, RecordPageHeader>, HeapFileError> {
-        self.read_page::<RecordPageHeader>(page_id)
+        let p = self.read_page::<RecordPageHeader>(page_id)?;
+        let free_space = p.page.free_space()?;
+        self.record_pages_fsm
+            .update_page_bucket_with_duplicate_check(page_id, free_space as _);
+        Ok(p)
     }
 
     fn read_overflow_page(
         &self,
         page_id: PageId,
     ) -> Result<HeapPage<PinnedReadPage, OverflowPageHeader>, HeapFileError> {
-        self.read_page::<OverflowPageHeader>(page_id)
+        let p = self.read_page::<OverflowPageHeader>(page_id)?;
+        let free_space = p.page.free_space()?;
+        self.overflow_pages_fsm
+            .update_page_bucket_with_duplicate_check(page_id, free_space as _);
+        Ok(p)
     }
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
@@ -437,8 +538,16 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
     fn load_existing_heap_file(self) -> Result<HeapFile<BUCKETS_COUNT>, HeapFileError> {
         let metadata = self.load_metadata()?;
 
-        let record_pages_fsm = self.load_record_fsm(metadata.first_record_page)?;
-        let overflow_pages_fsm = self.load_overflow_fsm(metadata.first_overflow_page)?;
+        let record_pages_fsm = FreeSpaceMap::<BUCKETS_COUNT, RecordPageHeader>::new(
+            self.cache.clone(),
+            self.file_key.clone(),
+            metadata.first_record_page,
+        );
+        let overflow_pages_fsm = FreeSpaceMap::<BUCKETS_COUNT, OverflowPageHeader>::new(
+            self.cache.clone(),
+            self.file_key.clone(),
+            metadata.first_overflow_page,
+        );
 
         let heap_file = HeapFile {
             cache: self.cache,
@@ -456,46 +565,6 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
         let page = self.cache.pin_read(&key)?;
         let metadata = Metadata::load_from_page(page.page())?;
         Ok(metadata)
-    }
-
-    fn load_record_fsm(
-        &self,
-        first_page: PageId,
-    ) -> Result<FreeSpaceMap<BUCKETS_COUNT, RecordPageHeader>, HeapFileError> {
-        let fsm = FreeSpaceMap::<BUCKETS_COUNT, RecordPageHeader>::new(
-            self.cache.clone(),
-            self.file_key.clone(),
-        );
-        let mut current_page_id = first_page;
-        while current_page_id != RecordPageHeader::NO_NEXT_PAGE {
-            let key = self.file_page_ref(current_page_id);
-            let page = self.cache.pin_read(&key)?;
-            let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page)?;
-            let free_space = slotted_page.free_space()?;
-            fsm.update_page_bucket(current_page_id, free_space as _);
-            current_page_id = slotted_page.get_header()?.next_page;
-        }
-        Ok(fsm)
-    }
-
-    fn load_overflow_fsm(
-        &self,
-        first_page: PageId,
-    ) -> Result<FreeSpaceMap<BUCKETS_COUNT, OverflowPageHeader>, HeapFileError> {
-        let fsm = FreeSpaceMap::<BUCKETS_COUNT, OverflowPageHeader>::new(
-            self.cache.clone(),
-            self.file_key.clone(),
-        );
-        let mut current_page_id = first_page;
-        while current_page_id != OverflowPageHeader::NO_NEXT_PAGE {
-            let key = self.file_page_ref(current_page_id);
-            let page = self.cache.pin_read(&key)?;
-            let slotted_page = SlottedPage::<_, OverflowPageHeader>::new(page)?;
-            let free_space = slotted_page.free_space()?;
-            fsm.update_page_bucket(current_page_id, free_space as _);
-            current_page_id = slotted_page.get_header()?.next_page;
-        }
-        Ok(fsm)
     }
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
@@ -529,6 +598,12 @@ mod tests {
     #[derive(Clone, Copy, Pod, Zeroable)]
     struct TestPageHeader {
         base: SlottedPageBaseHeader,
+    }
+
+    impl BaseHeapPageHeader for TestPageHeader {
+        fn next_page(&self) -> PageId {
+            NO_NEXT_PAGE
+        }
     }
 
     unsafe impl ReprC for TestPageHeader {}
@@ -595,8 +670,9 @@ mod tests {
     fn create_test_fsm<const BUCKETS: usize>(
         cache: Arc<Cache>,
         file_key: FileKey,
+        first_page_id: PageId,
     ) -> FreeSpaceMap<BUCKETS, TestPageHeader> {
-        FreeSpaceMap::new(cache, file_key)
+        FreeSpaceMap::new(cache, file_key, first_page_id)
     }
 
     /// Allocates a page and initializes it with a slotted page header with specific free space
@@ -740,7 +816,7 @@ mod tests {
     #[test]
     fn fsm_bucket_for_space_empty_page() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache, file_key);
+        let fsm = create_test_fsm::<4>(cache, file_key, NO_NEXT_PAGE);
 
         // Empty page (100% free) should go to last bucket
         let bucket = fsm.bucket_for_space(PAGE_SIZE);
@@ -750,7 +826,7 @@ mod tests {
     #[test]
     fn fsm_bucket_for_space_full_page() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache, file_key);
+        let fsm = create_test_fsm::<4>(cache, file_key, NO_NEXT_PAGE);
 
         // Full page (0% free) should go to first bucket
         let bucket = fsm.bucket_for_space(0);
@@ -760,7 +836,7 @@ mod tests {
     #[test]
     fn fsm_bucket_for_space_quarter_ranges() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache, file_key);
+        let fsm = create_test_fsm::<4>(cache, file_key, NO_NEXT_PAGE);
 
         // [0%, 25%) -> bucket 0
         assert_eq!(fsm.bucket_for_space(0), 0);
@@ -782,7 +858,7 @@ mod tests {
     #[test]
     fn fsm_update_page_bucket_adds_to_correct_bucket() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
 
         let (_, page_id) = cache.allocate_page(&file_key).unwrap();
 
@@ -798,7 +874,7 @@ mod tests {
     #[test]
     fn fsm_update_page_bucket_multiple_pages() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
 
         // Create pages with different free space amounts
         let pages_and_spaces = vec![
@@ -818,7 +894,7 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_empty_fsm() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache, file_key);
+        let fsm = create_test_fsm::<4>(cache, file_key, NO_NEXT_PAGE);
 
         // Should return None when FSM is empty
         let result = fsm.page_with_free_space(100).unwrap();
@@ -828,7 +904,7 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_finds_suitable_page() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
 
         // Create a page with 2000 bytes free
         let free_space = 2000;
@@ -839,7 +915,7 @@ mod tests {
         let result = fsm.page_with_free_space(1500).unwrap();
         assert!(result.is_some());
 
-        let found_page = result.unwrap();
+        let (_, found_page) = result.unwrap();
         let actual_free = found_page.free_space().unwrap() as usize;
         assert!(actual_free > 1500);
     }
@@ -847,7 +923,7 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_skips_insufficient_pages() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
 
         // Create pages with different free space amounts
         let small_free = 500;
@@ -863,7 +939,7 @@ mod tests {
         let result = fsm.page_with_free_space(1500).unwrap();
         assert!(result.is_some());
 
-        let found_page = result.unwrap();
+        let (_, found_page) = result.unwrap();
         let actual_free = found_page.free_space().unwrap() as usize;
         assert!(actual_free > 1500);
     }
@@ -871,7 +947,7 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_searches_higher_buckets() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
 
         // Add page to bucket 3 (high free space)
         let free_space = PAGE_SIZE * 90 / 100;
@@ -887,7 +963,7 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_no_suitable_page() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
 
         // Add page with small free space
         let free_space = 100;
@@ -902,7 +978,7 @@ mod tests {
     #[test]
     fn fsm_handles_stale_entries() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone());
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
 
         // Create page with initial free space
         let initial_free = 2000;
@@ -928,7 +1004,11 @@ mod tests {
     #[test]
     fn fsm_concurrent_updates_same_bucket() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = Arc::new(create_test_fsm::<4>(cache.clone(), file_key.clone()));
+        let fsm = Arc::new(create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            NO_NEXT_PAGE,
+        ));
 
         let mut handles = vec![];
 
@@ -965,6 +1045,112 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[test]
+    fn fsm_page_with_free_space_reinserts_same_bucket_insufficient_space() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+
+        // Create a page with 80% free space (bucket 3: [75%-100%])
+        let free_space_80_percent = PAGE_SIZE * 80 / 100;
+        let page_id = create_page_with_free_space(&cache, &file_key, free_space_80_percent);
+        fsm.update_page_bucket(page_id, free_space_80_percent);
+
+        // Request 90% free space - page should be popped but re-inserted since it's still in bucket 3
+        let needed_90_percent = PAGE_SIZE * 90 / 100;
+        let result = fsm.page_with_free_space(needed_90_percent).unwrap();
+        // Should not find suitable page
+        assert!(result.is_none());
+
+        // Verify the page was re-inserted back into bucket 3
+        assert!(bucket_contains_page(&fsm, 3, page_id));
+    }
+
+    #[test]
+    fn fsm_page_with_free_space_does_not_reinsert_different_bucket() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+
+        // Manually insert a page into bucket 3 that actually belongs to bucket 2
+        let free_space_60_percent = PAGE_SIZE * 60 / 100;
+        let page_id = create_page_with_free_space(&cache, &file_key, free_space_60_percent);
+        fsm.buckets[3].push(page_id);
+
+        // Request space that requires searching bucket 3
+        let needed_80_percent = PAGE_SIZE * 80 / 100;
+        let result = fsm.page_with_free_space(needed_80_percent).unwrap();
+        assert!(result.is_none());
+
+        // Verify page was not re-inserted into bucket 3
+        assert!(!bucket_contains_page(&fsm, 3, page_id));
+
+        // Verify page was not automatically moved to bucket 2 either
+        assert!(!bucket_contains_page(&fsm, 2, page_id));
+    }
+
+    #[test]
+    fn fsm_page_with_free_space_handles_multiple_stale_entries() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+
+        // Bucket 0
+        let page1_actual = PAGE_SIZE * 20 / 100;
+        // Bucket 1
+        let page2_actual = PAGE_SIZE * 45 / 100;
+        // Bucket 3
+        let page3_actual = PAGE_SIZE * 85 / 100;
+
+        let page1 = create_page_with_free_space(&cache, &file_key, page1_actual);
+        let page2 = create_page_with_free_space(&cache, &file_key, page2_actual);
+        let page3 = create_page_with_free_space(&cache, &file_key, page3_actual);
+
+        fsm.buckets[3].push(page1);
+        fsm.buckets[3].push(page2);
+        fsm.buckets[3].push(page3);
+
+        // Request 80% space - should find page3, but page1 and page2 should be discarded
+        let needed_80_percent = PAGE_SIZE * 80 / 100;
+        let result = fsm
+            .page_with_free_space(needed_80_percent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0, page3);
+
+        // Verify bucket 3 is now empty (page1 and page2 discarded, page3 returned)
+        assert!(!bucket_contains_page(&fsm, 3, page1));
+        assert!(!bucket_contains_page(&fsm, 3, page2));
+        assert!(!bucket_contains_page(&fsm, 3, page3));
+    }
+
+    #[test]
+    fn fsm_page_with_free_space_preserves_valid_entries_same_bucket() {
+        let (cache, _, file_key) = setup_test_cache();
+        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+
+        // Create two pages in bucket 2 [50%-75%] (only one with enough space)
+        let page1_space = PAGE_SIZE * 55 / 100;
+        let page2_space = PAGE_SIZE * 65 / 100;
+
+        let page1 = create_page_with_free_space(&cache, &file_key, page1_space);
+        let page2 = create_page_with_free_space(&cache, &file_key, page2_space);
+
+        fsm.update_page_bucket(page1, page1_space);
+        fsm.update_page_bucket(page2, page2_space);
+
+        // Request 60% - should return page2, but page1 should be re-inserted
+        let needed_60_percent = PAGE_SIZE * 60 / 100;
+        let result = fsm
+            .page_with_free_space(needed_60_percent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0, page2);
+
+        // Verify page1 is still in bucket 2 (re-inserted)
+        assert!(bucket_contains_page(&fsm, 2, page1));
+
+        // page2 should not be in bucket 2 anymore (it was returned)
+        assert!(!bucket_contains_page(&fsm, 2, page2));
+    }
+
     // Heap file factory
 
     #[test]
@@ -978,65 +1164,6 @@ mod tests {
         // Verify metadata was loaded
         assert_ne!(heap_file.first_record_page(), 0);
         assert_ne!(heap_file.first_overflow_page(), 0);
-    }
-
-    #[test]
-    fn heap_file_factory_loads_record_pages_fsm() {
-        let (cache, _, file_key) = setup_test_cache();
-        setup_heap_file_structure(&cache, &file_key);
-
-        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
-        let heap_file = factory.create_heap_file().unwrap();
-
-        // Verify FSMs have the pages
-        let result = heap_file
-            .record_pages_fsm
-            .page_with_free_space(100)
-            .unwrap();
-        assert!(result.is_some());
-
-        let result = heap_file
-            .overflow_pages_fsm
-            .page_with_free_space(100)
-            .unwrap();
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn heap_file_factory_loads_multiple_record_pages() {
-        let (cache, _, file_key) = setup_test_cache();
-        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
-
-        // Create a second record page linked to the first
-        let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
-        SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
-
-        // Link first page to second page
-        {
-            let file_page_ref = FilePageRef {
-                page_id: first_record_page_id,
-                file_key: file_key.clone(),
-            };
-            let pinned = cache.pin_write(&file_page_ref).unwrap();
-            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned).unwrap();
-            let header = slotted.get_header_mut().unwrap();
-            header.next_page = second_page_id;
-        }
-
-        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
-        let heap_file = factory.create_heap_file().unwrap();
-
-        // Both pages should be in FSM
-        let result1 = heap_file
-            .record_pages_fsm
-            .page_with_free_space(100)
-            .unwrap();
-        assert!(result1.is_some());
-        let result2 = heap_file
-            .record_pages_fsm
-            .page_with_free_space(100)
-            .unwrap();
-        assert!(result2.is_some());
     }
 
     #[test]
@@ -1064,38 +1191,6 @@ mod tests {
             let read_result = heap_file.record(&invalid_ptr);
             assert!(read_result.is_err());
         }
-    }
-
-    #[test]
-    fn heap_file_factory_loads_corrupted_record_page_list() {
-        let (cache, _, file_key) = setup_test_cache();
-        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
-
-        // Create a second record page with invalid next_page pointer
-        let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
-        let mut slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
-        let header = slotted.get_header_mut().unwrap();
-        header.next_page = 9999; // Invalid page id
-        drop(slotted);
-
-        // Link first page to second page
-        {
-            let file_page_ref = FilePageRef {
-                page_id: first_record_page_id,
-                file_key: file_key.clone(),
-            };
-            let pinned = cache.pin_write(&file_page_ref).unwrap();
-            let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned).unwrap();
-            let header = slotted.get_header_mut().unwrap();
-            header.next_page = second_page_id;
-        }
-
-        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
-        let result = factory.create_heap_file();
-
-        // Should fail when trying to load invalid page
-        assert!(result.is_err());
     }
 
     // Heap file reading
