@@ -427,6 +427,20 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         Ok(&self.page.data()[record_start..record_end])
     }
+
+    // TODO: add tests for this
+    /// Reads all records from page that are not marked as deleted.
+    pub fn read_all_records(&self) -> Result<impl Iterator<Item = &[u8]>, SlottedPageError> {
+        let slots = self.get_slots()?;
+        Ok(slots.iter().filter_map(|slot| {
+            if slot.is_deleted() {
+                return None;
+            }
+            let record_start = slot.offset as usize;
+            let record_end = record_start + slot.len as usize;
+            Some(&self.page.data()[record_start..record_end])
+        }))
+    }
 }
 
 impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
@@ -1244,6 +1258,49 @@ mod tests {
                 out_of_bounds_index: 0
             })
         ));
+    }
+
+    #[test]
+    fn test_read_all_records_returns_all_records_in_order() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        let records = [b"first", b"secon", b"third"];
+        for &r in &records {
+            page.insert(r).unwrap();
+        }
+
+        let iter = page.read_all_records().unwrap();
+        let collected: Vec<Vec<u8>> = iter.map(|s| s.to_vec()).collect();
+
+        let expected: Vec<Vec<u8>> = records.iter().map(|r| r.to_vec()).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_read_all_records_skips_deleted() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"keep1").unwrap();
+        page.insert(b"delme").unwrap();
+        page.insert(b"keep2").unwrap();
+
+        page.delete(1).unwrap();
+
+        let iter = page.read_all_records().unwrap();
+        let collected: Vec<Vec<u8>> = iter.map(|s| s.to_vec()).collect();
+
+        let expected = vec![b"keep1".to_vec(), b"keep2".to_vec()];
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_read_all_records_empty() {
+        let page = create_test_page(PAGE_SIZE);
+
+        let iter = page.read_all_records().unwrap();
+        let collected: Vec<Vec<u8>> = iter.map(|s| s.to_vec()).collect();
+
+        assert!(collected.is_empty());
     }
 
     #[test]

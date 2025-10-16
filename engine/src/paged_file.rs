@@ -447,7 +447,10 @@ impl FileMetadata {
     ///
     /// `-1` for metadata page and `-1` because `DEFAULT_NEXT_PAGE_ID` is the id of the next page (not allocated one).
     // TODO: after some tests we can adjust this value
-    const DEFAULT_NEXT_PAGE_ID: PageId = 4;
+    // FYI: I changed this for tests in heap file. When it was 4 we started the paged file with hash set
+    // containing 1,2 and 3 and it would allocate random page. We always want to allocate page with id 1 first (it will work this way once we replace hash set
+    // with linked list, its just temporary fix)
+    const DEFAULT_NEXT_PAGE_ID: PageId = 2;
 }
 
 /// Should be used to deserialize [`FileMetadata`] from [`Page`].
