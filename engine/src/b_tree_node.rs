@@ -1,9 +1,11 @@
-﻿use crate::cache::{PageRead, PageWrite};
-use crate::data_types::{DbSerializable, DbSerializationError};
+﻿use crate::b_tree_node::NodeInsertResult::PageFull;
+use crate::cache::{PageRead, PageWrite};
+use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
 use crate::paged_file::PageId;
+use crate::record::Record;
 use crate::slotted_page::{
-    PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
-    SlottedPageHeader, get_base_header,
+    InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
+    SlottedPageError, SlottedPageHeader, get_base_header,
 };
 use bytemuck::{Pod, Zeroable};
 use std::cmp::{Ordering, PartialEq};
@@ -26,6 +28,12 @@ pub(crate) enum NodeType {
     Internal,
     Leaf,
 }
+
+pub(crate) enum NodeInsertResult {
+    Success,
+    PageFull,
+}
+
 /// Type aliases for making things a little more readable
 pub(crate) type BTreeLeafNode<Page, Key> = BTreeNode<Page, BTreeLeafHeader, Key>;
 pub(crate) type BTreeInternalNode<Page, Key> = BTreeNode<Page, BTreeInternalHeader, Key>;
@@ -112,7 +120,7 @@ pub(crate) enum NodeSearchResult {
 }
 
 // TODO: Use the heap file record ptr
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// A struct containing all the information necessary to get the actual record data from a heap file.
 /// Stored inside leaf nodes of the b-tree.
 pub(crate) struct RecordPointer {
@@ -137,9 +145,24 @@ impl DbSerializable for RecordPointer {
 }
 
 /// Helper trait that every key of a b-tree must implement.
-pub(crate) trait BTreeKey: DbSerializable + Ord + Clone {}
-impl<T> BTreeKey for T where T: DbSerializable + Ord + Clone {}
+pub(crate) trait BTreeKey: DbSerializable + Ord + Clone {
+    const MAX_KEY_SIZE: u16;
+}
 
+macro_rules! impl_btree_key {
+    ($($t:ty),*) => {
+        $(impl BTreeKey for $t {
+            const MAX_KEY_SIZE: u16 = (size_of::<$t>() + size_of::<RecordPointer>() + size_of::<Slot>()) as u16;
+        })*
+    };
+}
+
+impl_btree_key!(i32, i64, DbDateTime, DbDate);
+
+impl BTreeKey for String {
+    // 512 is the max size of the string itself, but we also need to store its length when serializing.
+    const MAX_KEY_SIZE: u16 = (512 + size_of::<u16>()) as u16;
+}
 /// Struct representing a B-Tree node. It is a wrapper on a slotted page, that uses its api for
 /// lower level operations.
 pub(crate) struct BTreeNode<Page, Header, Key>
@@ -163,6 +186,17 @@ pub fn get_node_type<Page: PageRead>(page: Page) -> Result<NodeType, BTreeNodeEr
         _ => Err(BTreeNodeError::InvalidPageType),
     }
 }
+
+impl<Page, Header, Key> BTreeNode<Page, Header, Key>
+where
+    Header: SlottedPageHeader,
+    Key: BTreeKey,
+{
+    pub const fn max_insert_size() -> u16 {
+        Key::MAX_KEY_SIZE + (size_of::<RecordPointer>() + size_of::<Slot>()) as u16
+    }
+}
+
 impl<Page, Header, Key> BTreeNode<Page, Header, Key>
 where
     Page: PageRead,
@@ -171,9 +205,13 @@ where
 {
     pub fn new(page: Page) -> Result<Self, BTreeNodeError> {
         Ok(Self {
-            slotted_page: SlottedPage::new(page, true)?,
+            slotted_page: SlottedPage::new(page)?,
             _key_marker: PhantomData,
         })
+    }
+
+    pub fn can_fit_another(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.free_space()? >= Self::max_insert_size())
     }
 
     fn get_btree_header(&self) -> Result<&Header, BTreeNodeError> {
@@ -218,6 +256,10 @@ where
 {
     fn get_btree_header_mut(&mut self) -> Result<&mut Header, BTreeNodeError> {
         Ok(self.slotted_page.get_header_mut()?)
+    }
+
+    pub fn compact_slot_directory(&mut self) -> Result<(), BTreeNodeError> {
+        Ok(self.slotted_page.compact_slots()?)
     }
 }
 
@@ -356,6 +398,10 @@ where
             insert_slot_id: left,
         })
     }
+
+    // pub fn separator_key(&self) -> Result<Key, BTreeNodeError> {
+    //     self.slotted_page.num_slots()
+    // }
 }
 
 impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
@@ -376,6 +422,26 @@ where
         Self {
             slotted_page,
             _key_marker: PhantomData,
+        }
+    }
+
+    pub fn insert(
+        &mut self,
+        key: Key,
+        record_pointer: RecordPointer,
+        position: u16,
+    ) -> Result<NodeInsertResult, BTreeNodeError> {
+        let mut buffer = Vec::new();
+        record_pointer.serialize(&mut buffer);
+        let insert_result = self.slotted_page.insert_at(&buffer, position)?;
+        match insert_result {
+            InsertResult::Success(_) => Ok(NodeInsertResult::Success),
+            InsertResult::NeedsDefragmentation => {
+                self.slotted_page.compact_records()?;
+                self.slotted_page.insert_at(&buffer, position)?;
+                Ok(NodeInsertResult::Success)
+            }
+            InsertResult::PageFull => Ok(PageFull),
         }
     }
 }
@@ -410,10 +476,10 @@ mod test {
         }
     }
 
-    type LeafNode = BTreeNode<TestPage, BTreeLeafHeader, u32>;
-    type InternalNode = BTreeNode<TestPage, BTreeInternalHeader, u32>;
+    type LeafNode = BTreeNode<TestPage, BTreeLeafHeader, i32>;
+    type InternalNode = BTreeNode<TestPage, BTreeInternalHeader, i32>;
 
-    fn make_leaf_node(keys: &[u32], record_ptrs: &[RecordPointer]) -> LeafNode {
+    fn make_leaf_node(keys: &[i32], record_ptrs: &[RecordPointer]) -> LeafNode {
         assert_eq!(keys.len(), record_ptrs.len());
 
         let page = TestPage::new(PAGE_SIZE);
@@ -437,7 +503,7 @@ mod test {
         node
     }
 
-    fn make_internal_node(keys: &[u32], child_ptrs: &[PageId]) -> InternalNode {
+    fn make_internal_node(keys: &[i32], child_ptrs: &[PageId]) -> InternalNode {
         assert_eq!(keys.len() + 1, child_ptrs.len());
 
         let page = TestPage::new(PAGE_SIZE);
@@ -474,7 +540,7 @@ mod test {
 
     #[test]
     fn test_leaf_search_found_and_not_found() {
-        let keys = vec![10u32, 20u32, 30u32];
+        let keys = vec![10i32, 20i32, 30i32];
         let recs = vec![
             RecordPointer {
                 page_id: 1,
@@ -524,7 +590,7 @@ mod test {
 
     #[test]
     fn test_internal_search_follow_child() {
-        let keys = vec![10u32, 20u32, 30u32];
+        let keys = vec![10i32, 20i32, 30i32];
         let children = vec![100, 200, 300, 400];
 
         let node = make_internal_node(&keys, &children);
