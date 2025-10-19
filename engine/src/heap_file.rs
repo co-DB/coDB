@@ -290,14 +290,23 @@ impl RecordTag {
         Ok((record_tag, rest))
     }
 
-    fn insert_final(buffer: &mut Vec<u8>) {
-        buffer.push(RecordTag::Final as _);
+    /// Returns buffer with added [`RecordTag::Final`] at the beginning of it.
+    fn with_final(buffer: &[u8]) -> Vec<u8> {
+        let mut new_buffer = Vec::with_capacity(buffer.len() + size_of::<RecordTag>());
+        new_buffer.push(RecordTag::Final as _);
+        new_buffer.extend_from_slice(&buffer);
+        new_buffer
     }
 
-    fn insert_has_continuation(buffer: &mut Vec<u8>, continuation: &RecordPtr) {
-        buffer.push(RecordTag::HasContinuation as _);
+    /// Returns buffer with added [`RecordTag::HasContinuation`] at the beginning of it.
+    fn with_has_continuation(buffer: &[u8], continuation: &RecordPtr) -> Vec<u8> {
+        let mut new_buffer =
+            Vec::with_capacity(buffer.len() + size_of::<RecordTag>() + size_of::<RecordPtr>());
+        new_buffer.push(RecordTag::HasContinuation as _);
         let mut ptr = Vec::from(continuation);
-        buffer.append(&mut ptr);
+        new_buffer.append(&mut ptr);
+        new_buffer.extend_from_slice(buffer);
+        new_buffer
     }
 }
 
@@ -550,9 +559,6 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     pub(crate) fn insert(&self, record: Record) -> Result<RecordPtr, HeapFileError> {
         let mut serialized = record.serialize();
 
-        // Each record must end with [`RecordTag::Final`], so we can just add it at the end of the buffer
-        RecordTag::insert_final(&mut serialized);
-
         let max_record_size_on_single_page = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE
             as usize
             - size_of::<SlotId>()
@@ -560,21 +566,22 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         if serialized.len() < max_record_size_on_single_page as _ {
             // Record can be stored on single page
-            let ptr = self.insert_to_record_page(&serialized)?;
+            let data = RecordTag::with_final(&serialized);
+            let ptr = self.insert_to_record_page(&data)?;
             return Ok(ptr);
         }
 
         // We need to split record into pieces, so that each piece can fit into one page.
         let piece_size = max_record_size_on_single_page / 3;
 
-        // Last fragment has already inserted [`RecordTag`], so we handle it before the loop
         let last_fragment = serialized.split_off(serialized.len() - 1 - piece_size);
-        let mut next_ptr = self.insert_to_overflow_page(&last_fragment)?;
+        let last_fragment_with_tag = RecordTag::with_final(&last_fragment);
+        let mut next_ptr = self.insert_to_overflow_page(&last_fragment_with_tag)?;
 
         // It means 2 pieces is enough
         if serialized.len() <= piece_size {
-            RecordTag::insert_has_continuation(&mut serialized, &next_ptr);
-            let ptr = self.insert_to_record_page(&serialized)?;
+            let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
+            let ptr = self.insert_to_record_page(&data)?;
             return Ok(ptr);
         }
 
@@ -583,13 +590,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         // We save middle pieces into overflow pages
         for chunk in middle_pieces.rchunks(piece_size as _) {
-            let mut chunk = Vec::from(chunk);
-            RecordTag::insert_has_continuation(&mut chunk, &next_ptr);
+            let chunk = RecordTag::with_has_continuation(chunk, &next_ptr);
             next_ptr = self.insert_to_overflow_page(&chunk)?;
         }
 
-        RecordTag::insert_has_continuation(&mut serialized, &next_ptr);
-        let ptr = self.insert_to_record_page(&serialized)?;
+        let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
+        let ptr = self.insert_to_record_page(&data)?;
         Ok(ptr)
     }
 
@@ -2294,5 +2300,50 @@ mod tests {
             first_record_page_id
         ));
         assert_eq!(heap_file.record_pages_fsm.buckets[3].len(), 1);
+    }
+
+    // HeapFile inserting record
+
+    #[test]
+    fn heap_file_insert_simple_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a simple record
+        let id_field = Field::Int32(123);
+        let name_field = Field::String("test_user".into());
+        let record = Record::new(vec![id_field, name_field]);
+
+        let record_ptr = heap_file.insert(record).unwrap();
+
+        // Verify the record was inserted correctly
+        assert_eq!(record_ptr.page_id, first_record_page_id);
+        assert_eq!(record_ptr.slot, 0);
+
+        // Read back the record to verify it was stored correctly
+        let retrieved_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(retrieved_record.fields.len(), 2);
+        assert_i32(123, &retrieved_record.fields[0]);
+        assert_string("test_user", &retrieved_record.fields[1]);
+
+        // Verify the page was added to FSM after insertion
+        let file_page_ref = FilePageRef {
+            page_id: first_record_page_id,
+            file_key: file_key.clone(),
+        };
+        let page = cache.pin_read(&file_page_ref).unwrap();
+        let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page).unwrap();
+        let free_space = slotted_page.free_space().unwrap() as usize;
+        let expected_bucket = heap_file.record_pages_fsm.bucket_for_space(free_space);
+
+        assert!(bucket_contains_page(
+            &heap_file.record_pages_fsm,
+            expected_bucket,
+            first_record_page_id
+        ));
     }
 }
