@@ -589,8 +589,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         Ok(ptr)
     }
 
-    /// Helper for reading [`HeapFile`]'s pages.
-    fn read_page<H>(&self, page_id: PageId) -> Result<HeapPage<PinnedReadPage, H>, HeapFileError>
+    /// Generic helper for reading any type of heap page
+    fn read_heap_page<H>(
+        &self,
+        page_id: PageId,
+    ) -> Result<HeapPage<PinnedReadPage, H>, HeapFileError>
     where
         H: BaseHeapPageHeader,
     {
@@ -601,26 +604,33 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         Ok(heap_node)
     }
 
+    /// Generic helper for reading a page and updating its FSM
+    fn read_page_with_fsm<H>(
+        &self,
+        page_id: PageId,
+        fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
+    ) -> Result<HeapPage<PinnedReadPage, H>, HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+    {
+        let heap_page = self.read_heap_page::<H>(page_id)?;
+        let free_space = heap_page.page.free_space()?;
+        fsm.update_page_bucket_with_duplicate_check(page_id, free_space as _);
+        Ok(heap_page)
+    }
+
     fn read_record_page(
         &self,
         page_id: PageId,
     ) -> Result<HeapPage<PinnedReadPage, RecordPageHeader>, HeapFileError> {
-        let p = self.read_page::<RecordPageHeader>(page_id)?;
-        let free_space = p.page.free_space()?;
-        self.record_pages_fsm
-            .update_page_bucket_with_duplicate_check(page_id, free_space as _);
-        Ok(p)
+        self.read_page_with_fsm(page_id, &self.record_pages_fsm)
     }
 
     fn read_overflow_page(
         &self,
         page_id: PageId,
     ) -> Result<HeapPage<PinnedReadPage, OverflowPageHeader>, HeapFileError> {
-        let p = self.read_page::<OverflowPageHeader>(page_id)?;
-        let free_space = p.page.free_space()?;
-        self.overflow_pages_fsm
-            .update_page_bucket_with_duplicate_check(page_id, free_space as _);
-        Ok(p)
+        self.read_page_with_fsm(page_id, &self.overflow_pages_fsm)
     }
 
     /// Helper for allocating new [`HeapFile`]'s pages.
