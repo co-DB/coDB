@@ -633,8 +633,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         self.read_page_with_fsm(page_id, &self.overflow_pages_fsm)
     }
 
-    /// Helper for allocating new [`HeapFile`]'s pages.
-    fn allocate_page<H>(
+    /// Generic helper for allocating any type of heap page
+    fn allocate_heap_page<H>(
         &self,
         header: H,
     ) -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>
@@ -647,26 +647,38 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         Ok((page_id, heap_page))
     }
 
+    /// Generic helper for allocating a page and updating metadata
+    fn allocate_page_with_metadata<H, F>(
+        &self,
+        metadata_lock: &Mutex<PageId>,
+        header_fn: F,
+    ) -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+        F: FnOnce(PageId) -> H,
+    {
+        let mut metadata_page_lock = metadata_lock.lock();
+        let header = header_fn(*metadata_page_lock);
+        let (page_id, page) = self.allocate_heap_page(header)?;
+        *metadata_page_lock = page_id;
+        self.metadata.dirty.store(true, Ordering::Release);
+        Ok((page_id, page))
+    }
+
     fn allocate_record_page(
         &self,
     ) -> Result<(PageId, HeapPage<PinnedWritePage, RecordPageHeader>), HeapFileError> {
-        let mut metadata_record_page_lock = self.metadata.first_record_page.lock();
-        let header = RecordPageHeader::new(*metadata_record_page_lock);
-        let (page_id, page) = self.allocate_page(header)?;
-        *metadata_record_page_lock = page_id;
-        self.metadata.dirty.store(true, Ordering::Release);
-        Ok((page_id, page))
+        self.allocate_page_with_metadata(&self.metadata.first_record_page, |next_page| {
+            RecordPageHeader::new(next_page)
+        })
     }
 
     fn allocate_overflow_page(
         &self,
     ) -> Result<(PageId, HeapPage<PinnedWritePage, OverflowPageHeader>), HeapFileError> {
-        let mut metadata_overflow_page_lock = self.metadata.first_overflow_page.lock();
-        let header = OverflowPageHeader::new(*metadata_overflow_page_lock);
-        let (page_id, page) = self.allocate_page(header)?;
-        *metadata_overflow_page_lock = page_id;
-        self.metadata.dirty.store(true, Ordering::Release);
-        Ok((page_id, page))
+        self.allocate_page_with_metadata(&self.metadata.first_overflow_page, |next_page| {
+            OverflowPageHeader::new(next_page)
+        })
     }
 
     /// Inserts `data` into first found record page that has enough size.
