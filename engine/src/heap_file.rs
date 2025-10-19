@@ -271,6 +271,17 @@ impl MetadataRepr {
     }
 }
 
+impl From<&Metadata> for MetadataRepr {
+    fn from(value: &Metadata) -> Self {
+        let first_record_page = *value.first_record_page.lock();
+        let first_overflow_page = *value.first_overflow_page.lock();
+        MetadataRepr {
+            first_record_page,
+            first_overflow_page,
+        }
+    }
+}
+
 /// Tag preceding record payload that describes whether a RecordPtr follows.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +364,7 @@ impl<'d> RecordFragment<'d> {
     }
 }
 
+/// Trait that provides common functionality for all heap page headers.
 trait BaseHeapPageHeader: SlottedPageHeader {
     const NO_NEXT_PAGE: PageId = 0;
 
@@ -449,6 +461,7 @@ impl SlottedPageHeader for OverflowPageHeader {
     }
 }
 
+/// Wrapper around [`SlottedPage`] that provides heap file-specific functionality.
 struct HeapPage<P, H: BaseHeapPageHeader> {
     page: SlottedPage<P, H>,
 }
@@ -482,6 +495,8 @@ where
     P: PageWrite + PageRead,
     H: BaseHeapPageHeader,
 {
+    /// Inserts `data` into the page and returns its [`SlotId`].
+    /// If defragmentation is needed to store the data, it's done automatically and insertion is done once again.
     fn insert(&mut self, data: &[u8]) -> Result<SlotId, HeapFileError> {
         let result = self.page.insert(data)?;
         match result {
@@ -517,6 +532,10 @@ pub(crate) enum HeapFileError {
     NotEnoughSpaceOnPage,
 }
 
+/// Structure responsible for managing on-disk heap files.
+///
+/// Each [`HeapFile`] instance corresponds to a single physical file on disk.
+/// For concurrent access by multiple threads, wrap the instance in `Arc<HeapFile>`.
 pub(crate) struct HeapFile<const BUCKETS_COUNT: usize> {
     file_key: FileKey,
     metadata: Metadata,
@@ -597,6 +616,31 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
         let ptr = self.insert_to_record_page(&data)?;
         Ok(ptr)
+    }
+
+    /// Flushes [`HeapFile::metadata`] content to disk.
+    ///
+    /// If metadata is not dirty then this is no-op.
+    pub(crate) fn flush_metadata(&mut self) -> Result<(), HeapFileError> {
+        match self
+            .metadata
+            .dirty
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                // Changed dirty from true to false, so metadata must be flushed
+                let key = self.file_page_ref(Self::METADATA_PAGE_ID);
+                let mut page = self.cache.pin_write(&key)?;
+                let repr = MetadataRepr::from(&self.metadata);
+                let bytes = bytemuck::bytes_of(&repr);
+                page.page_mut()[..size_of::<MetadataRepr>()].copy_from_slice(bytes);
+                Ok(())
+            }
+            Err(_) => {
+                // Metadata was already clean
+                Ok(())
+            }
+        }
     }
 
     /// Generic helper for reading any type of heap page
@@ -742,6 +786,14 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         FilePageRef {
             page_id,
             file_key: self.file_key.clone(),
+        }
+    }
+}
+
+impl<const BUCKETS_COUNT: usize> Drop for HeapFile<BUCKETS_COUNT> {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_metadata() {
+            log::error!("failed to flush metadata while dropping HeapFile: {e}");
         }
     }
 }
@@ -2663,5 +2715,63 @@ mod tests {
         assert_eq!(retrieved2.fields.len(), 2);
         assert_i32(200, &retrieved2.fields[0]);
         assert_string("thread_2_record", &retrieved2.fields[1]);
+    }
+
+    // Metadata
+
+    #[test]
+    fn heap_file_flush_metadata() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Initially metadata should not be dirty
+        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        // Trigger a metadata change by allocating a new record page
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead;
+        let large_string = "x".repeat(large_string_size);
+
+        // Fill the first page completely
+        let large_record = Record::new(vec![Field::Int32(1), Field::String(large_string)]);
+        heap_file.insert(large_record).unwrap();
+
+        // Insert small record to trigger new page allocation
+        let small_record = Record::new(vec![Field::Int32(2), Field::String("small".into())]);
+        heap_file.insert(small_record).unwrap();
+
+        // Verify metadata is now dirty
+        assert!(heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        // Capture current metadata values
+        let first_record_page = *heap_file.metadata.first_record_page.lock();
+        let first_overflow_page = *heap_file.metadata.first_overflow_page.lock();
+
+        // Flush metadata
+        heap_file.flush_metadata().unwrap();
+
+        // Verify metadata is no longer dirty
+        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        // Read metadata directly from disk to verify it was written
+        let metadata_page_ref = heap_file.file_page_ref(HeapFile::<4>::METADATA_PAGE_ID);
+        let metadata_page = cache.pin_read(&metadata_page_ref).unwrap();
+        let disk_metadata = MetadataRepr::load_from_page(metadata_page.page()).unwrap();
+
+        assert_eq!(disk_metadata.first_record_page, first_record_page);
+        assert_eq!(disk_metadata.first_overflow_page, first_overflow_page);
+
+        // Try flushing again (should be no-op since metadata is clean)
+        heap_file.flush_metadata().unwrap();
+
+        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
     }
 }
