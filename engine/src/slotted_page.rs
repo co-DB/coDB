@@ -107,7 +107,7 @@ impl SlottedPageBaseHeader {
         );
         Self {
             co_db_magic_number: CO_DB_MAGIC_NUMBER,
-            total_free_space: PAGE_SIZE as u16,
+            total_free_space: PAGE_SIZE as u16 - header_size,
             contiguous_free_space: PAGE_SIZE as u16 - header_size,
             record_area_offset: PAGE_SIZE as u16,
             header_size,
