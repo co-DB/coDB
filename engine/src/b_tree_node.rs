@@ -1,7 +1,7 @@
 ﻿use crate::b_tree_node::NodeInsertResult::PageFull;
 use crate::cache::{PageRead, PageWrite};
 use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
-use crate::paged_file::PageId;
+use crate::paged_file::{PAGE_SIZE, PageId};
 use crate::record::Record;
 use crate::slotted_page::{
     InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
@@ -22,6 +22,8 @@ pub(crate) enum BTreeNodeError {
     CorruptNode { reason: String },
     #[error("tried to access a page with invalid type")]
     InvalidPageType,
+    #[error("tried to split a node with less than 2 keys")]
+    InvalidSplit,
 }
 
 pub(crate) enum NodeType {
@@ -210,10 +212,6 @@ where
         })
     }
 
-    pub fn can_fit_another(&self) -> Result<bool, BTreeNodeError> {
-        Ok(self.slotted_page.free_space()? >= Self::max_insert_size())
-    }
-
     fn get_btree_header(&self) -> Result<&Header, BTreeNodeError> {
         Ok(self.slotted_page.get_header()?)
     }
@@ -222,11 +220,21 @@ where
         Ok(self.get_btree_header()?.base())
     }
 
+    fn has_deleted_slots(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.get_base_header()?.base().has_free_slot())
+    }
+
     /// Gets the key stored in the given slot.
     fn get_key(&self, slot_id: SlotId) -> Result<Key, BTreeNodeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
         let (key, _) = Key::deserialize(record_bytes)?;
         Ok(key)
+    }
+
+    /// Returns whether another key can fit in this node. This assumes the worst-case scenario
+    /// for String keys (meaning the key is 512 bytes).
+    pub fn can_fit_another(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.free_space()? >= Self::max_insert_size())
     }
 
     /// Finds a new mid for binary search in the case where the slot in the base mid (left + right / 2)
@@ -260,6 +268,57 @@ where
 
     pub fn compact_slot_directory(&mut self) -> Result<(), BTreeNodeError> {
         Ok(self.slotted_page.compact_slots()?)
+    }
+
+    pub fn batch_insert(&mut self, insert_values: Vec<Vec<u8>>) -> Result<(), BTreeNodeError> {
+        for (index, value) in insert_values.iter().enumerate() {
+            self.slotted_page
+                .insert_at(value.as_slice(), index as SlotId)?;
+        }
+        Ok(())
+    }
+
+    pub fn split_keys(&mut self) -> Result<(Vec<Vec<u8>>, Key), BTreeNodeError> {
+        let valid_records = self
+            .slotted_page
+            .read_all_records_enumerated()?
+            .collect::<Vec<_>>();
+
+        if valid_records.len() < 2 {
+            return Err(BTreeNodeError::InvalidSplit);
+        }
+
+        let mut current_size = 0;
+
+        let split_position = valid_records
+            .iter()
+            .position(|(_, record)| {
+                current_size += record.len();
+                current_size > SlottedPage::<Page, Header>::USABLE_SPACE / 2
+            })
+            .unwrap_or(valid_records.len() / 2);
+
+        let (_, split_records) = valid_records.split_at(split_position);
+
+        let copied_split_records = split_records
+            .iter()
+            .map(|(_, record)| record.to_vec())
+            .collect::<Vec<_>>();
+
+        let split_indexes = split_records
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+
+        for index in split_indexes {
+            self.slotted_page.delete(index)?;
+        }
+
+        self.slotted_page.compact_slots()?;
+        self.slotted_page.compact_records()?;
+
+        let (separator_key, _) = Key::deserialize(copied_split_records.first().unwrap())?;
+        Ok((copied_split_records, separator_key))
     }
 }
 
@@ -398,10 +457,6 @@ where
             insert_slot_id: left,
         })
     }
-
-    // pub fn separator_key(&self) -> Result<Key, BTreeNodeError> {
-    //     self.slotted_page.num_slots()
-    // }
 }
 
 impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
@@ -432,6 +487,7 @@ where
         position: u16,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let mut buffer = Vec::new();
+        key.serialize(&mut buffer);
         record_pointer.serialize(&mut buffer);
         let insert_result = self.slotted_page.insert_at(&buffer, position)?;
         match insert_result {

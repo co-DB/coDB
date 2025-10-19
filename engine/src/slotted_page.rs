@@ -325,6 +325,8 @@ pub fn get_base_header<P: PageRead>(page: &P) -> Result<&SlottedPageBaseHeader, 
 
 /// Implementation for read-only slotted page
 impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
+    pub const USABLE_SPACE: usize = PAGE_SIZE - size_of::<H>();
+
     /// Creates a new SlottedPage wrapper around a page with default slot compaction settings based on page type.
     pub fn new(page: P) -> Result<Self, SlottedPageError> {
         let data = page.data();
@@ -454,6 +456,21 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             let record_start = slot.offset as usize;
             let record_end = record_start + slot.len as usize;
             Some(&self.page.data()[record_start..record_end])
+        }))
+    }
+
+    /// Reads all records from page that are not marked as deleted along with their indices.
+    pub fn read_all_records_enumerated(
+        &self,
+    ) -> Result<impl Iterator<Item = (SlotId, &[u8])>, SlottedPageError> {
+        let slots = self.get_slots()?;
+        Ok(slots.iter().enumerate().filter_map(|(i, slot)| {
+            if slot.is_deleted() {
+                return None;
+            }
+            let record_start = slot.offset as usize;
+            let record_end = record_start + slot.len as usize;
+            Some((i as SlotId, &self.page.data()[record_start..record_end]))
         }))
     }
 }
@@ -995,7 +1012,13 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             return Err(ForbiddenSlotCompaction);
         }
 
-        let header_size = self.get_base_header()?.header_size as usize;
+        let header = self.get_base_header()?;
+
+        if !header.has_free_slot() {
+            return Ok(());
+        }
+
+        let header_size = header.header_size as usize;
 
         let slots = self.get_slots()?;
 
