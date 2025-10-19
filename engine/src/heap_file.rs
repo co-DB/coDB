@@ -289,6 +289,16 @@ impl RecordTag {
         let record_tag = RecordTag::try_from(value)?;
         Ok((record_tag, rest))
     }
+
+    fn insert_final(buffer: &mut Vec<u8>) {
+        buffer.push(RecordTag::Final as _);
+    }
+
+    fn insert_has_continuation(buffer: &mut Vec<u8>, continuation: &RecordPtr) {
+        buffer.push(RecordTag::HasContinuation as _);
+        let mut ptr = Vec::from(continuation);
+        buffer.append(&mut ptr);
+    }
 }
 
 impl TryFrom<u8> for RecordTag {
@@ -541,7 +551,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut serialized = record.serialize();
 
         // Each record must end with [`RecordTag::Final`], so we can just add it at the end of the buffer
-        serialized.push(RecordTag::Final as u8);
+        RecordTag::insert_final(&mut serialized);
 
         let max_record_size_on_single_page = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE
             as usize
@@ -563,9 +573,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         // It means 2 pieces is enough
         if serialized.len() <= piece_size {
-            let mut record_ptr = Vec::from(&next_ptr);
-            serialized.push(RecordTag::HasContinuation as u8);
-            serialized.append(&mut record_ptr);
+            RecordTag::insert_has_continuation(&mut serialized, &next_ptr);
             let ptr = self.insert_to_record_page(&serialized)?;
             return Ok(ptr);
         }
@@ -576,15 +584,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // We save middle pieces into overflow pages
         for chunk in middle_pieces.rchunks(piece_size as _) {
             let mut chunk = Vec::from(chunk);
-            chunk.push(RecordTag::HasContinuation as u8);
-            let mut record_ptr = Vec::from(&next_ptr);
-            chunk.append(&mut record_ptr);
+            RecordTag::insert_has_continuation(&mut chunk, &next_ptr);
             next_ptr = self.insert_to_overflow_page(&chunk)?;
         }
 
-        serialized.push(RecordTag::HasContinuation as u8);
-        let mut record_ptr = Vec::from(&next_ptr);
-        serialized.append(&mut record_ptr);
+        RecordTag::insert_has_continuation(&mut serialized, &next_ptr);
         let ptr = self.insert_to_record_page(&serialized)?;
         Ok(ptr)
     }
