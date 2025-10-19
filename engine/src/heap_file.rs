@@ -681,47 +681,49 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         })
     }
 
-    /// Inserts `data` into first found record page that has enough size.
-    fn insert_to_record_page(&self, data: &[u8]) -> Result<RecordPtr, HeapFileError> {
-        let fsm_page = self.record_pages_fsm.page_with_free_space(data.len())?;
+    /// Generic helper for inserting data into any type of heap page
+    fn insert_to_page<H>(
+        &self,
+        data: &[u8],
+        fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
+        allocate_fn: impl FnOnce() -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>,
+    ) -> Result<RecordPtr, HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+    {
+        let fsm_page = fsm.page_with_free_space(data.len())?;
         let (page_id, mut page) = if let Some((page_id, page)) = fsm_page {
             let heap_page = HeapPage::new(page);
             (page_id, heap_page)
         } else {
-            self.allocate_record_page()?
+            allocate_fn()?
         };
-        let slot_id = match page.insert(&data) {
+
+        let slot_id = match page.insert(data) {
             Ok(slot_id) => slot_id,
             Err(HeapFileError::NotEnoughSpaceOnPage) => {
-                panic!("fatal error - not enough spaced return on page from FSM/allocated page")
+                panic!("fatal error - not enough space returned on page from FSM/allocated page")
             }
             Err(e) => return Err(e),
         };
+
+        fsm.update_page_bucket(page_id, page.page.free_space()? as _);
+
         Ok(RecordPtr {
             page_id,
             slot: slot_id,
         })
     }
 
+    /// Inserts `data` into first found record page that has enough size.
+    fn insert_to_record_page(&self, data: &[u8]) -> Result<RecordPtr, HeapFileError> {
+        self.insert_to_page(data, &self.record_pages_fsm, || self.allocate_record_page())
+    }
+
     /// Inserts `data` into first found overflow page that has enough size.
     fn insert_to_overflow_page(&self, data: &[u8]) -> Result<RecordPtr, HeapFileError> {
-        let fsm_page = self.overflow_pages_fsm.page_with_free_space(data.len())?;
-        let (page_id, mut page) = if let Some((page_id, page)) = fsm_page {
-            let heap_page = HeapPage::new(page);
-            (page_id, heap_page)
-        } else {
-            self.allocate_overflow_page()?
-        };
-        let slot_id = match page.insert(&data) {
-            Ok(slot_id) => slot_id,
-            Err(HeapFileError::NotEnoughSpaceOnPage) => {
-                panic!("fatal error - not enough spaced return on page from FSM/allocated page")
-            }
-            Err(e) => return Err(e),
-        };
-        Ok(RecordPtr {
-            page_id,
-            slot: slot_id,
+        self.insert_to_page(data, &self.overflow_pages_fsm, || {
+            self.allocate_overflow_page()
         })
     }
 
