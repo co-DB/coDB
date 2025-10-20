@@ -1,5 +1,4 @@
-﻿use crate::b_tree_node::NodeInsertResult::PageFull;
-use crate::cache::{PageRead, PageWrite};
+﻿use crate::cache::{PageRead, PageWrite};
 use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
 use crate::paged_file::{PAGE_SIZE, PageId};
 use crate::record::Record;
@@ -20,6 +19,8 @@ pub(crate) enum BTreeNodeError {
     DeserializationError(#[from] DbSerializationError),
     #[error("corrupt B-tree node detected: {reason}")]
     CorruptNode { reason: String },
+    #[error("tried to insert a duplicate key into an internal node")]
+    InternalNodeDuplicateKey,
     #[error("tried to access a page with invalid type")]
     InvalidPageType,
     #[error("tried to split a node with less than 2 keys")]
@@ -34,6 +35,7 @@ pub(crate) enum NodeType {
 pub(crate) enum NodeInsertResult {
     Success,
     PageFull,
+    KeyAlreadyExists,
 }
 
 /// Type aliases for making things a little more readable
@@ -86,8 +88,9 @@ pub(crate) struct BTreeLeafHeader {
     next_leaf_pointer: PageId,
 }
 impl BTreeLeafHeader {
-    const NO_NEXT_LEAF: PageId = PageId::MAX;
+    pub const NO_NEXT_LEAF: PageId = PageId::MAX;
 }
+
 impl SlottedPageHeader for BTreeLeafHeader {
     fn base(&self) -> &SlottedPageBaseHeader {
         &self.base_header
@@ -109,16 +112,18 @@ impl Default for BTreeLeafHeader {
 }
 
 #[derive(Debug)]
-/// Enum representing possible outcomes of a search operation.
-pub(crate) enum NodeSearchResult {
-    /// Leaf node: exact match found.
+/// Enum representing possible outcomes of a search operation in leaf node.
+pub(crate) enum LeafNodeSearchResult {
+    /// Exact match found.
     Found { record_ptr: RecordPointer },
 
-    /// Leaf node: key not found, but insertion point identified.
+    /// Key not found, but insertion point identified.
     NotFoundLeaf { insert_slot_id: SlotId },
+}
 
-    /// Internal node: follow this child.
-    FollowChild { child_ptr: PageId },
+pub(crate) struct InternalNodeSearchResult {
+    pub(crate) child_ptr: PageId,
+    pub(crate) insert_pos: Option<u16>,
 }
 
 // TODO: Use the heap file record ptr
@@ -328,7 +333,7 @@ where
     Key: BTreeKey,
 {
     /// Search returns which child to follow.
-    pub fn search(&self, target_key: &Key) -> Result<NodeSearchResult, BTreeNodeError> {
+    pub fn search(&self, target_key: &Key) -> Result<InternalNodeSearchResult, BTreeNodeError> {
         let num_slots = self.slotted_page.num_slots()?;
 
         if num_slots == 0 {
@@ -346,8 +351,8 @@ where
             if self.slotted_page.is_slot_deleted(mid)? {
                 match self.find_new_mid(mid, left, right)? {
                     None => {
-                        return Ok(NodeSearchResult::NotFoundLeaf {
-                            insert_slot_id: left,
+                        return Err(BTreeNodeError::CorruptNode {
+                            reason: "An internal node must contain at least 1 key".to_string(),
                         });
                     }
                     Some(new_mid) => {
@@ -361,9 +366,10 @@ where
             match key.cmp(target_key) {
                 Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
-                    let (child_page_id, _) = PageId::deserialize(child_page_id_bytes)?;
-                    return Ok(NodeSearchResult::FollowChild {
-                        child_ptr: child_page_id,
+                    let (child_ptr, _) = PageId::deserialize(child_page_id_bytes)?;
+                    return Ok(InternalNodeSearchResult {
+                        child_ptr,
+                        insert_pos: None,
                     });
                 }
                 Ordering::Greater => {
@@ -376,13 +382,16 @@ where
         }
 
         let header = self.get_btree_header()?;
-        let child_ptr = if left == 0 {
-            header.leftmost_child_pointer
+        let (child_ptr, insert_pos) = if left == 0 {
+            (header.leftmost_child_pointer, 0)
         } else {
-            self.get_child_ptr(left - 1)?
+            (self.get_child_ptr(left - 1)?, left - 1)
         };
 
-        Ok(NodeSearchResult::FollowChild { child_ptr })
+        Ok(InternalNodeSearchResult {
+            child_ptr,
+            insert_pos: Some(insert_pos),
+        })
     }
 
     fn get_child_ptr(&self, slot_id: SlotId) -> Result<PageId, BTreeNodeError> {
@@ -405,6 +414,30 @@ where
             _key_marker: PhantomData,
         }
     }
+
+    pub fn insert(
+        &mut self,
+        key: Key,
+        new_child_id: PageId,
+    ) -> Result<NodeInsertResult, BTreeNodeError> {
+        let position = match self.search(&key)?.insert_pos {
+            None => return Err(BTreeNodeError::InternalNodeDuplicateKey),
+            Some(pos) => pos,
+        };
+        let mut buffer = Vec::new();
+        key.serialize(&mut buffer);
+        new_child_id.serialize(&mut buffer);
+        let insert_result = self.slotted_page.insert_at(&buffer, position)?;
+        match insert_result {
+            InsertResult::Success(_) => Ok(NodeInsertResult::Success),
+            InsertResult::NeedsDefragmentation => {
+                self.slotted_page.compact_records()?;
+                self.slotted_page.insert_at(&buffer, position)?;
+                Ok(NodeInsertResult::Success)
+            }
+            InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
+        }
+    }
 }
 impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
 where
@@ -412,10 +445,10 @@ where
     Key: BTreeKey,
 {
     /// Search either finds record or insert slot.
-    pub fn search(&self, target_key: &Key) -> Result<NodeSearchResult, BTreeNodeError> {
+    pub fn search(&self, target_key: &Key) -> Result<LeafNodeSearchResult, BTreeNodeError> {
         let num_slots = self.slotted_page.num_slots()?;
         if num_slots == 0 {
-            return Ok(NodeSearchResult::NotFoundLeaf { insert_slot_id: 0 });
+            return Ok(LeafNodeSearchResult::NotFoundLeaf { insert_slot_id: 0 });
         }
 
         let mut left = 0;
@@ -426,7 +459,7 @@ where
             if self.slotted_page.is_slot_deleted(mid)? {
                 match self.find_new_mid(mid, left, right)? {
                     None => {
-                        return Ok(NodeSearchResult::NotFoundLeaf {
+                        return Ok(LeafNodeSearchResult::NotFoundLeaf {
                             insert_slot_id: left,
                         });
                     }
@@ -442,7 +475,7 @@ where
                 Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
                     let (record_ptr, _) = RecordPointer::deserialize(record_ptr_bytes)?;
-                    return Ok(NodeSearchResult::Found { record_ptr });
+                    return Ok(LeafNodeSearchResult::Found { record_ptr });
                 }
                 Ordering::Greater => {
                     if mid == 0 {
@@ -453,9 +486,16 @@ where
             }
         }
 
-        Ok(NodeSearchResult::NotFoundLeaf {
+        Ok(LeafNodeSearchResult::NotFoundLeaf {
             insert_slot_id: left,
         })
+    }
+
+    pub fn next_leaf_id(&self) -> Result<Option<PageId>, BTreeNodeError> {
+        match self.get_btree_header()?.next_leaf_pointer {
+            BTreeLeafHeader::NO_NEXT_LEAF => Ok(None),
+            val => Ok(Some(val)),
+        }
     }
 }
 
@@ -484,8 +524,13 @@ where
         &mut self,
         key: Key,
         record_pointer: RecordPointer,
-        position: u16,
+        allow_duplicates: bool,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
+        let position = match self.search(&key)? {
+            // TODO (For indexes): handle duplicated keys
+            LeafNodeSearchResult::Found { .. } => return Ok(NodeInsertResult::KeyAlreadyExists),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => insert_slot_id,
+        };
         let mut buffer = Vec::new();
         key.serialize(&mut buffer);
         record_pointer.serialize(&mut buffer);
@@ -497,8 +542,17 @@ where
                 self.slotted_page.insert_at(&buffer, position)?;
                 Ok(NodeInsertResult::Success)
             }
-            InsertResult::PageFull => Ok(PageFull),
+            InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
         }
+    }
+
+    pub fn set_next_leaf_id(&mut self, next_leaf_id: Option<PageId>) -> Result<(), BTreeNodeError> {
+        let header = self.get_btree_header_mut()?;
+        match next_leaf_id {
+            Some(next_leaf) => header.next_leaf_pointer == next_leaf,
+            None => header.next_leaf_pointer == BTreeLeafHeader::NO_NEXT_LEAF,
+        };
+        Ok(())
     }
 }
 mod test {
@@ -589,7 +643,7 @@ mod test {
 
         let res = node.search(&10).unwrap();
         match res {
-            NodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 0),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 0),
             _ => panic!("expected NotFoundLeaf"),
         }
     }
@@ -617,7 +671,7 @@ mod test {
         for (k, rec) in keys.iter().zip(recs.iter()) {
             let res = node.search(k).unwrap();
             match res {
-                NodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr } => {
                     assert_eq!(record_ptr.page_id, rec.page_id);
                     assert_eq!(record_ptr.slot_id, rec.slot_id);
                 }
@@ -627,19 +681,19 @@ mod test {
 
         let res = node.search(&15).unwrap();
         match res {
-            NodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 1),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 1),
             _ => panic!("expected NotFoundLeaf"),
         }
 
         let res = node.search(&5).unwrap();
         match res {
-            NodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 0),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 0),
             _ => panic!("expected NotFoundLeaf"),
         }
 
         let res = node.search(&40).unwrap();
         match res {
-            NodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 3),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 3),
             _ => panic!("expected NotFoundLeaf"),
         }
     }
@@ -652,27 +706,15 @@ mod test {
         let node = make_internal_node(&keys, &children);
 
         let res = node.search(&5).unwrap();
-        match res {
-            NodeSearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 100),
-            _ => panic!("expected FollowChild, got {:?}", res),
-        }
+        assert_eq!(res.child_ptr, 100);
 
         let res = node.search(&10).unwrap();
-        match res {
-            NodeSearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 200),
-            _ => panic!("expected FollowChild, got {:?}", res),
-        }
+        assert_eq!(res.child_ptr, 200);
 
         let res = node.search(&15).unwrap();
-        match res {
-            NodeSearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 200),
-            _ => panic!("expected FollowChild, got {:?}", res),
-        }
+        assert_eq!(res.child_ptr, 200);
 
         let res = node.search(&35).unwrap();
-        match res {
-            NodeSearchResult::FollowChild { child_ptr } => assert_eq!(child_ptr, 400),
-            _ => panic!("expected FollowChild, got {:?}", res),
-        }
+        assert_eq!(res.child_ptr, 400);
     }
 }
