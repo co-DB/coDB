@@ -497,6 +497,8 @@ where
 {
     /// Inserts `data` into the page and returns its [`SlotId`].
     /// If defragmentation is needed to store the data, it's done automatically and insertion is done once again.
+    ///
+    /// This function assumes that [`self`] has enough free space to insert `data` (the page should not be chosen by hand, but instead [`FreeSpaceMap`] should be used to get page with enough free space).
     fn insert(&mut self, data: &[u8]) -> Result<SlotId, HeapFileError> {
         let result = self.page.insert(data)?;
         match result {
@@ -511,6 +513,8 @@ where
                     ),
                 }
             }
+            // There wasn't enough free space on page, which breaks the invariant. Caller should decide how to handle this,
+            // but in correct program this should not happen.
             InsertResult::PageFull => Err(HeapFileError::NotEnoughSpaceOnPage),
         }
     }
