@@ -253,12 +253,12 @@ where
     Page: PageWrite + PageRead,
     Key: BTreeKey,
 {
-    pub fn initialize(page: Page) -> Self {
-        let slotted_page = SlottedPage::initialize_default(page, true);
-        Self {
+    pub fn initialize(page: Page) -> Result<Self, BTreeError> {
+        let slotted_page = SlottedPage::initialize_default(page)?;
+        Ok(Self {
             slotted_page,
             _key_marker: PhantomData,
-        }
+        })
     }
 }
 impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
@@ -307,7 +307,7 @@ where
     Page: PageWrite + PageRead,
     Key: BTreeKey,
 {
-    pub fn initialize(page: Page, next_leaf: Option<PageId>) -> Self {
+    pub fn initialize(page: Page, next_leaf: Option<PageId>) -> Result<Self, BTreeError> {
         let header = BTreeLeafHeader {
             base_header: SlottedPageBaseHeader::new(
                 size_of::<BTreeLeafHeader>() as u16,
@@ -316,11 +316,11 @@ where
             padding: 0,
             next_leaf_pointer: next_leaf.unwrap_or(BTreeLeafHeader::NO_NEXT_LEAF),
         };
-        let slotted_page = SlottedPage::initialize_with_header(page, true, header);
-        Self {
+        let slotted_page = SlottedPage::initialize_with_header(page, header)?;
+        Ok(Self {
             slotted_page,
             _key_marker: PhantomData,
-        }
+        })
     }
 }
 mod test {
@@ -361,7 +361,7 @@ mod test {
         assert_eq!(keys.len(), record_ptrs.len());
 
         let page = TestPage::new(PAGE_SIZE);
-        let mut node = LeafNode::initialize(page, None);
+        let mut node = LeafNode::initialize(page, None).unwrap();
 
         for (k, rec) in keys.iter().zip(record_ptrs.iter()) {
             let mut buf = Vec::new();
@@ -377,7 +377,7 @@ mod test {
         assert_eq!(keys.len() + 1, child_ptrs.len());
 
         let page = TestPage::new(PAGE_SIZE);
-        let mut node = InternalNode::initialize(page);
+        let mut node = InternalNode::initialize(page).unwrap();
 
         let header: &mut BTreeInternalHeader = node.get_btree_header_mut().unwrap();
         header.leftmost_child_pointer = child_ptrs[0];
@@ -399,7 +399,7 @@ mod test {
     #[test]
     fn test_leaf_search_empty_node() {
         let page = TestPage::new(PAGE_SIZE);
-        let node = LeafNode::initialize(page, None);
+        let node = LeafNode::initialize(page, None).unwrap();
 
         let res = node.search(&10).unwrap();
         match res {

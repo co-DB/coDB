@@ -1,4 +1,11 @@
-use std::{array, marker::PhantomData, sync::Arc};
+use std::{
+    array,
+    marker::PhantomData,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use bytemuck::{Pod, Zeroable};
 use crossbeam::queue::SegQueue;
@@ -8,14 +15,14 @@ use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::{
-    cache::{Cache, CacheError, FilePageRef, PageRead, PinnedReadPage, PinnedWritePage},
+    cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedReadPage, PinnedWritePage},
     data_types::DbSerializable,
     files_manager::FileKey,
     paged_file::{PAGE_SIZE, Page, PageId},
     record::{Record, RecordError},
     slotted_page::{
-        PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
-        SlottedPageHeader,
+        InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
+        SlottedPageError, SlottedPageHeader,
     },
 };
 
@@ -136,7 +143,7 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
         &self,
     ) -> Result<Option<(PageId, SlottedPage<PinnedWritePage, H>)>, HeapFileError> {
         let mut page_id = self.next_page_to_read.lock();
-        if *page_id == NO_NEXT_PAGE {
+        if *page_id == H::NO_NEXT_PAGE {
             return Ok(None);
         }
 
@@ -218,23 +225,60 @@ impl RecordPtr {
     }
 }
 
+impl From<&RecordPtr> for Vec<u8> {
+    fn from(value: &RecordPtr) -> Self {
+        let mut buffer = Vec::with_capacity(size_of::<RecordPtr>());
+        value.page_id.serialize(&mut buffer);
+        value.slot.serialize(&mut buffer);
+        buffer
+    }
+}
+
 /// Metadata of [`HeapFile`]. It's stored using bare [`PagedFile`].
+struct Metadata {
+    first_record_page: Mutex<PageId>,
+    first_overflow_page: Mutex<PageId>,
+    dirty: AtomicBool,
+}
+
+impl From<&MetadataRepr> for Metadata {
+    fn from(value: &MetadataRepr) -> Self {
+        Metadata {
+            first_record_page: Mutex::new(value.first_record_page),
+            first_overflow_page: Mutex::new(value.first_overflow_page),
+            dirty: AtomicBool::new(false),
+        }
+    }
+}
+
+/// On-disk representation of [`Metadata`].
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct Metadata {
+struct MetadataRepr {
     first_record_page: PageId,
     first_overflow_page: PageId,
 }
 
-impl Metadata {
+impl MetadataRepr {
     fn load_from_page(page: &Page) -> Result<Self, HeapFileError> {
-        let metadata_size = size_of::<Metadata>();
+        let metadata_size = size_of::<MetadataRepr>();
         let metadata = bytemuck::try_from_bytes(&page[..metadata_size]).map_err(|err| {
             HeapFileError::InvalidMetadataPage {
                 error: err.to_string(),
             }
         })?;
         Ok(*metadata)
+    }
+}
+
+impl From<&Metadata> for MetadataRepr {
+    fn from(value: &Metadata) -> Self {
+        let first_record_page = *value.first_record_page.lock();
+        let first_overflow_page = *value.first_overflow_page.lock();
+        MetadataRepr {
+            first_record_page,
+            first_overflow_page,
+        }
     }
 }
 
@@ -255,6 +299,25 @@ impl RecordTag {
             })?;
         let record_tag = RecordTag::try_from(value)?;
         Ok((record_tag, rest))
+    }
+
+    /// Returns buffer with added [`RecordTag::Final`] at the beginning of it.
+    fn with_final(buffer: &[u8]) -> Vec<u8> {
+        let mut new_buffer = Vec::with_capacity(buffer.len() + size_of::<RecordTag>());
+        new_buffer.push(RecordTag::Final as _);
+        new_buffer.extend_from_slice(&buffer);
+        new_buffer
+    }
+
+    /// Returns buffer with added [`RecordTag::HasContinuation`] at the beginning of it.
+    fn with_has_continuation(buffer: &[u8], continuation: &RecordPtr) -> Vec<u8> {
+        let mut new_buffer =
+            Vec::with_capacity(buffer.len() + size_of::<RecordTag>() + size_of::<RecordPtr>());
+        new_buffer.push(RecordTag::HasContinuation as _);
+        let mut ptr = Vec::from(continuation);
+        new_buffer.append(&mut ptr);
+        new_buffer.extend_from_slice(buffer);
+        new_buffer
     }
 }
 
@@ -301,6 +364,7 @@ impl<'d> RecordFragment<'d> {
     }
 }
 
+/// Trait that provides common functionality for all heap page headers.
 trait BaseHeapPageHeader: SlottedPageHeader {
     const NO_NEXT_PAGE: PageId = 0;
 
@@ -315,6 +379,16 @@ struct RecordPageHeader {
     next_page: PageId,
 }
 
+impl RecordPageHeader {
+    fn new(next_page: PageId) -> Self {
+        Self {
+            base: SlottedPageBaseHeader::new(size_of::<RecordPageHeader>() as _, PageType::Heap),
+            _padding: Default::default(),
+            next_page,
+        }
+    }
+}
+
 impl BaseHeapPageHeader for RecordPageHeader {
     fn next_page(&self) -> PageId {
         self.next_page
@@ -326,7 +400,7 @@ impl Default for RecordPageHeader {
         Self {
             base: SlottedPageBaseHeader::new(size_of::<RecordPageHeader>() as _, PageType::Heap),
             _padding: Default::default(),
-            next_page: NO_NEXT_PAGE,
+            next_page: Self::NO_NEXT_PAGE,
         }
     }
 }
@@ -347,6 +421,19 @@ struct OverflowPageHeader {
     next_page: PageId,
 }
 
+impl OverflowPageHeader {
+    fn new(next_page: PageId) -> Self {
+        Self {
+            base: SlottedPageBaseHeader::new(
+                size_of::<OverflowPageHeader>() as _,
+                PageType::Overflow,
+            ),
+            _padding: Default::default(),
+            next_page,
+        }
+    }
+}
+
 impl BaseHeapPageHeader for OverflowPageHeader {
     fn next_page(&self) -> PageId {
         self.next_page
@@ -361,7 +448,7 @@ impl Default for OverflowPageHeader {
                 PageType::Overflow,
             ),
             _padding: Default::default(),
-            next_page: NO_NEXT_PAGE,
+            next_page: Self::NO_NEXT_PAGE,
         }
     }
 }
@@ -374,9 +461,7 @@ impl SlottedPageHeader for OverflowPageHeader {
     }
 }
 
-/// Const representing "null" page.
-const NO_NEXT_PAGE: PageId = 0;
-
+/// Wrapper around [`SlottedPage`] that provides heap file-specific functionality.
 struct HeapPage<P, H: BaseHeapPageHeader> {
     page: SlottedPage<P, H>,
 }
@@ -405,10 +490,38 @@ where
     }
 }
 
+impl<P, H> HeapPage<P, H>
+where
+    P: PageWrite + PageRead,
+    H: BaseHeapPageHeader,
+{
+    /// Inserts `data` into the page and returns its [`SlotId`].
+    /// If defragmentation is needed to store the data, it's done automatically and insertion is done once again.
+    ///
+    /// This function assumes that [`self`] has enough free space to insert `data` (the page should not be chosen by hand, but instead [`FreeSpaceMap`] should be used to get page with enough free space).
+    fn insert(&mut self, data: &[u8]) -> Result<SlotId, HeapFileError> {
+        let result = self.page.insert(data)?;
+        match result {
+            InsertResult::Success(slot_id) => Ok(slot_id),
+            InsertResult::NeedsDefragmentation => {
+                self.page.compact_records()?;
+                let result = self.page.insert(data)?;
+                match result {
+                    InsertResult::Success(slot_id) => Ok(slot_id),
+                    _ => panic!(
+                        "Not enough space after defragmentation, even though 'NeedsDefragmentation' was returned"
+                    ),
+                }
+            }
+            // There wasn't enough free space on page, which breaks the invariant. Caller should decide how to handle this,
+            // but in correct program this should not happen.
+            InsertResult::PageFull => Err(HeapFileError::NotEnoughSpaceOnPage),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum HeapFileError {
-    #[error("corrupted header of heap file's page: {error}")]
-    CorruptedHeapPageHeader { error: String },
     #[error("invalid metadata page: {error}")]
     InvalidMetadataPage { error: String },
     #[error("failed to deserialize record entry: {error}")]
@@ -419,8 +532,14 @@ pub(crate) enum HeapFileError {
     SlottedPageError(#[from] SlottedPageError),
     #[error("failed to serialize/deserialize record: {0}")]
     RecordSerializationError(#[from] RecordError),
+    #[error("there was not enough space on page to perform request")]
+    NotEnoughSpaceOnPage,
 }
 
+/// Structure responsible for managing on-disk heap files.
+///
+/// Each [`HeapFile`] instance corresponds to a single physical file on disk.
+/// For concurrent access by multiple threads, wrap the instance in `Arc<HeapFile>`.
 pub(crate) struct HeapFile<const BUCKETS_COUNT: usize> {
     file_key: FileKey,
     metadata: Metadata,
@@ -445,8 +564,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         }
 
         // Record is saved across many pages - we need to load it fragment by fragment
-        let mut full_record_bytes = Vec::with_capacity(fragment.data.len());
-        full_record_bytes.extend_from_slice(fragment.data);
+        let mut full_record_bytes = Vec::from(fragment.data);
 
         let mut next_ptr = fragment.next_fragment;
         while let Some(next) = next_ptr {
@@ -460,8 +578,80 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         Ok(record)
     }
 
-    /// Helper for reading [`HeapFile`]'s pages.
-    fn read_page<H>(&self, page_id: PageId) -> Result<HeapPage<PinnedReadPage, H>, HeapFileError>
+    /// Inserts `record` into heap file and returns its [`RecordPtr`].
+    pub(crate) fn insert(&self, record: Record) -> Result<RecordPtr, HeapFileError> {
+        let mut serialized = record.serialize();
+
+        let max_record_size_on_single_page = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE
+            as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        if serialized.len() <= max_record_size_on_single_page as _ {
+            // Record can be stored on single page
+            let data = RecordTag::with_final(&serialized);
+            let ptr = self.insert_to_record_page(&data)?;
+            return Ok(ptr);
+        }
+
+        // We need to split record into pieces, so that each piece can fit into one page.
+        let piece_size = max_record_size_on_single_page - size_of::<RecordPtr>();
+
+        let last_fragment = serialized.split_off(serialized.len() - 1 - piece_size);
+        let last_fragment_with_tag = RecordTag::with_final(&last_fragment);
+        let mut next_ptr = self.insert_to_overflow_page(&last_fragment_with_tag)?;
+
+        // It means 2 pieces is enough
+        if serialized.len() <= piece_size {
+            let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
+            let ptr = self.insert_to_record_page(&data)?;
+            return Ok(ptr);
+        }
+
+        // We need to split it into more than 2 pieces
+        let middle_pieces = serialized.split_off(piece_size);
+
+        // We save middle pieces into overflow pages
+        for chunk in middle_pieces.rchunks(piece_size as _) {
+            let chunk = RecordTag::with_has_continuation(chunk, &next_ptr);
+            next_ptr = self.insert_to_overflow_page(&chunk)?;
+        }
+
+        let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
+        let ptr = self.insert_to_record_page(&data)?;
+        Ok(ptr)
+    }
+
+    /// Flushes [`HeapFile::metadata`] content to disk.
+    ///
+    /// If metadata is not dirty then this is no-op.
+    pub(crate) fn flush_metadata(&mut self) -> Result<(), HeapFileError> {
+        match self
+            .metadata
+            .dirty
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                // Changed dirty from true to false, so metadata must be flushed
+                let key = self.file_page_ref(Self::METADATA_PAGE_ID);
+                let mut page = self.cache.pin_write(&key)?;
+                let repr = MetadataRepr::from(&self.metadata);
+                let bytes = bytemuck::bytes_of(&repr);
+                page.page_mut()[..size_of::<MetadataRepr>()].copy_from_slice(bytes);
+                Ok(())
+            }
+            Err(_) => {
+                // Metadata was already clean
+                Ok(())
+            }
+        }
+    }
+
+    /// Generic helper for reading any type of heap page
+    fn read_heap_page<H>(
+        &self,
+        page_id: PageId,
+    ) -> Result<HeapPage<PinnedReadPage, H>, HeapFileError>
     where
         H: BaseHeapPageHeader,
     {
@@ -472,26 +662,127 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         Ok(heap_node)
     }
 
+    /// Generic helper for reading a page and updating its FSM
+    fn read_page_with_fsm<H>(
+        &self,
+        page_id: PageId,
+        fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
+    ) -> Result<HeapPage<PinnedReadPage, H>, HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+    {
+        let heap_page = self.read_heap_page::<H>(page_id)?;
+        let free_space = heap_page.page.free_space()?;
+        fsm.update_page_bucket_with_duplicate_check(page_id, free_space as _);
+        Ok(heap_page)
+    }
+
     fn read_record_page(
         &self,
         page_id: PageId,
     ) -> Result<HeapPage<PinnedReadPage, RecordPageHeader>, HeapFileError> {
-        let p = self.read_page::<RecordPageHeader>(page_id)?;
-        let free_space = p.page.free_space()?;
-        self.record_pages_fsm
-            .update_page_bucket_with_duplicate_check(page_id, free_space as _);
-        Ok(p)
+        self.read_page_with_fsm(page_id, &self.record_pages_fsm)
     }
 
     fn read_overflow_page(
         &self,
         page_id: PageId,
     ) -> Result<HeapPage<PinnedReadPage, OverflowPageHeader>, HeapFileError> {
-        let p = self.read_page::<OverflowPageHeader>(page_id)?;
-        let free_space = p.page.free_space()?;
-        self.overflow_pages_fsm
-            .update_page_bucket_with_duplicate_check(page_id, free_space as _);
-        Ok(p)
+        self.read_page_with_fsm(page_id, &self.overflow_pages_fsm)
+    }
+
+    /// Generic helper for allocating any type of heap page
+    fn allocate_heap_page<H>(
+        &self,
+        header: H,
+    ) -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+    {
+        let (page, page_id) = self.cache.allocate_page(&self.file_key)?;
+        let slotted_page = SlottedPage::initialize_with_header(page, header)?;
+        let heap_page = HeapPage::new(slotted_page);
+        Ok((page_id, heap_page))
+    }
+
+    /// Generic helper for allocating a page and updating metadata
+    fn allocate_page_with_metadata<H, F>(
+        &self,
+        metadata_lock: &Mutex<PageId>,
+        header_fn: F,
+    ) -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+        F: FnOnce(PageId) -> H,
+    {
+        let mut metadata_page_lock = metadata_lock.lock();
+        let header = header_fn(*metadata_page_lock);
+        let (page_id, page) = self.allocate_heap_page(header)?;
+        *metadata_page_lock = page_id;
+        self.metadata.dirty.store(true, Ordering::Release);
+        Ok((page_id, page))
+    }
+
+    fn allocate_record_page(
+        &self,
+    ) -> Result<(PageId, HeapPage<PinnedWritePage, RecordPageHeader>), HeapFileError> {
+        self.allocate_page_with_metadata(&self.metadata.first_record_page, |next_page| {
+            RecordPageHeader::new(next_page)
+        })
+    }
+
+    fn allocate_overflow_page(
+        &self,
+    ) -> Result<(PageId, HeapPage<PinnedWritePage, OverflowPageHeader>), HeapFileError> {
+        self.allocate_page_with_metadata(&self.metadata.first_overflow_page, |next_page| {
+            OverflowPageHeader::new(next_page)
+        })
+    }
+
+    /// Generic helper for inserting data into any type of heap page
+    fn insert_to_page<H>(
+        &self,
+        data: &[u8],
+        fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
+        allocate_fn: impl FnOnce() -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>,
+    ) -> Result<RecordPtr, HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+    {
+        let fsm_page = fsm.page_with_free_space(data.len())?;
+        let (page_id, mut page) = if let Some((page_id, page)) = fsm_page {
+            let heap_page = HeapPage::new(page);
+            (page_id, heap_page)
+        } else {
+            allocate_fn()?
+        };
+
+        let slot_id = match page.insert(data) {
+            Ok(slot_id) => slot_id,
+            Err(HeapFileError::NotEnoughSpaceOnPage) => {
+                panic!("fatal error - not enough space returned on page from FSM/allocated page")
+            }
+            Err(e) => return Err(e),
+        };
+
+        fsm.update_page_bucket(page_id, page.page.free_space()? as _);
+
+        Ok(RecordPtr {
+            page_id,
+            slot: slot_id,
+        })
+    }
+
+    /// Inserts `data` into first found record page that has enough size.
+    fn insert_to_record_page(&self, data: &[u8]) -> Result<RecordPtr, HeapFileError> {
+        self.insert_to_page(data, &self.record_pages_fsm, || self.allocate_record_page())
+    }
+
+    /// Inserts `data` into first found overflow page that has enough size.
+    fn insert_to_overflow_page(&self, data: &[u8]) -> Result<RecordPtr, HeapFileError> {
+        self.insert_to_page(data, &self.overflow_pages_fsm, || {
+            self.allocate_overflow_page()
+        })
     }
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
@@ -501,13 +792,13 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             file_key: self.file_key.clone(),
         }
     }
+}
 
-    fn first_record_page(&self) -> PageId {
-        self.metadata.first_record_page
-    }
-
-    fn first_overflow_page(&self) -> PageId {
-        self.metadata.first_overflow_page
+impl<const BUCKETS_COUNT: usize> Drop for HeapFile<BUCKETS_COUNT> {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_metadata() {
+            log::error!("failed to flush metadata while dropping HeapFile: {e}");
+        }
     }
 }
 
@@ -536,18 +827,20 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
     }
 
     fn load_existing_heap_file(self) -> Result<HeapFile<BUCKETS_COUNT>, HeapFileError> {
-        let metadata = self.load_metadata()?;
+        let metadata_repr = self.load_metadata_repr()?;
 
         let record_pages_fsm = FreeSpaceMap::<BUCKETS_COUNT, RecordPageHeader>::new(
             self.cache.clone(),
             self.file_key.clone(),
-            metadata.first_record_page,
+            metadata_repr.first_record_page,
         );
         let overflow_pages_fsm = FreeSpaceMap::<BUCKETS_COUNT, OverflowPageHeader>::new(
             self.cache.clone(),
             self.file_key.clone(),
-            metadata.first_overflow_page,
+            metadata_repr.first_overflow_page,
         );
+
+        let metadata = Metadata::from(&metadata_repr);
 
         let heap_file = HeapFile {
             cache: self.cache,
@@ -560,10 +853,10 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
         Ok(heap_file)
     }
 
-    fn load_metadata(&self) -> Result<Metadata, HeapFileError> {
+    fn load_metadata_repr(&self) -> Result<MetadataRepr, HeapFileError> {
         let key = self.file_page_ref(HeapFile::<BUCKETS_COUNT>::METADATA_PAGE_ID);
         let page = self.cache.pin_read(&key)?;
-        let metadata = Metadata::load_from_page(page.page())?;
+        let metadata = MetadataRepr::load_from_page(page.page())?;
         Ok(metadata)
     }
 
@@ -602,7 +895,7 @@ mod tests {
 
     impl BaseHeapPageHeader for TestPageHeader {
         fn next_page(&self) -> PageId {
-            NO_NEXT_PAGE
+            Self::NO_NEXT_PAGE
         }
     }
 
@@ -693,7 +986,8 @@ mod tests {
         let (pinned_page, page_id) = cache.allocate_page(file_key).unwrap();
 
         // Initialize the page with a slotted page structure
-        let mut slotted = SlottedPage::<_, TestPageHeader>::initialize_default(pinned_page, false);
+        let mut slotted =
+            SlottedPage::<_, TestPageHeader>::initialize_default(pinned_page).unwrap();
 
         // Fill the page to achieve desired free space
         // It will actually have a little less space, as some space will be taken by the slot itself.
@@ -744,17 +1038,17 @@ mod tests {
         let (overflow_pinned, first_overflow_page_id) = cache.allocate_page(file_key).unwrap();
 
         // Initialize pages
-        SlottedPage::<_, RecordPageHeader>::initialize_default(record_pinned, false);
+        SlottedPage::<_, RecordPageHeader>::initialize_default(record_pinned).unwrap();
 
-        SlottedPage::<_, OverflowPageHeader>::initialize_default(overflow_pinned, false);
+        SlottedPage::<_, OverflowPageHeader>::initialize_default(overflow_pinned).unwrap();
 
         // Write metadata
-        let metadata = Metadata {
+        let metadata_repr = MetadataRepr {
             first_record_page: first_record_page_id,
             first_overflow_page: first_overflow_page_id,
         };
 
-        let metadata_bytes = bytemuck::bytes_of(&metadata);
+        let metadata_bytes = bytemuck::bytes_of(&metadata_repr);
         metadata_pinned.page_mut()[..metadata_bytes.len()].copy_from_slice(metadata_bytes);
 
         (first_record_page_id, first_overflow_page_id)
@@ -826,7 +1120,7 @@ mod tests {
     #[test]
     fn fsm_bucket_for_space_empty_page() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache, file_key, NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(cache, file_key, TestPageHeader::NO_NEXT_PAGE);
 
         // Empty page (100% free) should go to last bucket
         let bucket = fsm.bucket_for_space(PAGE_SIZE);
@@ -836,7 +1130,7 @@ mod tests {
     #[test]
     fn fsm_bucket_for_space_full_page() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache, file_key, NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(cache, file_key, TestPageHeader::NO_NEXT_PAGE);
 
         // Full page (0% free) should go to first bucket
         let bucket = fsm.bucket_for_space(0);
@@ -846,7 +1140,7 @@ mod tests {
     #[test]
     fn fsm_bucket_for_space_quarter_ranges() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache, file_key, NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(cache, file_key, TestPageHeader::NO_NEXT_PAGE);
 
         // [0%, 25%) -> bucket 0
         assert_eq!(fsm.bucket_for_space(0), 0);
@@ -868,7 +1162,11 @@ mod tests {
     #[test]
     fn fsm_update_page_bucket_adds_to_correct_bucket() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         let (_, page_id) = cache.allocate_page(&file_key).unwrap();
 
@@ -884,7 +1182,11 @@ mod tests {
     #[test]
     fn fsm_update_page_bucket_multiple_pages() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Create pages with different free space amounts
         let pages_and_spaces = vec![
@@ -904,7 +1206,7 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_empty_fsm() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache, file_key, NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(cache, file_key, TestPageHeader::NO_NEXT_PAGE);
 
         // Should return None when FSM is empty
         let result = fsm.page_with_free_space(100).unwrap();
@@ -914,7 +1216,11 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_finds_suitable_page() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Create a page with 2000 bytes free
         let free_space = 2000;
@@ -933,7 +1239,11 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_skips_insufficient_pages() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Create pages with different free space amounts
         let small_free = 500;
@@ -957,7 +1267,11 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_searches_higher_buckets() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Add page to bucket 3 (high free space)
         let free_space = PAGE_SIZE * 90 / 100;
@@ -973,7 +1287,11 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_no_suitable_page() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Add page with small free space
         let free_space = 100;
@@ -988,7 +1306,11 @@ mod tests {
     #[test]
     fn fsm_handles_stale_entries() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Create page with initial free space
         let initial_free = 2000;
@@ -1017,7 +1339,7 @@ mod tests {
         let fsm = Arc::new(create_test_fsm::<4>(
             cache.clone(),
             file_key.clone(),
-            NO_NEXT_PAGE,
+            TestPageHeader::NO_NEXT_PAGE,
         ));
 
         let mut handles = vec![];
@@ -1032,7 +1354,7 @@ mod tests {
                 let (pinned_page, page_id) = cache_clone.allocate_page(&file_key_clone).unwrap();
 
                 let slotted =
-                    SlottedPage::<_, TestPageHeader>::initialize_default(pinned_page, false);
+                    SlottedPage::<_, TestPageHeader>::initialize_default(pinned_page).unwrap();
                 drop(slotted);
 
                 let free_space = PAGE_SIZE * (50 + i) / 100;
@@ -1058,7 +1380,11 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_reinserts_same_bucket_insufficient_space() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Create a page with 80% free space (bucket 3: [75%-100%])
         let free_space_80_percent = PAGE_SIZE * 80 / 100;
@@ -1078,7 +1404,11 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_does_not_reinsert_different_bucket() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Manually insert a page into bucket 3 that actually belongs to bucket 2
         let free_space_60_percent = PAGE_SIZE * 60 / 100;
@@ -1100,7 +1430,11 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_handles_multiple_stale_entries() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Bucket 0
         let page1_actual = PAGE_SIZE * 20 / 100;
@@ -1134,7 +1468,11 @@ mod tests {
     #[test]
     fn fsm_page_with_free_space_preserves_valid_entries_same_bucket() {
         let (cache, _, file_key) = setup_test_cache();
-        let fsm = create_test_fsm::<4>(cache.clone(), file_key.clone(), NO_NEXT_PAGE);
+        let fsm = create_test_fsm::<4>(
+            cache.clone(),
+            file_key.clone(),
+            TestPageHeader::NO_NEXT_PAGE,
+        );
 
         // Create two pages in bucket 2 [50%-75%] (only one with enough space)
         let page1_space = PAGE_SIZE * 55 / 100;
@@ -1169,7 +1507,7 @@ mod tests {
         let (first_page, first_page_id) = cache.allocate_page(&file_key).unwrap();
 
         // Initialize page
-        let page = SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+        let page = SlottedPage::<_, RecordPageHeader>::initialize_default(first_page).unwrap();
         drop(page);
 
         // Create FSM with empty buckets
@@ -1196,16 +1534,16 @@ mod tests {
 
         // Set up chain
         let mut first_slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page).unwrap();
         first_slotted.get_header_mut().unwrap().next_page = second_page_id;
 
         let mut second_slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page).unwrap();
         second_slotted.get_header_mut().unwrap().next_page = third_page_id;
 
         let mut third_slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(third_page, false);
-        third_slotted.get_header_mut().unwrap().next_page = NO_NEXT_PAGE;
+            SlottedPage::<_, RecordPageHeader>::initialize_default(third_page).unwrap();
+        third_slotted.get_header_mut().unwrap().next_page = RecordPageHeader::NO_NEXT_PAGE;
 
         // Fill first and second pages to have insufficient space
         let large_dummy = vec![0u8; 3000];
@@ -1241,12 +1579,12 @@ mod tests {
         let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
 
         let mut first_slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page).unwrap();
         first_slotted.get_header_mut().unwrap().next_page = second_page_id;
 
         let mut second_slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
-        second_slotted.get_header_mut().unwrap().next_page = NO_NEXT_PAGE;
+            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page).unwrap();
+        second_slotted.get_header_mut().unwrap().next_page = RecordPageHeader::NO_NEXT_PAGE;
 
         // Fill both pages almost completely
         let large_dummy = vec![0u8; 3500];
@@ -1279,16 +1617,16 @@ mod tests {
 
         // Set up chain: first -> second -> third -> NO_NEXT_PAGE
         let mut first_slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page, false);
+            SlottedPage::<_, RecordPageHeader>::initialize_default(first_page).unwrap();
         first_slotted.get_header_mut().unwrap().next_page = second_page_id;
 
         let mut second_slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+            SlottedPage::<_, RecordPageHeader>::initialize_default(second_page).unwrap();
         second_slotted.get_header_mut().unwrap().next_page = third_page_id;
 
         let mut third_slotted =
-            SlottedPage::<_, RecordPageHeader>::initialize_default(third_page, false);
-        third_slotted.get_header_mut().unwrap().next_page = NO_NEXT_PAGE;
+            SlottedPage::<_, RecordPageHeader>::initialize_default(third_page).unwrap();
+        third_slotted.get_header_mut().unwrap().next_page = RecordPageHeader::NO_NEXT_PAGE;
 
         drop(first_slotted);
         drop(second_slotted);
@@ -1326,8 +1664,8 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Verify metadata was loaded
-        assert_ne!(heap_file.first_record_page(), 0);
-        assert_ne!(heap_file.first_overflow_page(), 0);
+        assert_ne!(*heap_file.metadata.first_record_page.lock(), 0);
+        assert_ne!(*heap_file.metadata.first_overflow_page.lock(), 0);
     }
 
     #[test]
@@ -1349,7 +1687,7 @@ mod tests {
         // The actual error will occur when trying to read from invalid page IDs
         if let Ok(heap_file) = result {
             let invalid_ptr = RecordPtr {
-                page_id: heap_file.first_record_page(),
+                page_id: *heap_file.metadata.first_record_page.lock(),
                 slot: 0,
             };
             let read_result = heap_file.record(&invalid_ptr);
@@ -1452,7 +1790,7 @@ mod tests {
 
         // Create a second record page
         let (second_page, second_page_id) = cache.allocate_page(&file_key).unwrap();
-        SlottedPage::<_, RecordPageHeader>::initialize_default(second_page, false);
+        SlottedPage::<_, RecordPageHeader>::initialize_default(second_page).unwrap();
 
         // Insert records in both pages
         let record1_data = create_custom_record_data(1, "page1");
@@ -1725,7 +2063,7 @@ mod tests {
         // Create a second overflow page
         let (second_overflow_page, second_overflow_page_id) =
             cache.allocate_page(&file_key).unwrap();
-        SlottedPage::<_, OverflowPageHeader>::initialize_default(second_overflow_page, false);
+        SlottedPage::<_, OverflowPageHeader>::initialize_default(second_overflow_page).unwrap();
 
         let full_record = create_custom_record_data(42, "fragmented_record");
 
@@ -1796,7 +2134,7 @@ mod tests {
 
         let (second_overflow_page, second_overflow_page_id) =
             cache.allocate_page(&file_key).unwrap();
-        SlottedPage::<_, OverflowPageHeader>::initialize_default(second_overflow_page, false);
+        SlottedPage::<_, OverflowPageHeader>::initialize_default(second_overflow_page).unwrap();
 
         let third_slot = insert_record_fragment(
             &cache,
@@ -2018,5 +2356,426 @@ mod tests {
             first_record_page_id
         ));
         assert_eq!(heap_file.record_pages_fsm.buckets[3].len(), 1);
+    }
+
+    // HeapFile inserting record
+
+    #[test]
+    fn heap_file_insert_simple_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a simple record
+        let id_field = Field::Int32(123);
+        let name_field = Field::String("test_user".into());
+        let record = Record::new(vec![id_field, name_field]);
+
+        let record_ptr = heap_file.insert(record).unwrap();
+
+        // Verify the record was inserted correctly
+        assert_eq!(record_ptr.page_id, first_record_page_id);
+        assert_eq!(record_ptr.slot, 0);
+
+        // Read back the record to verify it was stored correctly
+        let retrieved_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(retrieved_record.fields.len(), 2);
+        assert_i32(123, &retrieved_record.fields[0]);
+        assert_string("test_user", &retrieved_record.fields[1]);
+
+        // Verify the page was added to FSM after insertion
+        let file_page_ref = FilePageRef {
+            page_id: first_record_page_id,
+            file_key: file_key.clone(),
+        };
+        let page = cache.pin_read(&file_page_ref).unwrap();
+        let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page).unwrap();
+        let free_space = slotted_page.free_space().unwrap() as usize;
+        let expected_bucket = heap_file.record_pages_fsm.bucket_for_space(free_space);
+
+        assert!(bucket_contains_page(
+            &heap_file.record_pages_fsm,
+            expected_bucket,
+            first_record_page_id
+        ));
+    }
+
+    #[test]
+    fn heap_file_insert_large_single_page_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Calculate maximum record size that can fit in a single page
+        let max_record_size_on_single_page = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE
+            as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        // Create a large string that will make the record use almost all available space
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+        let large_string_size = max_record_size_on_single_page - record_overhead;
+        let large_string = "x".repeat(large_string_size);
+
+        let id_field = Field::Int32(999);
+        let name_field = Field::String(large_string.clone());
+        let record = Record::new(vec![id_field, name_field]);
+
+        let record_ptr = heap_file.insert(record).unwrap();
+
+        // Verify the record was inserted correctly
+        assert_eq!(record_ptr.page_id, first_record_page_id);
+        assert_eq!(record_ptr.slot, 0);
+
+        // Read back the record to verify it was stored correctly
+        let retrieved_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(retrieved_record.fields.len(), 2);
+        assert_i32(999, &retrieved_record.fields[0]);
+        assert_string(&large_string, &retrieved_record.fields[1]);
+
+        // Verify the page now has no free space left
+        let file_page_ref = FilePageRef {
+            page_id: first_record_page_id,
+            file_key: file_key.clone(),
+        };
+        let page = cache.pin_read(&file_page_ref).unwrap();
+        let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page).unwrap();
+        let free_space = slotted_page.free_space().unwrap() as usize;
+
+        assert_eq!(free_space, 0);
+        assert!(bucket_contains_page(
+            &heap_file.record_pages_fsm,
+            0,
+            first_record_page_id
+        ));
+    }
+
+    #[test]
+    fn heap_file_insert_record_spanning_two_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, first_overflow_page_id) =
+            setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        // Create a record that's larger than single page capacity
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead + 500;
+        let large_string = "y".repeat(large_string_size);
+
+        let id_field = Field::Int32(777);
+        let name_field = Field::String(large_string.clone());
+        let record = Record::new(vec![id_field, name_field]);
+
+        let record_ptr = heap_file.insert(record).unwrap();
+
+        // Verify the record pointer points to the record page (first fragment)
+        assert_eq!(record_ptr.page_id, first_record_page_id);
+        assert_eq!(record_ptr.slot, 0);
+
+        // Read back the record to verify it was stored correctly across pages
+        let retrieved_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(retrieved_record.fields.len(), 2);
+        assert_i32(777, &retrieved_record.fields[0]);
+        assert_string(&large_string, &retrieved_record.fields[1]);
+
+        // Verify both pages were updated in their respective FSMs
+        let record_page_ref = FilePageRef {
+            page_id: first_record_page_id,
+            file_key: file_key.clone(),
+        };
+        let record_page = cache.pin_read(&record_page_ref).unwrap();
+        let record_slotted_page = SlottedPage::<_, RecordPageHeader>::new(record_page).unwrap();
+        let record_free_space = record_slotted_page.free_space().unwrap() as usize;
+        let record_bucket = heap_file
+            .record_pages_fsm
+            .bucket_for_space(record_free_space);
+
+        let overflow_page_ref = FilePageRef {
+            page_id: first_overflow_page_id,
+            file_key: file_key.clone(),
+        };
+        let overflow_page = cache.pin_read(&overflow_page_ref).unwrap();
+        let overflow_slotted_page =
+            SlottedPage::<_, OverflowPageHeader>::new(overflow_page).unwrap();
+        let overflow_free_space = overflow_slotted_page.free_space().unwrap() as usize;
+        let overflow_bucket = heap_file
+            .overflow_pages_fsm
+            .bucket_for_space(overflow_free_space);
+
+        // Both pages should have been added to their respective FSMs
+        assert!(bucket_contains_page(
+            &heap_file.record_pages_fsm,
+            record_bucket,
+            first_record_page_id
+        ));
+        assert!(bucket_contains_page(
+            &heap_file.overflow_pages_fsm,
+            overflow_bucket,
+            first_overflow_page_id
+        ));
+
+        // Verify that the first fragment contains a continuation tag
+        let first_fragment_data = record_slotted_page.read_record(0).unwrap();
+        let first_byte = first_fragment_data[0];
+        assert_eq!(first_byte, RecordTag::HasContinuation as u8);
+
+        // Verify that the second fragment contains a final tag
+        let second_fragment_data = overflow_slotted_page.read_record(0).unwrap();
+        let second_first_byte = second_fragment_data[0];
+        assert_eq!(second_first_byte, RecordTag::Final as u8);
+    }
+
+    #[test]
+    fn heap_file_insert_record_spanning_four_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, first_overflow_page_id) =
+            setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+
+        let large_string_size = (3 * max_single_page_size) - record_overhead + 100;
+        let large_string = "z".repeat(large_string_size);
+
+        let id_field = Field::Int32(555);
+        let name_field = Field::String(large_string.clone());
+        let record = Record::new(vec![id_field, name_field]);
+
+        let record_ptr = heap_file.insert(record).unwrap();
+
+        // Verify the record pointer points to the record page (first fragment)
+        assert_eq!(record_ptr.page_id, first_record_page_id);
+        assert_eq!(record_ptr.slot, 0);
+
+        // Read back the record to verify it was stored correctly across pages
+        let retrieved_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(retrieved_record.fields.len(), 2);
+        assert_i32(555, &retrieved_record.fields[0]);
+        assert_string(&large_string, &retrieved_record.fields[1]);
+
+        // Assert metadata change and allocations were successful
+        assert!(heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        let new_first_overflow_page = *heap_file.metadata.first_overflow_page.lock();
+        assert_ne!(new_first_overflow_page, first_overflow_page_id);
+
+        let mut overflow_pages_count = 0;
+        let mut current_page_id = new_first_overflow_page;
+
+        while current_page_id != OverflowPageHeader::NO_NEXT_PAGE {
+            overflow_pages_count += 1;
+
+            let file_page_ref = FilePageRef {
+                page_id: current_page_id,
+                file_key: file_key.clone(),
+            };
+            let page = cache.pin_read(&file_page_ref).unwrap();
+            let slotted_page = SlottedPage::<_, OverflowPageHeader>::new(page).unwrap();
+            let header = slotted_page.get_header().unwrap();
+            current_page_id = header.next_page();
+        }
+
+        assert_eq!(overflow_pages_count, 3);
+    }
+
+    #[test]
+    fn heap_file_insert_forces_new_record_page_allocation() {
+        let (cache, _, file_key) = setup_test_cache();
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Store initial metadata state
+        let initial_first_record_page = *heap_file.metadata.first_record_page.lock();
+        assert_eq!(initial_first_record_page, first_record_page_id);
+        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        // Insert a large record that fills the first page
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead;
+        let large_string = "x".repeat(large_string_size);
+
+        let large_record = Record::new(vec![Field::Int32(1), Field::String(large_string.clone())]);
+
+        let first_record_ptr = heap_file.insert(large_record).unwrap();
+        assert_eq!(first_record_ptr.page_id, first_record_page_id);
+        assert_eq!(first_record_ptr.slot, 0);
+
+        // Insert a small record that won't fit in the remaining space
+        let small_record = Record::new(vec![
+            Field::Int32(2),
+            Field::String("this_record_should_trigger_new_page".into()),
+        ]);
+
+        let second_record_ptr = heap_file.insert(small_record).unwrap();
+
+        // Verify a new record page was allocated
+        assert_ne!(second_record_ptr.page_id, first_record_page_id);
+        assert_eq!(second_record_ptr.slot, 0);
+
+        // Verify metadata was changed and is dirty
+        assert!(heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        let new_first_record_page = *heap_file.metadata.first_record_page.lock();
+        assert_ne!(new_first_record_page, initial_first_record_page);
+        assert_eq!(second_record_ptr.page_id, new_first_record_page);
+
+        // Verify the new page is properly linked in the chain
+        let new_page_ref = FilePageRef {
+            page_id: new_first_record_page,
+            file_key: file_key.clone(),
+        };
+        let new_page = cache.pin_read(&new_page_ref).unwrap();
+        let new_slotted_page = SlottedPage::<_, RecordPageHeader>::new(new_page).unwrap();
+        let new_header = new_slotted_page.get_header().unwrap();
+        assert_eq!(new_header.next_page(), first_record_page_id);
+
+        // Read back both records to verify they were stored correctly
+        let first_retrieved = heap_file.record(&first_record_ptr).unwrap();
+        assert_eq!(first_retrieved.fields.len(), 2);
+        assert_i32(1, &first_retrieved.fields[0]);
+        assert_string(&large_string, &first_retrieved.fields[1]);
+
+        let second_retrieved = heap_file.record(&second_record_ptr).unwrap();
+        assert_eq!(second_retrieved.fields.len(), 2);
+        assert_i32(2, &second_retrieved.fields[0]);
+        assert_string(
+            "this_record_should_trigger_new_page",
+            &second_retrieved.fields[1],
+        );
+    }
+
+    #[test]
+    fn heap_file_insert_concurrent() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = Arc::new(factory.create_heap_file().unwrap());
+
+        let record1 = Record::new(vec![
+            Field::Int32(100),
+            Field::String("thread_1_record".into()),
+        ]);
+
+        let record2 = Record::new(vec![
+            Field::Int32(200),
+            Field::String("thread_2_record".into()),
+        ]);
+
+        // Spawn two threads to insert records concurrently
+        let heap_file_clone1 = heap_file.clone();
+        let heap_file_clone2 = heap_file.clone();
+
+        let handle1 = thread::spawn(move || heap_file_clone1.insert(record1));
+
+        let handle2 = thread::spawn(move || heap_file_clone2.insert(record2));
+
+        // Wait for both insertions to complete
+        let result1 = handle1.join().unwrap();
+        let result2 = handle2.join().unwrap();
+
+        // Verify both insertions were successful
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+
+        let ptr1 = result1.unwrap();
+        let ptr2 = result2.unwrap();
+        assert!(ptr1 != ptr2);
+
+        // Verify both records can be read back correctly
+        let retrieved1 = heap_file.record(&ptr1).unwrap();
+        assert_eq!(retrieved1.fields.len(), 2);
+        assert_i32(100, &retrieved1.fields[0]);
+        assert_string("thread_1_record", &retrieved1.fields[1]);
+
+        let retrieved2 = heap_file.record(&ptr2).unwrap();
+        assert_eq!(retrieved2.fields.len(), 2);
+        assert_i32(200, &retrieved2.fields[0]);
+        assert_string("thread_2_record", &retrieved2.fields[1]);
+    }
+
+    // Metadata
+
+    #[test]
+    fn heap_file_flush_metadata() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Initially metadata should not be dirty
+        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        // Trigger a metadata change by allocating a new record page
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead;
+        let large_string = "x".repeat(large_string_size);
+
+        // Fill the first page completely
+        let large_record = Record::new(vec![Field::Int32(1), Field::String(large_string)]);
+        heap_file.insert(large_record).unwrap();
+
+        // Insert small record to trigger new page allocation
+        let small_record = Record::new(vec![Field::Int32(2), Field::String("small".into())]);
+        heap_file.insert(small_record).unwrap();
+
+        // Verify metadata is now dirty
+        assert!(heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        // Capture current metadata values
+        let first_record_page = *heap_file.metadata.first_record_page.lock();
+        let first_overflow_page = *heap_file.metadata.first_overflow_page.lock();
+
+        // Flush metadata
+        heap_file.flush_metadata().unwrap();
+
+        // Verify metadata is no longer dirty
+        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
+
+        // Read metadata directly from disk to verify it was written
+        let metadata_page_ref = heap_file.file_page_ref(HeapFile::<4>::METADATA_PAGE_ID);
+        let metadata_page = cache.pin_read(&metadata_page_ref).unwrap();
+        let disk_metadata = MetadataRepr::load_from_page(metadata_page.page()).unwrap();
+
+        assert_eq!(disk_metadata.first_record_page, first_record_page);
+        assert_eq!(disk_metadata.first_overflow_page, first_overflow_page);
+
+        // Try flushing again (should be no-op since metadata is clean)
+        heap_file.flush_metadata().unwrap();
+
+        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
     }
 }
