@@ -16,10 +16,10 @@ use thiserror::Error;
 
 use crate::{
     cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedReadPage, PinnedWritePage},
-    data_types::DbSerializable,
+    data_types::{DbSerializable, DbSerializationError},
     files_manager::FileKey,
     paged_file::{PAGE_SIZE, Page, PageId},
-    record::{Record, RecordError},
+    record::{Field, Record, RecordError},
     slotted_page::{
         InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
         SlottedPageError, SlottedPageHeader,
@@ -364,6 +364,30 @@ impl<'d> RecordFragment<'d> {
     }
 }
 
+/// Struct used for describing update of single field.
+pub(crate) struct FieldUpdateDescriptor {
+    column: ColumnMetadata,
+    field: Field,
+}
+
+impl FieldUpdateDescriptor {
+    /// Creates new [`FieldUpdateDescriptor`].
+    ///
+    /// Returns an error when `column` and `field` have different types.
+    pub(crate) fn new(
+        column: ColumnMetadata,
+        field: Field,
+    ) -> Result<FieldUpdateDescriptor, HeapFileError> {
+        if column.ty() != field.ty() {
+            return Err(HeapFileError::ColumnAndFieldTypesDontMatch {
+                column_ty: column.ty().to_string(),
+                field_ty: field.ty().to_string(),
+            });
+        }
+        Ok(FieldUpdateDescriptor { column, field })
+    }
+}
+
 /// Trait that provides common functionality for all heap page headers.
 trait BaseHeapPageHeader: SlottedPageHeader {
     const NO_NEXT_PAGE: PageId = 0;
@@ -534,6 +558,10 @@ pub(crate) enum HeapFileError {
     RecordSerializationError(#[from] RecordError),
     #[error("there was not enough space on page to perform request")]
     NotEnoughSpaceOnPage,
+    #[error("column type ({column_ty}) and field type ({field_ty}) do not match")]
+    ColumnAndFieldTypesDontMatch { column_ty: String, field_ty: String },
+    #[error("{0}")]
+    DBSerializationError(#[from] DbSerializationError),
 }
 
 /// Structure responsible for managing on-disk heap files.
@@ -622,6 +650,23 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         Ok(ptr)
     }
 
+    pub(crate) fn update(
+        &self,
+        ptr: &RecordPtr,
+        updated_fields: Vec<FieldUpdateDescriptor>,
+    ) -> Result<(), HeapFileError> {
+        // Read record bytes from disk
+        let mut record_bytes = self.record_bytes(ptr)?;
+
+        // Update fields
+        for update in updated_fields {
+            self.update_field(&mut record_bytes, update)?;
+        }
+
+        // Save back to disk at the same ptr
+        todo!()
+    }
+
     /// Flushes [`HeapFile::metadata`] content to disk.
     ///
     /// If metadata is not dirty then this is no-op.
@@ -642,6 +687,59 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             }
             Err(_) => {
                 // Metadata was already clean
+                Ok(())
+            }
+        }
+    }
+
+    /// Reads [`Record`] located at `ptr` and returns its bare bytes.
+    fn record_bytes(&self, ptr: &RecordPtr) -> Result<Vec<u8>, HeapFileError> {
+        let first_page = self.read_record_page(ptr.page_id)?;
+        let fragment = first_page.record_fragment(ptr.slot)?;
+        let mut full_record_bytes = Vec::from(fragment.data);
+        let mut next_ptr = fragment.next_fragment;
+        while let Some(next) = next_ptr {
+            let next_fragment_page = self.read_overflow_page(next.page_id)?;
+            let fragment = next_fragment_page.record_fragment(next.slot)?;
+            full_record_bytes.extend_from_slice(fragment.data);
+            next_ptr = fragment.next_fragment;
+        }
+        Ok(full_record_bytes)
+    }
+
+    /// Updates `data` bytes according to description in `update`.
+    fn update_field(
+        &self,
+        data: &mut Vec<u8>,
+        update: FieldUpdateDescriptor,
+    ) -> Result<(), HeapFileError> {
+        match update.column.ty().is_fixed_size() {
+            true => {
+                // If column is fixed-sized we know it's offset in the record bytes just from metadata,
+                // we just need to update bytes at that offset.
+                let offset = update.column.base_offset();
+                update.field.serialize_into(&mut data[offset..]);
+                Ok(())
+            }
+            false => {
+                // If column is variable-sized then we need to calculate it offset by hand.
+                // Record can have multiple variable-sized fields next to each other, e.g.:
+                // [int32][string1][string2][string3]
+                // Let's assume we want to edit [string3]. Its base_offset is 4 (because of int32),
+                // its base_pos is 1 and its pos is 3.
+                // We need to calculate offset by hand starting from pos 1 until we reach pos 3.
+                let mut current_pos = update.column.base_offset_pos();
+                let mut offset = update.column.base_offset();
+                while current_pos != update.column.pos() {
+                    let (len, _) = u16::deserialize(&data[offset..(offset + size_of::<u16>())])?;
+                    offset += len as usize;
+                    current_pos += 1;
+                }
+                let (before_update_len, _) =
+                    u16::deserialize(&data[offset..(offset + size_of::<u16>())])?;
+                let mut serialized = Vec::with_capacity(update.field.size_serialized());
+                update.field.serialize(&mut serialized);
+                data.splice(offset..(offset + before_update_len as usize), serialized);
                 Ok(())
             }
         }
