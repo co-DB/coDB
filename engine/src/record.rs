@@ -145,6 +145,20 @@ impl Field {
         }
     }
 
+    /// Returns number of bytes that serialized field will take on disk.
+    pub(crate) fn size_serialized(&self) -> usize {
+        match self {
+            Field::Int32(i) => i.size_serialized(),
+            Field::Int64(i) => i.size_serialized(),
+            Field::Float32(f) => f.size_serialized(),
+            Field::Float64(f) => f.size_serialized(),
+            Field::DateTime(d) => d.size_serialized(),
+            Field::Date(d) => d.size_serialized(),
+            Field::String(s) => s.size_serialized(),
+            Field::Bool(b) => b.size_serialized(),
+        }
+    }
+
     /// Deserializes raw data type, wraps it into the corresponding field and maps the error to the
     /// field error type (adding the name of the field we are deserializing)
     fn deserialize_and_wrap<'a, T, F>(

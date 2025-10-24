@@ -10,12 +10,16 @@ macro_rules! impl_db_serializable_for {
                 }
 
                 fn serialize_into(&self, buffer: &mut [u8]) {
-                    buffer[..size_of::<Self>()].copy_from_slice(&self.to_le_bytes());
+                    buffer[..self.size_serialized()].copy_from_slice(&self.to_le_bytes());
                 }
 
                 fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
                     Self::read_fixed_and_convert::<$t, { size_of::<$t>() }>(buffer, <$t>::from_le_bytes)
                 }
+
+fn size_serialized(&self) -> usize {
+size_of::<Self>()
+}
             }
         )*
     };
@@ -38,6 +42,9 @@ pub(crate) trait DbSerializable: Sized {
     /// Returns a tuple containing the deserialized value and a slice
     /// of the remaining unconsumed bytes.
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError>;
+
+    /// Returns number of bytes that [`self`] will take when serialized.
+    fn size_serialized(&self) -> usize;
 
     /// Helper function to read a fixed number of bytes and convert them to a value.
     fn read_fixed_and_convert<T, const N: usize>(
@@ -90,6 +97,10 @@ impl DbSerializable for String {
             .into();
         Ok((string, &rest[string_len..]))
     }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<u16>() + self.len()
+    }
 }
 
 impl DbSerializable for bool {
@@ -109,6 +120,10 @@ impl DbSerializable for bool {
                 _ => Err(DbSerializationError::FailedToDeserialize),
             },
         )
+    }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<u8>()
     }
 }
 
@@ -160,6 +175,10 @@ impl DbSerializable for DbDate {
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
         Self::read_fixed_and_convert::<i32, { size_of::<i32>() }>(buffer, i32::from_le_bytes)
             .map(|(val, rest)| (DbDate::new(val), rest))
+    }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<i32>()
     }
 }
 
@@ -246,13 +265,18 @@ impl DbSerializable for DbDateTime {
     fn serialize_into(&self, buffer: &mut [u8]) {
         self.days_since_epoch().serialize_into(buffer);
         let days_since_epoch_size = size_of::<i32>();
-        self.milliseconds_since_midnight().serialize_into(&mut buffer[days_since_epoch_size..]);
+        self.milliseconds_since_midnight()
+            .serialize_into(&mut buffer[days_since_epoch_size..]);
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
         let (days, rest) = i32::deserialize(buffer)?;
         let (milliseconds, rest) = u32::deserialize(rest)?;
         Ok((DbDateTime::new(DbDate::new(days), milliseconds), rest))
+    }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<i32>() + size_of::<u32>()
     }
 }
 

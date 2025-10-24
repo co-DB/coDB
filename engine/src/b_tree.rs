@@ -132,6 +132,10 @@ impl DbSerializable for RecordPointer {
         let record_ptr = Self { page_id, slot_id };
         Ok((record_ptr, rest))
     }
+
+    fn size_serialized(&self) -> usize {
+        todo!()
+    }
 }
 
 /// Helper trait that every key of a b-tree must implement.
