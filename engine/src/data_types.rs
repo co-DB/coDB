@@ -9,6 +9,10 @@ macro_rules! impl_db_serializable_for {
                     buffer.extend(self.to_le_bytes());
                 }
 
+                fn serialize_into(&self, buffer: &mut [u8]) {
+                    buffer[..size_of::<Self>()].copy_from_slice(&self.to_le_bytes());
+                }
+
                 fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
                     Self::read_fixed_and_convert::<$t, { size_of::<$t>() }>(buffer, <$t>::from_le_bytes)
                 }
@@ -22,8 +26,12 @@ impl_db_serializable_for!(i32, i64, u8, u16, u32, u64, f32, f64);
 /// A trait for types that can be serialized to and deserialized from bytes
 /// for database storage.
 pub(crate) trait DbSerializable: Sized {
-    /// Serializes the value into the provided buffer.
+    /// Serializes the value into the provided buffer appending serialized value at the end of it.
     fn serialize(&self, buffer: &mut Vec<u8>);
+
+    /// Serializes the value at the beginning of the provided buffer.
+    /// The buffer must have enough space to hold serialized value, otherwise function should panic.
+    fn serialize_into(&self, buffer: &mut [u8]);
 
     /// Deserializes a value from the given byte slice.
     ///
@@ -61,6 +69,12 @@ impl DbSerializable for String {
         buffer.extend(self.as_bytes());
     }
 
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        let len_size = size_of::<u16>();
+        buffer[0..len_size].copy_from_slice(&(self.len() as u16).to_le_bytes());
+        buffer[len_size..(len_size + self.len())].copy_from_slice(&self.as_bytes());
+    }
+
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
         let (len, rest) = u16::deserialize(buffer)?;
         let string_len = len as usize;
@@ -81,6 +95,10 @@ impl DbSerializable for String {
 impl DbSerializable for bool {
     fn serialize(&self, buffer: &mut Vec<u8>) {
         buffer.push(*self as u8)
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        buffer[0] = *self as u8;
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
@@ -133,6 +151,10 @@ impl DbDate {
 impl DbSerializable for DbDate {
     fn serialize(&self, buffer: &mut Vec<u8>) {
         buffer.extend(self.days_since_epoch().to_le_bytes());
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        self.days_since_epoch().serialize_into(buffer);
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
@@ -219,6 +241,12 @@ impl DbSerializable for DbDateTime {
     fn serialize(&self, buffer: &mut Vec<u8>) {
         buffer.extend(self.days_since_epoch().to_le_bytes());
         buffer.extend(self.milliseconds_since_midnight().to_le_bytes());
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        self.days_since_epoch().serialize_into(buffer);
+        let days_since_epoch_size = size_of::<i32>();
+        self.milliseconds_since_midnight().serialize_into(&mut buffer[days_since_epoch_size..]);
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
