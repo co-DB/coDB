@@ -633,14 +633,20 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     ) -> Result<(), HeapFileError> {
         // Read record bytes from disk
         let mut record_bytes = self.record_bytes(ptr)?;
+        let mut bytes_changed = vec![false; record_bytes.len()];
 
         // Update fields
         for update in updated_fields {
-            self.update_field(&mut record_bytes, update)?;
+            self.update_field(&mut record_bytes, &mut bytes_changed, update)?;
+        }
+
+        if !bytes_changed.iter().any(|&b| b) {
+            // No change was made
+            return Ok(());
         }
 
         // Save back to disk at the same ptr
-        self.update_record_bytes(ptr, &record_bytes)?;
+        self.update_record_bytes(ptr, &record_bytes, &bytes_changed)?;
 
         Ok(())
     }
@@ -691,6 +697,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     fn update_field(
         &self,
         data: &mut Vec<u8>,
+        bytes_changed: &mut Vec<bool>,
         update: FieldUpdateDescriptor,
     ) -> Result<(), HeapFileError> {
         match update.column.ty().is_fixed_size() {
@@ -698,6 +705,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 // If column is fixed-sized we know it's offset in the record bytes just from metadata,
                 // we just need to update bytes at that offset.
                 let offset = update.column.base_offset();
+
+                bytes_changed[offset..(offset + update.field.size_serialized())].fill(true);
+
                 update.field.serialize_into(&mut data[offset..]);
                 Ok(())
             }
@@ -719,22 +729,33 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                     u16::deserialize(&data[offset..(offset + size_of::<u16>())])?;
                 let mut serialized = Vec::with_capacity(update.field.size_serialized());
                 update.field.serialize(&mut serialized);
+
+                let bytes_changed_frag = vec![true; serialized.len()];
+                bytes_changed.splice(
+                    offset..(offset + before_update_len as usize),
+                    bytes_changed_frag,
+                );
+
                 data.splice(offset..(offset + before_update_len as usize), serialized);
                 Ok(())
             }
         }
     }
 
-    /// Updates record bytes at `start`, following the same split across pages as previous value, e.g.
+    /// Updates record bytes at `start` (only those bytes for which flag is set to `true` in `bytes_changed`), following the same split across pages as previous value, e.g.
     /// if record was splitted [page1 -> 80bytes], [page2 -> 24bytes], [page3 -> 12bytes]
     /// then this is preserved if record has the same length.
     /// If length is different then the difference is applied at the end of pages chain.
+    ///
+    /// This function assumes that `bytes` and `bytes_changed` have the same length.
     fn update_record_bytes(
         &self,
         start: &RecordPtr,
-        new_bytes: &[u8],
+        bytes: &[u8],
+        bytes_changed: &[bool],
     ) -> Result<(), HeapFileError> {
-        let mut remaining_bytes = new_bytes;
+        let mut remaining_bytes = bytes;
+        let mut bytes_changed = bytes_changed;
 
         let mut first_page = self.write_record_page(start.page_id)?;
         let previous_first_fragment = first_page.record_fragment(start.slot)?;
@@ -742,6 +763,14 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // Previously record was stored on single page.
         if previous_first_fragment.next_fragment.is_none() {
             let previous_len = previous_first_fragment.data.len();
+
+            if !bytes_changed[..previous_len.min(remaining_bytes.len())]
+                .iter()
+                .any(|&b| b)
+            {
+                // No changes in this fragment, skip update
+                return Ok(());
+            }
 
             // We can safely store updated record at previous position because we know we have enough space
             if remaining_bytes.len() <= previous_len {
@@ -787,39 +816,94 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             return Ok(());
         }
 
-        // Record was stored across more than one page, but it now can be saved only in first page
-        if remaining_bytes.len() <= previous_first_fragment.data.len() {
-            let with_tag = RecordTag::with_final(remaining_bytes);
-            first_page.update(start.slot, &with_tag)?;
+        let first_frag_len = previous_first_fragment.data.len();
+        // We already checked and know that `next_fragment` cannot be `None`
+        let next_tag = previous_first_fragment.next_fragment.unwrap();
+
+        // Check if first fragment has any changes
+        if bytes_changed[..first_frag_len.min(remaining_bytes.len())]
+            .iter()
+            .any(|&b| b)
+        {
+            // Record was stored across more than one page, but it now can be saved only in first page
+            if remaining_bytes.len() <= previous_first_fragment.data.len() {
+                let with_tag = RecordTag::with_final(remaining_bytes);
+                first_page.update(start.slot, &with_tag)?;
+                self.record_pages_fsm
+                    .update_page_bucket_with_duplicate_check(
+                        start.page_id,
+                        first_page.page.free_space()? as _,
+                    );
+                // TODO: delete all fragments from other pages
+                return Ok(());
+            }
+
+            // Update fragment located on first page
+            let (first_page_part, rest) =
+                remaining_bytes.split_at(previous_first_fragment.data.len());
+            remaining_bytes = rest;
+
+            let first_page_part_with_tag =
+                RecordTag::with_has_continuation(first_page_part, &next_tag);
+            first_page.update(start.slot, &first_page_part_with_tag)?;
             self.record_pages_fsm
                 .update_page_bucket_with_duplicate_check(
                     start.page_id,
                     first_page.page.free_space()? as _,
                 );
-            // TODO: delete all fragments from other pages
-            return Ok(());
+        } else {
+            // Skip first fragment, just move pointers
+            let (_, rest) = remaining_bytes.split_at(first_frag_len);
+            remaining_bytes = rest;
         }
 
-        // Update fragment located on first page
-        let (first_page_part, rest) = remaining_bytes.split_at(previous_first_fragment.data.len());
-        remaining_bytes = rest;
-        // SAFETY: We already checked and know that `next_fragment` cannot be `None`
-        let next_tag = previous_first_fragment.next_fragment.unwrap();
-        let first_page_part_with_tag = RecordTag::with_has_continuation(first_page_part, &next_tag);
-        first_page.update(start.slot, &first_page_part_with_tag)?;
-        self.record_pages_fsm
-            .update_page_bucket_with_duplicate_check(
-                start.page_id,
-                first_page.page.free_space()? as _,
-            );
-
+        bytes_changed = &bytes_changed[first_frag_len..];
         let mut current_ptr = next_tag;
+
         while remaining_bytes.len() != 0 {
             let mut current_page = self.write_overflow_page(current_ptr.page_id)?;
             let current_fragment = current_page.record_fragment(current_ptr.slot)?;
 
             let current_frag_len = current_fragment.data.len();
             let next_frag = current_fragment.next_fragment;
+
+            let fragment_end = current_frag_len.min(remaining_bytes.len());
+
+            // Check if this fragment has any changes
+            if !bytes_changed[..fragment_end].iter().any(|&b| b) {
+                // No changes in this fragment, skip to next
+                if remaining_bytes.len() <= current_frag_len {
+                    // This was the last fragment with no changes
+                    return Ok(());
+                }
+
+                // Move to next fragment
+                bytes_changed = &bytes_changed[current_frag_len..];
+                let (_, rest) = remaining_bytes.split_at(current_frag_len);
+                remaining_bytes = rest;
+
+                match next_frag {
+                    Some(next_ptr) => {
+                        current_ptr = next_ptr;
+                        continue;
+                    }
+                    None => {
+                        // No more changes to made
+                        if remaining_bytes.is_empty() {
+                            return Ok(());
+                        }
+                        // Need to allocate new fragments for remaining changed bytes
+                        let rest_ptr =
+                            self.insert_using_only_overflow_pages(Vec::from(remaining_bytes))?;
+                        // Update current fragment to point to new chain
+                        let current_data = current_fragment.data;
+                        let current_with_tag =
+                            RecordTag::with_has_continuation(current_data, &rest_ptr);
+                        current_page.update(current_ptr.slot, &current_with_tag)?;
+                        return Ok(());
+                    }
+                }
+            }
 
             // We can save all remaining bytes on this page
             if remaining_bytes.len() <= current_frag_len {
