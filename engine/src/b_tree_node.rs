@@ -337,7 +337,6 @@ where
         let num_slots = self.slotted_page.num_slots()?;
 
         if num_slots == 0 {
-            // Edge case: empty internal node (corruption? root?)
             return Err(BTreeNodeError::CorruptNode {
                 reason: "internal node has no slots".into(),
             });
@@ -437,6 +436,12 @@ where
             }
             InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
         }
+    }
+
+    pub fn set_leftmost_child_id(&mut self, child_id: PageId) -> Result<(), BTreeNodeError> {
+        let header = self.get_btree_header_mut()?;
+        header.leftmost_child_pointer = child_id;
+        Ok(())
     }
 }
 impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
@@ -549,8 +554,8 @@ where
     pub fn set_next_leaf_id(&mut self, next_leaf_id: Option<PageId>) -> Result<(), BTreeNodeError> {
         let header = self.get_btree_header_mut()?;
         match next_leaf_id {
-            Some(next_leaf) => header.next_leaf_pointer == next_leaf,
-            None => header.next_leaf_pointer == BTreeLeafHeader::NO_NEXT_LEAF,
+            Some(next_leaf) => header.next_leaf_pointer = next_leaf,
+            None => header.next_leaf_pointer = BTreeLeafHeader::NO_NEXT_LEAF,
         };
         Ok(())
     }

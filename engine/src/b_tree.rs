@@ -3,6 +3,7 @@
     NodeInsertResult, NodeType, RecordPointer, get_node_type,
 };
 use crate::cache::{Cache, CacheError, FilePageRef, PageWrite, PinnedReadPage, PinnedWritePage};
+use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::files_manager::FileKey;
 use crate::paged_file::PageId;
 use crate::slotted_page::PageType::BTreeInternal;
@@ -19,6 +20,8 @@ pub(crate) enum BTreeError {
     NodeError(#[from] BTreeNodeError),
     #[error("tried to insert a duplicate key")]
     DuplicateKey,
+    #[error("deserialization error occurred: {0}")]
+    DeserializationError(#[from] DbSerializationError),
 }
 
 pub(crate) struct BTree<Key: BTreeKey> {
@@ -176,7 +179,7 @@ impl<Key: BTreeKey> BTree<Key> {
         is_unique: bool,
     ) -> Result<(), BTreeError> {
         // First we split half (by size) of the key in leaf node and get the separator key.
-        let (records, mut separator_key) = leaf_node.split_keys()?;
+        let (records, separator_key) = leaf_node.split_keys()?;
 
         // We must get the next leaf's page id from the leaf node being split.
         let next_leaf_id = leaf_node.next_leaf_id()?;
@@ -192,32 +195,103 @@ impl<Key: BTreeKey> BTree<Key> {
         // Make the old leaf point to the new one
         leaf_node.set_next_leaf_id(Some(new_leaf_id))?;
 
-        // TODO (for indexes): Maybe handle the case where it is equal (for now assuming it can' be)
         if separator_key > key {
             leaf_node.insert(key, record_pointer, is_unique)?;
-        } else {
+        } else if separator_key < key {
             new_leaf_node.insert(key, record_pointer, is_unique)?;
+        } else if is_unique {
+            return Err(BTreeError::DuplicateKey);
+        } else {
+            // TODO: Change this for indexes.
+            unimplemented!()
         }
 
         // We have the leaf nodes set up correctly, so we must now propagate the separator key
         // along with the new leaf node page id up to the parent internal node.
 
-        // This means we are in root
+        // This means we are in root.
         if internal_nodes.is_empty() {
+            // Since we need to put the new separator key somewhere, we need to create a new root.
+            // TODO: Change the root page id here
+            return self.create_new_root(self.root_page_id, separator_key, new_leaf_id);
         } else {
+            let mut current_separator_key = separator_key.clone();
+            let mut child_page_id = new_leaf_id;
             while let Some((page_id, mut internal_node)) = internal_nodes.pop() {
-                match internal_node.insert(separator_key.clone(), page_id)? {
+                match internal_node.insert(current_separator_key.clone(), page_id)? {
                     NodeInsertResult::KeyAlreadyExists => return Err(BTreeError::DuplicateKey),
                     NodeInsertResult::Success => return Ok(()),
-                    NodeInsertResult::PageFull => {}
+                    NodeInsertResult::PageFull => {
+                        // Need to split this internal node too
+                        let (split_records, new_separator) = internal_node.split_keys()?;
+
+                        let (new_internal_page, new_internal_id) =
+                            self.cache.allocate_page(&self.file_key)?;
+                        let mut new_internal_node =
+                            BTreeInternalNode::<PinnedWritePage, Key>::initialize(
+                                new_internal_page,
+                            );
+
+                        // The first record in split_records contains the leftmost child
+                        // pointer for the new internal node. This is because the key of this record
+                        // is moved to the parent node and thus its pointer (which points to a page
+                        // with keys >= key[0] && < key[1]) now fulfills the criteria to be leftmost
+                        // child pointer.
+                        let (_, child_ptr_bytes) = Key::deserialize(&split_records[0])?;
+                        let (child_ptr, _) = PageId::deserialize(child_ptr_bytes)?;
+
+                        // We don't insert the first key as it is moved up to parent
+                        new_internal_node.batch_insert(split_records[1..].to_vec())?;
+                        new_internal_node.set_leftmost_child_id(child_ptr)?;
+
+                        if new_separator > current_separator_key {
+                            internal_node.insert(current_separator_key, child_page_id)?;
+                        } else if new_separator < current_separator_key {
+                            new_internal_node.insert(current_separator_key, child_page_id)?;
+                        } else if is_unique {
+                            return Err(BTreeError::DuplicateKey);
+                        } else {
+                            // TODO: Change this for indexes.
+                            unimplemented!()
+                        }
+
+                        current_separator_key = new_separator;
+                        child_page_id = new_internal_id;
+
+                        // If this was the last internal node (the root), create new root
+                        // TODO: Change the root page id here
+                        if internal_nodes.is_empty() {
+                            return self.create_new_root(
+                                self.root_page_id,
+                                current_separator_key,
+                                child_page_id,
+                            );
+                        }
+                    }
                 };
             }
         }
         Ok(())
     }
 
-    // TODO: Implement this
-    fn update_root(new_root_id: PageId) -> Result<(), BTreeError> {
+    fn create_new_root(
+        &mut self,
+        left_child_id: PageId,
+        separator_key: Key,
+        right_child_id: PageId,
+    ) -> Result<(), BTreeError> {
+        let (new_root_page, new_root_id) = self.cache.allocate_page(&self.file_key)?;
+        let mut new_root = BTreeInternalNode::<PinnedWritePage, Key>::initialize(new_root_page);
+
+        // Set the leftmost child to point to the left child (old root or left sibling)
+        new_root.set_leftmost_child_id(left_child_id)?;
+
+        // Insert the separator key with the right child pointer
+        new_root.insert(separator_key, right_child_id)?;
+
+        // TODO: Set new root id when root page manager exists
+        // e.g Self::set_new_root_id(new_root_id);
+
         Ok(())
     }
 }
