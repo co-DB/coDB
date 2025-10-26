@@ -17,9 +17,9 @@ macro_rules! impl_db_serializable_for {
                     Self::read_fixed_and_convert::<$t, { size_of::<$t>() }>(buffer, <$t>::from_le_bytes)
                 }
 
-fn size_serialized(&self) -> usize {
-size_of::<Self>()
-}
+                fn size_serialized(&self) -> usize {
+                    size_of::<Self>()
+                }
             }
         )*
     };
