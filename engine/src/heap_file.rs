@@ -724,21 +724,27 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 let mut offset = update.column.base_offset();
                 while current_pos != update.column.pos() {
                     let (len, _) = u16::deserialize(&data[offset..(offset + size_of::<u16>())])?;
-                    offset += len as usize;
+                    offset += size_of::<u16>() + len as usize;
                     current_pos += 1;
                 }
                 let (before_update_len, _) =
                     u16::deserialize(&data[offset..(offset + size_of::<u16>())])?;
+                let before_update_total_size = size_of::<u16>() + before_update_len as usize;
+
                 let mut serialized = Vec::with_capacity(update.field.size_serialized());
                 update.field.serialize(&mut serialized);
 
                 let bytes_changed_frag = vec![true; serialized.len()];
                 bytes_changed.splice(
-                    offset..(offset + before_update_len as usize),
+                    offset..(offset + before_update_total_size),
                     bytes_changed_frag,
                 );
+                // When we update a string and its len changes we must update all fields that come after it
+                if serialized.len() != before_update_total_size {
+                    bytes_changed[(offset + serialized.len())..].fill(true);
+                }
 
-                data.splice(offset..(offset + before_update_len as usize), serialized);
+                data.splice(offset..(offset + before_update_total_size), serialized);
                 Ok(())
             }
         }
@@ -3695,4 +3701,168 @@ mod tests {
 
         assert_eq!(fragment_count, 2);
     }
+
+    #[test]
+    fn heap_file_update_middle_string_field_grows_large() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file with 3 string fields
+        let columns_metadata = vec![
+            ColumnMetadata::new("first_name".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("middle_name".into(), Type::String, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("last_name".into(), Type::String, 2, 0, 0).unwrap(),
+        ];
+
+        let factory =
+            HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record with three small strings
+        let original_record = Record::new(vec![
+            Field::String("John".into()),
+            Field::String("Middle".into()),
+            Field::String("Doe".into()),
+        ]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update the middle string to be very large (more than one page)
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        let large_middle_name = "M".repeat(max_single_page_size + 500);
+
+        let column_metadata = columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String(large_middle_name.clone()))
+                .unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_string("John", &updated_record.fields[0]);
+        assert_string(&large_middle_name, &updated_record.fields[1]);
+        assert_string("Doe", &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_update_middle_string_field_shrinks_small() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file with 3 string fields
+        let columns_metadata = vec![
+            ColumnMetadata::new("first_name".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("middle_name".into(), Type::String, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("last_name".into(), Type::String, 2, 0, 0).unwrap(),
+        ];
+
+        let factory =
+            HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Create a very large middle string (more than one page)
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        let large_middle_name = "M".repeat(max_single_page_size + 500);
+
+        // Insert a record with small first/last names and large middle name
+        let original_record = Record::new(vec![
+            Field::String("John".into()),
+            Field::String(large_middle_name.clone()),
+            Field::String("Doe".into()),
+        ]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update the middle string to be very small
+        let small_middle_name = "M";
+
+        let column_metadata = columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String(small_middle_name.into()))
+                .unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_string("John", &updated_record.fields[0]);
+        assert_string(small_middle_name, &updated_record.fields[1]);
+        assert_string("Doe", &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_update_all_string_fields_grow_ten_times() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file with 5 string fields
+        let columns_metadata = vec![
+            ColumnMetadata::new("field1".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("field2".into(), Type::String, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("field3".into(), Type::String, 2, 0, 0).unwrap(),
+            ColumnMetadata::new("field4".into(), Type::String, 3, 0, 0).unwrap(),
+            ColumnMetadata::new("field5".into(), Type::String, 4, 0, 0).unwrap(),
+        ];
+
+        let factory =
+            HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record with 5 small strings
+        let original_strings = vec![
+            "field1_initial",
+            "field2_initial",
+            "field3_initial",
+            "field4_initial",
+            "field5_initial",
+        ];
+
+        let original_record = Record::new(
+            original_strings
+                .iter()
+                .map(|s| Field::String(s.to_string()))
+                .collect(),
+        );
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Create updated strings that are 10x larger
+        let updated_strings: Vec<String> = original_strings.iter().map(|s| s.repeat(10)).collect();
+
+        // Create update descriptors for all 5 fields
+        let update_descriptors: Vec<FieldUpdateDescriptor> = columns_metadata
+            .iter()
+            .zip(updated_strings.iter())
+            .map(|(col, s)| {
+                FieldUpdateDescriptor::new(col.clone(), Field::String(s.clone())).unwrap()
+            })
+            .collect();
+
+        // Perform the update
+        heap_file.update(&record_ptr, update_descriptors).unwrap();
+
+        // Read back the record to verify all updates
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 5);
+
+        // Verify each field was updated correctly
+        for (i, expected_string) in updated_strings.iter().enumerate() {
+            assert_string(expected_string, &updated_record.fields[i]);
+        }
+    }
+
+    // TODO: add tests for concurrent updates
 }
