@@ -388,6 +388,43 @@ impl FieldUpdateDescriptor {
     }
 }
 
+/// Helper for managing fragment traversal state during record updates
+struct FragmentProcessor<'a> {
+    remaining_bytes: &'a [u8],
+    bytes_changed: &'a [bool],
+}
+
+impl<'a> FragmentProcessor<'a> {
+    fn new(remaining_bytes: &'a [u8], bytes_changed: &'a [bool]) -> Self {
+        Self {
+            remaining_bytes,
+            bytes_changed,
+        }
+    }
+
+    /// Checks if the current fragment has any changes
+    fn has_changes(&self, fragment_len: usize) -> bool {
+        let check_len = fragment_len.min(self.remaining_bytes.len());
+        self.bytes_changed[..check_len].iter().any(|&b| b)
+    }
+
+    /// Advances past the current fragment
+    fn skip_fragment(&mut self, fragment_len: usize) {
+        self.remaining_bytes = &self.remaining_bytes[fragment_len..];
+        self.bytes_changed = &self.bytes_changed[fragment_len..];
+    }
+
+    /// Returns true if we've processed all bytes
+    fn is_complete(&self) -> bool {
+        self.remaining_bytes.is_empty()
+    }
+
+    /// Returns true if this is the last fragment (remaining bytes fit in fragment)
+    fn is_last_fragment(&self, fragment_len: usize) -> bool {
+        self.remaining_bytes.len() <= fragment_len
+    }
+}
+
 /// Trait that provides common functionality for all heap page headers.
 trait BaseHeapPageHeader: SlottedPageHeader {
     const NO_NEXT_PAGE: PageId = 0;
@@ -762,8 +799,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         bytes: &[u8],
         bytes_changed: &[bool],
     ) -> Result<(), HeapFileError> {
-        let mut remaining_bytes = bytes;
-        let mut bytes_changed = bytes_changed;
+        let mut processor = FragmentProcessor::new(bytes, bytes_changed);
 
         let mut first_page = self.write_record_page(start.page_id)?;
         let previous_first_fragment = first_page.record_fragment(start.slot)?;
@@ -772,10 +808,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         if previous_first_fragment.next_fragment.is_none() {
             let previous_len = previous_first_fragment.data.len();
 
-            if !bytes_changed[..previous_len.min(remaining_bytes.len())]
-                .iter()
-                .any(|&b| b)
-            {
+            if !processor.has_changes(previous_len) {
                 // No changes in this fragment, skip update
                 return Ok(());
             }
@@ -785,7 +818,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 &mut first_page,
                 start.slot,
                 start.page_id,
-                remaining_bytes,
+                processor.remaining_bytes,
                 previous_len,
                 &self.record_pages_fsm,
             )? {
@@ -798,7 +831,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 &mut first_page,
                 start.slot,
                 start.page_id,
-                remaining_bytes,
+                processor.remaining_bytes,
                 previous_len,
                 &self.record_pages_fsm,
             )?;
@@ -810,13 +843,10 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let next_tag = previous_first_fragment.next_fragment.unwrap();
 
         // Check if first fragment has any changes
-        if bytes_changed[..first_frag_len.min(remaining_bytes.len())]
-            .iter()
-            .any(|&b| b)
-        {
+        if processor.has_changes(first_frag_len) {
             // Record was stored across more than one page, but it now can be saved only in first page
-            if remaining_bytes.len() <= previous_first_fragment.data.len() {
-                let with_tag = RecordTag::with_final(remaining_bytes);
+            if processor.is_last_fragment(first_frag_len) {
+                let with_tag = RecordTag::with_final(processor.remaining_bytes);
                 self.update_record_page_with_fsm(
                     &mut first_page,
                     start.slot,
@@ -828,9 +858,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             }
 
             // Update fragment located on first page
-            let (first_page_part, rest) =
-                remaining_bytes.split_at(previous_first_fragment.data.len());
-            remaining_bytes = rest;
+            let (first_page_part, _) = processor.remaining_bytes.split_at(first_frag_len);
 
             let first_page_part_with_tag =
                 RecordTag::with_has_continuation(first_page_part, &next_tag);
@@ -840,36 +868,26 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 &first_page_part_with_tag,
                 start.page_id,
             )?;
-        } else {
-            // Skip first fragment, just move pointers
-            let (_, rest) = remaining_bytes.split_at(first_frag_len);
-            remaining_bytes = rest;
         }
 
-        bytes_changed = &bytes_changed[first_frag_len..];
+        // Skip first fragment after processing it
+        processor.skip_fragment(first_frag_len);
         let mut current_ptr = next_tag;
 
-        while remaining_bytes.len() != 0 {
+        while !processor.is_complete() {
             let mut current_page = self.write_overflow_page(current_ptr.page_id)?;
             let current_fragment = current_page.record_fragment(current_ptr.slot)?;
 
             let current_frag_len = current_fragment.data.len();
             let next_frag = current_fragment.next_fragment;
 
-            let fragment_end = current_frag_len.min(remaining_bytes.len());
-
-            // Check if this fragment has any changes
-            if !bytes_changed[..fragment_end].iter().any(|&b| b) {
-                // No changes in this fragment, skip to next
-                if remaining_bytes.len() <= current_frag_len {
-                    // This was the last fragment with no changes
+            if !processor.has_changes(current_frag_len) {
+                // This was the last fragment with no changes
+                if processor.is_last_fragment(current_frag_len) {
                     return Ok(());
                 }
 
-                // Move to next fragment
-                bytes_changed = &bytes_changed[current_frag_len..];
-                let (_, rest) = remaining_bytes.split_at(current_frag_len);
-                remaining_bytes = rest;
+                processor.skip_fragment(current_frag_len);
 
                 match next_frag {
                     Some(next_ptr) => {
@@ -878,12 +896,13 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                     }
                     None => {
                         // No more changes to made
-                        if remaining_bytes.is_empty() {
+                        if processor.is_complete() {
                             return Ok(());
                         }
                         // Need to allocate new fragments for remaining changed bytes
-                        let rest_ptr =
-                            self.insert_using_only_overflow_pages(Vec::from(remaining_bytes))?;
+                        let rest_ptr = self.insert_using_only_overflow_pages(Vec::from(
+                            processor.remaining_bytes,
+                        ))?;
                         // Update current fragment to point to new chain
                         let current_data = current_fragment.data;
                         let current_with_tag =
@@ -899,7 +918,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 &mut current_page,
                 current_ptr.slot,
                 current_ptr.page_id,
-                remaining_bytes,
+                processor.remaining_bytes,
                 current_frag_len,
                 &self.overflow_pages_fsm,
             )? {
@@ -911,8 +930,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             match next_frag {
                 Some(next_ptr) => {
                     // In this case we have next_ptr, so we update bytes on this page and go to the next one
-                    let (current_page_part, rest) = remaining_bytes.split_at(current_frag_len);
-                    remaining_bytes = rest;
+                    let (current_page_part, _) =
+                        processor.remaining_bytes.split_at(current_frag_len);
                     let current_with_tag =
                         RecordTag::with_has_continuation(&current_page_part, &next_ptr);
                     current_page.update(current_ptr.slot, &current_with_tag)?;
@@ -924,7 +943,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                         &mut current_page,
                         current_ptr.slot,
                         current_ptr.page_id,
-                        remaining_bytes,
+                        processor.remaining_bytes,
                         current_frag_len,
                         &self.overflow_pages_fsm,
                     )?;
