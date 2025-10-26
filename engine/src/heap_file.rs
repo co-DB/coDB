@@ -783,25 +783,25 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             // We can safely store updated record at previous position because we know we have enough space
             if remaining_bytes.len() <= previous_len {
                 let with_tag = RecordTag::with_final(remaining_bytes);
-                first_page.update(start.slot, &with_tag)?;
-                self.record_pages_fsm
-                    .update_page_bucket_with_duplicate_check(
-                        start.page_id,
-                        first_page.page.free_space()? as _,
-                    );
+                self.update_record_page_with_fsm(
+                    &mut first_page,
+                    start.slot,
+                    &with_tag,
+                    start.page_id,
+                )?;
                 return Ok(());
             }
 
             // We need more space, but potentially record can fit in this page (it can fail if page has other record inserted)
             if remaining_bytes.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
                 let with_tag = RecordTag::with_final(remaining_bytes);
-                match first_page.update(start.slot, &with_tag) {
+                match self.update_record_page_with_fsm(
+                    &mut first_page,
+                    start.slot,
+                    &with_tag,
+                    start.page_id,
+                ) {
                     Ok(_) => {
-                        self.record_pages_fsm
-                            .update_page_bucket_with_duplicate_check(
-                                start.page_id,
-                                first_page.page.free_space()? as _,
-                            );
                         return Ok(());
                     }
                     Err(e) => match e {
@@ -836,12 +836,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             // Record was stored across more than one page, but it now can be saved only in first page
             if remaining_bytes.len() <= previous_first_fragment.data.len() {
                 let with_tag = RecordTag::with_final(remaining_bytes);
-                first_page.update(start.slot, &with_tag)?;
-                self.record_pages_fsm
-                    .update_page_bucket_with_duplicate_check(
-                        start.page_id,
-                        first_page.page.free_space()? as _,
-                    );
+                self.update_record_page_with_fsm(
+                    &mut first_page,
+                    start.slot,
+                    &with_tag,
+                    start.page_id,
+                )?;
                 // TODO: delete all fragments from other pages
                 return Ok(());
             }
@@ -853,12 +853,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
             let first_page_part_with_tag =
                 RecordTag::with_has_continuation(first_page_part, &next_tag);
-            first_page.update(start.slot, &first_page_part_with_tag)?;
-            self.record_pages_fsm
-                .update_page_bucket_with_duplicate_check(
-                    start.page_id,
-                    first_page.page.free_space()? as _,
-                );
+            self.update_record_page_with_fsm(
+                &mut first_page,
+                start.slot,
+                &first_page_part_with_tag,
+                start.page_id,
+            )?;
         } else {
             // Skip first fragment, just move pointers
             let (_, rest) = remaining_bytes.split_at(first_frag_len);
@@ -916,12 +916,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             // We can save all remaining bytes on this page
             if remaining_bytes.len() <= current_frag_len {
                 let with_tag = RecordTag::with_final(remaining_bytes);
-                current_page.update(current_ptr.slot, &with_tag)?;
-                self.overflow_pages_fsm
-                    .update_page_bucket_with_duplicate_check(
-                        current_ptr.page_id,
-                        current_page.page.free_space()? as _,
-                    );
+                self.update_overflow_page_with_fsm(
+                    &mut current_page,
+                    current_ptr.slot,
+                    &with_tag,
+                    current_ptr.page_id,
+                )?;
                 // TODO: delete all fragments after this
                 return Ok(());
             }
@@ -929,13 +929,13 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             // We need more space, but potentially record can fit in this page (it can fail if page has other record inserted)
             if remaining_bytes.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
                 let with_tag = RecordTag::with_final(remaining_bytes);
-                match current_page.update(current_ptr.slot, &with_tag) {
+                match self.update_overflow_page_with_fsm(
+                    &mut current_page,
+                    current_ptr.slot,
+                    &with_tag,
+                    current_ptr.page_id,
+                ) {
                     Ok(_) => {
-                        self.overflow_pages_fsm
-                            .update_page_bucket_with_duplicate_check(
-                                current_ptr.page_id,
-                                current_page.page.free_space()? as _,
-                            );
                         return Ok(());
                     }
                     Err(e) => match e {
@@ -968,12 +968,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                     let rest_ptr = self.insert_using_only_overflow_pages(Vec::from(rest))?;
                     let current_with_tag =
                         RecordTag::with_has_continuation(&current_page_part, &rest_ptr);
-                    current_page.update(current_ptr.slot, &current_with_tag)?;
-                    self.overflow_pages_fsm
-                        .update_page_bucket_with_duplicate_check(
-                            current_ptr.page_id,
-                            current_page.page.free_space()? as _,
-                        );
+                    self.update_overflow_page_with_fsm(
+                        &mut current_page,
+                        current_ptr.slot,
+                        &current_with_tag,
+                        current_ptr.page_id,
+                    )?;
                     return Ok(());
                 }
             }
@@ -1234,6 +1234,45 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
         insert_first_fragment(self, &data)
+    }
+
+    /// Generic helper for updating a record and registering the page in FSM
+    fn update_page_with_fsm<H>(
+        &self,
+        page: &mut HeapPage<PinnedWritePage, H>,
+        slot: SlotId,
+        data: &[u8],
+        page_id: PageId,
+        fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
+    ) -> Result<(), HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+    {
+        page.update(slot, data)?;
+        fsm.update_page_bucket_with_duplicate_check(page_id, page.page.free_space()? as _);
+        Ok(())
+    }
+
+    /// Updates a record on a record page and updates FSM
+    fn update_record_page_with_fsm(
+        &self,
+        page: &mut HeapPage<PinnedWritePage, RecordPageHeader>,
+        slot: SlotId,
+        data: &[u8],
+        page_id: PageId,
+    ) -> Result<(), HeapFileError> {
+        self.update_page_with_fsm(page, slot, data, page_id, &self.record_pages_fsm)
+    }
+
+    /// Updates a record on an overflow page and updates FSM
+    fn update_overflow_page_with_fsm(
+        &self,
+        page: &mut HeapPage<PinnedWritePage, OverflowPageHeader>,
+        slot: SlotId,
+        data: &[u8],
+        page_id: PageId,
+    ) -> Result<(), HeapFileError> {
+        self.update_page_with_fsm(page, slot, data, page_id, &self.overflow_pages_fsm)
     }
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
