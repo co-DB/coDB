@@ -780,47 +780,28 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 return Ok(());
             }
 
-            // We can safely store updated record at previous position because we know we have enough space
-            if remaining_bytes.len() <= previous_len {
-                let with_tag = RecordTag::with_final(remaining_bytes);
-                self.update_record_page_with_fsm(
-                    &mut first_page,
-                    start.slot,
-                    &with_tag,
-                    start.page_id,
-                )?;
+            // Try to update in place
+            if self.try_update_fragment_in_place(
+                &mut first_page,
+                start.slot,
+                start.page_id,
+                remaining_bytes,
+                previous_len,
+                &self.record_pages_fsm,
+            )? {
                 return Ok(());
-            }
-
-            // We need more space, but potentially record can fit in this page (it can fail if page has other record inserted)
-            if remaining_bytes.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
-                let with_tag = RecordTag::with_final(remaining_bytes);
-                match self.update_record_page_with_fsm(
-                    &mut first_page,
-                    start.slot,
-                    &with_tag,
-                    start.page_id,
-                ) {
-                    Ok(_) => {
-                        return Ok(());
-                    }
-                    Err(e) => match e {
-                        // There wasn't enough space, so we need to split the record
-                        HeapFileError::NotEnoughSpaceOnPage => {}
-                        _ => return Err(e),
-                    },
-                }
             }
 
             // Record cannot fit in this page. We store as much as before (`- RecordPtr` to be sure continuation will fit)
             // in the first page and save `rest` in other page(s).
-            let (first_page_part, rest) =
-                remaining_bytes.split_at(previous_len - size_of::<RecordPtr>());
-
-            let rest_ptr = self.insert_using_only_overflow_pages(Vec::from(rest))?;
-
-            let first_with_tag = RecordTag::with_has_continuation(first_page_part, &rest_ptr);
-            first_page.update(start.slot, &first_with_tag)?;
+            self.split_and_extend_fragment(
+                &mut first_page,
+                start.slot,
+                start.page_id,
+                remaining_bytes,
+                previous_len,
+                &self.record_pages_fsm,
+            )?;
             return Ok(());
         }
 
@@ -913,37 +894,17 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 }
             }
 
-            // We can save all remaining bytes on this page
-            if remaining_bytes.len() <= current_frag_len {
-                let with_tag = RecordTag::with_final(remaining_bytes);
-                self.update_overflow_page_with_fsm(
-                    &mut current_page,
-                    current_ptr.slot,
-                    &with_tag,
-                    current_ptr.page_id,
-                )?;
+            // Try to update in place
+            if self.try_update_fragment_in_place(
+                &mut current_page,
+                current_ptr.slot,
+                current_ptr.page_id,
+                remaining_bytes,
+                current_frag_len,
+                &self.overflow_pages_fsm,
+            )? {
                 // TODO: delete all fragments after this
                 return Ok(());
-            }
-
-            // We need more space, but potentially record can fit in this page (it can fail if page has other record inserted)
-            if remaining_bytes.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
-                let with_tag = RecordTag::with_final(remaining_bytes);
-                match self.update_overflow_page_with_fsm(
-                    &mut current_page,
-                    current_ptr.slot,
-                    &with_tag,
-                    current_ptr.page_id,
-                ) {
-                    Ok(_) => {
-                        return Ok(());
-                    }
-                    Err(e) => match e {
-                        // There wasn't enough space, so we need to split the record
-                        HeapFileError::NotEnoughSpaceOnPage => {}
-                        _ => return Err(e),
-                    },
-                }
             }
 
             // At this point we know that remaining_bytes > current_fragment
@@ -959,26 +920,93 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 }
                 None => {
                     // This is the last fragment from original chain, so additional bytes can be added wherever we want
-
-                    // When converting from Final to HasContinuation, we need space for RecordPtr
-                    // So we can only keep (current_frag_len - size_of::<RecordPtr>()) bytes in this fragment
-                    let space_for_data = current_frag_len.saturating_sub(size_of::<RecordPtr>());
-
-                    let (current_page_part, rest) = remaining_bytes.split_at(space_for_data);
-                    let rest_ptr = self.insert_using_only_overflow_pages(Vec::from(rest))?;
-                    let current_with_tag =
-                        RecordTag::with_has_continuation(&current_page_part, &rest_ptr);
-                    self.update_overflow_page_with_fsm(
+                    self.split_and_extend_fragment(
                         &mut current_page,
                         current_ptr.slot,
-                        &current_with_tag,
                         current_ptr.page_id,
+                        remaining_bytes,
+                        current_frag_len,
+                        &self.overflow_pages_fsm,
                     )?;
                     return Ok(());
                 }
             }
         }
 
+        Ok(())
+    }
+
+    /// Attempts to update a fragment with new data, first trying to fit it in available space,
+    /// then trying to fit it as a single fragment if possible.
+    ///
+    /// Returns `Ok(true)` if update was successful, `Ok(false)` if there wasn't enough space
+    /// and the caller should handle splitting the record.
+    fn try_update_fragment_in_place<H>(
+        &self,
+        page: &mut HeapPage<PinnedWritePage, H>,
+        slot: SlotId,
+        page_id: PageId,
+        remaining_bytes: &[u8],
+        previous_len: usize,
+        fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
+    ) -> Result<bool, HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+    {
+        // We can safely store updated record at previous position because we know we have enough space
+        if remaining_bytes.len() <= previous_len {
+            let with_tag = RecordTag::with_final(remaining_bytes);
+            self.update_page_with_fsm(page, slot, &with_tag, page_id, fsm)?;
+            return Ok(true);
+        }
+
+        // We need more space, but potentially record can fit in this page (it can fail if page has other record inserted)
+        if remaining_bytes.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
+            let with_tag = RecordTag::with_final(remaining_bytes);
+            match self.update_page_with_fsm(page, slot, &with_tag, page_id, fsm) {
+                Ok(_) => {
+                    return Ok(true);
+                }
+                Err(e) => match e {
+                    // There wasn't enough space, so we need to split the record
+                    HeapFileError::NotEnoughSpaceOnPage => {
+                        return Ok(false);
+                    }
+                    _ => return Err(e),
+                },
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Converts a Final fragment to HasContinuation by splitting the data and allocating
+    /// overflow pages for the remaining bytes.
+    ///
+    /// Takes the maximum amount of data that can fit in the current fragment (accounting for
+    /// the RecordPtr overhead), stores it with a continuation tag, and recursively stores
+    /// the remaining data in overflow pages.
+    fn split_and_extend_fragment<H>(
+        &self,
+        page: &mut HeapPage<PinnedWritePage, H>,
+        slot: SlotId,
+        page_id: PageId,
+        remaining_bytes: &[u8],
+        previous_fragment_len: usize,
+        fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
+    ) -> Result<(), HeapFileError>
+    where
+        H: BaseHeapPageHeader,
+    {
+        // When converting from Final to HasContinuation, we need space for RecordPtr
+        // So we can only keep (previous_fragment_len - size_of::<RecordPtr>()) bytes in this fragment
+        let space_for_data = previous_fragment_len.saturating_sub(size_of::<RecordPtr>());
+
+        let (current_page_part, rest) = remaining_bytes.split_at(space_for_data);
+        let rest_ptr = self.insert_using_only_overflow_pages(Vec::from(rest))?;
+        let current_with_tag = RecordTag::with_has_continuation(current_page_part, &rest_ptr);
+
+        self.update_page_with_fsm(page, slot, &current_with_tag, page_id, fsm)?;
         Ok(())
     }
 
@@ -1437,6 +1465,8 @@ mod tests {
         }
     }
 
+    // TODO: This fails to drop the dir after tests are finished.
+    // We need to figure it out somehow.
     /// Creates a test cache and files manager in a temporary directory
     fn setup_test_cache() -> (Arc<Cache>, Arc<FilesManager>, FileKey) {
         let temp_dir = tempdir().unwrap();
