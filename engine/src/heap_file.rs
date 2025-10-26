@@ -618,9 +618,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Inserts `record` into heap file and returns its [`RecordPtr`].
     pub(crate) fn insert(&self, record: Record) -> Result<RecordPtr, HeapFileError> {
         let serialized = record.serialize();
-        self.insert_record_internal(serialized, |heap_file, data| {
-            heap_file.insert_to_record_page(data)
-        })
+        self.insert_record_internal(
+            serialized,
+            |heap_file, data| heap_file.insert_to_record_page(data),
+            |heap_file, data| heap_file.insert_to_overflow_page(data),
+        )
     }
 
     /// Applies all updates described in `updated_fields` to [`Record`] stored at `ptr`.
@@ -951,11 +953,21 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 }
                 None => {
                     // This is the last fragment from original chain, so additional bytes can be added wherever we want
-                    let (current_page_part, rest) = remaining_bytes.split_at(current_frag_len);
+
+                    // When converting from Final to HasContinuation, we need space for RecordPtr
+                    // So we can only keep (current_frag_len - size_of::<RecordPtr>()) bytes in this fragment
+                    let space_for_data = current_frag_len.saturating_sub(size_of::<RecordPtr>());
+
+                    let (current_page_part, rest) = remaining_bytes.split_at(space_for_data);
                     let rest_ptr = self.insert_using_only_overflow_pages(Vec::from(rest))?;
                     let current_with_tag =
                         RecordTag::with_has_continuation(&current_page_part, &rest_ptr);
                     current_page.update(current_ptr.slot, &current_with_tag)?;
+                    self.overflow_pages_fsm
+                        .update_page_bucket_with_duplicate_check(
+                            current_ptr.page_id,
+                            current_page.page.free_space()? as _,
+                        );
                     return Ok(());
                 }
             }
@@ -966,13 +978,40 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
     /// Inserts `data` into heap file using only overflow pages and returns its [`RecordPtr`].
     /// It is intended to use during update operation.
+    /// We use new allocation, because otherwise we end up with deadlock as we hold write-lock to page and fsm wants to get it as well.
     pub fn insert_using_only_overflow_pages(
         &self,
         serialized: Vec<u8>,
     ) -> Result<RecordPtr, HeapFileError> {
-        self.insert_record_internal(serialized, |heap_file, data| {
-            heap_file.insert_to_overflow_page(data)
-        })
+        self.insert_record_internal(
+            serialized,
+            |heap_file, data| heap_file.insert_to_overflow_with_new_allocation(data),
+            |heap_file, data| heap_file.insert_to_overflow_with_new_allocation(data),
+        )
+    }
+
+    /// Same as [`Self::insert_to_overflow_page`], but it doesn't check fsm and always allocates page.
+    fn insert_to_overflow_with_new_allocation(
+        &self,
+        data: &[u8],
+    ) -> Result<RecordPtr, HeapFileError> {
+        let (page_id, mut page) = self.allocate_overflow_page()?;
+
+        let slot_id = match page.insert(data) {
+            Ok(slot_id) => slot_id,
+            Err(HeapFileError::NotEnoughSpaceOnPage) => {
+                panic!("fatal error - not enough space returned on page from FSM/allocated page")
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.overflow_pages_fsm
+            .update_page_bucket(page_id, page.page.free_space()? as _);
+
+        return Ok(RecordPtr {
+            page_id,
+            slot: slot_id,
+        });
     }
 
     /// Generic helper for reading any type of heap page
@@ -1145,13 +1184,15 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Generic helper for inserting serialized record data using first-fragment-insert strategy
     // TODO: we need to keep previous page before getting the new one, and drop it only when we
     // get the new one, because otheriwse we migth have race condition
-    fn insert_record_internal<F>(
+    fn insert_record_internal<F, G>(
         &self,
         mut serialized: Vec<u8>,
         insert_first_fragment: F,
+        insert_next_fragments: G,
     ) -> Result<RecordPtr, HeapFileError>
     where
         F: FnOnce(&Self, &[u8]) -> Result<RecordPtr, HeapFileError>,
+        G: Fn(&Self, &[u8]) -> Result<RecordPtr, HeapFileError>,
     {
         if serialized.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
             // Record can be stored on single page
@@ -1162,9 +1203,13 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // We need to split record into pieces, so that each piece can fit into one page.
         let piece_size = Self::MAX_RECORD_SIZE_WHEN_MANY_FRAGMENTS;
 
+        // At this point we know that `serialized.len() > Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT`,
+        // `Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT > Self::MAX_RECORD_SIZE_WHEN_MANY_FRAGMENTS `,
+        // so `serialized.len() Self::MAX_RECORD_SIZE_WHEN_MANY_FRAGMENTS`
+
         let last_fragment = serialized.split_off(serialized.len() - 1 - piece_size);
         let last_fragment_with_tag = RecordTag::with_final(&last_fragment);
-        let mut next_ptr = self.insert_to_overflow_page(&last_fragment_with_tag)?;
+        let mut next_ptr = insert_next_fragments(self, &last_fragment_with_tag)?;
 
         // It means 2 pieces is enough
         if serialized.len() <= piece_size {
@@ -1178,7 +1223,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // We save middle pieces into overflow pages
         for chunk in middle_pieces.rchunks(piece_size as _) {
             let chunk = RecordTag::with_has_continuation(chunk, &next_ptr);
-            next_ptr = self.insert_to_overflow_page(&chunk)?;
+            next_ptr = insert_next_fragments(self, &chunk)?;
         }
 
         let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
@@ -1335,6 +1380,15 @@ mod tests {
                 assert_eq!(expected, *i);
             }
             _ => panic!("expected Int32, got {:?}", actual),
+        }
+    }
+
+    fn assert_i64(expected: i64, actual: &Field) {
+        match actual {
+            Field::Int64(i) => {
+                assert_eq!(expected, *i);
+            }
+            _ => panic!("expected Int64, got {:?}", actual),
         }
     }
 
@@ -3177,5 +3231,468 @@ mod tests {
         heap_file.flush_metadata().unwrap();
 
         assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
+    }
+
+    // HeapFile updating record
+
+    #[test]
+    fn heap_file_update_fixed_size_field_single_fragment() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a simple record
+        let original_record = Record::new(vec![
+            Field::Int32(100),
+            Field::String("original_name".into()),
+        ]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update the Int32 field
+        let column_metadata = heap_file.columns_metadata[0].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::Int32(200)).unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(200, &updated_record.fields[0]);
+        assert_string("original_name", &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_update_multiple_fixed_size_fields_multi_fragment() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file with multiple fixed-size columns
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("score".into(), Type::I64, 2, 2 * size_of::<i32>(), 2).unwrap(),
+            ColumnMetadata::new(
+                "name".into(),
+                Type::String,
+                3,
+                2 * size_of::<i32>() + size_of::<i64>(),
+                3,
+            )
+            .unwrap(),
+        ];
+
+        let factory =
+            HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Create a large record that spans multiple fragments
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        let record_overhead = 2 * size_of::<i32>() + size_of::<i64>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead + 500;
+        let large_string = "x".repeat(large_string_size);
+
+        let original_record = Record::new(vec![
+            Field::Int32(100),
+            Field::Int32(25),
+            Field::Int64(1000),
+            Field::String(large_string.clone()),
+        ]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update multiple fixed-size fields
+        let update_id =
+            FieldUpdateDescriptor::new(columns_metadata[0].clone(), Field::Int32(200)).unwrap();
+        let update_age =
+            FieldUpdateDescriptor::new(columns_metadata[1].clone(), Field::Int32(30)).unwrap();
+        let update_score =
+            FieldUpdateDescriptor::new(columns_metadata[2].clone(), Field::Int64(2000)).unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_id, update_age, update_score])
+            .unwrap();
+
+        // Read back the record to verify all updates
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 4);
+        assert_i32(200, &updated_record.fields[0]);
+        assert_i32(30, &updated_record.fields[1]);
+        assert_i64(2000, &updated_record.fields[2]);
+        assert_string(&large_string, &updated_record.fields[3]);
+    }
+
+    #[test]
+    fn heap_file_update_string_field_same_size_single_fragment() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a simple record
+        let original_record = Record::new(vec![
+            Field::Int32(100),
+            Field::String("original_name".into()),
+        ]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update the String field with same length string
+        let column_metadata = heap_file.columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String("0RIGIN4L_name".into()))
+                .unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(100, &updated_record.fields[0]);
+        assert_string("0RIGIN4L_name", &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_update_string_field_shorter_single_fragment() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record with a longer string
+        let original_record = Record::new(vec![
+            Field::Int32(100),
+            Field::String("original_long_name".into()),
+        ]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update the String field with a shorter string
+        let column_metadata = heap_file.columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String("short".into())).unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(100, &updated_record.fields[0]);
+        assert_string("short", &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_update_string_field_longer_single_fragment() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record with a short string
+        let original_record = Record::new(vec![Field::Int32(100), Field::String("short".into())]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update the String field with a longer string (but still fits in one page)
+        let longer_string =
+            "this_is_a_much_longer_string_than_the_original_one_but_still_fits_in_single_page";
+        let column_metadata = heap_file.columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String(longer_string.into()))
+                .unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(100, &updated_record.fields[0]);
+        assert_string(longer_string, &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_update_string_field_grows_to_four_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record with a short string
+        let original_record = Record::new(vec![Field::Int32(100), Field::String("short".into())]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Create a very large string that will span 4 pages
+        // The reason it spans 4 pages:
+        // - first we have a record on single page of length 11
+        // - then we update it, we decide that new record is more than one page so we need to use overflow pages
+        // - at prev location we store (prev_len - size of RecordPtr -> 3 in our case)
+        // - rest of the bytes (slightly more than 8k) need 3 pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+
+        let very_large_string_size = (2 * max_single_page_size) - record_overhead + 100;
+        let very_large_string = "z".repeat(very_large_string_size);
+
+        let column_metadata = heap_file.columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String(very_large_string.clone()))
+                .unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(100, &updated_record.fields[0]);
+        assert_string(&very_large_string, &updated_record.fields[1]);
+
+        // Verify that the record now spans multiple pages by checking fragments
+        let first_page = heap_file.read_record_page(record_ptr.page_id).unwrap();
+        let first_fragment = first_page.record_fragment(record_ptr.slot).unwrap();
+
+        // First fragment should have a continuation
+        assert!(first_fragment.next_fragment.is_some());
+
+        let second_ptr = first_fragment.next_fragment.unwrap();
+        let second_page = heap_file.read_overflow_page(second_ptr.page_id).unwrap();
+        let second_fragment = second_page.record_fragment(second_ptr.slot).unwrap();
+
+        // Second fragment should also have a continuation
+        assert!(second_fragment.next_fragment.is_some());
+
+        let third_ptr = second_fragment.next_fragment.unwrap();
+        let third_page = heap_file.read_overflow_page(third_ptr.page_id).unwrap();
+        let third_fragment = third_page.record_fragment(third_ptr.slot).unwrap();
+
+        // Third fragment should also have a continuation
+        assert!(third_fragment.next_fragment.is_some());
+
+        let fourth_ptr = third_fragment.next_fragment.unwrap();
+        let fourth_page = heap_file.read_overflow_page(fourth_ptr.page_id).unwrap();
+        let fourth_fragment = fourth_page.record_fragment(fourth_ptr.slot).unwrap();
+
+        // Fourth fragment should be the last one
+        assert!(fourth_fragment.next_fragment.is_none());
+    }
+
+    #[test]
+    fn heap_file_update_string_field_shrinks_from_multi_fragment_to_single() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Create a large string that spans multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead + 500;
+        let large_string = "x".repeat(large_string_size);
+
+        let original_record =
+            Record::new(vec![Field::Int32(100), Field::String(large_string.clone())]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Verify the record initially spans multiple pages
+        let first_page = heap_file.read_record_page(record_ptr.page_id).unwrap();
+        let first_fragment = first_page.record_fragment(record_ptr.slot).unwrap();
+        assert!(first_fragment.next_fragment.is_some());
+        drop(first_fragment);
+        drop(first_page);
+
+        // Update the String field with a small string that fits in one page
+        let small_string = "tiny";
+        let column_metadata = heap_file.columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String(small_string.into()))
+                .unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(100, &updated_record.fields[0]);
+        assert_string(small_string, &updated_record.fields[1]);
+
+        // Verify that the record now fits in a single page
+        let first_page_after = heap_file.read_record_page(record_ptr.page_id).unwrap();
+        let first_fragment_after = first_page_after.record_fragment(record_ptr.slot).unwrap();
+
+        assert!(first_fragment_after.next_fragment.is_none());
+    }
+
+    #[test]
+    fn heap_file_update_string_field_grows_from_three_to_six_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<i32>() + size_of::<u16>();
+
+        // Create a string that spans exactly 3 pages
+        let first_fragment_capacity =
+            max_single_page_size - record_overhead - size_of::<RecordPtr>();
+        let overflow_fragment_capacity =
+            max_single_page_size - size_of::<RecordTag>() - size_of::<RecordPtr>();
+
+        let initial_string_size = first_fragment_capacity + overflow_fragment_capacity + 100;
+        let initial_string = "x".repeat(initial_string_size);
+
+        let original_record = Record::new(vec![
+            Field::Int32(100),
+            Field::String(initial_string.clone()),
+        ]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update with a string that's 2x larger (should span 6 pages)
+        let updated_string_size = initial_string_size * 2;
+        let updated_string = "y".repeat(updated_string_size);
+
+        let column_metadata = heap_file.columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String(updated_string.clone()))
+                .unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(100, &updated_record.fields[0]);
+        assert_string(&updated_string, &updated_record.fields[1]);
+
+        // Verify that the record now spans 6 pages by walking the fragment chain
+        let mut fragment_count = 0;
+        let mut current_ptr = Some(record_ptr);
+
+        while let Some(ptr) = current_ptr {
+            fragment_count += 1;
+
+            if fragment_count == 1 {
+                let page = heap_file.read_record_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            } else {
+                let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            }
+        }
+
+        assert_eq!(fragment_count, 6);
+    }
+
+    #[test]
+    fn heap_file_update_string_field_shrinks_from_four_to_two_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<i32>() + size_of::<u16>();
+
+        // Create a string that spans exactly 4 pages
+        let first_fragment_capacity =
+            max_single_page_size - record_overhead - size_of::<RecordPtr>();
+        let overflow_fragment_capacity =
+            max_single_page_size - size_of::<RecordTag>() - size_of::<RecordPtr>();
+
+        // Size for 4 pages: first + 2 full overflow + partial last
+        let initial_string_size = first_fragment_capacity + 2 * overflow_fragment_capacity + 100;
+        let initial_string = "x".repeat(initial_string_size);
+
+        let original_record = Record::new(vec![
+            Field::Int32(100),
+            Field::String(initial_string.clone()),
+        ]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Update with a string that's half the size (should span 2 pages)
+        let updated_string_size = initial_string_size / 2;
+        let updated_string = "y".repeat(updated_string_size);
+
+        let column_metadata = heap_file.columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String(updated_string.clone()))
+                .unwrap();
+
+        heap_file
+            .update(&record_ptr, vec![update_descriptor])
+            .unwrap();
+
+        // Read back the record to verify the update
+        let updated_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(100, &updated_record.fields[0]);
+        assert_string(&updated_string, &updated_record.fields[1]);
+
+        // Verify that the record now spans only 2 pages
+        let mut fragment_count = 0;
+        let mut current_ptr = Some(record_ptr);
+
+        while let Some(ptr) = current_ptr {
+            fragment_count += 1;
+            if fragment_count == 1 {
+                let page = heap_file.read_record_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            } else {
+                let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            }
+        }
+
+        assert_eq!(fragment_count, 2);
     }
 }
