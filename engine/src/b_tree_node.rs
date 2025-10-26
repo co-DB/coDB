@@ -529,7 +529,6 @@ where
         &mut self,
         key: Key,
         record_pointer: RecordPointer,
-        allow_duplicates: bool,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let position = match self.search(&key)? {
             // TODO (For indexes): handle duplicated keys
