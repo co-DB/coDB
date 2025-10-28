@@ -491,6 +491,9 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// Updates the record at given position.
+    ///
+    /// When [`UpdateResult::NeedsDefragmentation`] is returned user should call [`SlottedPage::defragment_and_update`]
+    /// instead of compacting records by hand.
     pub fn update(
         &mut self,
         slot_id: SlotId,

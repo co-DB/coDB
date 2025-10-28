@@ -122,11 +122,19 @@ impl DbSerializable for RecordPointer {
         buf.extend(self.slot_id.to_le_bytes());
     }
 
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        todo!()
+    }
+
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
         let (page_id, rest) = PageId::deserialize(buffer)?;
         let (slot_id, rest) = SlotId::deserialize(rest)?;
         let record_ptr = Self { page_id, slot_id };
         Ok((record_ptr, rest))
+    }
+
+    fn size_serialized(&self) -> usize {
+        todo!()
     }
 }
 
