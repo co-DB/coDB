@@ -587,8 +587,7 @@ where
         match result {
             UpdateResult::Success => Ok(()),
             UpdateResult::NeedsDefragmentation => {
-                self.page.compact_records()?;
-                let result = self.page.update(slot, data)?;
+                let result = self.page.defragment_and_update(slot, data)?;
                 match result {
                     UpdateResult::Success => Ok(()),
                     _ => panic!(
