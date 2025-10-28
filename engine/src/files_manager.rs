@@ -17,7 +17,7 @@ enum FileType {
 
 /// Helper type created to make referring to files easier and cleaner.
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
-pub struct FileKey {
+pub(crate) struct FileKey {
     table_name: String,
     file_type: FileType,
 }
@@ -32,12 +32,12 @@ impl FileKey {
     }
 
     /// Returns a key for the data file of the given table.
-    pub fn data(table_name: impl Into<String>) -> Self {
+    pub(crate) fn data(table_name: impl Into<String>) -> Self {
         Self::new(table_name, FileType::Data)
     }
 
     /// Returns a key for the index file of the given table.
-    pub fn index(table_name: impl Into<String>) -> Self {
+    pub(crate) fn index(table_name: impl Into<String>) -> Self {
         Self::new(table_name, FileType::Index)
     }
 
@@ -57,7 +57,7 @@ impl FileKey {
 
 /// Responsible for storing and distributing [`PagedFile`]s of a single database
 /// to higher level components.
-pub struct FilesManager {
+pub(crate) struct FilesManager {
     /// (Almost) All public api of [`PagedFile`] takes `&mut self`, so there is
     /// no point in using [`RwLock`] instead of [`Mutex`] here.
     open_files: DashMap<FileKey, Arc<Mutex<PagedFile>>>,
@@ -66,7 +66,7 @@ pub struct FilesManager {
 
 /// Error for [`FilesManager`] related operations
 #[derive(Error, Debug)]
-pub enum FilesManagerError {
+pub(crate) enum FilesManagerError {
     #[error("couldn't find the data directory")]
     DirectoryNotFound,
     #[error("paged file error: {0}")]
@@ -79,7 +79,7 @@ impl FilesManager {
     ///
     /// Can fail if the directory in which we want to store the data (refer to `docs/file_structure.md` for
     /// OS-specific details) doesn't exist.
-    pub fn new<P>(base_path: P, database_name: &str) -> Result<Self, FilesManagerError>
+    pub(crate) fn new<P>(base_path: P, database_name: &str) -> Result<Self, FilesManagerError>
     where
         P: AsRef<Path>,
     {
@@ -101,7 +101,7 @@ impl FilesManager {
     ///
     /// Can fail if [`PagedFile`] instantiation didn't succeed (refer to
     /// [`PagedFile`]'s implementation for more details)
-    pub fn get_or_open_new_file(
+    pub(crate) fn get_or_open_new_file(
         &self,
         key: &FileKey,
     ) -> Result<Arc<Mutex<PagedFile>>, FilesManagerError> {
@@ -115,7 +115,7 @@ impl FilesManager {
 
     /// Closes a file and removes its entry from the stored [`PagedFile`]s. Can be used for when
     /// a table is deleted or renamed.
-    pub fn close_file(&mut self, key: &FileKey) {
+    pub(crate) fn close_file(&mut self, key: &FileKey) {
         self.open_files.remove(key);
     }
 }
