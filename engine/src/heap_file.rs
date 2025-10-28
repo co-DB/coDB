@@ -18,7 +18,7 @@ use crate::{
     cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedReadPage, PinnedWritePage},
     data_types::{DbSerializable, DbSerializationError},
     files_manager::FileKey,
-    paged_file::{PAGE_SIZE, Page, PageId},
+    paged_file::{PAGE_SIZE, Page, PageId, PagedFileError},
     record::{Field, Record, RecordError},
     slotted_page::{
         InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
@@ -1359,10 +1359,6 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
     }
 
     pub(crate) fn create_heap_file(self) -> Result<HeapFile<BUCKETS_COUNT>, HeapFileError> {
-        self.load_existing_heap_file()
-    }
-
-    fn load_existing_heap_file(self) -> Result<HeapFile<BUCKETS_COUNT>, HeapFileError> {
         let metadata_repr = self.load_metadata_repr()?;
 
         let record_pages_fsm = FreeSpaceMap::<BUCKETS_COUNT, RecordPageHeader>::new(
@@ -1391,9 +1387,46 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
 
     fn load_metadata_repr(&self) -> Result<MetadataRepr, HeapFileError> {
         let key = self.file_page_ref(HeapFile::<BUCKETS_COUNT>::METADATA_PAGE_ID);
-        let page = self.cache.pin_read(&key)?;
-        let metadata = MetadataRepr::load_from_page(page.page())?;
-        Ok(metadata)
+        match self.cache.pin_read(&key) {
+            Ok(page) => {
+                let metadata = MetadataRepr::load_from_page(page.page())?;
+                Ok(metadata)
+            }
+            Err(e) => {
+                if let CacheError::PagedFileError(PagedFileError::InvalidPageId(HeapFile::<
+                    BUCKETS_COUNT,
+                >::METADATA_PAGE_ID)) = e
+                {
+                    // This mean that metadata page was not allocated yet, so the file was just created
+                    let (mut metadata_page, metadata_page_id) =
+                        self.cache.allocate_page(&key.file_key)?;
+                    debug_assert_eq!(
+                        metadata_page_id,
+                        HeapFile::<BUCKETS_COUNT>::METADATA_PAGE_ID
+                    );
+
+                    let (record_page, record_page_id) = self.cache.allocate_page(&key.file_key)?;
+                    SlottedPage::<_, RecordPageHeader>::initialize_default(record_page).unwrap();
+
+                    let (overflow_page, overflow_page_id) =
+                        self.cache.allocate_page(&key.file_key)?;
+                    SlottedPage::<_, OverflowPageHeader>::initialize_default(overflow_page)
+                        .unwrap();
+
+                    let repr = MetadataRepr {
+                        first_record_page: record_page_id,
+                        first_overflow_page: overflow_page_id,
+                    };
+
+                    let bytes = bytemuck::bytes_of(&repr);
+                    metadata_page.page_mut()[..size_of::<MetadataRepr>()].copy_from_slice(bytes);
+
+                    Ok(repr)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
@@ -2240,6 +2273,60 @@ mod tests {
             let read_result = heap_file.record(&invalid_ptr);
             assert!(read_result.is_err());
         }
+    }
+
+    #[test]
+    fn heap_file_factory_auto_creates_file_on_first_use() {
+        let (cache, _, file_key) = setup_test_cache();
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Verify metadata was created with correct initial values
+        let first_record_page = *heap_file.metadata.first_record_page.lock();
+        let first_overflow_page = *heap_file.metadata.first_overflow_page.lock();
+        assert_eq!(first_record_page, 2);
+        assert_eq!(first_overflow_page, 3);
+
+        // Verify both pages exist and are properly initialized
+        let record_page_ref = FilePageRef {
+            page_id: first_record_page,
+            file_key: file_key.clone(),
+        };
+        let record_page = cache.pin_read(&record_page_ref).unwrap();
+        let record_slotted = SlottedPage::<_, RecordPageHeader>::new(record_page).unwrap();
+
+        // Should have maximum free space
+        assert_eq!(
+            record_slotted.free_space().unwrap(),
+            SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE
+        );
+        drop(record_slotted);
+
+        let overflow_page_ref = FilePageRef {
+            page_id: first_overflow_page,
+            file_key: file_key.clone(),
+        };
+        let overflow_page = cache.pin_read(&overflow_page_ref).unwrap();
+        let overflow_slotted = SlottedPage::<_, OverflowPageHeader>::new(overflow_page).unwrap();
+
+        // Should have maximum free space
+        assert_eq!(
+            overflow_slotted.free_space().unwrap(),
+            SlottedPage::<(), OverflowPageHeader>::MAX_FREE_SPACE
+        );
+        drop(overflow_slotted);
+
+        // Verify we can insert and read a record in the newly created file
+        let test_record = Record::new(vec![Field::Int32(42), Field::String("test".into())]);
+
+        let record_ptr = heap_file.insert(test_record).unwrap();
+        assert_eq!(record_ptr.page_id, first_record_page);
+
+        let retrieved = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(retrieved.fields.len(), 2);
+        assert_i32(42, &retrieved.fields[0]);
+        assert_string("test", &retrieved.fields[1]);
     }
 
     // Heap file reading
