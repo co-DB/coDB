@@ -425,6 +425,151 @@ impl<'a> FragmentProcessor<'a> {
     }
 }
 
+/// Helper struct used for locking pages when working with records.
+///
+/// Locking pages in [`HeapFile`] should work as follows:
+/// - read page
+/// - do an action on the page
+/// - read next page
+/// - drop the previous page
+/// This struct encapsulates this drop-only-after-read strategy.
+///
+/// When dealing with record that spans multiple pages (multi-fragment record) pages shouldn't be read by hand,
+/// but instead this struct should be used.
+struct PageLockChain<'hf, const BUCKETS_COUNT: usize, P> {
+    heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+    record_page: Option<HeapPage<P, RecordPageHeader>>,
+    overflow_page: Option<HeapPage<P, OverflowPageHeader>>,
+}
+
+impl<'hf, const BUCKETS_COUNT: usize, P> PageLockChain<'hf, BUCKETS_COUNT, P> {
+    /// Gets current record page.
+    ///
+    /// Panics if we hold overflow page instead.
+    fn record_page(&self) -> &HeapPage<P, RecordPageHeader> {
+        match &self.record_page {
+            Some(record_page) => record_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
+    }
+
+    /// Gets mutable current record page.
+    ///
+    /// Panics if we hold overflow page instead.
+    fn record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
+        match &mut self.record_page {
+            Some(record_page) => record_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
+    }
+
+    /// Gets current overflow page.
+    ///
+    /// Panics if we hold record page instead.
+    fn overflow_page(&self) -> &HeapPage<P, OverflowPageHeader> {
+        match &self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get overflow page when record page is stored instead"
+            ),
+        }
+    }
+
+    /// Gets mutable current overflow page.
+    ///
+    /// Panics if we hold record page instead.
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader> {
+        match &mut self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<'hf, BUCKETS_COUNT, PinnedReadPage> {
+    /// Creates new [`PageLockChain`] that starts with record page
+    fn with_record(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let record_page = heap_file.read_record_page(page_id)?;
+        Ok(PageLockChain {
+            heap_file,
+            record_page: Some(record_page),
+            overflow_page: None,
+        })
+    }
+
+    /// Creates new [`PageLockChain`] that starts with overflow page
+    fn with_overflow(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let overflow_page = heap_file.read_overflow_page(page_id)?;
+        Ok(PageLockChain {
+            heap_file,
+            record_page: None,
+            overflow_page: Some(overflow_page),
+        })
+    }
+
+    /// Locks the next page and only then drops the previous one
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
+        // Read next page
+        let new_page = self.heap_file.read_overflow_page(next_page_id)?;
+
+        // Drop previous page
+        self.record_page = None;
+        self.overflow_page = Some(new_page);
+        Ok(())
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage> {
+    /// Creates new [`PageLockChain`] that starts with record page
+    fn with_record(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let record_page = heap_file.write_record_page(page_id)?;
+        Ok(PageLockChain {
+            heap_file,
+            record_page: Some(record_page),
+            overflow_page: None,
+        })
+    }
+
+    /// Creates new [`PageLockChain`] that starts with overflow page
+    fn with_overflow(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let overflow_page = heap_file.write_overflow_page(page_id)?;
+        Ok(PageLockChain {
+            heap_file,
+            record_page: None,
+            overflow_page: Some(overflow_page),
+        })
+    }
+
+    /// Locks the next page and only then drops the previous one
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
+        // Read next page
+        let new_page = self.heap_file.write_overflow_page(next_page_id)?;
+
+        // Drop previous page
+        self.record_page = None;
+        self.overflow_page = Some(new_page);
+        Ok(())
+    }
+}
+
 /// Trait that provides common functionality for all heap page headers.
 trait BaseHeapPageHeader: SlottedPageHeader {
     const NO_NEXT_PAGE: PageId = 0;
@@ -715,15 +860,20 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Reads [`Record`] located at `ptr` and returns its bare bytes.
-    // TODO: we need to keep previous page before getting the new one, and drop it only when we
-    // get the new one, because otheriwse we migth have race condition
     fn record_bytes(&self, ptr: &RecordPtr) -> Result<Vec<u8>, HeapFileError> {
-        let first_page = self.read_record_page(ptr.page_id)?;
+        let mut page_chain =
+            PageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(&self, ptr.page_id)?;
+
+        // Read first fragment
+        let first_page = page_chain.record_page();
         let fragment = first_page.record_fragment(ptr.slot)?;
         let mut full_record_bytes = Vec::from(fragment.data);
+
+        // Follow chain of other fragments
         let mut next_ptr = fragment.next_fragment;
         while let Some(next) = next_ptr {
-            let next_fragment_page = self.read_overflow_page(next.page_id)?;
+            page_chain.advance(next.page_id)?;
+            let next_fragment_page = page_chain.overflow_page();
             let fragment = next_fragment_page.record_fragment(next.slot)?;
             full_record_bytes.extend_from_slice(fragment.data);
             next_ptr = fragment.next_fragment;
@@ -799,8 +949,10 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         bytes_changed: &[bool],
     ) -> Result<(), HeapFileError> {
         let mut processor = FragmentProcessor::new(bytes, bytes_changed);
+        let mut page_chain =
+            PageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, start.page_id)?;
 
-        let mut first_page = self.write_record_page(start.page_id)?;
+        let mut first_page = page_chain.record_page_mut();
         let previous_first_fragment = first_page.record_fragment(start.slot)?;
 
         // Previously record was stored on single page.
@@ -814,7 +966,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
             // Try to update in place
             if self.try_update_fragment_in_place(
-                &mut first_page,
+                first_page,
                 start.slot,
                 start.page_id,
                 processor.remaining_bytes,
@@ -874,7 +1026,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut current_ptr = next_tag;
 
         while !processor.is_complete() {
-            let mut current_page = self.write_overflow_page(current_ptr.page_id)?;
+            page_chain.advance(current_ptr.page_id)?;
+            let mut current_page = page_chain.overflow_page_mut();
             let current_fragment = current_page.record_fragment(current_ptr.slot)?;
 
             let current_frag_len = current_fragment.data.len();
