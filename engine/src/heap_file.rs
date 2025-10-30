@@ -4194,5 +4194,146 @@ mod tests {
         }
     }
 
-    // TODO: add tests for concurrent updates
+    #[test]
+    fn heap_file_concurrent_read_write_multi_fragment_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("field1".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("field2".into(), Type::String, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("field3".into(), Type::String, 2, 0, 0).unwrap(),
+        ];
+
+        let factory =
+            HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata.clone());
+        let heap_file = Arc::new(factory.create_heap_file().unwrap());
+
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        // Each field should be large enough to ensure multi-page record
+        let field_size = max_single_page_size / 2;
+        let initial_field1 = "A".repeat(field_size);
+        let initial_field2 = "B".repeat(field_size);
+        let initial_field3 = "C".repeat(field_size);
+
+        let initial_record = Record::new(vec![
+            Field::String(initial_field1.clone()),
+            Field::String(initial_field2.clone()),
+            Field::String(initial_field3.clone()),
+        ]);
+
+        let record_ptr = heap_file.insert(initial_record).unwrap();
+
+        let num_iterations = 50;
+        let num_reader_threads = 4;
+        let num_writer_threads = 2;
+
+        // Expected patterns
+        let expected_field1_abc = "A".repeat(field_size);
+        let expected_field2_abc = "B".repeat(field_size);
+        let expected_field3_abc = "C".repeat(field_size);
+
+        let expected_field1_xyz = "X".repeat(field_size);
+        let expected_field2_xyz = "Y".repeat(field_size);
+        let expected_field3_xyz = "Z".repeat(field_size);
+
+        // Spawn reader threads
+        let mut reader_handles = vec![];
+        for _ in 0..num_reader_threads {
+            let heap_file_clone = heap_file.clone();
+            let ptr = record_ptr.clone();
+            let exp_f1_abc = expected_field1_abc.clone();
+            let exp_f2_abc = expected_field2_abc.clone();
+            let exp_f3_abc = expected_field3_abc.clone();
+            let exp_f1_xyz = expected_field1_xyz.clone();
+            let exp_f2_xyz = expected_field2_xyz.clone();
+            let exp_f3_xyz = expected_field3_xyz.clone();
+
+            let handle = thread::spawn(move || {
+                for _ in 0..num_iterations {
+                    let record = heap_file_clone.record(&ptr).unwrap();
+
+                    assert_eq!(record.fields.len(), 3,);
+
+                    // Try to match ABC pattern
+                    let is_abc_pattern = matches!(&record.fields[0], Field::String(s) if s == &exp_f1_abc)
+                        && matches!(&record.fields[1], Field::String(s) if s == &exp_f2_abc)
+                        && matches!(&record.fields[2], Field::String(s) if s == &exp_f3_abc);
+
+                    // Try to match XYZ pattern
+                    let is_xyz_pattern = matches!(&record.fields[0], Field::String(s) if s == &exp_f1_xyz)
+                        && matches!(&record.fields[1], Field::String(s) if s == &exp_f2_xyz)
+                        && matches!(&record.fields[2], Field::String(s) if s == &exp_f3_xyz);
+
+                    assert!(is_abc_pattern || is_xyz_pattern,);
+
+                    thread::sleep(std::time::Duration::from_micros(10));
+                }
+            });
+
+            reader_handles.push(handle);
+        }
+
+        // Spawn writer threads
+        let mut writer_handles = vec![];
+        for _ in 0..num_writer_threads {
+            let heap_file_clone = heap_file.clone();
+            let ptr = record_ptr.clone();
+            let cols = columns_metadata.clone();
+
+            let handle = thread::spawn(move || {
+                for iteration in 0..num_iterations {
+                    let (char1, char2, char3) = if iteration % 2 == 0 {
+                        ('X', 'Y', 'Z')
+                    } else {
+                        ('A', 'B', 'C')
+                    };
+
+                    let updated_field1 = char1.to_string().repeat(field_size);
+                    let updated_field2 = char2.to_string().repeat(field_size);
+                    let updated_field3 = char3.to_string().repeat(field_size);
+
+                    let update_descriptors = vec![
+                        FieldUpdateDescriptor::new(cols[0].clone(), Field::String(updated_field1))
+                            .unwrap(),
+                        FieldUpdateDescriptor::new(cols[1].clone(), Field::String(updated_field2))
+                            .unwrap(),
+                        FieldUpdateDescriptor::new(cols[2].clone(), Field::String(updated_field3))
+                            .unwrap(),
+                    ];
+
+                    heap_file_clone.update(&ptr, update_descriptors).unwrap();
+
+                    thread::sleep(std::time::Duration::from_micros(10));
+                }
+            });
+
+            writer_handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in reader_handles {
+            handle.join().unwrap();
+        }
+
+        for handle in writer_handles {
+            handle.join().unwrap();
+        }
+
+        let final_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(final_record.fields.len(), 3);
+
+        let is_abc = matches!(&final_record.fields[0], Field::String(s) if s == &expected_field1_abc)
+            && matches!(&final_record.fields[1], Field::String(s) if s == &expected_field2_abc)
+            && matches!(&final_record.fields[2], Field::String(s) if s == &expected_field3_abc);
+
+        let is_xyz = matches!(&final_record.fields[0], Field::String(s) if s == &expected_field1_xyz)
+            && matches!(&final_record.fields[1], Field::String(s) if s == &expected_field2_xyz)
+            && matches!(&final_record.fields[2], Field::String(s) if s == &expected_field3_xyz);
+
+        assert!(is_abc || is_xyz);
+    }
 }
