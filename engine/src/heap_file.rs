@@ -1387,8 +1387,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Generic helper for inserting serialized record data using first-fragment-insert strategy
-    // TODO: we need to keep previous page before getting the new one, and drop it only when we
-    // get the new one, because otheriwse we migth have race condition
+    ///
+    /// In insert we don't need to use our lock strategy (get next then drop previous), because in insert we write record
+    /// starting from the end of it. It means that once we write the first fragment in record page, the rest is already there
+    /// and we can safely drop it. During inserts to overflow pages we don't need this locking strategy, as heap file is still not
+    /// aware of this record (because its first fragment hasn't been inserted yet).
     fn insert_record_internal<F, G>(
         &self,
         mut serialized: Vec<u8>,
