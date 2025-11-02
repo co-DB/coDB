@@ -425,6 +425,151 @@ impl<'a> FragmentProcessor<'a> {
     }
 }
 
+/// Helper struct used for locking pages when working with records.
+///
+/// Locking pages in [`HeapFile`] should work as follows:
+/// - read page
+/// - do an action on the page
+/// - read next page
+/// - drop the previous page
+/// This struct encapsulates this drop-only-after-read strategy.
+///
+/// When dealing with record that spans multiple pages (multi-fragment record) pages shouldn't be read by hand,
+/// but instead this struct should be used.
+struct PageLockChain<'hf, const BUCKETS_COUNT: usize, P> {
+    heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+    record_page: Option<HeapPage<P, RecordPageHeader>>,
+    overflow_page: Option<HeapPage<P, OverflowPageHeader>>,
+}
+
+impl<'hf, const BUCKETS_COUNT: usize, P> PageLockChain<'hf, BUCKETS_COUNT, P> {
+    /// Gets current record page.
+    ///
+    /// Panics if we hold overflow page instead.
+    fn record_page(&self) -> &HeapPage<P, RecordPageHeader> {
+        match &self.record_page {
+            Some(record_page) => record_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
+    }
+
+    /// Gets mutable current record page.
+    ///
+    /// Panics if we hold overflow page instead.
+    fn record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
+        match &mut self.record_page {
+            Some(record_page) => record_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
+    }
+
+    /// Gets current overflow page.
+    ///
+    /// Panics if we hold record page instead.
+    fn overflow_page(&self) -> &HeapPage<P, OverflowPageHeader> {
+        match &self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get overflow page when record page is stored instead"
+            ),
+        }
+    }
+
+    /// Gets mutable current overflow page.
+    ///
+    /// Panics if we hold record page instead.
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader> {
+        match &mut self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<'hf, BUCKETS_COUNT, PinnedReadPage> {
+    /// Creates new [`PageLockChain`] that starts with record page
+    fn with_record(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let record_page = heap_file.read_record_page(page_id)?;
+        Ok(PageLockChain {
+            heap_file,
+            record_page: Some(record_page),
+            overflow_page: None,
+        })
+    }
+
+    /// Creates new [`PageLockChain`] that starts with overflow page
+    fn with_overflow(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let overflow_page = heap_file.read_overflow_page(page_id)?;
+        Ok(PageLockChain {
+            heap_file,
+            record_page: None,
+            overflow_page: Some(overflow_page),
+        })
+    }
+
+    /// Locks the next page and only then drops the previous one
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
+        // Read next page
+        let new_page = self.heap_file.read_overflow_page(next_page_id)?;
+
+        // Drop previous page
+        self.record_page = None;
+        self.overflow_page = Some(new_page);
+        Ok(())
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage> {
+    /// Creates new [`PageLockChain`] that starts with record page
+    fn with_record(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let record_page = heap_file.write_record_page(page_id)?;
+        Ok(PageLockChain {
+            heap_file,
+            record_page: Some(record_page),
+            overflow_page: None,
+        })
+    }
+
+    /// Creates new [`PageLockChain`] that starts with overflow page
+    fn with_overflow(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let overflow_page = heap_file.write_overflow_page(page_id)?;
+        Ok(PageLockChain {
+            heap_file,
+            record_page: None,
+            overflow_page: Some(overflow_page),
+        })
+    }
+
+    /// Locks the next page and only then drops the previous one
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
+        // Read next page
+        let new_page = self.heap_file.write_overflow_page(next_page_id)?;
+
+        // Drop previous page
+        self.record_page = None;
+        self.overflow_page = Some(new_page);
+        Ok(())
+    }
+}
+
 /// Trait that provides common functionality for all heap page headers.
 trait BaseHeapPageHeader: SlottedPageHeader {
     const NO_NEXT_PAGE: PageId = 0;
@@ -715,15 +860,20 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Reads [`Record`] located at `ptr` and returns its bare bytes.
-    // TODO: we need to keep previous page before getting the new one, and drop it only when we
-    // get the new one, because otheriwse we migth have race condition
     fn record_bytes(&self, ptr: &RecordPtr) -> Result<Vec<u8>, HeapFileError> {
-        let first_page = self.read_record_page(ptr.page_id)?;
+        let mut page_chain =
+            PageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(&self, ptr.page_id)?;
+
+        // Read first fragment
+        let first_page = page_chain.record_page();
         let fragment = first_page.record_fragment(ptr.slot)?;
         let mut full_record_bytes = Vec::from(fragment.data);
+
+        // Follow chain of other fragments
         let mut next_ptr = fragment.next_fragment;
         while let Some(next) = next_ptr {
-            let next_fragment_page = self.read_overflow_page(next.page_id)?;
+            page_chain.advance(next.page_id)?;
+            let next_fragment_page = page_chain.overflow_page();
             let fragment = next_fragment_page.record_fragment(next.slot)?;
             full_record_bytes.extend_from_slice(fragment.data);
             next_ptr = fragment.next_fragment;
@@ -799,8 +949,10 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         bytes_changed: &[bool],
     ) -> Result<(), HeapFileError> {
         let mut processor = FragmentProcessor::new(bytes, bytes_changed);
+        let mut page_chain =
+            PageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, start.page_id)?;
 
-        let mut first_page = self.write_record_page(start.page_id)?;
+        let mut first_page = page_chain.record_page_mut();
         let previous_first_fragment = first_page.record_fragment(start.slot)?;
 
         // Previously record was stored on single page.
@@ -814,7 +966,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
             // Try to update in place
             if self.try_update_fragment_in_place(
-                &mut first_page,
+                first_page,
                 start.slot,
                 start.page_id,
                 processor.remaining_bytes,
@@ -874,7 +1026,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut current_ptr = next_tag;
 
         while !processor.is_complete() {
-            let mut current_page = self.write_overflow_page(current_ptr.page_id)?;
+            page_chain.advance(current_ptr.page_id)?;
+            let mut current_page = page_chain.overflow_page_mut();
             let current_fragment = current_page.record_fragment(current_ptr.slot)?;
 
             let current_frag_len = current_fragment.data.len();
@@ -1234,8 +1387,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Generic helper for inserting serialized record data using first-fragment-insert strategy
-    // TODO: we need to keep previous page before getting the new one, and drop it only when we
-    // get the new one, because otheriwse we migth have race condition
+    ///
+    /// In insert we don't need to use our lock strategy (get next then drop previous), because in insert we write record
+    /// starting from the end of it. It means that once we write the first fragment in record page, the rest is already there
+    /// and we can safely drop it. During inserts to overflow pages we don't need this locking strategy, as heap file is still not
+    /// aware of this record (because its first fragment hasn't been inserted yet).
     fn insert_record_internal<F, G>(
         &self,
         mut serialized: Vec<u8>,
@@ -4038,5 +4194,146 @@ mod tests {
         }
     }
 
-    // TODO: add tests for concurrent updates
+    #[test]
+    fn heap_file_concurrent_read_write_multi_fragment_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("field1".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("field2".into(), Type::String, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("field3".into(), Type::String, 2, 0, 0).unwrap(),
+        ];
+
+        let factory =
+            HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata.clone());
+        let heap_file = Arc::new(factory.create_heap_file().unwrap());
+
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+
+        // Each field should be large enough to ensure multi-page record
+        let field_size = max_single_page_size / 2;
+        let initial_field1 = "A".repeat(field_size);
+        let initial_field2 = "B".repeat(field_size);
+        let initial_field3 = "C".repeat(field_size);
+
+        let initial_record = Record::new(vec![
+            Field::String(initial_field1.clone()),
+            Field::String(initial_field2.clone()),
+            Field::String(initial_field3.clone()),
+        ]);
+
+        let record_ptr = heap_file.insert(initial_record).unwrap();
+
+        let num_iterations = 50;
+        let num_reader_threads = 4;
+        let num_writer_threads = 2;
+
+        // Expected patterns
+        let expected_field1_abc = "A".repeat(field_size);
+        let expected_field2_abc = "B".repeat(field_size);
+        let expected_field3_abc = "C".repeat(field_size);
+
+        let expected_field1_xyz = "X".repeat(field_size);
+        let expected_field2_xyz = "Y".repeat(field_size);
+        let expected_field3_xyz = "Z".repeat(field_size);
+
+        // Spawn reader threads
+        let mut reader_handles = vec![];
+        for _ in 0..num_reader_threads {
+            let heap_file_clone = heap_file.clone();
+            let ptr = record_ptr.clone();
+            let exp_f1_abc = expected_field1_abc.clone();
+            let exp_f2_abc = expected_field2_abc.clone();
+            let exp_f3_abc = expected_field3_abc.clone();
+            let exp_f1_xyz = expected_field1_xyz.clone();
+            let exp_f2_xyz = expected_field2_xyz.clone();
+            let exp_f3_xyz = expected_field3_xyz.clone();
+
+            let handle = thread::spawn(move || {
+                for _ in 0..num_iterations {
+                    let record = heap_file_clone.record(&ptr).unwrap();
+
+                    assert_eq!(record.fields.len(), 3,);
+
+                    // Try to match ABC pattern
+                    let is_abc_pattern = matches!(&record.fields[0], Field::String(s) if s == &exp_f1_abc)
+                        && matches!(&record.fields[1], Field::String(s) if s == &exp_f2_abc)
+                        && matches!(&record.fields[2], Field::String(s) if s == &exp_f3_abc);
+
+                    // Try to match XYZ pattern
+                    let is_xyz_pattern = matches!(&record.fields[0], Field::String(s) if s == &exp_f1_xyz)
+                        && matches!(&record.fields[1], Field::String(s) if s == &exp_f2_xyz)
+                        && matches!(&record.fields[2], Field::String(s) if s == &exp_f3_xyz);
+
+                    assert!(is_abc_pattern || is_xyz_pattern,);
+
+                    thread::sleep(std::time::Duration::from_micros(10));
+                }
+            });
+
+            reader_handles.push(handle);
+        }
+
+        // Spawn writer threads
+        let mut writer_handles = vec![];
+        for _ in 0..num_writer_threads {
+            let heap_file_clone = heap_file.clone();
+            let ptr = record_ptr.clone();
+            let cols = columns_metadata.clone();
+
+            let handle = thread::spawn(move || {
+                for iteration in 0..num_iterations {
+                    let (char1, char2, char3) = if iteration % 2 == 0 {
+                        ('X', 'Y', 'Z')
+                    } else {
+                        ('A', 'B', 'C')
+                    };
+
+                    let updated_field1 = char1.to_string().repeat(field_size);
+                    let updated_field2 = char2.to_string().repeat(field_size);
+                    let updated_field3 = char3.to_string().repeat(field_size);
+
+                    let update_descriptors = vec![
+                        FieldUpdateDescriptor::new(cols[0].clone(), Field::String(updated_field1))
+                            .unwrap(),
+                        FieldUpdateDescriptor::new(cols[1].clone(), Field::String(updated_field2))
+                            .unwrap(),
+                        FieldUpdateDescriptor::new(cols[2].clone(), Field::String(updated_field3))
+                            .unwrap(),
+                    ];
+
+                    heap_file_clone.update(&ptr, update_descriptors).unwrap();
+
+                    thread::sleep(std::time::Duration::from_micros(10));
+                }
+            });
+
+            writer_handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in reader_handles {
+            handle.join().unwrap();
+        }
+
+        for handle in writer_handles {
+            handle.join().unwrap();
+        }
+
+        let final_record = heap_file.record(&record_ptr).unwrap();
+        assert_eq!(final_record.fields.len(), 3);
+
+        let is_abc = matches!(&final_record.fields[0], Field::String(s) if s == &expected_field1_abc)
+            && matches!(&final_record.fields[1], Field::String(s) if s == &expected_field2_abc)
+            && matches!(&final_record.fields[2], Field::String(s) if s == &expected_field3_abc);
+
+        let is_xyz = matches!(&final_record.fields[0], Field::String(s) if s == &expected_field1_xyz)
+            && matches!(&final_record.fields[1], Field::String(s) if s == &expected_field2_xyz)
+            && matches!(&final_record.fields[2], Field::String(s) if s == &expected_field3_xyz);
+
+        assert!(is_abc || is_xyz);
+    }
 }
