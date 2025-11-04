@@ -743,6 +743,12 @@ where
             UpdateResult::PageFull => Err(HeapFileError::NotEnoughSpaceOnPage),
         }
     }
+
+    /// Deletes record located at `slot`.
+    fn delete(&mut self, slot: SlotId) -> Result<(), HeapFileError> {
+        self.page.delete(slot)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -831,6 +837,30 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // Save back to disk at the same ptr
         self.update_record_bytes(ptr, &record_bytes, &bytes_changed)?;
 
+        Ok(())
+    }
+
+    /// Removes [`Record`] located at `ptr`.
+    pub(crate) fn delete(&self, ptr: &RecordPtr) -> Result<(), HeapFileError> {
+        let mut page_chain =
+            PageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
+        let first_page = page_chain.record_page_mut();
+        let record_first_fragment = first_page.record_fragment(ptr.slot)?;
+
+        let mut next_ptr = record_first_fragment.next_fragment;
+
+        // Delete first fragment of the record
+        first_page.delete(ptr.slot)?;
+
+        // Follow record chain and delete each fragment
+        while let Some(next) = next_ptr {
+            page_chain.advance(next.page_id)?;
+            let page = page_chain.overflow_page_mut();
+            let record_fragment = page.record_fragment(next.slot)?;
+
+            next_ptr = record_fragment.next_fragment;
+            page.delete(next.slot)?;
+        }
         Ok(())
     }
 
@@ -1598,7 +1628,7 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
 mod tests {
     use std::{
         fs, thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use metadata::types::Type;
@@ -4335,5 +4365,161 @@ mod tests {
             && matches!(&final_record.fields[2], Field::String(s) if s == &expected_field3_xyz);
 
         assert!(is_abc || is_xyz);
+    }
+
+    // HeapFile deleting record
+
+    #[test]
+    fn heap_file_delete_single_page_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a simple record
+        let original_record =
+            Record::new(vec![Field::Int32(100), Field::String("test_record".into())]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Delete the record
+        heap_file.delete(&record_ptr).unwrap();
+
+        // Verify the record was deleted - reading should fail
+        let result = heap_file.record(&record_ptr);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HeapFileError::SlottedPageError(_)
+        ));
+    }
+
+    #[test]
+    fn heap_file_delete_multi_page_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        // Create a large record that spans multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+
+        // Create a string large enough to span 3 pages
+        let large_string_size = (2 * max_single_page_size) - record_overhead + 100;
+        let large_string = "x".repeat(large_string_size);
+
+        let original_record = Record::new(vec![Field::Int32(42), Field::String(large_string)]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        // Delete the record
+        heap_file.delete(&record_ptr).unwrap();
+
+        // Verify the record was deleted - reading should fail
+        let result = heap_file.record(&record_ptr);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HeapFileError::SlottedPageError(_)
+        ));
+    }
+
+    #[test]
+    fn heap_file_delete_concurrent_read_multi_page_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Create heap file
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = Arc::new(factory.create_heap_file().unwrap());
+
+        // Create a large record that spans multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+
+        // Create a string large enough to span 4 pages
+        let large_string_size = (3 * max_single_page_size) - record_overhead + 100;
+        let large_string = "x".repeat(large_string_size);
+
+        let original_record =
+            Record::new(vec![Field::Int32(42), Field::String(large_string.clone())]);
+
+        let record_ptr = heap_file.insert(original_record).unwrap();
+
+        let num_reader_threads = 8;
+        let mut reader_handles = vec![];
+
+        // Spawn reader threads
+        for _ in 0..num_reader_threads {
+            let heap_file_clone = heap_file.clone();
+            let ptr = record_ptr.clone();
+            let expected_string = large_string.clone();
+
+            let handle = thread::spawn(move || {
+                let mut successful_reads = 0;
+                let mut failed_reads = 0;
+
+                // Try to read the record many times
+                for _ in 0..100 {
+                    match heap_file_clone.record(&ptr) {
+                        Ok(record) => {
+                            // If we successfully read, verify it's complete and correct
+                            assert_eq!(record.fields.len(), 2);
+                            assert_i32(42, &record.fields[0]);
+                            assert_string(&expected_string, &record.fields[1]);
+                            successful_reads += 1;
+                        }
+                        Err(_) => {
+                            // Read failed - this is expected after deletion
+                            failed_reads += 1;
+                        }
+                    }
+
+                    // Small delay to increase chance of interleaving with delete
+                    thread::sleep(Duration::from_micros(10));
+                }
+
+                (successful_reads, failed_reads)
+            });
+
+            reader_handles.push(handle);
+        }
+
+        // Let readers run for a bit before deleting
+        thread::sleep(Duration::from_millis(50));
+
+        // Delete the record
+        heap_file.delete(&record_ptr).unwrap();
+
+        // Wait for all reader threads and collect results
+        let mut total_successful = 0;
+        let mut total_failed = 0;
+
+        for handle in reader_handles {
+            let (successful, failed) = handle.join().unwrap();
+            total_successful += successful;
+            total_failed += failed;
+        }
+
+        // Verify that we had both successful reads (before delete) and failed reads (after delete)
+        assert!(total_successful > 0);
+        assert!(total_failed > 0);
+
+        // Verify the record is deleted
+        let result = heap_file.record(&record_ptr);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HeapFileError::SlottedPageError(_)
+        ));
     }
 }
