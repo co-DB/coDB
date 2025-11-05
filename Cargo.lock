@@ -462,6 +462,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 
 [[package]]
+name = "planner"
+version = "0.1.0"
+dependencies = [
+ "metadata",
+ "parking_lot",
+ "tempfile",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -474,17 +485,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02b3e5e68a3a1a02aad3ec490a98007cbc13c37cbe84a3cd7b8e406d76e7f778"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "query"
-version = "0.1.0"
-dependencies = [
- "metadata",
- "parking_lot",
- "tempfile",
- "thiserror",
- "time",
 ]
 
 [[package]]
