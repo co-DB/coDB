@@ -1,10 +1,11 @@
 ﻿use crate::b_tree_node::{
     BTreeInternalNode, BTreeKey, BTreeLeafNode, BTreeNode, BTreeNodeError, LeafNodeSearchResult,
-    NodeInsertResult, NodeType, RecordPointer, get_node_type,
+    NodeInsertResult, NodeType, get_node_type,
 };
 use crate::cache::{Cache, CacheError, FilePageRef, PageWrite, PinnedReadPage, PinnedWritePage};
 use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::files_manager::FileKey;
+use crate::heap_file::RecordPtr;
 use crate::paged_file::{Page, PageId};
 use crate::slotted_page::SlottedPage;
 use bytemuck::{Pod, PodCastError, Zeroable};
@@ -92,7 +93,7 @@ impl<Key: BTreeKey> BTree<Key> {
         }
     }
 
-    pub fn search(&self, key: &Key) -> Result<Option<RecordPointer>, BTreeError> {
+    pub fn search(&self, key: &Key) -> Result<Option<RecordPtr>, BTreeError> {
         let mut current_page_id = self.read_root_page_id()?;
 
         loop {
@@ -133,11 +134,7 @@ impl<Key: BTreeKey> BTree<Key> {
     /// their child, that we descend into, has enough space to fit another key. That's because
     /// we know that the child can't become full and won't need to be split. If we reach the leaf
     /// and the node is still full we start the recursive split operation.
-    pub(crate) fn insert(
-        &mut self,
-        key: Key,
-        record_pointer: RecordPointer,
-    ) -> Result<(), BTreeError> {
+    pub(crate) fn insert(&mut self, key: Key, record_pointer: RecordPtr) -> Result<(), BTreeError> {
         let optimistic_succeeded = self.insert_optimistic(&key, &record_pointer)?;
         if optimistic_succeeded {
             return Ok(());
@@ -148,7 +145,7 @@ impl<Key: BTreeKey> BTree<Key> {
     fn insert_optimistic(
         &mut self,
         key: &Key,
-        record_pointer: &RecordPointer,
+        record_pointer: &RecordPtr,
     ) -> Result<bool, BTreeError> {
         let mut current_page_id = self.read_root_page_id()?;
 
@@ -185,7 +182,7 @@ impl<Key: BTreeKey> BTree<Key> {
     fn insert_pessimistic(
         &mut self,
         key: Key,
-        record_pointer: RecordPointer,
+        record_pointer: RecordPtr,
     ) -> Result<(), BTreeError> {
         let mut metadata_page = Some(self.cache.pin_write(&FilePageRef::new(
             BTree::<Key>::METADATA_PAGE_ID,
@@ -244,7 +241,7 @@ impl<Key: BTreeKey> BTree<Key> {
         mut internal_nodes: Vec<BTreeInternalNode<PinnedWritePage, Key>>,
         mut leaf_node: BTreeLeafNode<PinnedWritePage, Key>,
         key: Key,
-        record_pointer: RecordPointer,
+        record_pointer: RecordPtr,
         metadata_page: Option<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
         // First we split half (by size) of the key in leaf node and get the separator key.
@@ -256,7 +253,7 @@ impl<Key: BTreeKey> BTree<Key> {
         // Then we create a new leaf node that will take those keys.
         let (new_page, new_leaf_id) = self.cache.allocate_page(&self.file_key)?;
         let mut new_leaf_node =
-            BTreeLeafNode::<PinnedWritePage, Key>::initialize(new_page, next_leaf_id);
+            BTreeLeafNode::<PinnedWritePage, Key>::initialize(new_page, next_leaf_id)?;
 
         // Insert the keys into the newly created leaf.
         new_leaf_node.batch_insert(records)?;
@@ -301,7 +298,7 @@ impl<Key: BTreeKey> BTree<Key> {
                         let mut new_internal_node =
                             BTreeInternalNode::<PinnedWritePage, Key>::initialize(
                                 new_internal_page,
-                            );
+                            )?;
 
                         // The first record in split_records contains the leftmost child
                         // pointer for the new internal node. This is because the key of this record
@@ -356,7 +353,7 @@ impl<Key: BTreeKey> BTree<Key> {
         mut metadata_page: PinnedWritePage,
     ) -> Result<(), BTreeError> {
         let (new_root_page, new_root_id) = self.cache.allocate_page(&self.file_key)?;
-        let mut new_root = BTreeInternalNode::<PinnedWritePage, Key>::initialize(new_root_page);
+        let mut new_root = BTreeInternalNode::<PinnedWritePage, Key>::initialize(new_root_page)?;
 
         // Set the leftmost child to point to the left child (old root or left sibling)
         new_root.set_leftmost_child_id(left_child_id)?;

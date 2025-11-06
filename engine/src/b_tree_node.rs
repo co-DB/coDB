@@ -1,7 +1,7 @@
 ﻿use crate::cache::{PageRead, PageWrite};
 use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
+use crate::heap_file::RecordPtr;
 use crate::paged_file::{PAGE_SIZE, PageId};
-use crate::record::Record;
 use crate::slotted_page::{
     InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
     SlottedPageError, SlottedPageHeader, get_base_header,
@@ -115,7 +115,7 @@ impl Default for BTreeLeafHeader {
 /// Enum representing possible outcomes of a search operation in leaf node.
 pub(crate) enum LeafNodeSearchResult {
     /// Exact match found.
-    Found { record_ptr: RecordPointer },
+    Found { record_ptr: RecordPtr },
 
     /// Key not found, but insertion point identified.
     NotFoundLeaf { insert_slot_id: SlotId },
@@ -126,31 +126,6 @@ pub(crate) struct InternalNodeSearchResult {
     pub(crate) insert_pos: Option<u16>,
 }
 
-// TODO: Use the heap file record ptr
-#[derive(Debug, Clone)]
-/// A struct containing all the information necessary to get the actual record data from a heap file.
-/// Stored inside leaf nodes of the b-tree.
-pub(crate) struct RecordPointer {
-    /// Page id of the heap file.
-    page_id: PageId,
-    /// Slot inside that page.
-    slot_id: SlotId,
-}
-
-impl DbSerializable for RecordPointer {
-    fn serialize(&self, buf: &mut Vec<u8>) {
-        buf.extend(self.page_id.to_le_bytes());
-        buf.extend(self.slot_id.to_le_bytes());
-    }
-
-    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
-        let (page_id, rest) = PageId::deserialize(buffer)?;
-        let (slot_id, rest) = SlotId::deserialize(rest)?;
-        let record_ptr = Self { page_id, slot_id };
-        Ok((record_ptr, rest))
-    }
-}
-
 /// Helper trait that every key of a b-tree must implement.
 pub(crate) trait BTreeKey: DbSerializable + Ord + Clone {
     const MAX_KEY_SIZE: u16;
@@ -159,7 +134,7 @@ pub(crate) trait BTreeKey: DbSerializable + Ord + Clone {
 macro_rules! impl_btree_key {
     ($($t:ty),*) => {
         $(impl BTreeKey for $t {
-            const MAX_KEY_SIZE: u16 = (size_of::<$t>() + size_of::<RecordPointer>() + size_of::<Slot>()) as u16;
+            const MAX_KEY_SIZE: u16 = (size_of::<$t>() + size_of::<RecordPtr>() + size_of::<Slot>()) as u16;
         })*
     };
 }
@@ -200,7 +175,7 @@ where
     Key: BTreeKey,
 {
     pub const fn max_insert_size() -> u16 {
-        Key::MAX_KEY_SIZE + (size_of::<RecordPointer>() + size_of::<Slot>()) as u16
+        Key::MAX_KEY_SIZE + (size_of::<RecordPtr>() + size_of::<Slot>()) as u16
     }
 }
 
@@ -299,7 +274,7 @@ where
             .iter()
             .position(|(_, record)| {
                 current_size += record.len();
-                current_size > SlottedPage::<Page, Header>::USABLE_SPACE / 2
+                current_size > SlottedPage::<Page, Header>::MAX_FREE_SPACE as usize / 2
             })
             .unwrap_or(valid_records.len() / 2);
 
@@ -406,12 +381,12 @@ where
     Page: PageWrite + PageRead,
     Key: BTreeKey,
 {
-    pub fn initialize(page: Page) -> Self {
-        let slotted_page = SlottedPage::initialize_default(page, true);
-        Self {
+    pub fn initialize(page: Page) -> Result<Self, BTreeNodeError> {
+        let slotted_page = SlottedPage::initialize_default(page)?;
+        Ok(Self {
             slotted_page,
             _key_marker: PhantomData,
-        }
+        })
     }
 
     pub fn insert(
@@ -479,7 +454,7 @@ where
             match key.cmp(target_key) {
                 Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
-                    let (record_ptr, _) = RecordPointer::deserialize(record_ptr_bytes)?;
+                    let (record_ptr, _) = RecordPtr::deserialize(record_ptr_bytes)?;
                     return Ok(LeafNodeSearchResult::Found { record_ptr });
                 }
                 Ordering::Greater => {
@@ -509,7 +484,7 @@ where
     Page: PageWrite + PageRead,
     Key: BTreeKey,
 {
-    pub fn initialize(page: Page, next_leaf: Option<PageId>) -> Self {
+    pub fn initialize(page: Page, next_leaf: Option<PageId>) -> Result<Self, BTreeNodeError> {
         let header = BTreeLeafHeader {
             base_header: SlottedPageBaseHeader::new(
                 size_of::<BTreeLeafHeader>() as u16,
@@ -518,17 +493,17 @@ where
             padding: 0,
             next_leaf_pointer: next_leaf.unwrap_or(BTreeLeafHeader::NO_NEXT_LEAF),
         };
-        let slotted_page = SlottedPage::initialize_with_header(page, true, header);
-        Self {
+        let slotted_page = SlottedPage::initialize_with_header(page, header)?;
+        Ok(Self {
             slotted_page,
             _key_marker: PhantomData,
-        }
+        })
     }
 
     pub fn insert(
         &mut self,
         key: Key,
-        record_pointer: RecordPointer,
+        record_pointer: RecordPtr,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let position = match self.search(&key)? {
             // TODO (For indexes): handle duplicated keys
@@ -593,11 +568,11 @@ mod test {
     type LeafNode = BTreeNode<TestPage, BTreeLeafHeader, i32>;
     type InternalNode = BTreeNode<TestPage, BTreeInternalHeader, i32>;
 
-    fn make_leaf_node(keys: &[i32], record_ptrs: &[RecordPointer]) -> LeafNode {
+    fn make_leaf_node(keys: &[i32], record_ptrs: &[RecordPtr]) -> LeafNode {
         assert_eq!(keys.len(), record_ptrs.len());
 
         let page = TestPage::new(PAGE_SIZE);
-        let mut node = LeafNode::initialize(page, None);
+        let mut node = LeafNode::initialize(page, None).unwrap();
 
         for (k, rec) in keys.iter().zip(record_ptrs.iter()) {
             let mut buf = Vec::new();
@@ -621,7 +596,7 @@ mod test {
         assert_eq!(keys.len() + 1, child_ptrs.len());
 
         let page = TestPage::new(PAGE_SIZE);
-        let mut node = InternalNode::initialize(page);
+        let mut node = InternalNode::initialize(page).unwrap();
 
         let header: &mut BTreeInternalHeader = node.get_btree_header_mut().unwrap();
         header.leftmost_child_pointer = child_ptrs[0];
@@ -643,7 +618,7 @@ mod test {
     #[test]
     fn test_leaf_search_empty_node() {
         let page = TestPage::new(PAGE_SIZE);
-        let node = LeafNode::initialize(page, None);
+        let node = LeafNode::initialize(page, None).unwrap();
 
         let res = node.search(&10).unwrap();
         match res {
@@ -656,18 +631,9 @@ mod test {
     fn test_leaf_search_found_and_not_found() {
         let keys = vec![10i32, 20i32, 30i32];
         let recs = vec![
-            RecordPointer {
-                page_id: 1,
-                slot_id: 1,
-            },
-            RecordPointer {
-                page_id: 1,
-                slot_id: 2,
-            },
-            RecordPointer {
-                page_id: 2,
-                slot_id: 3,
-            },
+            RecordPtr::new(1, 1),
+            RecordPtr::new(1, 2),
+            RecordPtr::new(2, 3),
         ];
 
         let node = make_leaf_node(&keys, &recs);
