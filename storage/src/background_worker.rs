@@ -4,7 +4,7 @@ use thiserror::Error;
 
 /// Error for [`BackgroundWorker`] related operations.
 #[derive(Debug, Error)]
-pub(crate) enum BackgroundWorkerError {
+pub enum BackgroundWorkerError {
     #[error("failed to shutdown: {0}")]
     FailedToShutdown(String),
     #[error("background worker was already shutdown")]
@@ -15,7 +15,7 @@ pub(crate) enum BackgroundWorkerError {
 
 /// Handle returned by starting [`BackgroundWorker`].
 /// Can be used for shutting down worker and awaiting its completion.
-pub(crate) struct BackgroundWorkerHandle {
+pub struct BackgroundWorkerHandle {
     /// Handle to the [`BackgroundWorker`]'s thread.
     handle: thread::JoinHandle<()>,
     /// Sender end of the channel used for shutting down [`BackgroundWorker`].
