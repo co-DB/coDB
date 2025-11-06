@@ -107,7 +107,7 @@ impl SlottedPageBaseHeader {
         );
         Self {
             co_db_magic_number: CO_DB_MAGIC_NUMBER,
-            total_free_space: PAGE_SIZE as u16,
+            total_free_space: PAGE_SIZE as u16 - header_size,
             contiguous_free_space: PAGE_SIZE as u16 - header_size,
             record_area_offset: PAGE_SIZE as u16,
             header_size,
@@ -314,6 +314,11 @@ pub(crate) struct SlottedPage<P, H: SlottedPageHeader> {
     _header_marker: PhantomData<H>,
 }
 
+impl<P, H: SlottedPageHeader> SlottedPage<P, H> {
+    /// Maximum free space available in the slotted page (when no slot is used).
+    pub const MAX_FREE_SPACE: u16 = (PAGE_SIZE - size_of::<H>()) as _;
+}
+
 /// Gets a reference to the base header from the given page without creating an instance of
 /// the slotted page struct. Can be used for e.g. getting the page type before creating a
 /// specific slotted page wrapper like B-Tree internal or leaf node.
@@ -325,7 +330,6 @@ pub fn get_base_header<P: PageRead>(page: &P) -> Result<&SlottedPageBaseHeader, 
 
 /// Implementation for read-only slotted page
 impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
-    pub const USABLE_SPACE: usize = PAGE_SIZE - size_of::<H>();
 
     /// Creates a new SlottedPage wrapper around a page with default slot compaction settings based on page type.
     pub fn new(page: P) -> Result<Self, SlottedPageError> {
@@ -445,7 +449,6 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(&self.page.data()[record_start..record_end])
     }
 
-    // TODO: add tests for this
     /// Reads all records from page that are not marked as deleted.
     pub fn read_all_records(&self) -> Result<impl Iterator<Item = &[u8]>, SlottedPageError> {
         let slots = self.get_slots()?;
@@ -476,21 +479,25 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 }
 
 impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
-    pub fn initialize_with_header(page: P, allow_slot_compaction: bool, header: H) -> Self {
+    pub fn initialize_with_header(page: P, header: H) -> Result<Self, SlottedPageError> {
         let mut page = page;
         page.data_mut()[0..size_of::<H>()].copy_from_slice(bytemuck::bytes_of(&header));
-        Self {
+
+        let ty = header.base().page_type()?;
+        let allow_slot_compaction = ty.allow_slot_compaction();
+
+        Ok(Self {
             page,
             allow_slot_compaction,
             _header_marker: PhantomData,
-        }
+        })
     }
 
-    pub fn initialize_default(page: P, allow_slot_compaction: bool) -> Self
+    pub fn initialize_default(page: P) -> Result<Self, SlottedPageError>
     where
         H: Default,
     {
-        Self::initialize_with_header(page, allow_slot_compaction, H::default())
+        Self::initialize_with_header(page, H::default())
     }
 
     /// Generic method to cast page header to any type implementing SlottedPageHeader
@@ -515,6 +522,9 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     }
 
     /// Updates the record at given position.
+    ///
+    /// When [`UpdateResult::NeedsDefragmentation`] is returned user should call [`SlottedPage::defragment_and_update`]
+    /// instead of compacting records by hand.
     pub fn update(
         &mut self,
         slot_id: SlotId,
