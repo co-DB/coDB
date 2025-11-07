@@ -1,15 +1,18 @@
 [package]
-name = "query"
+name = "storage"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
-metadata = { path = "../metadata" }
-
+bytemuck.workspace = true
 thiserror.workspace = true
+log.workspace = true
 parking_lot.workspace = true
-time.workspace = true
+dashmap.workspace = true
+
+lru = "0.16.0"
+directories = "6.0.0"
 
 [dev-dependencies]
 tempfile = "3.20.0"

@@ -1,9 +1,9 @@
-﻿use crate::cache::{PageRead, PageWrite};
-use crate::paged_file::PAGE_SIZE;
-use crate::slotted_page::SlottedPageError::ForbiddenSlotCompaction;
+﻿use crate::slotted_page::SlottedPageError::ForbiddenSlotCompaction;
 use bitflags::bitflags;
 use bytemuck::{Pod, PodCastError, Zeroable};
 use std::marker::PhantomData;
+use storage::cache::{PageRead, PageWrite};
+use storage::paged_file::PAGE_SIZE;
 use thiserror::Error;
 
 /// Helper trait meant for structs implementing SlottedPageHeader trait. Making implementing it

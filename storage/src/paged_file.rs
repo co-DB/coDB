@@ -11,13 +11,13 @@ use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
 /// Type representing page id, should be used instead of bare `u32`.
-pub(crate) type PageId = u32;
+pub type PageId = u32;
 
 /// Size of each page in [`PagedFile`].
-pub(crate) const PAGE_SIZE: usize = 4096; // 4 kB
+pub const PAGE_SIZE: usize = 4096; // 4 kB
 
 /// Type representing page, should be used instead of bare array of bytes.
-pub(crate) type Page = [u8; PAGE_SIZE];
+pub type Page = [u8; PAGE_SIZE];
 
 /// Responsible for managing a single on-disk file.
 /// Only this structure should be responsible for directly communicating with disk.
@@ -40,7 +40,7 @@ pub(crate) struct PagedFile {
 
 /// Error for [`PagedFile`] related operations.
 #[derive(Error, Debug)]
-pub(crate) enum PagedFileError {
+pub enum PagedFileError {
     /// Provided page id was invalid, e.g. tried to read [`METADATA_PAGE_ID`]
     #[error("invalid page id: {0}")]
     InvalidPageId(PageId),

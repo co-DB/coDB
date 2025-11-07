@@ -1,10 +1,5 @@
 mod b_tree;
-pub mod background_worker;
-pub mod cache;
-mod consts;
 mod data_types;
-pub mod files_manager;
 mod heap_file;
-pub mod paged_file;
 pub mod record;
 mod slotted_page;
