@@ -847,20 +847,13 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let first_page = page_chain.record_page_mut();
         let record_first_fragment = first_page.record_fragment(ptr.slot)?;
 
-        let mut next_ptr = record_first_fragment.next_fragment;
+        let next_ptr = record_first_fragment.next_fragment;
 
         // Delete first fragment of the record
         first_page.delete(ptr.slot)?;
 
         // Follow record chain and delete each fragment
-        while let Some(next) = next_ptr {
-            page_chain.advance(next.page_id)?;
-            let page = page_chain.overflow_page_mut();
-            let record_fragment = page.record_fragment(next.slot)?;
-
-            next_ptr = record_fragment.next_fragment;
-            page.delete(next.slot)?;
-        }
+        self.delete_record_fragments_from_overflow_pages_chain(page_chain, next_ptr)?;
         Ok(())
     }
 
@@ -1034,7 +1027,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                     &with_tag,
                     start.page_id,
                 )?;
-                // TODO: delete all fragments from other pages
+                self.delete_record_fragments_from_overflow_pages_chain(page_chain, Some(next_tag))?;
                 return Ok(());
             }
 
@@ -1104,7 +1097,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 current_frag_len,
                 &self.overflow_pages_fsm,
             )? {
-                // TODO: delete all fragments after this
+                self.delete_record_fragments_from_overflow_pages_chain(page_chain, next_frag)?;
                 return Ok(());
             }
 
@@ -1247,6 +1240,22 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             page_id,
             slot: slot_id,
         });
+    }
+
+    /// Deletes all record fragments from chain of overflow pages starting in `next_ptr`.
+    fn delete_record_fragments_from_overflow_pages_chain<'hf>(
+        &'hf self,
+        mut chain: PageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage>,
+        mut next_ptr: Option<RecordPtr>,
+    ) -> Result<(), HeapFileError> {
+        while let Some(next) = next_ptr {
+            chain.advance(next.page_id)?;
+            let page = chain.overflow_page_mut();
+            let record_fragment = page.record_fragment(next.slot)?;
+            next_ptr = record_fragment.next_fragment;
+            page.delete(next.slot)?;
+        }
+        Ok(())
     }
 
     /// Generic helper for reading any type of heap page
@@ -3854,12 +3863,25 @@ mod tests {
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
-        // Verify the record initially spans multiple pages
-        let first_page = heap_file.read_record_page(record_ptr.page_id).unwrap();
-        let first_fragment = first_page.record_fragment(record_ptr.slot).unwrap();
-        assert!(first_fragment.next_fragment.is_some());
-        drop(first_fragment);
-        drop(first_page);
+        // Collect all fragment locations before update
+        let mut original_fragment_locations = vec![];
+        let mut current_ptr = Some(record_ptr);
+
+        while let Some(ptr) = current_ptr {
+            original_fragment_locations.push((ptr.page_id, ptr.slot));
+
+            if original_fragment_locations.len() == 1 {
+                let page = heap_file.read_record_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            } else {
+                let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            }
+        }
+
+        assert!(original_fragment_locations.len() >= 2);
 
         // Update the String field with a small string that fits in one page
         let small_string = "tiny";
@@ -3883,6 +3905,21 @@ mod tests {
         let first_fragment_after = first_page_after.record_fragment(record_ptr.slot).unwrap();
 
         assert!(first_fragment_after.next_fragment.is_none());
+
+        // Verify all overflow fragments were deleted
+        for (i, (page_id, slot_id)) in original_fragment_locations.iter().enumerate() {
+            if i == 0 {
+                // First fragment should still exist
+                let page = heap_file.read_record_page(*page_id).unwrap();
+                let result = page.page.read_record(*slot_id);
+                assert!(result.is_ok());
+            } else {
+                // All overflow fragments should be deleted
+                let page = heap_file.read_overflow_page(*page_id).unwrap();
+                let result = page.page.read_record(*slot_id);
+                assert!(result.is_err());
+            }
+        }
     }
 
     #[test]
@@ -3986,6 +4023,26 @@ mod tests {
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
+        // Collect all fragment locations before update (should be 4 pages)
+        let mut original_fragment_locations = vec![];
+        let mut current_ptr = Some(record_ptr);
+
+        while let Some(ptr) = current_ptr {
+            original_fragment_locations.push((ptr.page_id, ptr.slot));
+
+            if original_fragment_locations.len() == 1 {
+                let page = heap_file.read_record_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            } else {
+                let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            }
+        }
+
+        assert_eq!(original_fragment_locations.len(), 4);
+
         // Update with a string that's half the size (should span 2 pages)
         let updated_string_size = initial_string_size / 2;
         let updated_string = "y".repeat(updated_string_size);
@@ -4023,6 +4080,26 @@ mod tests {
         }
 
         assert_eq!(fragment_count, 2);
+
+        // Verify that the last 2 fragments were deleted from their pages
+        for (i, (page_id, slot_id)) in original_fragment_locations.iter().enumerate() {
+            if i < 2 {
+                // First 2 fragments should still be readable
+                let result = if i == 0 {
+                    let page = heap_file.read_record_page(*page_id).unwrap();
+                    page.page.read_record(*slot_id).is_ok()
+                } else {
+                    let page = heap_file.read_overflow_page(*page_id).unwrap();
+                    page.page.read_record(*slot_id).is_ok()
+                };
+                assert!(result);
+            } else {
+                // Last 2 fragments should be deleted
+                let page = heap_file.read_overflow_page(*page_id).unwrap();
+                let result = page.page.read_record(*slot_id);
+                assert!(result.is_err(),);
+            }
+        }
     }
 
     #[test]
@@ -4382,8 +4459,42 @@ mod tests {
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
+        // Collect all page IDs and slots that contain fragments before deletion
+        let mut fragment_locations = vec![];
+        let mut current_ptr = Some(record_ptr);
+
+        while let Some(ptr) = current_ptr {
+            fragment_locations.push((ptr.page_id, ptr.slot));
+
+            if fragment_locations.len() == 1 {
+                let page = heap_file.read_record_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            } else {
+                let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
+                let fragment = page.record_fragment(ptr.slot).unwrap();
+                current_ptr = fragment.next_fragment;
+            }
+        }
+
         // Delete the record
         heap_file.delete(&record_ptr).unwrap();
+
+        // Verify all fragments were deleted from their respective pages
+        for (i, (page_id, slot_id)) in fragment_locations.iter().enumerate() {
+            let result = if i == 0 {
+                // First fragment on record page
+                let page = heap_file.read_record_page(*page_id).unwrap();
+                page.page.read_record(*slot_id).is_err()
+            } else {
+                // Subsequent fragments on overflow pages
+                let page = heap_file.read_overflow_page(*page_id).unwrap();
+                page.page.read_record(*slot_id).is_err()
+            };
+
+            // Reading a deleted slot should fail
+            assert!(result);
+        }
 
         // Verify the record was deleted - reading should fail
         let result = heap_file.record(&record_ptr);
@@ -4393,7 +4504,6 @@ mod tests {
             HeapFileError::SlottedPageError(_)
         ));
     }
-
     #[test]
     fn heap_file_delete_concurrent_read_multi_page_record() {
         let (cache, _, file_key) = setup_test_cache();
