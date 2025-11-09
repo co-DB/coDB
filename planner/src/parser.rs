@@ -53,7 +53,7 @@ pub enum ParserError {
     },
 }
 
-struct Parser {
+pub(crate) struct Parser {
     /// lexer to supply the tokens
     lexer: Lexer,
     /// The ast being constructed
