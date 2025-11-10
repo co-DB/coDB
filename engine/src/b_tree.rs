@@ -78,7 +78,6 @@ pub(crate) struct BTree<Key: BTreeKey> {
     _key_marker: PhantomData<Key>,
     file_key: FileKey,
     cache: Arc<Cache>,
-    is_unique: bool,
 }
 
 impl<Key: BTreeKey> BTree<Key> {
@@ -94,11 +93,10 @@ impl<Key: BTreeKey> BTree<Key> {
         Ok(metadata.root_page_id)
     }
 
-    fn new(cache: Arc<Cache>, file_key: FileKey, is_unique: bool) -> Self {
+    fn new(cache: Arc<Cache>, file_key: FileKey) -> Self {
         Self {
             cache,
             file_key,
-            is_unique,
             _key_marker: PhantomData,
         }
     }
@@ -450,7 +448,6 @@ mod test {
     fn create_empty_btree<Key: BTreeKey>(
         cache: Arc<Cache>,
         file_key: FileKey,
-        is_unique: bool,
     ) -> Result<BTree<Key>, BTreeError> {
         let (mut metadata_page, metadata_page_id) = cache.allocate_page(&file_key)?;
 
@@ -466,16 +463,15 @@ mod test {
 
         drop(metadata_page);
 
-        Ok(BTree::new(cache, file_key, is_unique))
+        Ok(BTree::new(cache, file_key))
     }
 
     fn create_btree_with_data<Key: BTreeKey>(
         cache: Arc<Cache>,
         file_key: FileKey,
-        is_unique: bool,
         data: Vec<(Key, RecordPtr)>,
     ) -> Result<BTree<Key>, BTreeError> {
-        let mut btree = create_empty_btree(cache, file_key, is_unique)?;
+        let mut btree = create_empty_btree(cache, file_key)?;
 
         for (key, record_ptr) in data {
             btree.insert(key, record_ptr)?;
@@ -488,7 +484,7 @@ mod test {
     fn test_create_empty_btree() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
 
-        let btree = create_empty_btree::<i32>(cache, file_key, true);
+        let btree = create_empty_btree::<i32>(cache, file_key);
         assert!(btree.is_ok());
     }
 
@@ -498,7 +494,7 @@ mod test {
     #[test]
     fn test_search_empty_btree() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = create_empty_btree::<i32>(cache, file_key, true).unwrap();
+        let btree = create_empty_btree::<i32>(cache, file_key).unwrap();
 
         let result = btree.search(&42);
         assert!(result.is_ok());
@@ -508,7 +504,7 @@ mod test {
     #[test]
     fn test_insert_single_key() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let mut btree = create_empty_btree::<i32>(cache, file_key, true).unwrap();
+        let mut btree = create_empty_btree::<i32>(cache, file_key).unwrap();
 
         let record_ptr = test_record_pointer(10, 5);
         let result = btree.insert(42, record_ptr.clone());
@@ -530,7 +526,7 @@ mod test {
             (50, test_record_pointer(2, 1)),
         ];
 
-        let btree = create_btree_with_data(cache, file_key, true, data.clone()).unwrap();
+        let btree = create_btree_with_data(cache, file_key, data.clone()).unwrap();
 
         for (key, expected_ptr) in data {
             let result = btree.search(&key).unwrap();
@@ -541,7 +537,7 @@ mod test {
     #[test]
     fn test_insert_duplicate_key_unique_btree() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let mut btree = create_empty_btree::<i32>(cache, file_key, true).unwrap();
+        let mut btree = create_empty_btree::<i32>(cache, file_key).unwrap();
 
         let record_ptr1 = test_record_pointer(10, 5);
         let record_ptr2 = test_record_pointer(20, 10);
@@ -562,7 +558,7 @@ mod test {
             (30, test_record_pointer(1, 2)),
         ];
 
-        let btree = create_btree_with_data(cache, file_key, true, data).unwrap();
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
 
         assert_eq!(btree.search(&5).unwrap(), None);
         assert_eq!(btree.search(&15).unwrap(), None);
@@ -583,7 +579,7 @@ mod test {
             (80, test_record_pointer(8, 0)),
         ];
 
-        let btree = create_btree_with_data(cache, file_key, true, data.clone()).unwrap();
+        let btree = create_btree_with_data(cache, file_key, data.clone()).unwrap();
 
         for (key, expected_ptr) in data {
             let result = btree.search(&key).unwrap();
@@ -594,7 +590,7 @@ mod test {
     #[test]
     fn test_insert_enough_to_split_test() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let mut btree = create_empty_btree::<i32>(cache.clone(), file_key.clone(), true).unwrap();
+        let mut btree = create_empty_btree::<i32>(cache.clone(), file_key.clone()).unwrap();
         let num_keys = 2000;
 
         for i in 0..num_keys {
@@ -627,7 +623,7 @@ mod test {
     #[test]
     fn test_split_trigger_with_large_string_keys() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let mut btree = create_empty_btree::<String>(cache, file_key, true).unwrap();
+        let mut btree = create_empty_btree::<String>(cache, file_key).unwrap();
 
         for i in 0..32 {
             let key = format!("KEY_{}_{}", i, random_string(480));
@@ -643,7 +639,7 @@ mod test {
     #[test]
     fn test_concurrent_inserts_arc_btree() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = Arc::new(create_empty_btree::<i32>(cache, file_key, true).unwrap());
+        let btree = Arc::new(create_empty_btree::<i32>(cache, file_key).unwrap());
 
         let num_threads = 8;
         let keys_per_thread = 250;
