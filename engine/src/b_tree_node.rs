@@ -7,7 +7,8 @@ use crate::slotted_page::{
     SlottedPageError, SlottedPageHeader, get_base_header,
 };
 use bytemuck::{Pod, Zeroable};
-use std::cmp::{Ordering, PartialEq};
+use std::cmp::Ordering;
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use thiserror::Error;
 
@@ -47,7 +48,9 @@ pub(crate) type BTreeInternalNode<Page, Key> = BTreeNode<Page, BTreeInternalHead
 #[derive(Pod, Zeroable, Copy, Clone)]
 pub(crate) struct BTreeInternalHeader {
     base_header: SlottedPageBaseHeader,
-    padding: u16,
+    /// Version number tracking structural changes (splits/merges) to validate that this page is
+    /// still the correct one.
+    page_version: u16,
     /// Stores the page id of the child node with keys lesser than the smallest one in
     /// this node. We store this here, because a btree node with n keys needs n+1 child
     /// pointers and storing the first pointer here is easier than storing it in a
@@ -72,8 +75,8 @@ impl Default for BTreeInternalHeader {
                 size_of::<BTreeInternalHeader>() as u16,
                 PageType::BTreeInternal,
             ),
-            padding: 0,
             leftmost_child_pointer: Self::NO_LEFTMOST_CHILD_POINTER,
+            page_version: 0,
         }
     }
 }
@@ -83,7 +86,9 @@ impl Default for BTreeInternalHeader {
 #[derive(Pod, Zeroable, Copy, Clone)]
 pub(crate) struct BTreeLeafHeader {
     base_header: SlottedPageBaseHeader,
-    padding: u16,
+    /// Version number tracking structural changes (splits/merges) to validate that this page is
+    /// still the correct one.
+    page_version: u16,
     /// Pointer to the right sibling leaf node (for range queries)
     next_leaf_pointer: PageId,
 }
@@ -105,8 +110,8 @@ impl Default for BTreeLeafHeader {
                 size_of::<BTreeLeafHeader>() as u16,
                 PageType::BTreeLeaf,
             ),
-            padding: 0,
             next_leaf_pointer: Self::NO_NEXT_LEAF,
+            page_version: 0,
         }
     }
 }
@@ -127,7 +132,7 @@ pub(crate) struct InternalNodeSearchResult {
 }
 
 /// Helper trait that every key of a b-tree must implement.
-pub(crate) trait BTreeKey: DbSerializable + Ord + Clone {
+pub(crate) trait BTreeKey: DbSerializable + Ord + Clone + Debug {
     const MAX_KEY_SIZE: u16;
 }
 
@@ -246,10 +251,6 @@ where
         Ok(self.slotted_page.get_header_mut()?)
     }
 
-    pub fn compact_slot_directory(&mut self) -> Result<(), BTreeNodeError> {
-        Ok(self.slotted_page.compact_slots()?)
-    }
-
     pub fn batch_insert(&mut self, insert_values: Vec<Vec<u8>>) -> Result<(), BTreeNodeError> {
         for (index, value) in insert_values.iter().enumerate() {
             self.slotted_page
@@ -307,13 +308,18 @@ where
     Page: PageRead,
     Key: BTreeKey,
 {
+    pub fn read_version_number(&self) -> Result<u16, BTreeNodeError> {
+        Ok(self.get_btree_header()?.page_version)
+    }
+
     /// Search returns which child to follow.
     pub fn search(&self, target_key: &Key) -> Result<InternalNodeSearchResult, BTreeNodeError> {
         let num_slots = self.slotted_page.num_slots()?;
 
         if num_slots == 0 {
-            return Err(BTreeNodeError::CorruptNode {
-                reason: "internal node has no slots".into(),
+            return Ok(InternalNodeSearchResult {
+                child_ptr: self.get_btree_header()?.leftmost_child_pointer,
+                insert_pos: Some(0),
             });
         }
 
@@ -359,7 +365,7 @@ where
         let (child_ptr, insert_pos) = if left == 0 {
             (header.leftmost_child_pointer, 0)
         } else {
-            (self.get_child_ptr(left - 1)?, left - 1)
+            (self.get_child_ptr(left - 1)?, left)
         };
 
         Ok(InternalNodeSearchResult {
@@ -381,8 +387,24 @@ where
     Page: PageWrite + PageRead,
     Key: BTreeKey,
 {
-    pub fn initialize(page: Page) -> Result<Self, BTreeNodeError> {
-        let slotted_page = SlottedPage::initialize_default(page)?;
+    pub fn update_version_number(&mut self) -> Result<(), BTreeNodeError> {
+        let header = self.get_btree_header_mut()?;
+        header.page_version += 1;
+        Ok(())
+    }
+
+    pub fn initialize(page: Page, leftmost_child_pointer: PageId) -> Result<Self, BTreeNodeError> {
+        let header = BTreeInternalHeader {
+            base_header: SlottedPageBaseHeader::new(
+                size_of::<BTreeInternalHeader>() as u16,
+                PageType::BTreeInternal,
+            ),
+            leftmost_child_pointer,
+            page_version: 0,
+        };
+
+        let slotted_page = SlottedPage::initialize_with_header(page, header)?;
+
         Ok(Self {
             slotted_page,
             _key_marker: PhantomData,
@@ -424,6 +446,10 @@ where
     Page: PageRead,
     Key: BTreeKey,
 {
+    pub fn read_version_number(&self) -> Result<u16, BTreeNodeError> {
+        Ok(self.get_btree_header()?.page_version)
+    }
+
     /// Search either finds record or insert slot.
     pub fn search(&self, target_key: &Key) -> Result<LeafNodeSearchResult, BTreeNodeError> {
         let num_slots = self.slotted_page.num_slots()?;
@@ -490,14 +516,20 @@ where
                 size_of::<BTreeLeafHeader>() as u16,
                 PageType::BTreeLeaf,
             ),
-            padding: 0,
             next_leaf_pointer: next_leaf.unwrap_or(BTreeLeafHeader::NO_NEXT_LEAF),
+            page_version: 0,
         };
         let slotted_page = SlottedPage::initialize_with_header(page, header)?;
         Ok(Self {
             slotted_page,
             _key_marker: PhantomData,
         })
+    }
+
+    pub fn update_version_number(&mut self) -> Result<(), BTreeNodeError> {
+        let header = self.get_btree_header_mut()?;
+        header.page_version += 1;
+        Ok(())
     }
 
     pub fn insert(
@@ -518,8 +550,11 @@ where
             InsertResult::Success(_) => Ok(NodeInsertResult::Success),
             InsertResult::NeedsDefragmentation => {
                 self.slotted_page.compact_records()?;
-                self.slotted_page.insert_at(&buffer, position)?;
-                Ok(NodeInsertResult::Success)
+                let new_response = self.slotted_page.insert_at(&buffer, position)?;
+                match new_response {
+                    InsertResult::Success(_) => Ok(NodeInsertResult::Success),
+                    _ => unreachable!(),
+                }
             }
             InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
         }
@@ -566,6 +601,7 @@ mod test {
     }
 
     type LeafNode = BTreeNode<TestPage, BTreeLeafHeader, i32>;
+
     type InternalNode = BTreeNode<TestPage, BTreeInternalHeader, i32>;
 
     fn make_leaf_node(keys: &[i32], record_ptrs: &[RecordPtr]) -> LeafNode {
@@ -596,7 +632,7 @@ mod test {
         assert_eq!(keys.len() + 1, child_ptrs.len());
 
         let page = TestPage::new(PAGE_SIZE);
-        let mut node = InternalNode::initialize(page).unwrap();
+        let mut node = InternalNode::initialize(page, child_ptrs[0]).unwrap();
 
         let header: &mut BTreeInternalHeader = node.get_btree_header_mut().unwrap();
         header.leftmost_child_pointer = child_ptrs[0];

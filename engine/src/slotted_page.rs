@@ -330,7 +330,6 @@ pub fn get_base_header<P: PageRead>(page: &P) -> Result<&SlottedPageBaseHeader, 
 
 /// Implementation for read-only slotted page
 impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
-
     /// Creates a new SlottedPage wrapper around a page with default slot compaction settings based on page type.
     pub fn new(page: P) -> Result<Self, SlottedPageError> {
         let data = page.data();
