@@ -7,7 +7,7 @@ use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
 
 /// [`ResolvedTree`] is a semantically analyzed version of [`Ast`].
 #[derive(Default, Debug)]
-pub(crate) struct ResolvedTree {
+pub struct ResolvedTree {
     pub(crate) nodes: Vec<ResolvedExpression>,
     pub(crate) statements: Vec<ResolvedStatement>,
 }
@@ -26,7 +26,7 @@ impl ResolvedTree {
     }
 
     /// Returns node with `node_id`.
-    pub(crate) fn node(&self, id: ResolvedNodeId) -> &ResolvedExpression {
+    pub fn node(&self, id: ResolvedNodeId) -> &ResolvedExpression {
         &self.nodes[id.0]
     }
 
@@ -138,11 +138,11 @@ pub(crate) struct ResolvedDropStatement {
     pub(crate) table: ResolvedNodeId,
 }
 
-#[derive(Debug)]
-pub(crate) struct ResolvedCreateColumnDescriptor {
-    pub(crate) name: String,
-    pub(crate) ty: Type,
-    pub(crate) addon: ResolvedCreateColumnAddon,
+#[derive(Debug, Clone)]
+pub struct ResolvedCreateColumnDescriptor {
+    pub name: String,
+    pub ty: Type,
+    pub addon: ResolvedCreateColumnAddon,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
@@ -170,7 +170,7 @@ impl Display for ResolvedCreateColumnAddon {
 }
 
 #[derive(Debug)]
-pub(crate) enum ResolvedExpression {
+pub enum ResolvedExpression {
     TableRef(ResolvedTable),
     ColumnRef(ResolvedColumn),
     FunctionRef(ResolvedFunction),
@@ -182,56 +182,56 @@ pub(crate) enum ResolvedExpression {
 }
 
 #[derive(Debug)]
-pub(crate) struct ResolvedTable {
-    pub(crate) name: String,
-    pub(crate) primary_key_name: String,
+pub struct ResolvedTable {
+    pub name: String,
+    pub primary_key_name: String,
 }
 
 #[derive(Debug)]
-pub(crate) struct ResolvedColumn {
-    pub(crate) table: ResolvedNodeId,
-    pub(crate) name: String,
-    pub(crate) ty: Type,
-    pub(crate) pos: u16,
+pub struct ResolvedColumn {
+    pub table: ResolvedNodeId,
+    pub name: String,
+    pub ty: Type,
+    pub pos: u16,
 }
 
 #[derive(Debug)]
-pub(crate) struct ResolvedFunction {
-    pub(crate) name: String,
-    pub(crate) args: Vec<ResolvedNodeId>,
-    pub(crate) output_ty: Type,
+pub struct ResolvedFunction {
+    pub name: String,
+    pub args: Vec<ResolvedNodeId>,
+    pub output_ty: Type,
 }
 
 #[derive(Debug)]
-pub(crate) struct ResolvedLogicalExpression {
-    pub(crate) left: ResolvedNodeId,
-    pub(crate) right: ResolvedNodeId,
-    pub(crate) op: LogicalOperator,
+pub struct ResolvedLogicalExpression {
+    pub left: ResolvedNodeId,
+    pub right: ResolvedNodeId,
+    pub op: LogicalOperator,
 }
 
 #[derive(Debug)]
-pub(crate) struct ResolvedBinaryExpression {
-    pub(crate) left: ResolvedNodeId,
-    pub(crate) right: ResolvedNodeId,
-    pub(crate) op: BinaryOperator,
-    pub(crate) ty: Type,
+pub struct ResolvedBinaryExpression {
+    pub left: ResolvedNodeId,
+    pub right: ResolvedNodeId,
+    pub op: BinaryOperator,
+    pub ty: Type,
 }
 
 #[derive(Debug)]
-pub(crate) struct ResolvedUnaryExpression {
-    pub(crate) expression: ResolvedNodeId,
-    pub(crate) op: UnaryOperator,
-    pub(crate) ty: Type,
+pub struct ResolvedUnaryExpression {
+    pub expression: ResolvedNodeId,
+    pub op: UnaryOperator,
+    pub ty: Type,
 }
 
 #[derive(Debug)]
-pub(crate) struct ResolvedCast {
-    pub(crate) child: ResolvedNodeId,
-    pub(crate) new_ty: Type,
+pub struct ResolvedCast {
+    pub child: ResolvedNodeId,
+    pub new_ty: Type,
 }
 
 #[derive(Debug)]
-pub(crate) enum ResolvedLiteral {
+pub enum ResolvedLiteral {
     String(String),
     Float32(f32),
     Float64(f64),

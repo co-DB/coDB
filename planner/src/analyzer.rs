@@ -75,12 +75,6 @@ pub(crate) enum AnalyzerError {
     UnexpectedAstError(#[from] AstError),
 }
 
-/// Used for resolving identifiers when caller knows from context what type of identifier is expected.
-enum ResolveIdentifierHint {
-    ExpectedColumn,
-    ExpectedTable,
-}
-
 /// Used as a key type for [`StatementContext::inserted_columns`].
 #[derive(Debug, Hash, PartialEq, Eq)]
 struct InsertedColumnRef {
@@ -1202,13 +1196,6 @@ mod tests {
         match rt.node(id) {
             ResolvedExpression::Literal(ResolvedLiteral::Int32(v)) => *v,
             other => panic!("expected Int32 literal, got: {:?}", other),
-        }
-    }
-
-    fn expect_literal_i64(rt: &ResolvedTree, id: ResolvedNodeId) -> i64 {
-        match rt.node(id) {
-            ResolvedExpression::Literal(ResolvedLiteral::Int64(v)) => *v,
-            other => panic!("expected Int64 literal, got: {:?}", other),
         }
     }
 

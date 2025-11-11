@@ -3,7 +3,7 @@ use core::fmt;
 use metadata::types::Type;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum BinaryOperator {
+pub enum BinaryOperator {
     Plus,
     Minus,
     Star,
@@ -18,13 +18,13 @@ pub(crate) enum BinaryOperator {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum LogicalOperator {
+pub enum LogicalOperator {
     And,
     Or,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum UnaryOperator {
+pub enum UnaryOperator {
     Plus,
     Minus,
     Bang,
