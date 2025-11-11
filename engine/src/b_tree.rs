@@ -1,17 +1,18 @@
-﻿use crate::b_tree_node::{
+use storage::paged_file::{Page, PageId};
+
+use crate::b_tree_node::{
     BTreeInternalNode, BTreeKey, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult,
     NodeInsertResult, NodeType, get_node_type,
 };
-use crate::cache::{Cache, CacheError, FilePageRef, PinnedReadPage, PinnedWritePage};
 use crate::data_types::{DbSerializable, DbSerializationError};
-use crate::files_manager::FileKey;
 use crate::heap_file::RecordPtr;
-use crate::paged_file::{Page, PageId};
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use storage::cache::{Cache, CacheError, FilePageRef, PinnedReadPage, PinnedWritePage};
+use storage::files_manager::FileKey;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -548,9 +549,9 @@ impl<Key: BTreeKey> BTree<Key> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::files_manager::FilesManager;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use std::{fs, thread};
+    use storage::files_manager::FilesManager;
     use tempfile::{TempDir, tempdir};
 
     /// Creates a test cache and files manager in a temporary directory

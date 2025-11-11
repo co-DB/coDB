@@ -15,15 +15,18 @@ use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::{
-    cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedReadPage, PinnedWritePage},
     data_types::{DbSerializable, DbSerializationError},
-    files_manager::FileKey,
-    paged_file::{PAGE_SIZE, Page, PageId, PagedFileError},
     record::{Field, Record, RecordError},
     slotted_page::{
         InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
         SlottedPageError, SlottedPageHeader, UpdateResult,
     },
+};
+
+use storage::{
+    cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedReadPage, PinnedWritePage},
+    files_manager::FileKey,
+    paged_file::{PAGE_SIZE, Page, PageId, PagedFileError},
 };
 
 /// Free-space map for a HeapFile.
@@ -193,10 +196,7 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
 
     /// Creates a `FilePageRef` for `page_id` using this map's file key.
     fn file_page_ref(&self, page_id: PageId) -> FilePageRef {
-        FilePageRef {
-            page_id,
-            file_key: self.file_key.clone(),
-        }
+        FilePageRef::new(page_id, self.file_key.clone())
     }
 }
 
@@ -1548,10 +1548,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
     fn file_page_ref(&self, page_id: PageId) -> FilePageRef {
-        FilePageRef {
-            page_id,
-            file_key: self.file_key.clone(),
-        }
+        FilePageRef::new(page_id, self.file_key.clone())
     }
 }
 
@@ -1624,17 +1621,18 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
                 {
                     // This mean that metadata page was not allocated yet, so the file was just created
                     let (mut metadata_page, metadata_page_id) =
-                        self.cache.allocate_page(&key.file_key)?;
+                        self.cache.allocate_page(&key.file_key())?;
                     debug_assert_eq!(
                         metadata_page_id,
                         HeapFile::<BUCKETS_COUNT>::METADATA_PAGE_ID
                     );
 
-                    let (record_page, record_page_id) = self.cache.allocate_page(&key.file_key)?;
+                    let (record_page, record_page_id) =
+                        self.cache.allocate_page(&key.file_key())?;
                     SlottedPage::<_, RecordPageHeader>::initialize_default(record_page).unwrap();
 
                     let (overflow_page, overflow_page_id) =
-                        self.cache.allocate_page(&key.file_key)?;
+                        self.cache.allocate_page(&key.file_key())?;
                     SlottedPage::<_, OverflowPageHeader>::initialize_default(overflow_page)
                         .unwrap();
 
@@ -1656,10 +1654,7 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
     fn file_page_ref(&self, page_id: PageId) -> FilePageRef {
-        FilePageRef {
-            page_id,
-            file_key: self.file_key.clone(),
-        }
+        FilePageRef::new(page_id, self.file_key.clone())
     }
 }
 
@@ -1674,10 +1669,11 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        files_manager::FilesManager,
         record::Field,
         slotted_page::{InsertResult, PageType},
     };
+
+    use storage::files_manager::FilesManager;
 
     use super::*;
 
@@ -1877,10 +1873,7 @@ mod tests {
         data: &[u8],
         next_fragment: Option<RecordPtr>,
     ) -> Result<SlotId, HeapFileError> {
-        let file_page_ref = FilePageRef {
-            page_id,
-            file_key: file_key.clone(),
-        };
+        let file_page_ref = FilePageRef::new(page_id, file_key.clone());
         let pinned = cache.pin_write(&file_page_ref)?;
         let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned)?;
 
@@ -2124,10 +2117,7 @@ mod tests {
 
         // Modify the page to reduce free space
         {
-            let file_page_ref = FilePageRef {
-                page_id,
-                file_key: file_key.clone(),
-            };
+            let file_page_ref = FilePageRef::new(page_id, file_key.clone());
             let pinned = cache.pin_write(&file_page_ref).unwrap();
             let mut slotted = SlottedPage::<_, TestPageHeader>::new(pinned).unwrap();
             let dummy_data = vec![0u8; 1500];
@@ -2514,10 +2504,7 @@ mod tests {
         assert_eq!(first_overflow_page, 3);
 
         // Verify both pages exist and are properly initialized
-        let record_page_ref = FilePageRef {
-            page_id: first_record_page,
-            file_key: file_key.clone(),
-        };
+        let record_page_ref = FilePageRef::new(first_record_page, file_key.clone());
         let record_page = cache.pin_read(&record_page_ref).unwrap();
         let record_slotted = SlottedPage::<_, RecordPageHeader>::new(record_page).unwrap();
 
@@ -2528,10 +2515,7 @@ mod tests {
         );
         drop(record_slotted);
 
-        let overflow_page_ref = FilePageRef {
-            page_id: first_overflow_page,
-            file_key: file_key.clone(),
-        };
+        let overflow_page_ref = FilePageRef::new(first_overflow_page, file_key.clone());
         let overflow_page = cache.pin_read(&overflow_page_ref).unwrap();
         let overflow_slotted = SlottedPage::<_, OverflowPageHeader>::new(overflow_page).unwrap();
 
@@ -2837,10 +2821,7 @@ mod tests {
         corrupted_data.extend_from_slice(&create_test_record_data());
 
         let slot_id = {
-            let file_page_ref = FilePageRef {
-                page_id: first_record_page_id,
-                file_key: file_key.clone(),
-            };
+            let file_page_ref = FilePageRef::new(first_record_page_id, file_key.clone());
             let pinned = cache.pin_write(&file_page_ref).unwrap();
             let mut slotted = SlottedPage::<_, RecordPageHeader>::new(pinned).unwrap();
             match slotted.insert(&corrupted_data).unwrap() {
@@ -3246,10 +3227,7 @@ mod tests {
         assert_string("test_user", &retrieved_record.fields[1]);
 
         // Verify the page was added to FSM after insertion
-        let file_page_ref = FilePageRef {
-            page_id: first_record_page_id,
-            file_key: file_key.clone(),
-        };
+        let file_page_ref = FilePageRef::new(first_record_page_id, file_key.clone());
         let page = cache.pin_read(&file_page_ref).unwrap();
         let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page).unwrap();
         let free_space = slotted_page.free_space().unwrap() as usize;
@@ -3299,10 +3277,7 @@ mod tests {
         assert_string(&large_string, &retrieved_record.fields[1]);
 
         // Verify the page now has no free space left
-        let file_page_ref = FilePageRef {
-            page_id: first_record_page_id,
-            file_key: file_key.clone(),
-        };
+        let file_page_ref = FilePageRef::new(first_record_page_id, file_key.clone());
         let page = cache.pin_read(&file_page_ref).unwrap();
         let slotted_page = SlottedPage::<_, RecordPageHeader>::new(page).unwrap();
         let free_space = slotted_page.free_space().unwrap() as usize;
@@ -3351,10 +3326,7 @@ mod tests {
         assert_string(&large_string, &retrieved_record.fields[1]);
 
         // Verify both pages were updated in their respective FSMs
-        let record_page_ref = FilePageRef {
-            page_id: first_record_page_id,
-            file_key: file_key.clone(),
-        };
+        let record_page_ref = FilePageRef::new(first_record_page_id, file_key.clone());
         let record_page = cache.pin_read(&record_page_ref).unwrap();
         let record_slotted_page = SlottedPage::<_, RecordPageHeader>::new(record_page).unwrap();
         let record_free_space = record_slotted_page.free_space().unwrap() as usize;
@@ -3362,10 +3334,7 @@ mod tests {
             .record_pages_fsm
             .bucket_for_space(record_free_space);
 
-        let overflow_page_ref = FilePageRef {
-            page_id: first_overflow_page_id,
-            file_key: file_key.clone(),
-        };
+        let overflow_page_ref = FilePageRef::new(first_overflow_page_id, file_key.clone());
         let overflow_page = cache.pin_read(&overflow_page_ref).unwrap();
         let overflow_slotted_page =
             SlottedPage::<_, OverflowPageHeader>::new(overflow_page).unwrap();
@@ -3443,10 +3412,7 @@ mod tests {
         while current_page_id != OverflowPageHeader::NO_NEXT_PAGE {
             overflow_pages_count += 1;
 
-            let file_page_ref = FilePageRef {
-                page_id: current_page_id,
-                file_key: file_key.clone(),
-            };
+            let file_page_ref = FilePageRef::new(current_page_id, file_key.clone());
             let page = cache.pin_read(&file_page_ref).unwrap();
             let slotted_page = SlottedPage::<_, OverflowPageHeader>::new(page).unwrap();
             let header = slotted_page.get_header().unwrap();
@@ -3505,10 +3471,7 @@ mod tests {
         assert_eq!(second_record_ptr.page_id, new_first_record_page);
 
         // Verify the new page is properly linked in the chain
-        let new_page_ref = FilePageRef {
-            page_id: new_first_record_page,
-            file_key: file_key.clone(),
-        };
+        let new_page_ref = FilePageRef::new(new_first_record_page, file_key.clone());
         let new_page = cache.pin_read(&new_page_ref).unwrap();
         let new_slotted_page = SlottedPage::<_, RecordPageHeader>::new(new_page).unwrap();
         let new_header = new_slotted_page.get_header().unwrap();

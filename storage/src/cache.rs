@@ -23,7 +23,7 @@ use crate::{
 
 /// Structure for referring to single page in the file.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub(crate) struct FilePageRef {
+pub struct FilePageRef {
     pub(crate) page_id: PageId,
     pub(crate) file_key: FileKey,
 }
@@ -31,6 +31,14 @@ pub(crate) struct FilePageRef {
 impl FilePageRef {
     pub fn new(page_id: PageId, file_key: FileKey) -> Self {
         Self { page_id, file_key }
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub fn file_key(&self) -> &FileKey {
+        &self.file_key
     }
 }
 
@@ -85,7 +93,7 @@ impl PageFrame {
 }
 
 /// Wrapper around frame and its guard - shared or exclusive lock.
-pub(crate) struct PinnedPage<G> {
+pub struct PinnedPage<G> {
     /// This field should not be exposed. It's here because [`PinnedPage::guard`] cannot outlive it.
     frame: Arc<PageFrame>,
     /// The content of the [`Page`] wrapped in a guard.
@@ -102,7 +110,7 @@ impl<G> Drop for PinnedPage<G> {
 }
 
 /// [`Page`] wrapped in shared lock.
-pub(crate) type PinnedReadPage = PinnedPage<RwLockReadGuard<'static, Page>>;
+pub type PinnedReadPage = PinnedPage<RwLockReadGuard<'static, Page>>;
 
 impl PinnedReadPage {
     pub fn page(&self) -> &Page {
@@ -111,7 +119,7 @@ impl PinnedReadPage {
 }
 
 /// [`Page`] wrapped in exclusive lock.
-pub(crate) type PinnedWritePage = PinnedPage<RwLockWriteGuard<'static, Page>>;
+pub type PinnedWritePage = PinnedPage<RwLockWriteGuard<'static, Page>>;
 
 impl PinnedWritePage {
     pub fn page(&self) -> &Page {
@@ -123,11 +131,11 @@ impl PinnedWritePage {
     }
 }
 
-pub(crate) trait PageRead {
+pub trait PageRead {
     fn data(&self) -> &[u8];
 }
 
-pub(crate) trait PageWrite {
+pub trait PageWrite {
     fn data_mut(&mut self) -> &mut [u8];
 }
 
@@ -162,7 +170,7 @@ impl PageWrite for PinnedWritePage {
 
 /// Error for cache related operations.
 #[derive(Debug, Error)]
-pub(crate) enum CacheError {
+pub enum CacheError {
     #[error("failed to load file: {0}")]
     FilesManagerError(#[from] FilesManagerError),
     #[error("{0}")]
@@ -172,7 +180,7 @@ pub(crate) enum CacheError {
 /// Responsible for caching [`Page`]s and distributing it to other threads.
 /// Threads that use [`Cache`] should not have to worry about multithreading problems - all of them should be handled by [`Cache`].
 /// [`Cache`] must be used per-database, as it depends on [`FilesManager`] which works that way.
-pub(crate) struct Cache {
+pub struct Cache {
     /// List of the [`PageFrame`]s currently stored in cache. This is the source of truth from [`Cache`]'s point of view.
     ///
     /// It is guaranteed that:
@@ -194,7 +202,7 @@ pub(crate) struct Cache {
 
 impl Cache {
     /// Creates new [`Cache`] that handles frames for single database.
-    pub(crate) fn new(capacity: usize, files: Arc<FilesManager>) -> Arc<Self> {
+    pub fn new(capacity: usize, files: Arc<FilesManager>) -> Arc<Self> {
         Arc::new(Self {
             frames: DashMap::with_capacity(capacity),
             lru: Arc::new(RwLock::new(LruCache::new(NonZero::new(capacity).unwrap()))),
@@ -204,7 +212,7 @@ impl Cache {
     }
 
     /// Creates new [`Cache`] that handles frames for single database and its [`BackgroundCacheCleaner`]'s handle.
-    pub(crate) fn with_background_cleaner(
+    pub fn with_background_cleaner(
         capacity: usize,
         files: Arc<FilesManager>,
         cleanup_interval: Duration,
@@ -218,7 +226,7 @@ impl Cache {
     }
 
     /// Returns shared lock to the page. If page was not found in the cache it loads it from disk.
-    pub(crate) fn pin_read(&self, id: &FilePageRef) -> Result<PinnedReadPage, CacheError> {
+    pub fn pin_read(&self, id: &FilePageRef) -> Result<PinnedReadPage, CacheError> {
         let frame = self.get_pinned_frame(id)?;
 
         let guard_local = frame.read();
@@ -237,7 +245,7 @@ impl Cache {
     }
 
     /// Returns exclusive lock to the page. If page was not found in the cache it loads it from disk.
-    pub(crate) fn pin_write(&self, id: &FilePageRef) -> Result<PinnedWritePage, CacheError> {
+    pub fn pin_write(&self, id: &FilePageRef) -> Result<PinnedWritePage, CacheError> {
         let frame = self.get_pinned_frame(id)?;
 
         let guard_local = frame.write();
@@ -257,10 +265,7 @@ impl Cache {
 
     /// Allocates new page in `file` and returns exclusive lock to that page and its id.
     /// In case if lock is not needed the return value should not be assigned, so that lock lives as little as needed.
-    pub(crate) fn allocate_page(
-        &self,
-        file: &FileKey,
-    ) -> Result<(PinnedWritePage, PageId), CacheError> {
+    pub fn allocate_page(&self, file: &FileKey) -> Result<(PinnedWritePage, PageId), CacheError> {
         let pf = self.files.get_or_open_new_file(file)?;
         let page_id = pf.lock().allocate_page()?;
         let id = FilePageRef {
@@ -273,7 +278,7 @@ impl Cache {
     /// Remove page from file. If there is a lock on the frame this will block
     /// until it gets the exclusive lock on the frame. Any changes made to the page
     /// after calling this function will not be flushed to the disk.
-    pub(crate) fn free_page(&self, id: &FilePageRef) -> Result<(), CacheError> {
+    pub fn free_page(&self, id: &FilePageRef) -> Result<(), CacheError> {
         match self.frames.entry(id.clone()) {
             Entry::Occupied(occupied_entry) => {
                 // We hold exclusive lock on the key and remove it from the dashmap,

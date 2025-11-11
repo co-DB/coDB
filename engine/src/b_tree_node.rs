@@ -1,7 +1,5 @@
-﻿use crate::cache::{PageRead, PageWrite};
-use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
+﻿use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
 use crate::heap_file::RecordPtr;
-use crate::paged_file::{PAGE_SIZE, PageId};
 use crate::slotted_page::{
     InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
     SlottedPageError, SlottedPageHeader, get_base_header,
@@ -10,6 +8,8 @@ use bytemuck::{Pod, Zeroable};
 use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use storage::cache::{PageRead, PageWrite};
+use storage::paged_file::PageId;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -547,7 +547,6 @@ where
 }
 mod test {
     use super::*;
-    use crate::cache::{PageRead, PageWrite};
     use crate::slotted_page::InsertResult;
 
     const PAGE_SIZE: usize = 4096;

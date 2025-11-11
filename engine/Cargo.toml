@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 metadata = { path = "../metadata" }
+storage = { path = "../storage" }
 
 tokio.workspace = true
 thiserror.workspace = true
@@ -14,12 +15,10 @@ serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
 time.workspace = true
+bytemuck.workspace = true
+dashmap.workspace = true
 
 byteorder = "1.5.0"
-directories = "6.0.0"
-dashmap = "6.1.0"
-lru = "0.16.0"
-bytemuck = { version = "1.23.2", features = ["derive"] }
 crossbeam = "0.8"
 bitflags = { version = "2.9.4", features = ["bytemuck"] }
 rand = "0.10.0-rc.5"
