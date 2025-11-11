@@ -138,15 +138,15 @@ pub(crate) struct ResolvedDropStatement {
     pub(crate) table: ResolvedNodeId,
 }
 
-#[derive(Debug)]
-pub(crate) struct ResolvedCreateColumnDescriptor {
-    pub(crate) name: String,
-    pub(crate) ty: Type,
-    pub(crate) addon: ResolvedCreateColumnAddon,
+#[derive(Debug, Clone)]
+pub struct ResolvedCreateColumnDescriptor {
+    pub name: String,
+    pub ty: Type,
+    pub addon: ResolvedCreateColumnAddon,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) enum ResolvedCreateColumnAddon {
+pub enum ResolvedCreateColumnAddon {
     PrimaryKey,
     None,
 }
