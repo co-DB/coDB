@@ -235,15 +235,17 @@ impl<Key: BTreeKey> BTree<Key> {
         let mut path_versions = Vec::new();
 
         loop {
-            let page = self
-                .cache
-                .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
-
-            // Record page version before descending
+            // Record page version before descending (necessary here before page read, because if a
+            // split happens before pin it won't work)
             let version = self
                 .structural_version_numbers
                 .get(&current_page_id)
                 .map_or(0, |v| v.load(Ordering::Acquire));
+
+            let page = self
+                .cache
+                .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
+
             path_versions.push(PageVersion::new(current_page_id, version));
 
             match get_node_type(&page)? {
@@ -409,9 +411,6 @@ impl<Key: BTreeKey> BTree<Key> {
         key: Key,
         record_pointer: RecordPtr,
     ) -> Result<(Key, PageId), BTreeError> {
-        // Bump version.
-        self.update_structural_version(leaf_page_id);
-
         // Split keys of the leaf.
         let (records_to_move, separator_key) = leaf_node.split_keys()?;
 
@@ -434,6 +433,9 @@ impl<Key: BTreeKey> BTree<Key> {
         } else {
             return Err(BTreeError::DuplicateKey);
         }
+
+        // Bump version.
+        self.update_structural_version(leaf_page_id);
 
         Ok((separator_key, new_leaf_id))
     }
@@ -468,9 +470,6 @@ impl<Key: BTreeKey> BTree<Key> {
                 NodeInsertResult::PageFull => {
                     // Parent is full,so we must split it and continue upward.
 
-                    // Bump version for parent to indicate structural change.
-                    self.update_structural_version(parent_page_id);
-
                     // Split this internal node: obtain its split_records and new_separator
                     let (split_records, new_separator) = parent_node.split_keys()?;
 
@@ -495,6 +494,9 @@ impl<Key: BTreeKey> BTree<Key> {
                     } else {
                         return Err(BTreeError::DuplicateKey);
                     }
+
+                    // Bump version for parent to indicate structural change.
+                    self.update_structural_version(parent_page_id);
 
                     // The new separator and new child id will be propagated up
                     current_separator_key = new_separator;
