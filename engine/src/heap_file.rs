@@ -216,8 +216,8 @@ impl RecordPtr {
 }
 impl DbSerializable for RecordPtr {
     fn serialize(&self, buffer: &mut Vec<u8>) {
-        buffer.extend_from_slice(&self.page_id.to_le_bytes());
-        buffer.extend_from_slice(&self.slot_id.to_le_bytes());
+        self.page_id.serialize(buffer);
+        self.slot_id.serialize(buffer);
     }
 
     fn serialize_into(&self, buffer: &mut [u8]) {

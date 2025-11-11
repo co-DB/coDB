@@ -235,16 +235,16 @@ impl<Key: BTreeKey> BTree<Key> {
         let mut path_versions = Vec::new();
 
         loop {
+            let page = self
+                .cache
+                .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
+
             // Record page version before descending
             let version = self
                 .structural_version_numbers
                 .get(&current_page_id)
                 .map_or(0, |v| v.load(Ordering::Acquire));
             path_versions.push(PageVersion::new(current_page_id, version));
-
-            let page = self
-                .cache
-                .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
 
             match get_node_type(&page)? {
                 NodeType::Internal => {
@@ -351,6 +351,13 @@ impl<Key: BTreeKey> BTree<Key> {
         }
     }
 
+    fn update_structural_version(&self, page_id: PageId) {
+        self.structural_version_numbers
+            .entry(page_id)
+            .or_insert(AtomicU16::new(0))
+            .fetch_add(1, Ordering::Release);
+    }
+
     /// Allocates a new leaf page and initializes it with the given `next_leaf_id`.
     fn allocate_and_init_leaf(
         &self,
@@ -403,10 +410,7 @@ impl<Key: BTreeKey> BTree<Key> {
         record_pointer: RecordPtr,
     ) -> Result<(Key, PageId), BTreeError> {
         // Bump version.
-        self.structural_version_numbers
-            .entry(leaf_page_id)
-            .or_insert(AtomicU16::new(0))
-            .fetch_add(1, Ordering::Release);
+        self.update_structural_version(leaf_page_id);
 
         // Split keys of the leaf.
         let (records_to_move, separator_key) = leaf_node.split_keys()?;
@@ -465,10 +469,7 @@ impl<Key: BTreeKey> BTree<Key> {
                     // Parent is full,so we must split it and continue upward.
 
                     // Bump version for parent to indicate structural change.
-                    self.structural_version_numbers
-                        .entry(parent_page_id)
-                        .or_insert(AtomicU16::new(0))
-                        .fetch_add(1, Ordering::Release);
+                    self.update_structural_version(parent_page_id);
 
                     // Split this internal node: obtain its split_records and new_separator
                     let (split_records, new_separator) = parent_node.split_keys()?;

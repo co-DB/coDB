@@ -297,6 +297,26 @@ where
         let (separator_key, _) = Key::deserialize(copied_split_records.first().unwrap())?;
         Ok((copied_split_records, separator_key))
     }
+
+    fn handle_insert_result(
+        &mut self,
+        insert_result: InsertResult,
+        record_buffer: &[u8],
+        position: SlotId,
+    ) -> Result<NodeInsertResult, BTreeNodeError> {
+        match insert_result {
+            InsertResult::Success(_) => Ok(NodeInsertResult::Success),
+            InsertResult::NeedsDefragmentation => {
+                self.slotted_page.compact_records()?;
+                let new_response = self.slotted_page.insert_at(record_buffer, position)?;
+                match new_response {
+                    InsertResult::Success(_) => Ok(NodeInsertResult::Success),
+                    _ => unreachable!(),
+                }
+            }
+            InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
+        }
+    }
 }
 
 impl<Page, Key> BTreeNode<Page, BTreeInternalHeader, Key>
@@ -410,15 +430,7 @@ where
         key.serialize(&mut buffer);
         new_child_id.serialize(&mut buffer);
         let insert_result = self.slotted_page.insert_at(&buffer, position)?;
-        match insert_result {
-            InsertResult::Success(_) => Ok(NodeInsertResult::Success),
-            InsertResult::NeedsDefragmentation => {
-                self.slotted_page.compact_records()?;
-                self.slotted_page.insert_at(&buffer, position)?;
-                Ok(NodeInsertResult::Success)
-            }
-            InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
-        }
+        self.handle_insert_result(insert_result, &buffer, position)
     }
 
     pub fn set_leftmost_child_id(&mut self, child_id: PageId) -> Result<(), BTreeNodeError> {
@@ -522,18 +534,7 @@ where
         key.serialize(&mut buffer);
         record_pointer.serialize(&mut buffer);
         let insert_result = self.slotted_page.insert_at(&buffer, position)?;
-        match insert_result {
-            InsertResult::Success(_) => Ok(NodeInsertResult::Success),
-            InsertResult::NeedsDefragmentation => {
-                self.slotted_page.compact_records()?;
-                let new_response = self.slotted_page.insert_at(&buffer, position)?;
-                match new_response {
-                    InsertResult::Success(_) => Ok(NodeInsertResult::Success),
-                    _ => unreachable!(),
-                }
-            }
-            InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
-        }
+        self.handle_insert_result(insert_result, &buffer, position)
     }
 
     pub fn set_next_leaf_id(&mut self, next_leaf_id: Option<PageId>) -> Result<(), BTreeNodeError> {
