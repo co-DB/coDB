@@ -17,16 +17,7 @@ pub enum Type {
 
 impl Type {
     pub fn is_fixed_size(&self) -> bool {
-        match self {
-            Type::String => false,
-            Type::F32 => true,
-            Type::F64 => true,
-            Type::I32 => true,
-            Type::I64 => true,
-            Type::Bool => true,
-            Type::Date => true,
-            Type::DateTime => true,
-        }
+        !matches!(self, Type::String)
     }
 
     /// Returns `Some(type)` where `type` can hold both values of `lhs` and `rhs`.

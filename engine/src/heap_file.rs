@@ -205,10 +205,46 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
 /// It should only be used for referencing start of the record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordPtr {
-    page_id: PageId,
-    slot: SlotId,
+    pub(crate) page_id: PageId,
+    pub(crate) slot_id: SlotId,
 }
 
+impl RecordPtr {
+    pub(crate) fn new(page_id: PageId, slot_id: SlotId) -> Self {
+        Self { page_id, slot_id }
+    }
+}
+impl DbSerializable for RecordPtr {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        self.page_id.serialize(buffer);
+        self.slot_id.serialize(buffer);
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        let mut start = 0;
+        let mut end = size_of::<PageId>();
+        buffer[start..end].copy_from_slice(&self.page_id.to_le_bytes());
+        start += size_of::<PageId>();
+        end += size_of::<SlotId>();
+        buffer[start..end].copy_from_slice(&self.slot_id.to_le_bytes());
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        let (page_id, rest) = PageId::deserialize(buffer)?;
+        let (slot, _) = SlotId::deserialize(rest)?;
+        Ok((
+            Self {
+                page_id,
+                slot_id: slot,
+            },
+            buffer,
+        ))
+    }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<Self>()
+    }
+}
 impl RecordPtr {
     /// Reads [`RecordPtr`] from buffer and returns the rest of the buffer.
     fn read_from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), HeapFileError> {
@@ -220,7 +256,10 @@ impl RecordPtr {
             SlotId::deserialize(bytes).map_err(|err| HeapFileError::CorruptedRecordEntry {
                 error: err.to_string(),
             })?;
-        let ptr = RecordPtr { page_id, slot };
+        let ptr = RecordPtr {
+            page_id,
+            slot_id: slot,
+        };
         Ok((ptr, bytes))
     }
 }
@@ -229,7 +268,7 @@ impl From<&RecordPtr> for Vec<u8> {
     fn from(value: &RecordPtr) -> Self {
         let mut buffer = Vec::with_capacity(size_of::<RecordPtr>());
         value.page_id.serialize(&mut buffer);
-        value.slot.serialize(&mut buffer);
+        value.slot_id.serialize(&mut buffer);
         buffer
     }
 }
@@ -845,12 +884,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut page_chain =
             PageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
         let first_page = page_chain.record_page_mut();
-        let record_first_fragment = first_page.record_fragment(ptr.slot)?;
+        let record_first_fragment = first_page.record_fragment(ptr.slot_id)?;
 
         let next_ptr = record_first_fragment.next_fragment;
 
         // Delete first fragment of the record
-        first_page.delete(ptr.slot)?;
+        first_page.delete(ptr.slot_id)?;
 
         // Follow record chain and delete each fragment
         self.delete_record_fragments_from_overflow_pages_chain(page_chain, next_ptr)?;
@@ -889,7 +928,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         // Read first fragment
         let first_page = page_chain.record_page();
-        let fragment = first_page.record_fragment(ptr.slot)?;
+        let fragment = first_page.record_fragment(ptr.slot_id)?;
         let mut full_record_bytes = Vec::from(fragment.data);
 
         // Follow chain of other fragments
@@ -897,7 +936,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         while let Some(next) = next_ptr {
             page_chain.advance(next.page_id)?;
             let next_fragment_page = page_chain.overflow_page();
-            let fragment = next_fragment_page.record_fragment(next.slot)?;
+            let fragment = next_fragment_page.record_fragment(next.slot_id)?;
             full_record_bytes.extend_from_slice(fragment.data);
             next_ptr = fragment.next_fragment;
         }
@@ -976,7 +1015,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             PageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, start.page_id)?;
 
         let mut first_page = page_chain.record_page_mut();
-        let previous_first_fragment = first_page.record_fragment(start.slot)?;
+        let previous_first_fragment = first_page.record_fragment(start.slot_id)?;
 
         // Previously record was stored on single page.
         if previous_first_fragment.next_fragment.is_none() {
@@ -990,7 +1029,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             // Try to update in place
             if self.try_update_fragment_in_place(
                 first_page,
-                start.slot,
+                start.slot_id,
                 start.page_id,
                 processor.remaining_bytes,
                 previous_len,
@@ -1003,7 +1042,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             // in the first page and save `rest` in other page(s).
             self.split_and_extend_fragment(
                 &mut first_page,
-                start.slot,
+                start.slot_id,
                 start.page_id,
                 processor.remaining_bytes,
                 previous_len,
@@ -1023,7 +1062,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 let with_tag = RecordTag::with_final(processor.remaining_bytes);
                 self.update_record_page_with_fsm(
                     &mut first_page,
-                    start.slot,
+                    start.slot_id,
                     &with_tag,
                     start.page_id,
                 )?;
@@ -1038,7 +1077,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 RecordTag::with_has_continuation(first_page_part, &next_tag);
             self.update_record_page_with_fsm(
                 &mut first_page,
-                start.slot,
+                start.slot_id,
                 &first_page_part_with_tag,
                 start.page_id,
             )?;
@@ -1051,7 +1090,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         while !processor.is_complete() {
             page_chain.advance(current_ptr.page_id)?;
             let mut current_page = page_chain.overflow_page_mut();
-            let current_fragment = current_page.record_fragment(current_ptr.slot)?;
+            let current_fragment = current_page.record_fragment(current_ptr.slot_id)?;
 
             let current_frag_len = current_fragment.data.len();
             let next_frag = current_fragment.next_fragment;
@@ -1082,7 +1121,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                         let current_data = current_fragment.data;
                         let current_with_tag =
                             RecordTag::with_has_continuation(current_data, &rest_ptr);
-                        current_page.update(current_ptr.slot, &current_with_tag)?;
+                        current_page.update(current_ptr.slot_id, &current_with_tag)?;
                         return Ok(());
                     }
                 }
@@ -1091,7 +1130,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             // Try to update in place
             if self.try_update_fragment_in_place(
                 &mut current_page,
-                current_ptr.slot,
+                current_ptr.slot_id,
                 current_ptr.page_id,
                 processor.remaining_bytes,
                 current_frag_len,
@@ -1109,14 +1148,14 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                         processor.remaining_bytes.split_at(current_frag_len);
                     let current_with_tag =
                         RecordTag::with_has_continuation(&current_page_part, &next_ptr);
-                    current_page.update(current_ptr.slot, &current_with_tag)?;
+                    current_page.update(current_ptr.slot_id, &current_with_tag)?;
                     current_ptr = next_ptr;
                 }
                 None => {
                     // This is the last fragment from original chain, so additional bytes can be added wherever we want
                     self.split_and_extend_fragment(
                         &mut current_page,
-                        current_ptr.slot,
+                        current_ptr.slot_id,
                         current_ptr.page_id,
                         processor.remaining_bytes,
                         current_frag_len,
@@ -1236,10 +1275,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         self.overflow_pages_fsm
             .update_page_bucket(page_id, page.page.free_space()? as _);
 
-        return Ok(RecordPtr {
-            page_id,
-            slot: slot_id,
-        });
+        return Ok(RecordPtr { page_id, slot_id });
     }
 
     /// Deletes all record fragments from chain of overflow pages starting in `next_ptr`.
@@ -1251,9 +1287,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         while let Some(next) = next_ptr {
             chain.advance(next.page_id)?;
             let page = chain.overflow_page_mut();
-            let record_fragment = page.record_fragment(next.slot)?;
+            let record_fragment = page.record_fragment(next.slot_id)?;
             next_ptr = record_fragment.next_fragment;
-            page.delete(next.slot)?;
+            page.delete(next.slot_id)?;
         }
         Ok(())
     }
@@ -1407,10 +1443,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         fsm.update_page_bucket(page_id, page.page.free_space()? as _);
 
-        Ok(RecordPtr {
-            page_id,
-            slot: slot_id,
-        })
+        Ok(RecordPtr { page_id, slot_id })
     }
 
     /// Inserts `data` into first found record page that has enough size.
@@ -1856,7 +1889,7 @@ mod tests {
             Some(ptr) => {
                 fragment_data.push(RecordTag::HasContinuation as u8);
                 fragment_data.extend_from_slice(&ptr.page_id.to_le_bytes());
-                fragment_data.extend_from_slice(&ptr.slot.to_le_bytes());
+                fragment_data.extend_from_slice(&ptr.slot_id.to_le_bytes());
             }
         }
         fragment_data.extend_from_slice(data);
@@ -2453,7 +2486,7 @@ mod tests {
         if let Ok(heap_file) = result {
             let invalid_ptr = RecordPtr {
                 page_id: *heap_file.metadata.first_record_page.lock(),
-                slot: 0,
+                slot_id: 0,
             };
             let read_result = heap_file.record(&invalid_ptr);
             assert!(read_result.is_err());
@@ -2527,7 +2560,7 @@ mod tests {
 
         let record_ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: slot_id,
+            slot_id,
         };
 
         let record = heap_file.record(&record_ptr).unwrap();
@@ -2567,15 +2600,15 @@ mod tests {
         // Read all records
         let ptr1 = RecordPtr {
             page_id: first_record_page_id,
-            slot: slot1,
+            slot_id: slot1,
         };
         let ptr2 = RecordPtr {
             page_id: first_record_page_id,
-            slot: slot2,
+            slot_id: slot2,
         };
         let ptr3 = RecordPtr {
             page_id: first_record_page_id,
-            slot: slot3,
+            slot_id: slot3,
         };
 
         let rec1 = heap_file.record(&ptr1).unwrap();
@@ -2623,11 +2656,11 @@ mod tests {
         // Read records from different pages
         let ptr1 = RecordPtr {
             page_id: first_record_page_id,
-            slot: slot1,
+            slot_id: slot1,
         };
         let ptr2 = RecordPtr {
             page_id: second_page_id,
-            slot: slot2,
+            slot_id: slot2,
         };
 
         let rec1 = heap_file.record(&ptr1).unwrap();
@@ -2662,7 +2695,7 @@ mod tests {
 
         let record_ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: slot_id,
+            slot_id,
         };
 
         let record = heap_file.record(&record_ptr).unwrap();
@@ -2688,7 +2721,7 @@ mod tests {
             record_ptrs.push((
                 RecordPtr {
                     page_id: first_record_page_id,
-                    slot: slot_id,
+                    slot_id,
                 },
                 i,
             ));
@@ -2727,7 +2760,7 @@ mod tests {
         // Try to read from a non-existent page
         let invalid_ptr = RecordPtr {
             page_id: 9999,
-            slot: 0,
+            slot_id: 0,
         };
 
         let result = heap_file.record(&invalid_ptr);
@@ -2746,7 +2779,7 @@ mod tests {
         // Try to read from a non-existent slot
         let invalid_ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: 999,
+            slot_id: 999,
         };
 
         let result = heap_file.record(&invalid_ptr);
@@ -2770,7 +2803,7 @@ mod tests {
 
         let ptr = RecordPtr {
             page_id: uninitialized_page_id,
-            slot: 0,
+            slot_id: 0,
         };
 
         let result = heap_file.record(&ptr);
@@ -2805,7 +2838,7 @@ mod tests {
 
         let ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: slot_id,
+            slot_id,
         };
 
         let result = heap_file.record(&ptr);
@@ -2837,7 +2870,7 @@ mod tests {
 
         let continuation_ptr = RecordPtr {
             page_id: first_overflow_page_id,
-            slot: second_slot,
+            slot_id: second_slot,
         };
         let first_slot = insert_record_fragment(
             &cache,
@@ -2854,7 +2887,7 @@ mod tests {
 
         let ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: first_slot,
+            slot_id: first_slot,
         };
 
         let record = heap_file.record(&ptr).unwrap();
@@ -2890,7 +2923,7 @@ mod tests {
 
         let third_ptr = RecordPtr {
             page_id: second_overflow_page_id,
-            slot: third_slot,
+            slot_id: third_slot,
         };
         let second_slot = insert_record_fragment(
             &cache,
@@ -2903,7 +2936,7 @@ mod tests {
 
         let second_ptr = RecordPtr {
             page_id: first_overflow_page_id,
-            slot: second_slot,
+            slot_id: second_slot,
         };
         let first_slot = insert_record_fragment(
             &cache,
@@ -2920,7 +2953,7 @@ mod tests {
 
         let ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: first_slot,
+            slot_id: first_slot,
         };
 
         let record = heap_file.record(&ptr).unwrap();
@@ -2962,7 +2995,7 @@ mod tests {
             &full_record[split1..split2],
             Some(RecordPtr {
                 page_id: second_overflow_page_id,
-                slot: third_slot,
+                slot_id: third_slot,
             }),
         )
         .unwrap();
@@ -2974,7 +3007,7 @@ mod tests {
             &full_record[..split1],
             Some(RecordPtr {
                 page_id: first_overflow_page_id,
-                slot: second_slot,
+                slot_id: second_slot,
             }),
         )
         .unwrap();
@@ -2985,7 +3018,7 @@ mod tests {
 
         let ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: first_slot,
+            slot_id: first_slot,
         };
 
         let record = heap_file.record(&ptr).unwrap();
@@ -3006,7 +3039,7 @@ mod tests {
         // Insert first fragment with invalid continuation pointer
         let invalid_ptr = RecordPtr {
             page_id: 9999,
-            slot: 0,
+            slot_id: 0,
         };
         let first_slot = insert_record_fragment(
             &cache,
@@ -3023,7 +3056,7 @@ mod tests {
 
         let ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: first_slot,
+            slot_id: first_slot,
         };
 
         let result = heap_file.record(&ptr);
@@ -3043,7 +3076,7 @@ mod tests {
         // Insert first fragment with invalid slot in continuation
         let invalid_ptr = RecordPtr {
             page_id: first_overflow_page_id,
-            slot: 999,
+            slot_id: 999,
         };
         let first_slot = insert_record_fragment(
             &cache,
@@ -3060,7 +3093,7 @@ mod tests {
 
         let ptr = RecordPtr {
             page_id: first_record_page_id,
-            slot: first_slot,
+            slot_id: first_slot,
         };
 
         let result = heap_file.record(&ptr);
@@ -3100,7 +3133,7 @@ mod tests {
                 &record[..split],
                 Some(RecordPtr {
                     page_id: first_overflow_page_id,
-                    slot: second_slot,
+                    slot_id: second_slot,
                 }),
             )
             .unwrap();
@@ -3108,7 +3141,7 @@ mod tests {
             record_ptrs.push((
                 RecordPtr {
                     page_id: first_record_page_id,
-                    slot: first_slot,
+                    slot_id: first_slot,
                 },
                 i,
             ));
@@ -3188,7 +3221,7 @@ mod tests {
 
         // Verify the record was inserted correctly
         assert_eq!(record_ptr.page_id, first_record_page_id);
-        assert_eq!(record_ptr.slot, 0);
+        assert_eq!(record_ptr.slot_id, 0);
 
         // Read back the record to verify it was stored correctly
         let retrieved_record = heap_file.record(&record_ptr).unwrap();
@@ -3238,7 +3271,7 @@ mod tests {
 
         // Verify the record was inserted correctly
         assert_eq!(record_ptr.page_id, first_record_page_id);
-        assert_eq!(record_ptr.slot, 0);
+        assert_eq!(record_ptr.slot_id, 0);
 
         // Read back the record to verify it was stored correctly
         let retrieved_record = heap_file.record(&record_ptr).unwrap();
@@ -3287,7 +3320,7 @@ mod tests {
 
         // Verify the record pointer points to the record page (first fragment)
         assert_eq!(record_ptr.page_id, first_record_page_id);
-        assert_eq!(record_ptr.slot, 0);
+        assert_eq!(record_ptr.slot_id, 0);
 
         // Read back the record to verify it was stored correctly across pages
         let retrieved_record = heap_file.record(&record_ptr).unwrap();
@@ -3362,7 +3395,7 @@ mod tests {
 
         // Verify the record pointer points to the record page (first fragment)
         assert_eq!(record_ptr.page_id, first_record_page_id);
-        assert_eq!(record_ptr.slot, 0);
+        assert_eq!(record_ptr.slot_id, 0);
 
         // Read back the record to verify it was stored correctly across pages
         let retrieved_record = heap_file.record(&record_ptr).unwrap();
@@ -3419,7 +3452,7 @@ mod tests {
 
         let first_record_ptr = heap_file.insert(large_record).unwrap();
         assert_eq!(first_record_ptr.page_id, first_record_page_id);
-        assert_eq!(first_record_ptr.slot, 0);
+        assert_eq!(first_record_ptr.slot_id, 0);
 
         // Insert a small record that won't fit in the remaining space
         let small_record = Record::new(vec![
@@ -3431,7 +3464,7 @@ mod tests {
 
         // Verify a new record page was allocated
         assert_ne!(second_record_ptr.page_id, first_record_page_id);
-        assert_eq!(second_record_ptr.slot, 0);
+        assert_eq!(second_record_ptr.slot_id, 0);
 
         // Verify metadata was changed and is dirty
         assert!(heap_file.metadata.dirty.load(Ordering::Acquire));
@@ -3814,28 +3847,28 @@ mod tests {
 
         // Verify that the record now spans multiple pages by checking fragments
         let first_page = heap_file.read_record_page(record_ptr.page_id).unwrap();
-        let first_fragment = first_page.record_fragment(record_ptr.slot).unwrap();
+        let first_fragment = first_page.record_fragment(record_ptr.slot_id).unwrap();
 
         // First fragment should have a continuation
         assert!(first_fragment.next_fragment.is_some());
 
         let second_ptr = first_fragment.next_fragment.unwrap();
         let second_page = heap_file.read_overflow_page(second_ptr.page_id).unwrap();
-        let second_fragment = second_page.record_fragment(second_ptr.slot).unwrap();
+        let second_fragment = second_page.record_fragment(second_ptr.slot_id).unwrap();
 
         // Second fragment should also have a continuation
         assert!(second_fragment.next_fragment.is_some());
 
         let third_ptr = second_fragment.next_fragment.unwrap();
         let third_page = heap_file.read_overflow_page(third_ptr.page_id).unwrap();
-        let third_fragment = third_page.record_fragment(third_ptr.slot).unwrap();
+        let third_fragment = third_page.record_fragment(third_ptr.slot_id).unwrap();
 
         // Third fragment should also have a continuation
         assert!(third_fragment.next_fragment.is_some());
 
         let fourth_ptr = third_fragment.next_fragment.unwrap();
         let fourth_page = heap_file.read_overflow_page(fourth_ptr.page_id).unwrap();
-        let fourth_fragment = fourth_page.record_fragment(fourth_ptr.slot).unwrap();
+        let fourth_fragment = fourth_page.record_fragment(fourth_ptr.slot_id).unwrap();
 
         // Fourth fragment should be the last one
         assert!(fourth_fragment.next_fragment.is_none());
@@ -3868,15 +3901,15 @@ mod tests {
         let mut current_ptr = Some(record_ptr);
 
         while let Some(ptr) = current_ptr {
-            original_fragment_locations.push((ptr.page_id, ptr.slot));
+            original_fragment_locations.push((ptr.page_id, ptr.slot_id));
 
             if original_fragment_locations.len() == 1 {
                 let page = heap_file.read_record_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             } else {
                 let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             }
         }
@@ -3902,7 +3935,9 @@ mod tests {
 
         // Verify that the record now fits in a single page
         let first_page_after = heap_file.read_record_page(record_ptr.page_id).unwrap();
-        let first_fragment_after = first_page_after.record_fragment(record_ptr.slot).unwrap();
+        let first_fragment_after = first_page_after
+            .record_fragment(record_ptr.slot_id)
+            .unwrap();
 
         assert!(first_fragment_after.next_fragment.is_none());
 
@@ -3980,11 +4015,11 @@ mod tests {
 
             if fragment_count == 1 {
                 let page = heap_file.read_record_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             } else {
                 let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             }
         }
@@ -4028,15 +4063,15 @@ mod tests {
         let mut current_ptr = Some(record_ptr);
 
         while let Some(ptr) = current_ptr {
-            original_fragment_locations.push((ptr.page_id, ptr.slot));
+            original_fragment_locations.push((ptr.page_id, ptr.slot_id));
 
             if original_fragment_locations.len() == 1 {
                 let page = heap_file.read_record_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             } else {
                 let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             }
         }
@@ -4070,11 +4105,11 @@ mod tests {
             fragment_count += 1;
             if fragment_count == 1 {
                 let page = heap_file.read_record_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             } else {
                 let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             }
         }
@@ -4464,15 +4499,15 @@ mod tests {
         let mut current_ptr = Some(record_ptr);
 
         while let Some(ptr) = current_ptr {
-            fragment_locations.push((ptr.page_id, ptr.slot));
+            fragment_locations.push((ptr.page_id, ptr.slot_id));
 
             if fragment_locations.len() == 1 {
                 let page = heap_file.read_record_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             } else {
                 let page = heap_file.read_overflow_page(ptr.page_id).unwrap();
-                let fragment = page.record_fragment(ptr.slot).unwrap();
+                let fragment = page.record_fragment(ptr.slot_id).unwrap();
                 current_ptr = fragment.next_fragment;
             }
         }

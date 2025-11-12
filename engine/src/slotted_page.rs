@@ -319,6 +319,15 @@ impl<P, H: SlottedPageHeader> SlottedPage<P, H> {
     pub const MAX_FREE_SPACE: u16 = (PAGE_SIZE - size_of::<H>()) as _;
 }
 
+/// Gets a reference to the base header from the given page without creating an instance of
+/// the slotted page struct. Can be used for e.g. getting the page type before creating a
+/// specific slotted page wrapper like B-Tree internal or leaf node.
+pub fn get_base_header<P: PageRead>(page: &P) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
+    Ok(bytemuck::try_from_bytes(
+        &page.data()[..size_of::<SlottedPageBaseHeader>()],
+    )?)
+}
+
 /// Implementation for read-only slotted page
 impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     /// Creates a new SlottedPage wrapper around a page with default slot compaction settings based on page type.
@@ -371,15 +380,6 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         self.get_generic_header::<SlottedPageBaseHeader>()
     }
 
-    /// Gets a reference to the base header from the given page without creating an instance of
-    /// the slotted page struct. Can be used for e.g. getting the page type before creating a
-    /// specific slotted page wrapper like B-Tree internal or leaf node.
-    pub fn static_get_base_header(page: &P) -> Result<&SlottedPageBaseHeader, SlottedPageError> {
-        Ok(bytemuck::try_from_bytes(
-            &page.data()[..size_of::<SlottedPageBaseHeader>()],
-        )?)
-    }
-
     /// Returns the total number of slots (both used and unused) in this page
     pub fn num_slots(&self) -> Result<u16, SlottedPageError> {
         let header = self.get_base_header()?;
@@ -416,6 +416,21 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(&slots[slot_id as usize])
     }
 
+    /// Reads the slot at position [`slot_id`] and returns whether it is deleted
+    pub fn is_slot_deleted(&self, slot_id: SlotId) -> Result<bool, SlottedPageError> {
+        let header = self.get_base_header()?;
+
+        if slot_id >= header.num_slots {
+            return Err(SlottedPageError::SlotIndexOutOfBounds {
+                num_slots: header.num_slots,
+                out_of_bounds_index: slot_id,
+            });
+        }
+
+        let slots = self.get_slots()?;
+        Ok(slots[slot_id as usize].is_deleted())
+    }
+
     /// Reads the record data for a given slot. Checks if the record is deleted . Safe version of
     /// read_record
     pub fn read_record(&self, slot_id: SlotId) -> Result<&[u8], SlottedPageError> {
@@ -443,6 +458,21 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             let record_start = slot.offset as usize;
             let record_end = record_start + slot.len as usize;
             Some(&self.page.data()[record_start..record_end])
+        }))
+    }
+
+    /// Reads all records from page that are not marked as deleted along with their indices.
+    pub fn read_all_records_enumerated(
+        &self,
+    ) -> Result<impl Iterator<Item = (SlotId, &[u8])>, SlottedPageError> {
+        let slots = self.get_slots()?;
+        Ok(slots.iter().enumerate().filter_map(|(i, slot)| {
+            if slot.is_deleted() {
+                return None;
+            }
+            let record_start = slot.offset as usize;
+            let record_end = record_start + slot.len as usize;
+            Some((i as SlotId, &self.page.data()[record_start..record_end]))
         }))
     }
 }
@@ -991,7 +1021,13 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             return Err(ForbiddenSlotCompaction);
         }
 
-        let header_size = self.get_base_header()?.header_size as usize;
+        let header = self.get_base_header()?;
+
+        if !header.has_free_slot() {
+            return Ok(());
+        }
+
+        let header_size = header.header_size as usize;
 
         let slots = self.get_slots()?;
 
