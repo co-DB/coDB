@@ -13,10 +13,10 @@
 /// 3. `QueryCompleted` - All statements in the query finished
 ///
 /// Errors can occur at any stage of the response and
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-enum Request {
+pub enum Request {
     /// For creating, deleting and listing databases in the system.
     CreateDatabase {
         database_name: String,
@@ -43,10 +43,10 @@ enum Request {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-enum Response {
+pub enum Response {
     /// Confirms that the user connected with the database with the given name.
     Connected { database_name: String },
 
@@ -61,10 +61,10 @@ enum Response {
         column_metadata: Vec<String>,
     },
 
-    /// Contains all the column values of a single row from the current query's result set.
-    Row {
+    /// Contains all the column values of a single batch of rows from the current query's result set.
+    Rows {
         // TODO: Change to record type probably,
-        record: Vec<String>,
+        records: Vec<Vec<String>>,
     },
 
     /// Lets the client know that all the result for this statement have been sent and that the
@@ -86,9 +86,8 @@ enum Response {
     /// the error message and possibly an error code for distinguishing whether it happened because
     /// of an internal issue, a query not following the coSQL grammar or a networking/request problem.
     Error {
-        statement_index: Option<u8>,
         message: String,
-        error_code: u16,
+        error_type: ErrorType,
     },
 
     /// Confirms that the database with the given name was created
@@ -101,14 +100,23 @@ enum Response {
     DatabasesListed { database_names: Vec<String> },
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "UPPERCASE")]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum StatementType {
     Select,
     Insert,
     Update,
     Delete,
     CreateTable,
+    TruncateTable,
     DropTable,
     AlterTable,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorType {
+    Query,
+    Execution,
+    Communication,
 }
