@@ -743,7 +743,7 @@ where
     /// Inserts `data` into the page and returns its [`SlotId`].
     /// If defragmentation is needed to store the data, it's done automatically and insertion is done once again.
     ///
-    /// This function assumes that [`self`] has enough free space to insert `data` (the page should not be chosen by hand, but instead [`FreeSpaceMap`] should be used to get page with enough free space).
+    /// This function assumes that [`self`] has enough free space to insert `data` and its slot (the page should not be chosen by hand, but instead [`FreeSpaceMap`] should be used to get page with enough free space).
     fn insert(&mut self, data: &[u8]) -> Result<SlotId, HeapFileError> {
         let result = self.page.insert(data)?;
         match result {
@@ -1425,7 +1425,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     where
         H: BaseHeapPageHeader,
     {
-        let fsm_page = fsm.page_with_free_space(data.len())?;
+        let total_record_size = data.len() + size_of::<Slot>();
+        let fsm_page = fsm.page_with_free_space(total_record_size)?;
         let (page_id, mut page) = if let Some((page_id, page)) = fsm_page {
             let heap_page = HeapPage::new(page);
             (page_id, heap_page)
