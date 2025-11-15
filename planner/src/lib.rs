@@ -26,7 +26,7 @@ pub enum PlannerError {
 pub fn process_query(
     query_str: &str,
     catalog: Arc<RwLock<Catalog>>,
-) -> Result<QueryPlan, PlannerError> {
+) -> Result<QueryPlan, Vec<PlannerError>> {
     let parser = Parser::new(&query_str);
     let ast = parser.parse_program().unwrap();
     let analyzer = Analyzer::new(&ast, catalog);

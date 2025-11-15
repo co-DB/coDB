@@ -188,6 +188,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "executor"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "engine",
+ "metadata",
+ "parking_lot",
+ "planner",
+ "storage",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

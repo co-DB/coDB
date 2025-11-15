@@ -63,7 +63,7 @@ pub(crate) trait DbSerializable: Sized {
 }
 
 #[derive(Error, Debug)]
-pub(crate) enum DbSerializationError {
+pub enum DbSerializationError {
     #[error("expected to read {expected} bytes, but only {actual} were left in the buffer")]
     UnexpectedEnd { expected: usize, actual: usize },
     #[error("failed to deserialize")]
