@@ -12,7 +12,7 @@ use storage::cache::Cache;
 
 use crate::{
     consts::HEAP_FILE_BUCKET_SIZE,
-    iterators::{ExecutionIter, ExecutorIterator, ParsingFailedIter},
+    iterators::{ParseErrorIter, QueryResultIter, StatementIter},
 };
 
 pub struct Executor {
@@ -26,18 +26,29 @@ pub struct ColumnData {
     pub ty: Type,
 }
 
-pub enum ExecutionResult {
+pub enum StatementType {
+    Insert,
+    Update,
+    Delete,
+    Create,
+    Alter,
+    Truncate,
+    Drop,
+}
+
+pub enum StatementResult {
     OperationSuccessful {
         rows_affected: usize,
+        ty: StatementType,
     },
     SelectSuccessful {
         columns: Vec<ColumnData>,
         rows: Vec<Record>,
     },
-    ParsingFailed {
+    ParseError {
         error: String,
     },
-    ExecutingFailed {
+    RuntimeError {
         error: String,
     },
 }
@@ -47,15 +58,15 @@ impl Executor {
         todo!()
     }
 
-    pub fn execute<'e>(&'e self, query: &str) -> ExecutorIterator<'e> {
+    pub fn execute<'e>(&'e self, query: &str) -> QueryResultIter<'e> {
         let parse_output = planner::process_query(query, self.catalog.clone());
         match parse_output {
-            Ok(query_plan) => ExecutionIter::new(query_plan.plans, query_plan.tree, &self).into(),
-            Err(errors) => ParsingFailedIter::new(errors).into(),
+            Ok(query_plan) => StatementIter::new(query_plan.plans, query_plan.tree, &self).into(),
+            Err(errors) => ParseErrorIter::new(errors).into(),
         }
     }
 
-    fn execute_statement(&self, statement: &StatementPlan, ast: &ResolvedTree) -> ExecutionResult {
+    fn execute_statement(&self, statement: &StatementPlan, ast: &ResolvedTree) -> StatementResult {
         todo!()
     }
 }
