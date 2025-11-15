@@ -5,7 +5,7 @@ use thiserror::Error;
 
 /// Error for record related operations
 #[derive(Error, Debug)]
-pub(crate) enum RecordError {
+pub enum RecordError {
     #[error(
         "while reading field {field_name}: expected to read {expected} bytes, but only {actual} were left in the buffer"
     )]
@@ -43,7 +43,7 @@ impl RecordError {
 /// defined in a table schema. Records can be serialized to bytes for
 /// storage and deserialized back to their structured form.
 #[derive(Debug)]
-pub(crate) struct Record {
+pub struct Record {
     pub fields: Vec<Field>,
 }
 

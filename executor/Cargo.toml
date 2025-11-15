@@ -1,0 +1,14 @@
+[package]
+name = "executor"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+storage = { path = "../storage" }
+metadata = { path = "../metadata" }
+planner = { path = "../planner" }
+
+dashmap.workspace = true
+parking_lot.workspace = true

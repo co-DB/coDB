@@ -204,7 +204,7 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
 ///
 /// It should only be used for referencing start of the record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RecordPtr {
+pub struct RecordPtr {
     pub(crate) page_id: PageId,
     pub(crate) slot_id: SlotId,
 }
@@ -404,7 +404,7 @@ impl<'d> RecordFragment<'d> {
 }
 
 /// Struct used for describing update of single field.
-pub(crate) struct FieldUpdateDescriptor {
+pub struct FieldUpdateDescriptor {
     column: ColumnMetadata,
     field: Field,
 }
@@ -413,7 +413,7 @@ impl FieldUpdateDescriptor {
     /// Creates new [`FieldUpdateDescriptor`].
     ///
     /// Returns an error when `column` and `field` have different types.
-    pub(crate) fn new(
+    pub fn new(
         column: ColumnMetadata,
         field: Field,
     ) -> Result<FieldUpdateDescriptor, HeapFileError> {
@@ -791,7 +791,7 @@ where
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum HeapFileError {
+pub enum HeapFileError {
     #[error("invalid metadata page: {error}")]
     InvalidMetadataPage { error: String },
     #[error("failed to deserialize record entry: {error}")]
@@ -814,7 +814,7 @@ pub(crate) enum HeapFileError {
 ///
 /// Each [`HeapFile`] instance corresponds to a single physical file on disk.
 /// For concurrent access by multiple threads, wrap the instance in `Arc<HeapFile>`.
-pub(crate) struct HeapFile<const BUCKETS_COUNT: usize> {
+pub struct HeapFile<const BUCKETS_COUNT: usize> {
     file_key: FileKey,
     metadata: Metadata,
     record_pages_fsm: FreeSpaceMap<BUCKETS_COUNT, RecordPageHeader>,
@@ -835,14 +835,14 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT - size_of::<RecordPtr>();
 
     /// Reads [`Record`] located at `ptr` and deserializes it.
-    pub(crate) fn record(&self, ptr: &RecordPtr) -> Result<Record, HeapFileError> {
+    pub fn record(&self, ptr: &RecordPtr) -> Result<Record, HeapFileError> {
         let record_bytes = self.record_bytes(ptr)?;
         let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
         Ok(record)
     }
 
     /// Inserts `record` into heap file and returns its [`RecordPtr`].
-    pub(crate) fn insert(&self, record: Record) -> Result<RecordPtr, HeapFileError> {
+    pub fn insert(&self, record: Record) -> Result<RecordPtr, HeapFileError> {
         let serialized = record.serialize();
         self.insert_record_internal(
             serialized,
@@ -854,7 +854,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Applies all updates described in `updated_fields` to [`Record`] stored at `ptr`.
     /// Starting position of updated record does not change, only the end can shrink/expand in case
     /// of record changing its size.
-    pub(crate) fn update(
+    pub fn update(
         &self,
         ptr: &RecordPtr,
         updated_fields: Vec<FieldUpdateDescriptor>,
@@ -880,7 +880,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Removes [`Record`] located at `ptr`.
-    pub(crate) fn delete(&self, ptr: &RecordPtr) -> Result<(), HeapFileError> {
+    pub fn delete(&self, ptr: &RecordPtr) -> Result<(), HeapFileError> {
         let mut page_chain =
             PageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
         let first_page = page_chain.record_page_mut();
@@ -899,7 +899,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Flushes [`HeapFile::metadata`] content to disk.
     ///
     /// If metadata is not dirty then this is no-op.
-    pub(crate) fn flush_metadata(&mut self) -> Result<(), HeapFileError> {
+    pub fn flush_metadata(&mut self) -> Result<(), HeapFileError> {
         match self
             .metadata
             .dirty
@@ -1246,7 +1246,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Inserts `data` into heap file using only overflow pages and returns its [`RecordPtr`].
     /// It is intended to use during update operation.
     /// We use new allocation, because otherwise we end up with deadlock as we hold write-lock to page and fsm wants to get it as well.
-    pub fn insert_using_only_overflow_pages(
+    fn insert_using_only_overflow_pages(
         &self,
         serialized: Vec<u8>,
     ) -> Result<RecordPtr, HeapFileError> {
@@ -1564,14 +1564,14 @@ impl<const BUCKETS_COUNT: usize> Drop for HeapFile<BUCKETS_COUNT> {
 }
 
 /// Factory responsible for creating and loading existing [`HeapFile`].
-struct HeapFileFactory<const BUCKETS_COUNT: usize> {
+pub struct HeapFileFactory<const BUCKETS_COUNT: usize> {
     file_key: FileKey,
     cache: Arc<Cache>,
     columns_metadata: Vec<ColumnMetadata>,
 }
 
 impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
-    pub(crate) fn new(
+    pub fn new(
         file_key: FileKey,
         cache: Arc<Cache>,
         columns_metadata: Vec<ColumnMetadata>,
@@ -1583,7 +1583,7 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
         }
     }
 
-    pub(crate) fn create_heap_file(self) -> Result<HeapFile<BUCKETS_COUNT>, HeapFileError> {
+    pub fn create_heap_file(self) -> Result<HeapFile<BUCKETS_COUNT>, HeapFileError> {
         let metadata_repr = self.load_metadata_repr()?;
 
         let record_pages_fsm = FreeSpaceMap::<BUCKETS_COUNT, RecordPageHeader>::new(

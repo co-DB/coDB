@@ -7,7 +7,7 @@ coDB is a relational database built from scratch.
 - [Project structure](#project-structure)
     - [Adding a new crate](#adding-a-new-crate)
     - [Adding internal dependency](#adding-internal-dependency)
-    - [Adding external dependecy](#adding-external-dependecy)
+    - [Adding external dependency](#adding-external-dependecy)
     - [Updating rust version](#updating-rust-version)
 - [Running locally](#running-locally)
     - [Prerequisites](#prerequisites)
@@ -23,11 +23,11 @@ The project is organized as a Cargo workspace with multiple crates for modularit
 
 - **Binary crate:**
     ```shell
-    cargo new <BINARY_NAME> --vsc none --bin
+    cargo new <BINARY_NAME> --vcs none --bin
     ```
 - **Library crate:**
     ```shell
-    cargo new <LIBRARY_NAME> --vsc none --lib
+    cargo new <LIBRARY_NAME> --vcs none --lib
     ```
 
 Ensure the root `Cargo.toml` includes the new crate under `[workspace].members` and `new-crate/Cargo.toml` includes `rust-version.workspace = true` under `package`. Add those manually if needed.
@@ -42,7 +42,7 @@ To use one crate from another within the workspace (e.g. `crateA` imports `crate
 crateB = { path = "../crateB" }
 ```
 
-### Adding external dependecy
+### Adding external dependency
 
 If an external crate is needed by only one coDB crate, add it to that crate's Cargo.toml.  
 For example, to add `external-1` to the `query` crate, add it in `query/Cargo.toml`.
