@@ -65,6 +65,8 @@ pub(crate) enum AnalyzerError {
     ColumnAlreadyExists { column: String },
     #[error("column '{column}' cannot be dropped")]
     ColumnCannotBeDropped { column: String },
+    #[error("primary key missing in create table statement")]
+    PrimaryKeyMissing,
     #[error("unexpected type: expected {expected}, got {got}")]
     UnexpectedType { expected: String, got: String },
     #[error("unexpected catalog error: {0}")]
@@ -324,31 +326,42 @@ impl<'a> Analyzer<'a> {
 
         let mut already_used_unique_addons = HashSet::new();
 
-        let columns = create
-            .columns
-            .iter()
-            .map(|c| {
-                let addon = self.transform_addon(&c.addon);
-                if addon.unique_per_table() {
-                    if already_used_unique_addons.contains(&addon) {
-                        return Err(AnalyzerError::UniqueAddonUsedMoreThanOnce {
-                            addon: addon.to_string(),
-                        });
-                    }
-                    already_used_unique_addons.insert(addon);
+        let mut resolved_columns = Vec::with_capacity(create.columns.len() - 1);
+        let mut primary_key_column = None;
+
+        for col in &create.columns {
+            let addon = self.transform_addon(&col.addon);
+            if addon.unique_per_table() {
+                if already_used_unique_addons.contains(&addon) {
+                    return Err(AnalyzerError::UniqueAddonUsedMoreThanOnce {
+                        addon: addon.to_string(),
+                    });
                 }
-                let resolved = ResolvedCreateColumnDescriptor {
-                    name: self.get_identifier_value(c.name)?,
-                    ty: c.ty,
-                    addon: addon,
-                };
-                Ok(resolved)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                already_used_unique_addons.insert(addon);
+            }
+
+            let resolved = ResolvedCreateColumnDescriptor {
+                name: self.get_identifier_value(col.name)?,
+                ty: col.ty,
+                addon: addon,
+            };
+
+            if addon == ResolvedCreateColumnAddon::PrimaryKey {
+                primary_key_column = Some(resolved)
+            } else {
+                resolved_columns.push(resolved);
+            }
+        }
+
+        let primary_key_resolved = match primary_key_column {
+            Some(col) => col,
+            None => return Err(AnalyzerError::PrimaryKeyMissing),
+        };
 
         let create_statement = ResolvedCreateStatement {
             table_name,
-            columns,
+            primary_key_column: primary_key_resolved,
+            columns: resolved_columns,
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Create(create_statement));
@@ -2732,16 +2745,16 @@ mod tests {
 
         let create = expect_create(&rt, 0);
         assert_eq!(create.table_name, "my_table");
-        assert_eq!(create.columns.len(), 2);
-        assert_eq!(create.columns[0].name, "a");
-        assert_eq!(create.columns[0].ty, Type::I32);
+        assert_eq!(create.columns.len(), 1);
+        assert_eq!(create.primary_key_column.name, "a");
+        assert_eq!(create.primary_key_column.ty, Type::I32);
         assert_eq!(
-            create.columns[0].addon,
+            create.primary_key_column.addon,
             ResolvedCreateColumnAddon::PrimaryKey
         );
-        assert_eq!(create.columns[1].name, "b");
-        assert_eq!(create.columns[1].ty, Type::String);
-        assert_eq!(create.columns[1].addon, ResolvedCreateColumnAddon::None);
+        assert_eq!(create.columns[0].name, "b");
+        assert_eq!(create.columns[0].ty, Type::String);
+        assert_eq!(create.columns[0].addon, ResolvedCreateColumnAddon::None);
     }
 
     #[test]
@@ -2766,6 +2779,46 @@ mod tests {
         match err {
             AnalyzerError::TableAlreadyExists { table } => assert_eq!(table, "users"),
             other => panic!("expected TableAlreadyExists, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_create_statement_missing_primary_key() {
+        let tmp = TempDir::new().unwrap();
+        let db_file = tmp.path().join("testdb");
+        fs::write(&db_file, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let catalog = Arc::new(RwLock::new(catalog));
+
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "missing_pk".into(),
+        }));
+
+        let col_x_ident =
+            ast.add_node(Expression::Identifier(IdentifierNode { value: "x".into() }));
+
+        let col_x = CreateColumnDescriptor {
+            name: col_x_ident,
+            ty: Type::I32,
+            addon: CreateColumnAddon::None,
+        };
+
+        let create = CreateStatement {
+            table_name: table_ident,
+            columns: vec![col_x],
+        };
+        ast.add_statement(Statement::Create(create));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
+
+        match err {
+            AnalyzerError::PrimaryKeyMissing => {}
+            other => panic!("expected PrimaryKeyMissing, got: {:?}", other),
         }
     }
 
