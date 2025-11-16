@@ -4,10 +4,17 @@ mod iterators;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use engine::{heap_file::HeapFile, record::Record};
-use metadata::{catalog::Catalog, types::Type};
+use engine::{data_types, heap_file::HeapFile, record::Record};
+use itertools::Itertools;
+use metadata::{
+    catalog::{Catalog, ColumnMetadata, TableMetadata},
+    types::Type,
+};
 use parking_lot::RwLock;
-use planner::{query_plan::StatementPlan, resolved_tree::ResolvedTree};
+use planner::{
+    query_plan::{CreateTable, StatementPlan, StatementPlanItem},
+    resolved_tree::{ResolvedCreateColumnAddon, ResolvedTree},
+};
 use storage::cache::Cache;
 
 use crate::{
@@ -67,6 +74,82 @@ impl Executor {
     }
 
     fn execute_statement(&self, statement: &StatementPlan, ast: &ResolvedTree) -> StatementResult {
-        todo!()
+        let root = statement.item(statement.root());
+        match root {
+            StatementPlanItem::TableScan(table_scan) => todo!(),
+            StatementPlanItem::IndexScan(index_scan) => todo!(),
+            StatementPlanItem::Filter(filter) => todo!(),
+            StatementPlanItem::Projection(projection) => todo!(),
+            StatementPlanItem::Insert(insert) => todo!(),
+            StatementPlanItem::CreateTable(create_table) => {
+                self.execute_create_table_statement(create_table)
+            }
+        }
+    }
+
+    fn execute_create_table_statement(&self, create_table: &CreateTable) -> StatementResult {
+        let mut column_metadatas = Vec::with_capacity(create_table.columns.len());
+
+        let cols = create_table.columns.iter().sorted_by(|a, b| {
+            let a_fixed = a.ty.is_fixed_size();
+            let b_fixed = b.ty.is_fixed_size();
+            b_fixed.cmp(&a_fixed)
+        });
+
+        let mut primary_key_name = None;
+        let mut pos = 0;
+        let mut last_fixed_pos = 0;
+        let mut base_offset = 0;
+        for col in cols {
+            if col.addon == ResolvedCreateColumnAddon::PrimaryKey {
+                primary_key_name = Some(col.name.clone());
+            }
+            let column_metadata = match ColumnMetadata::new(
+                col.name.clone(),
+                col.ty,
+                pos,
+                base_offset,
+                last_fixed_pos,
+            ) {
+                Ok(cm) => cm,
+                Err(err) => {
+                    return StatementResult::RuntimeError {
+                        error: format!("Failed to create column: {}", err),
+                    };
+                }
+            };
+            column_metadatas.push(column_metadata);
+            pos += 1;
+            if col.ty.is_fixed_size() {
+                let offset = data_types::type_size_on_disk(&col.ty)
+                    .expect("type with fixed size must return value");
+                last_fixed_pos += 1;
+                base_offset += offset;
+            }
+        }
+
+        let primary_key_name = primary_key_name.expect(
+            "exactly one column should have primary key addon after processing query in Analyzer",
+        );
+
+        let table_metadata =
+            match TableMetadata::new(&create_table.name, &column_metadatas, primary_key_name) {
+                Ok(tm) => tm,
+                Err(err) => {
+                    return StatementResult::RuntimeError {
+                        error: format!("Failed to create table: {}", err),
+                    };
+                }
+            };
+
+        match self.catalog.write().add_table(table_metadata) {
+            Ok(_) => StatementResult::OperationSuccessful {
+                rows_affected: 0,
+                ty: StatementType::Create,
+            },
+            Err(err) => StatementResult::RuntimeError {
+                error: format!("Failed to create table: {}", err),
+            },
+        }
     }
 }
