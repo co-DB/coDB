@@ -204,6 +204,8 @@ dependencies = [
  "parking_lot",
  "planner",
  "storage",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
