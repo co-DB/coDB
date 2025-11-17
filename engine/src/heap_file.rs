@@ -733,6 +733,14 @@ where
         let bytes = self.page.read_record(record_id)?;
         RecordFragment::read_from_bytes(bytes)
     }
+
+    fn next_page(&self) -> Result<PageId, HeapFileError> {
+        Ok(self.page.get_header()?.next_page())
+    }
+
+    fn not_deleted_slot_ids(&self) -> Result<impl Iterator<Item = SlotId>, HeapFileError> {
+        Ok(self.page.get_not_deleted_slot_ids()?)
+    }
 }
 
 impl<P, H> HeapPage<P, H>
@@ -743,7 +751,7 @@ where
     /// Inserts `data` into the page and returns its [`SlotId`].
     /// If defragmentation is needed to store the data, it's done automatically and insertion is done once again.
     ///
-    /// This function assumes that [`self`] has enough free space to insert `data` (the page should not be chosen by hand, but instead [`FreeSpaceMap`] should be used to get page with enough free space).
+    /// This function assumes that [`self`] has enough free space to insert `data` and its slot (the page should not be chosen by hand, but instead [`FreeSpaceMap`] should be used to get page with enough free space).
     fn insert(&mut self, data: &[u8]) -> Result<SlotId, HeapFileError> {
         let result = self.page.insert(data)?;
         match result {
@@ -839,6 +847,18 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let record_bytes = self.record_bytes(ptr)?;
         let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
         Ok(record)
+    }
+
+    /// Reads all [`Record`]s stored in heap file.
+    pub fn all_records(&self) -> Result<Vec<Record>, HeapFileError> {
+        let mut page_id = *self.metadata.first_record_page.lock();
+        let mut all_records = vec![];
+        while page_id != RecordPageHeader::NO_NEXT_PAGE {
+            let (next_page_id, mut records) = self.read_all_record_from_page(page_id)?;
+            all_records.append(&mut records);
+            page_id = next_page_id;
+        }
+        Ok(all_records)
     }
 
     /// Inserts `record` into heap file and returns its [`RecordPtr`].
@@ -941,6 +961,26 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             next_ptr = fragment.next_fragment;
         }
         Ok(full_record_bytes)
+    }
+
+    /// Reads all records from page.
+    /// Returns the records and id of next record page.
+    fn read_all_record_from_page(
+        &self,
+        page_id: PageId,
+    ) -> Result<(PageId, Vec<Record>), HeapFileError> {
+        let page = self.read_record_page(page_id)?;
+        let next_page_id = page.next_page()?;
+
+        let records = page
+            .not_deleted_slot_ids()?
+            .map(|slot_id| {
+                let ptr = RecordPtr::new(page_id, slot_id);
+                self.record(&ptr)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((next_page_id, records))
     }
 
     /// Updates `data` bytes according to description in `update`.
@@ -1425,7 +1465,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     where
         H: BaseHeapPageHeader,
     {
-        let fsm_page = fsm.page_with_free_space(data.len())?;
+        let total_record_size = data.len() + size_of::<Slot>();
+        let fsm_page = fsm.page_with_free_space(total_record_size)?;
         let (page_id, mut page) = if let Some((page_id, page)) = fsm_page {
             let heap_page = HeapPage::new(page);
             (page_id, heap_page)
@@ -2847,6 +2888,302 @@ mod tests {
             result.unwrap_err(),
             HeapFileError::CorruptedRecordEntry { .. }
         ));
+    }
+
+    #[test]
+    fn heap_file_all_records_empty_file() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let all_records = heap_file.all_records().unwrap();
+        assert_eq!(all_records.len(), 0);
+    }
+
+    #[test]
+    fn heap_file_all_records_single_record_single_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let record = Record::new(vec![Field::Int32(1), Field::String("test".into())]);
+        heap_file.insert(record).unwrap();
+
+        let all_records = heap_file.all_records().unwrap();
+        assert_eq!(all_records.len(), 1);
+        assert_i32(1, &all_records[0].fields[0]);
+        assert_string("test", &all_records[0].fields[1]);
+    }
+
+    #[test]
+    fn heap_file_all_records_multiple_records_single_page() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        for i in 0..10 {
+            let record = Record::new(vec![
+                Field::Int32(i),
+                Field::String(format!("record_{}", i)),
+            ]);
+            heap_file.insert(record).unwrap();
+        }
+
+        let all_records = heap_file.all_records().unwrap();
+        assert_eq!(all_records.len(), 10);
+
+        for (i, record) in all_records.iter().enumerate() {
+            assert_i32(i as i32, &record.fields[0]);
+            assert_string(&format!("record_{}", i), &record.fields[1]);
+        }
+    }
+
+    #[test]
+    fn heap_file_all_records_multiple_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead;
+        let large_string = "x".repeat(large_string_size);
+
+        // Insert first large record to fill first page
+        let record1 = Record::new(vec![Field::Int32(1), Field::String(large_string.clone())]);
+        heap_file.insert(record1).unwrap();
+
+        // Insert more records to trigger new page allocation
+        for i in 2..=5 {
+            let record = Record::new(vec![
+                Field::Int32(i),
+                Field::String(format!("record_{}", i)),
+            ]);
+            heap_file.insert(record).unwrap();
+        }
+
+        let all_records = heap_file.all_records().unwrap();
+        assert_eq!(all_records.len(), 5);
+
+        // Verify all records are present (order may vary due to page allocation)
+        let mut found_ids = all_records
+            .iter()
+            .map(|r| match &r.fields[0] {
+                Field::Int32(id) => *id,
+                _ => panic!("Expected Int32"),
+            })
+            .collect::<Vec<_>>();
+        found_ids.sort();
+
+        assert_eq!(found_ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn heap_file_all_records_includes_multi_fragment_records() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<u32>() + size_of::<u16>();
+
+        // Insert small record
+        let small_record = Record::new(vec![Field::Int32(1), Field::String("small".into())]);
+        heap_file.insert(small_record).unwrap();
+
+        // Insert large multi-fragment record
+        let large_string_size = (2 * max_single_page_size) - record_overhead + 100;
+        let large_string = "y".repeat(large_string_size);
+        let large_record = Record::new(vec![Field::Int32(2), Field::String(large_string.clone())]);
+        heap_file.insert(large_record).unwrap();
+
+        // Insert another small record
+        let small_record2 = Record::new(vec![Field::Int32(3), Field::String("small2".into())]);
+        heap_file.insert(small_record2).unwrap();
+
+        let all_records = heap_file.all_records().unwrap();
+        assert_eq!(all_records.len(), 3);
+
+        // Find records by ID (order may vary)
+        let record1 = all_records
+            .iter()
+            .find(|r| match &r.fields[0] {
+                Field::Int32(1) => true,
+                _ => false,
+            })
+            .unwrap();
+        assert_string("small", &record1.fields[1]);
+
+        let record2 = all_records
+            .iter()
+            .find(|r| match &r.fields[0] {
+                Field::Int32(2) => true,
+                _ => false,
+            })
+            .unwrap();
+        assert_string(&large_string, &record2.fields[1]);
+
+        let record3 = all_records
+            .iter()
+            .find(|r| match &r.fields[0] {
+                Field::Int32(3) => true,
+                _ => false,
+            })
+            .unwrap();
+        assert_string("small2", &record3.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_all_records_after_deletions() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let mut record_ptrs = vec![];
+        for i in 0..5 {
+            let record = Record::new(vec![
+                Field::Int32(i),
+                Field::String(format!("record_{}", i)),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            record_ptrs.push(ptr);
+        }
+
+        heap_file.delete(&record_ptrs[1]).unwrap();
+        heap_file.delete(&record_ptrs[3]).unwrap();
+
+        let all_records = heap_file.all_records().unwrap();
+        assert_eq!(all_records.len(), 3);
+
+        // Verify remaining IDs (0, 2, 4)
+        let mut found_ids = all_records
+            .iter()
+            .map(|r| match &r.fields[0] {
+                Field::Int32(id) => *id,
+                _ => panic!("Expected Int32"),
+            })
+            .collect::<Vec<_>>();
+        found_ids.sort();
+
+        assert_eq!(found_ids, vec![0, 2, 4]);
+
+        // Verify content of remaining records
+        for id in [0, 2, 4] {
+            let record = all_records
+                .iter()
+                .find(|r| match &r.fields[0] {
+                    Field::Int32(rid) => *rid == id,
+                    _ => false,
+                })
+                .unwrap();
+            assert_string(&format!("record_{}", id), &record.fields[1]);
+        }
+    }
+
+    #[test]
+    fn heap_file_all_records_after_updates() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = factory.create_heap_file().unwrap();
+
+        let mut record_ptrs = vec![];
+        for i in 0..3 {
+            let record = Record::new(vec![
+                Field::Int32(i),
+                Field::String(format!("original_{}", i)),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            record_ptrs.push(ptr);
+        }
+
+        // Update record with ID 1
+        let column_metadata = heap_file.columns_metadata[1].clone();
+        let update_descriptor =
+            FieldUpdateDescriptor::new(column_metadata, Field::String("updated_1".into())).unwrap();
+        heap_file
+            .update(&record_ptrs[1], vec![update_descriptor])
+            .unwrap();
+
+        let all_records = heap_file.all_records().unwrap();
+        assert_eq!(all_records.len(), 3);
+
+        // Find and verify each record
+        for id in 0..3 {
+            let record = all_records
+                .iter()
+                .find(|r| match &r.fields[0] {
+                    Field::Int32(rid) => *rid == id,
+                    _ => false,
+                })
+                .unwrap();
+
+            if id == 1 {
+                assert_string("updated_1", &record.fields[1]);
+            } else {
+                assert_string(&format!("original_{}", id), &record.fields[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn heap_file_all_records_concurrent_reads() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = Arc::new(factory.create_heap_file().unwrap());
+
+        for i in 0..20 {
+            let record = Record::new(vec![
+                Field::Int32(i),
+                Field::String(format!("record_{}", i)),
+            ]);
+            heap_file.insert(record).unwrap();
+        }
+
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let heap_file_clone = heap_file.clone();
+            let handle = thread::spawn(move || {
+                let all_records = heap_file_clone.all_records().unwrap();
+                assert_eq!(all_records.len(), 20);
+
+                // Verify all IDs are present
+                let mut found_ids = all_records
+                    .iter()
+                    .map(|r| match &r.fields[0] {
+                        Field::Int32(id) => *id,
+                        _ => panic!("Expected Int32"),
+                    })
+                    .collect::<Vec<_>>();
+                found_ids.sort();
+
+                assert_eq!(found_ids, (0..20).collect::<Vec<_>>());
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     // Heap file reading multi-fragment records

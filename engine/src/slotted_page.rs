@@ -401,6 +401,19 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(bytemuck::try_cast_slice(&self.page.data()[start..end])?)
     }
 
+    pub fn get_not_deleted_slot_ids(
+        &self,
+    ) -> Result<impl Iterator<Item = SlotId>, SlottedPageError> {
+        Ok(self
+            .get_slots()?
+            .into_iter()
+            .enumerate()
+            .filter_map(|(id, slot)| match slot.is_deleted() {
+                true => None,
+                false => Some(id as SlotId),
+            }))
+    }
+
     /// Gets a reference to a specific slot by index
     fn get_slot(&self, slot_id: SlotId) -> Result<&Slot, SlottedPageError> {
         let header = self.get_base_header()?;
