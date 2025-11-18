@@ -8,13 +8,16 @@ use std::{
     time,
 };
 
+use crate::metadata_file_helper::MetadataFileHelper;
+use crate::types::Type;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::types::Type;
+/// Name of the metadata file for catalog storage
+pub(crate) const METADATA_FILE_NAME: &str = "metadata.coDB";
 
 /// [`Catalog`] is an in-memory structure that holds information about a database's tables.
-/// It maps to the underlying file `{PATH_TO_CODB}/{DATABASE_NAME}/metadata.coDB`.
+/// It maps to the underlying file `{PATH_TO_CODB}/{DATABASE_NAME}/{METADATA_FILE_NAME}`.
 /// The on-disk file format is JSON.
 ///
 /// [`Catalog`] is created once at database startup. It is assumed that the number of tables and columns
@@ -47,6 +50,8 @@ pub enum CatalogError {
     TableError(#[from] TableMetadataError),
 }
 
+// TODO: Add updating columns
+// TODO (2): Make table level api (column CRUD) callable from Catalog level
 impl Catalog {
     /// Creates new instance of [`Catalog`] for database `database_name`.
     /// Can fail if database does not exist or io error occurs.
@@ -54,7 +59,10 @@ impl Catalog {
     where
         P: AsRef<Path>,
     {
-        let catalog_json = Self::latest_catalog_json(&main_dir_path, database_name)?;
+        let catalog_json =
+            MetadataFileHelper::latest_catalog_json(&main_dir_path, database_name, |path| {
+                CatalogJson::read_from_file(path)
+            })?;
         let tables = catalog_json
             .tables
             .into_iter()
@@ -63,7 +71,10 @@ impl Catalog {
                 TableMetadata::try_from(t).map(|tm| (name, tm))
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
-        let file_path = main_dir_path.as_ref().join(database_name);
+        let file_path = main_dir_path
+            .as_ref()
+            .join(database_name)
+            .join(METADATA_FILE_NAME);
         Ok(Catalog { file_path, tables })
     }
 
@@ -77,7 +88,7 @@ impl Catalog {
     }
 
     /// Adds `table` to list of tables in the catalog.
-    /// IMPORTANT NOTE: this function is purely for changing contents of `metadata.coDB` file. It is NOT responsible for managing table related files (e.g. creating new b-tree).
+    /// IMPORTANT NOTE: this function is purely for changing contents of metadata file. It is NOT responsible for managing table related files (e.g. creating new b-tree).
     /// Can fail if table with same name already exists.
     pub fn add_table(&mut self, table: TableMetadata) -> Result<(), CatalogError> {
         let already_exists = self.tables.contains_key(&table.name);
@@ -91,7 +102,7 @@ impl Catalog {
     }
 
     /// Removes table with `table_name` name from list of tables in the catalog.
-    /// IMPORTANT NOTE: this function is purely for changing contents of `metadata.coDB` file. It is NOT responsible for managing table related files (e.g. removing folder `.{PATH_TO_CODB}/{DATABASE_NAME}/{TABLE_NAME}` and its files).
+    /// IMPORTANT NOTE: this function is purely for changing contents of metadata file. It is NOT responsible for managing table related files (e.g. removing folder `.{PATH_TO_CODB}/{DATABASE_NAME}/{TABLE_NAME}` and its files).
     /// Can fail if table with `table_name` does not exist.
     pub fn remove_table(&mut self, table_name: &str) -> Result<(), CatalogError> {
         self.tables
@@ -103,152 +114,10 @@ impl Catalog {
     /// Syncs in-memory [`Catalog`] instance with underlying file.
     /// Can fail if io error occurs.
     pub fn sync_to_disk(&mut self) -> Result<(), CatalogError> {
-        // Performance note: it's much easier to write whole json all at once instead of updating only the diff.
-        // I'm aware that for a large number of tables and columns it might be quite slow,
-        // though we assume this operation to be called quite rarely (we will mostly load the catalog
-        // but making updates to it will be (at least we expect it to be) quite rare).
-        let catalog_json = CatalogJson::from(&*self);
-        let content = serde_json::to_string_pretty(&catalog_json)?;
-
-        // We can unwrap here, because we know `UNIX_EPOCH` was before `SystemTime::now`
-        let epoch = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let tmp_path = self.file_path.with_extension(format!("tmp-{epoch}"));
-
-        // We firstly store content in temporary file, only when all content is successfully saved to file
-        // we swap it with previous file content.
-        let mut tmp_file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        tmp_file.write_all(content.as_bytes())?;
-        tmp_file.sync_data()?;
-
-        fs::rename(&tmp_path, &self.file_path)?;
-
-        Ok(())
-    }
-
-    /// Returns the latest version of [`CatalogJson`] saved on disk.
-    /// Most of the time it will just return content of `main_dir_path/database_name`,
-    /// but in cases when there was a problem during [`Catalog::sync_to_disk`] and new content was only saved to temporary file it will return the content from newest temporary file.
-    /// Can fail if io error occurs or file was not properly formatted (JSON).
-    fn latest_catalog_json<P>(
-        main_dir_path: P,
-        database_name: &str,
-    ) -> Result<CatalogJson, CatalogError>
-    where
-        P: AsRef<Path>,
-    {
-        let main_file = main_dir_path.as_ref().join(database_name);
-        let mut tmp_files = Self::list_catalog_tmp_files(main_dir_path, database_name)?;
-
-        let catalog_json_tmp = Self::find_latest_valid_tmp_catalog(&main_file, &mut tmp_files)?;
-
-        Self::remove_tmp_files(&mut tmp_files)?;
-
-        let catalog_json = catalog_json_tmp.unwrap_or(CatalogJson::read_from_file(&main_file)?);
-        Ok(catalog_json)
-    }
-
-    /// Returns time of last file modification. For convenience in case of error just returns EPOCH.
-    fn file_last_modified_time<P>(path: P) -> time::SystemTime
-    where
-        P: AsRef<Path>,
-    {
-        let meta = fs::metadata(path);
-        meta.and_then(|m| m.modified()).unwrap_or(time::UNIX_EPOCH)
-    }
-
-    /// Returns a list of all catalog tmp files (each file whose name matches `{CATALOG_FILE_NAME}.tmp-{TIME}`), sorted by their `created_at` time (the latest is the last).
-    /// Can fail if io error occurs.
-    fn list_catalog_tmp_files<P>(
-        main_dir_path: P,
-        database_name: &str,
-    ) -> Result<Vec<PathBuf>, CatalogError>
-    where
-        P: AsRef<Path>,
-    {
-        let mut tmp_files = fs::read_dir(main_dir_path)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                let file_name = path.file_name()?.to_string_lossy();
-                let prefix = format!("{database_name}.tmp-");
-                if file_name.starts_with(&prefix)
-                    && let Ok(epoch) = file_name[prefix.len()..].parse::<u128>()
-                {
-                    return Some((epoch, path));
-                }
-                None
-            })
-            .collect::<Vec<(u128, std::path::PathBuf)>>();
-
-        tmp_files.sort_by_key(|(epoch, _)| *epoch);
-
-        Ok(tmp_files.into_iter().map(|(_, p)| p).collect())
-    }
-
-    /// Iterates over elements in `tmp_files` and tries to find one that has:
-    ///    
-    /// - modification time > main file modification time
-    /// - valid [`CatalogJson`] as its content
-    ///
-    /// If successfully found tmp file that matches requirements returns `Some(CatalogJson)` - [`CatalogJson`] loaded from tmp file.
-    /// If no such tmp file was found then `None` is returned, meaning that [`CatalogJson`] should be loaded from the main file.
-    ///
-    /// Each element consumed from `tmp_files` is guaranteed to be removed from the file system.
-    ///
-    /// Can fail if io error occurs.
-    fn find_latest_valid_tmp_catalog<P>(
-        main_file: P,
-        tmp_files: &mut Vec<PathBuf>,
-    ) -> Result<Option<CatalogJson>, CatalogError>
-    where
-        P: AsRef<Path>,
-    {
-        let main_mtime = Self::file_last_modified_time(&main_file);
-
-        let mut catalog_json = None;
-
-        while let Some(tmp_path) = tmp_files.pop() {
-            let tmp_mtime = Self::file_last_modified_time(&tmp_path);
-            let tmp_is_latest = tmp_mtime > main_mtime;
-            match tmp_is_latest {
-                true => {
-                    let tmp_catalog_json = CatalogJson::read_from_file(&tmp_path);
-                    // In this case it means we have successfully deserialize proper [`CatalogJson`] structure from the file.
-                    // We will assume that this is the most recent version that should be used.
-                    if let Ok(cj) = tmp_catalog_json {
-                        fs::rename(&tmp_path, &main_file)?;
-                        catalog_json = Some(cj);
-                        break;
-                    }
-                    // In this case we tried to read from file but it didn't contain proper json structure.
-                    // We can remove the file as it will no longer be needed.
-                    fs::remove_file(&tmp_path)?;
-                }
-                false => {
-                    // If main file has latest modification time then we no longer need tmp file and can remove it.
-                    fs::remove_file(&tmp_path)?;
-                    break;
-                }
-            };
-        }
-
-        Ok(catalog_json)
-    }
-
-    /// Removes all `tmp_files` from file system.
-    /// Can fail if io error occurs.
-    fn remove_tmp_files(tmp_files: &mut Vec<PathBuf>) -> Result<(), CatalogError> {
-        for tmp_path in tmp_files {
-            fs::remove_file(tmp_path)?;
-        }
-        Ok(())
+        MetadataFileHelper::sync_to_disk(&self.file_path, self, |catalog| {
+            let catalog_json = CatalogJson::from(catalog);
+            Ok(serde_json::to_string_pretty(&catalog_json)?)
+        })
     }
 }
 
@@ -469,10 +338,7 @@ struct CatalogJson {
 }
 
 impl CatalogJson {
-    pub fn read_from_file<P>(path: P) -> Result<Self, CatalogError>
-    where
-        P: AsRef<Path>,
-    {
+    pub fn read_from_file(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
         let content = fs::read_to_string(path)?;
         let catalog_json = serde_json::from_str(&content)?;
         Ok(catalog_json)
@@ -646,7 +512,8 @@ mod tests {
 
     // Helper to create path for tmp file
     fn tmp_path(dir: &std::path::Path, db: &str, epoch: u64) -> std::path::PathBuf {
-        dir.join(format!("{db}.tmp-{epoch}"))
+        dir.join(db)
+            .join(format!("{}.tmp-{epoch}", METADATA_FILE_NAME))
     }
 
     // Helper to check if file contains expected json
@@ -660,8 +527,9 @@ mod tests {
 
     // Helper to check if no tmp files are in the directory
     fn assert_no_tmp_files(dir: &std::path::Path, db: &str) {
-        let prefix = format!("{db}.tmp-");
-        for entry in fs::read_dir(dir).unwrap() {
+        let prefix = format!("{}.tmp-", METADATA_FILE_NAME);
+        let db_dir = dir.join(db);
+        for entry in fs::read_dir(&db_dir).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().to_string_lossy().to_string();
             assert!(
@@ -700,7 +568,9 @@ mod tests {
     fn catalog_new_returns_error_when_file_is_not_json() {
         // given file with invalid json
         let tmp_dir = tempfile::tempdir().unwrap();
-        let db_path = tmp_dir.path().join("db");
+        let db_dir = tmp_dir.path().join("db");
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
         std::fs::write(&db_path, b"not a json").unwrap();
 
         // when creating catalog
@@ -718,7 +588,9 @@ mod tests {
     fn catalog_new_returns_error_when_file_is_json_but_not_catalog_json() {
         // given file with valid json but not CatalogJson
         let tmp_dir = tempfile::tempdir().unwrap();
-        let db_path = tmp_dir.path().join("db");
+        let db_dir = tmp_dir.path().join("db");
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
         std::fs::write(&db_path, b"{\"foo\": 123}").unwrap();
 
         // when creating catalog
@@ -736,7 +608,9 @@ mod tests {
     fn catalog_new_loads_proper_catalog_json() {
         // given file with valid CatalogJson
         let tmp_dir = tempfile::tempdir().unwrap();
-        let db_path = tmp_dir.path().join("db");
+        let db_dir = tmp_dir.path().join("db");
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let json = r#"
     {
@@ -788,7 +662,9 @@ mod tests {
         // given one tmp file with mtime > main and valid json
         let tmp_dir = tempfile::tempdir().unwrap();
         let db = "db";
-        let db_path = tmp_dir.path().join(db);
+        let db_dir = tmp_dir.path().join(db);
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let main_json = r#"{
     "tables":[
@@ -841,7 +717,9 @@ mod tests {
         // given multiple tmp files with valid json
         let tmp_dir = tempfile::tempdir().unwrap();
         let db = "db";
-        let db_path = tmp_dir.path().join(db);
+        let db_dir = tmp_dir.path().join(db);
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let main_json = r#"{
         "tables":[
@@ -910,7 +788,9 @@ mod tests {
         // given multiple tmp files with only one in the middle with valid json
         let tmp_dir = tempfile::tempdir().unwrap();
         let db = "db";
-        let db_path = tmp_dir.path().join(db);
+        let db_dir = tmp_dir.path().join(db);
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let main_json = r#"{
         "tables":[
@@ -971,7 +851,9 @@ mod tests {
         // given multiple tmp files, none of them with valid json
         let tmp_dir = tempfile::tempdir().unwrap();
         let db = "db";
-        let db_path = tmp_dir.path().join(db);
+        let db_dir = tmp_dir.path().join(db);
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let main_json = r#"{
         "tables":[
@@ -1014,7 +896,9 @@ mod tests {
     fn catalog_new_returns_error_when_column_is_invalid() {
         // given file with a column that has invalid base_offset_pos > pos
         let tmp_dir = tempfile::tempdir().unwrap();
-        let db_path = tmp_dir.path().join("db");
+        let db_dir = tmp_dir.path().join("db");
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let json = r#"
     {
@@ -1048,7 +932,9 @@ mod tests {
     fn catalog_new_returns_error_when_table_has_duplicate_column_names() {
         // given file with a table that has duplicate column names
         let tmp_dir = tempfile::tempdir().unwrap();
-        let db_path = tmp_dir.path().join("db");
+        let db_dir = tmp_dir.path().join("db");
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let json = r#"
     {
@@ -1165,7 +1051,9 @@ mod tests {
     fn catalog_sync_to_disk_saves_to_file() {
         // given a catalog with one table
         let tmp_dir = tempfile::tempdir().unwrap();
-        let db_path = tmp_dir.path().join("db");
+        let db_dir = tmp_dir.path().join("db");
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let users = users_table();
         let mut tables = HashMap::new();
@@ -1189,7 +1077,9 @@ mod tests {
     fn catalog_sync_to_disk_after_adding_table() {
         // given a catalog with one table
         let tmp_dir = tempfile::tempdir().unwrap();
-        let db_path = tmp_dir.path().join("db");
+        let db_dir = tmp_dir.path().join("db");
+        std::fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let users = users_table();
         let mut tables = HashMap::new();
