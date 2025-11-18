@@ -8,13 +8,12 @@ use std::{
     time,
 };
 
+use crate::consts::METADATA_FILE_NAME;
 use crate::metadata_file_helper::MetadataFileHelper;
 use crate::types::Type;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-/// Name of the metadata file for catalog storage
-pub(crate) const METADATA_FILE_NAME: &str = "metadata.coDB";
 
 /// [`Catalog`] is an in-memory structure that holds information about a database's tables.
 /// It maps to the underlying file `{PATH_TO_CODB}/{DATABASE_NAME}/{METADATA_FILE_NAME}`.
@@ -426,6 +425,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
+    use crate::consts::METADATA_FILE_NAME;
     use filetime::{FileTime, set_file_mtime};
     use serde::de::Error;
     use tempfile::NamedTempFile;

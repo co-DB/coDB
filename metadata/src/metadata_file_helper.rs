@@ -1,4 +1,5 @@
-﻿use crate::catalog::{CatalogError, METADATA_FILE_NAME};
+﻿use crate::catalog::CatalogError;
+use crate::consts::METADATA_FILE_NAME;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{fs, time};
