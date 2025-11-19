@@ -2799,9 +2799,11 @@ mod tests {
     #[test]
     fn analyze_create_statement_missing_primary_key() {
         let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
-        fs::write(&db_file, r#"{ "tables": [] }"#).unwrap();
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let db_dir = tmp.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+        fs::write(&db_path, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp.path(), "db").unwrap();
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();

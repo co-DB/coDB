@@ -200,11 +200,16 @@ mod tests {
 
     use super::*;
 
+    const METADATA_FILE_NAME: &str = "metadata.coDB";
     // Helper to create a test executor
     fn create_test_executor() -> (Executor, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let catalog = Catalog::new(temp_dir.path(), "test_db").unwrap_or_else(|_| {
-            fs::write(temp_dir.path().join("test_db"), r#"{"tables":[]}"#).unwrap();
+            let db_dir = temp_dir.path().join("test_db");
+            fs::create_dir(&db_dir).unwrap();
+            let db_path = db_dir.join(METADATA_FILE_NAME);
+
+            fs::write(db_path, r#"{"tables":[]}"#).unwrap();
             Catalog::new(temp_dir.path(), "test_db").unwrap()
         });
 
