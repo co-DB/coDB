@@ -6,7 +6,7 @@ use std::{fs, time};
 
 /// Helper struct that provides utility functions for managing metadata files
 /// and their temporary counterparts.
-pub(crate) struct MetadataFileHelper {}
+pub(crate) struct MetadataFileHelper;
 
 impl MetadataFileHelper {
     /// Removes all temporary files from the file system.
@@ -139,7 +139,7 @@ impl MetadataFileHelper {
     /// 1. Serialize data using the provided `serialize_fn`
     /// 2. Create a temporary file with name `{file_path}.tmp-{epoch}`
     /// 3. Write serialized content to temporary file
-    /// 4. Sync data to disk (fsync)
+    /// 4. Sync data to disk
     /// 5. Atomically rename temporary file to replace the main file
     ///
     /// The `serialize_fn` should convert the data into a string format (e.g., JSON).
@@ -157,7 +157,12 @@ impl MetadataFileHelper {
             .duration_since(time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let tmp_path = file_path.as_ref().with_extension(format!("tmp-{epoch}"));
+
+        let tmp_path = file_path.as_ref().with_file_name(format!(
+            "{}.tmp-{}",
+            file_path.as_ref().file_name().unwrap().to_string_lossy(),
+            epoch
+        ));
 
         // We firstly store content in temporary file, only when all content is successfully saved to file
         // we swap it with previous file content.
@@ -168,7 +173,7 @@ impl MetadataFileHelper {
             .open(&tmp_path)?;
 
         tmp_file.write_all(content.as_bytes())?;
-        tmp_file.sync_data()?;
+        tmp_file.sync_all()?;
 
         fs::rename(&tmp_path, file_path.as_ref())?;
 
