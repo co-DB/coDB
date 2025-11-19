@@ -2,7 +2,7 @@
 use crate::consts::METADATA_FILE_NAME;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::{fs, time};
+use std::{fs, io, time};
 
 /// Helper struct that provides utility functions for managing metadata files
 /// and their temporary counterparts.
@@ -11,7 +11,10 @@ pub(crate) struct MetadataFileHelper;
 impl MetadataFileHelper {
     /// Removes all temporary files from the file system.
     /// Can fail if io error occurs.
-    fn remove_tmp_files(tmp_files: &mut Vec<PathBuf>) -> Result<(), CatalogError> {
+    fn remove_tmp_files<Err>(tmp_files: &mut Vec<PathBuf>) -> Result<(), Err>
+    where
+        Err: From<io::Error>,
+    {
         for tmp_path in tmp_files {
             fs::remove_file(tmp_path)?;
         }
@@ -27,18 +30,19 @@ impl MetadataFileHelper {
     /// The function uses a provided `load_fn` to deserialize the metadata from the file.
     ///
     /// Can fail if io error occurs or file was not properly formatted.
-    pub(crate) fn latest_catalog_json<T>(
-        main_dir_path: impl AsRef<Path>,
-        database_name: &str,
-        load_fn: impl Fn(&Path) -> Result<T, CatalogError>,
-    ) -> Result<T, CatalogError> {
-        let db_dir = main_dir_path.as_ref().join(database_name);
-        let main_file = db_dir.join(METADATA_FILE_NAME);
+    pub(crate) fn latest_catalog_json<T, Err>(
+        directory_path: impl AsRef<Path>,
+        load_fn: impl Fn(&Path) -> Result<T, Err>,
+    ) -> Result<T, Err>
+    where
+        Err: From<io::Error>,
+    {
+        let main_file = directory_path.as_ref().join(METADATA_FILE_NAME);
         let tmp_file_prefix = format!("{}.tmp-", METADATA_FILE_NAME);
-        let mut tmp_files = Self::list_catalog_tmp_files(&db_dir, &tmp_file_prefix)?;
+        let mut tmp_files = Self::list_catalog_tmp_files(&directory_path, &tmp_file_prefix)?;
 
         let catalog_json_tmp =
-            Self::find_latest_valid_tmp_catalog::<T>(&main_file, &mut tmp_files, &load_fn)?;
+            Self::find_latest_valid_tmp_catalog::<T, Err>(&main_file, &mut tmp_files, &load_fn)?;
 
         Self::remove_tmp_files(&mut tmp_files)?;
 
@@ -54,10 +58,13 @@ impl MetadataFileHelper {
     /// where `{epoch}` is a timestamp in milliseconds since UNIX_EPOCH.
     ///
     /// Can fail if io error occurs.
-    pub(crate) fn list_catalog_tmp_files(
+    pub(crate) fn list_catalog_tmp_files<Err>(
         directory_path: impl AsRef<Path>,
         file_prefix: &str,
-    ) -> Result<Vec<PathBuf>, CatalogError> {
+    ) -> Result<Vec<PathBuf>, Err>
+    where
+        Err: From<io::Error>,
+    {
         let mut tmp_files = fs::read_dir(directory_path)?
             .filter_map(|entry| {
                 let entry = entry.ok()?;
@@ -92,11 +99,14 @@ impl MetadataFileHelper {
     /// - Removed from the file system (if invalid or older than main file)
     ///
     /// Can fail if io error occurs.
-    pub(crate) fn find_latest_valid_tmp_catalog<T>(
+    pub(crate) fn find_latest_valid_tmp_catalog<T, Err>(
         main_file: impl AsRef<Path>,
         tmp_files: &mut Vec<PathBuf>,
-        load_fn: &impl Fn(&Path) -> Result<T, CatalogError>,
-    ) -> Result<Option<T>, CatalogError> {
+        load_fn: &impl Fn(&Path) -> Result<T, Err>,
+    ) -> Result<Option<T>, Err>
+    where
+        Err: From<io::Error>,
+    {
         let main_mtime = Self::file_last_modified_time(&main_file);
 
         let mut catalog_json = None;

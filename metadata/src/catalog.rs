@@ -58,10 +58,10 @@ impl Catalog {
     where
         P: AsRef<Path>,
     {
-        let catalog_json =
-            MetadataFileHelper::latest_catalog_json(&main_dir_path, database_name, |path| {
-                CatalogJson::read_from_file(path)
-            })?;
+        let catalog_json = MetadataFileHelper::latest_catalog_json(
+            &main_dir_path.as_ref().join(database_name),
+            |path| CatalogJson::read_from_file(path),
+        )?;
         let tables = catalog_json
             .tables
             .into_iter()
