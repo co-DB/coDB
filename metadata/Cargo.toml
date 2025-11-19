@@ -5,6 +5,7 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
+directories = "6.0.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

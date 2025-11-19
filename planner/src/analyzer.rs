@@ -1093,10 +1093,14 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    const METADATA_FILE_NAME: &str = "metadata.coDB";
+
     // Helper to create a catalog file with a users table
     fn catalog_with_users() -> Arc<RwLock<Catalog>> {
-        let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
+        let tmp_dir = TempDir::new().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let json = r#"
         {
@@ -1112,9 +1116,10 @@ mod tests {
             ]
         }
         "#;
-        std::fs::write(&db_file, json).unwrap();
 
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        fs::write(&db_path, json).unwrap();
+
+        let catalog = Catalog::new(tmp_dir.path(), "db").unwrap();
         Arc::new(RwLock::new(catalog))
     }
 
@@ -1732,10 +1737,13 @@ mod tests {
 
     #[test]
     fn analyze_select_table_not_found() {
-        let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
-        std::fs::write(&db_file, r#"{ "tables": [] }"#).unwrap();
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+        fs::write(&db_path, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp_dir.path(), "db").unwrap();
+
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();
@@ -2267,8 +2275,10 @@ mod tests {
 
     #[test]
     fn analyze_insert_cast_value_to_column_type() {
-        let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
+        let tmp_dir = TempDir::new().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
         let json = r#"
         {
             "tables": [
@@ -2282,8 +2292,8 @@ mod tests {
             ]
         }
         "#;
-        fs::write(&db_file, json).unwrap();
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        fs::write(&db_path, json).unwrap();
+        let catalog = Catalog::new(tmp_dir.path(), "db").unwrap();
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();
@@ -2328,8 +2338,10 @@ mod tests {
 
     #[test]
     fn analyze_insert_value_cast_disallowed_f64_to_f32() {
-        let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
+        let tmp_dir = TempDir::new().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
         let json = r#"
         {
             "tables": [
@@ -2343,8 +2355,8 @@ mod tests {
             ]
         }
         "#;
-        fs::write(&db_file, json).unwrap();
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        fs::write(&db_path, json).unwrap();
+        let catalog = Catalog::new(tmp_dir.path(), "db").unwrap();
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();
@@ -2703,11 +2715,13 @@ mod tests {
 
     #[test]
     fn analyze_create_statement_success() {
-        let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
+        let tmp_dir = TempDir::new().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
         // no tables
-        fs::write(&db_file, r#"{ "tables": [] }"#).unwrap();
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        fs::write(&db_path, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp_dir.path(), "db").unwrap();
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();
@@ -2785,9 +2799,11 @@ mod tests {
     #[test]
     fn analyze_create_statement_missing_primary_key() {
         let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
-        fs::write(&db_file, r#"{ "tables": [] }"#).unwrap();
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let db_dir = tmp.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+        fs::write(&db_path, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp.path(), "db").unwrap();
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();
@@ -2824,10 +2840,13 @@ mod tests {
 
     #[test]
     fn analyze_create_duplicate_primary_key() {
-        let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
-        fs::write(&db_file, r#"{ "tables": [] }"#).unwrap();
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+        fs::write(&db_path, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp_dir.path(), "db").unwrap();
+
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();
@@ -3097,8 +3116,10 @@ mod tests {
     #[test]
     fn analyze_alter_rename_table_new_name_already_exists() {
         // create a catalog containing both "users" and "accounts"
-        let tmp = TempDir::new().unwrap();
-        let db_file = tmp.path().join("testdb");
+        let tmp_dir = TempDir::new().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
         let json = r#"
         {
             "tables": [
@@ -3121,8 +3142,8 @@ mod tests {
             ]
         }
         "#;
-        fs::write(&db_file, json).unwrap();
-        let catalog = Catalog::new(tmp.path(), "testdb").unwrap();
+        fs::write(&db_path, json).unwrap();
+        let catalog = Catalog::new(tmp_dir.path(), "db").unwrap();
         let catalog = Arc::new(RwLock::new(catalog));
 
         let mut ast = Ast::default();
