@@ -12,3 +12,9 @@ planner = { path = "../planner" }
 
 dashmap.workspace = true
 parking_lot.workspace = true
+thiserror.workspace = true
+
+itertools = "0.14.0"
+
+[dev-dependencies]
+tempfile = "3.20.0"

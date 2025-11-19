@@ -87,8 +87,16 @@ impl StatementPlanItem {
         })
     }
 
-    pub(crate) fn create_table(name: String, columns: Vec<ResolvedCreateColumnDescriptor>) -> Self {
-        StatementPlanItem::CreateTable(CreateTable { name, columns })
+    pub(crate) fn create_table(
+        name: String,
+        primary_key_column: ResolvedCreateColumnDescriptor,
+        columns: Vec<ResolvedCreateColumnDescriptor>,
+    ) -> Self {
+        StatementPlanItem::CreateTable(CreateTable {
+            name,
+            primary_key_column,
+            columns,
+        })
     }
 }
 
@@ -132,5 +140,6 @@ pub struct Insert {
 #[derive(Debug)]
 pub struct CreateTable {
     pub name: String,
+    pub primary_key_column: ResolvedCreateColumnDescriptor,
     pub columns: Vec<ResolvedCreateColumnDescriptor>,
 }

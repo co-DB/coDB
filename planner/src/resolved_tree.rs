@@ -99,6 +99,7 @@ pub(crate) struct ResolvedDeleteStatement {
 #[derive(Debug)]
 pub(crate) struct ResolvedCreateStatement {
     pub(crate) table_name: String,
+    pub(crate) primary_key_column: ResolvedCreateColumnDescriptor,
     pub(crate) columns: Vec<ResolvedCreateColumnDescriptor>,
 }
 

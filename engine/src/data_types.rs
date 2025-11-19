@@ -1,4 +1,5 @@
-﻿use thiserror::Error;
+﻿use metadata::types::Type;
+use thiserror::Error;
 use time::{Date, Duration, PrimitiveDateTime, Time};
 
 macro_rules! impl_db_serializable_for {
@@ -26,6 +27,20 @@ macro_rules! impl_db_serializable_for {
 }
 
 impl_db_serializable_for!(i32, i64, u8, u16, u32, u64, f32, f64);
+
+macro_rules! impl_db_serializable_fixed_size_for {
+    ($($t:ty),*) => {
+        $(
+            impl DbSerializableFixedSize for $t {
+                fn fixed_size_serialized() -> usize {
+                    size_of::<Self>()
+                }
+            }
+        )*
+    };
+}
+
+impl_db_serializable_fixed_size_for!(i32, i64, f32, f64);
 
 /// A trait for types that can be serialized to and deserialized from bytes
 /// for database storage.
@@ -60,6 +75,12 @@ pub(crate) trait DbSerializable: Sized {
         let arr: [u8; N] = buffer[..N].try_into().unwrap();
         Ok((convert(arr), &buffer[N..]))
     }
+}
+
+pub(crate) trait DbSerializableFixedSize: DbSerializable {
+    /// Returns number of bytes that any instance of this type will take when serialized.
+    /// Should only be implemented for types that are fixed-size.
+    fn fixed_size_serialized() -> usize;
 }
 
 #[derive(Error, Debug)]
@@ -127,6 +148,12 @@ impl DbSerializable for bool {
     }
 }
 
+impl DbSerializableFixedSize for bool {
+    fn fixed_size_serialized() -> usize {
+        size_of::<u8>()
+    }
+}
+
 // 1970-01-01 - the date we measure our date against.
 const EPOCH_DATE: Date = match Date::from_ordinal_date(1970, 1) {
     Ok(date) => date,
@@ -178,6 +205,12 @@ impl DbSerializable for DbDate {
     }
 
     fn size_serialized(&self) -> usize {
+        size_of::<i32>()
+    }
+}
+
+impl DbSerializableFixedSize for DbDate {
+    fn fixed_size_serialized() -> usize {
         size_of::<i32>()
     }
 }
@@ -280,6 +313,12 @@ impl DbSerializable for DbDateTime {
     }
 }
 
+impl DbSerializableFixedSize for DbDateTime {
+    fn fixed_size_serialized() -> usize {
+        size_of::<i32>() + size_of::<u32>()
+    }
+}
+
 /// This conversion is defined for usage in database inserts/updates where we want to convert the
 /// coSQL representation of DateTime used in queries into the internal one.
 impl From<PrimitiveDateTime> for DbDateTime {
@@ -317,6 +356,18 @@ impl From<DbDateTime> for PrimitiveDateTime {
     }
 }
 
+pub fn type_size_on_disk(ty: &Type) -> Option<usize> {
+    match ty {
+        Type::String => None,
+        Type::F32 => Some(f32::fixed_size_serialized()),
+        Type::F64 => Some(f64::fixed_size_serialized()),
+        Type::I32 => Some(i32::fixed_size_serialized()),
+        Type::I64 => Some(i64::fixed_size_serialized()),
+        Type::Bool => Some(bool::fixed_size_serialized()),
+        Type::Date => Some(DbDate::fixed_size_serialized()),
+        Type::DateTime => Some(DbDateTime::fixed_size_serialized()),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

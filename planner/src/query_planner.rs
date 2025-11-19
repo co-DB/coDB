@@ -87,6 +87,7 @@ impl QueryPlanner {
 
         plan.add_item(StatementPlanItem::create_table(
             create.table_name.clone(),
+            create.primary_key_column.clone(),
             create.columns.clone(),
         ));
 
@@ -379,7 +380,8 @@ mod tests {
 
         let create = ResolvedCreateStatement {
             table_name: "users".into(),
-            columns: vec![col1.clone(), col2.clone(), col3.clone()],
+            primary_key_column: col1.clone(),
+            columns: vec![col2.clone(), col3.clone()],
         };
 
         tree.add_statement(ResolvedStatement::Create(create));
@@ -400,26 +402,26 @@ mod tests {
         let create_table = assert_create_table_item(create_item);
 
         assert_eq!(create_table.name, "users");
-        assert_eq!(create_table.columns.len(), 3);
+        assert_eq!(create_table.columns.len(), 2);
 
-        assert_eq!(create_table.columns[0].name, "id");
-        assert_eq!(create_table.columns[0].ty, Type::I32);
+        assert_eq!(create_table.primary_key_column.name, "id");
+        assert_eq!(create_table.primary_key_column.ty, Type::I32);
         assert_eq!(
-            create_table.columns[0].addon,
+            create_table.primary_key_column.addon,
             ResolvedCreateColumnAddon::PrimaryKey
         );
 
-        assert_eq!(create_table.columns[1].name, "name");
-        assert_eq!(create_table.columns[1].ty, Type::String);
+        assert_eq!(create_table.columns[0].name, "name");
+        assert_eq!(create_table.columns[0].ty, Type::String);
         assert_eq!(
-            create_table.columns[1].addon,
+            create_table.columns[0].addon,
             ResolvedCreateColumnAddon::None
         );
 
-        assert_eq!(create_table.columns[2].name, "age");
-        assert_eq!(create_table.columns[2].ty, Type::I32);
+        assert_eq!(create_table.columns[1].name, "age");
+        assert_eq!(create_table.columns[1].ty, Type::I32);
         assert_eq!(
-            create_table.columns[2].addon,
+            create_table.columns[1].addon,
             ResolvedCreateColumnAddon::None
         );
     }
