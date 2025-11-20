@@ -3,8 +3,12 @@ mod iterators;
 
 use std::{iter::once, path::Path, sync::Arc};
 
-use dashmap::DashMap;
-use engine::{data_types, heap_file::HeapFile, record::Record};
+use dashmap::{DashMap, mapref::one::Ref};
+use engine::{
+    data_types,
+    heap_file::{HeapFile, HeapFileError, HeapFileFactory},
+    record::Record,
+};
 use itertools::Itertools;
 use metadata::{
     catalog::{Catalog, ColumnMetadata, ColumnMetadataError, TableMetadata},
@@ -12,12 +16,12 @@ use metadata::{
 };
 use parking_lot::RwLock;
 use planner::{
-    query_plan::{CreateTable, StatementPlan, StatementPlanItem},
+    query_plan::{CreateTable, StatementPlan, StatementPlanItem, TableScan},
     resolved_tree::{ResolvedCreateColumnDescriptor, ResolvedTree},
 };
 use storage::{
     cache::Cache,
-    files_manager::{FilesManager, FilesManagerError},
+    files_manager::{FileKey, FilesManager, FilesManagerError},
 };
 use thiserror::Error;
 
@@ -37,6 +41,17 @@ pub struct Executor {
 pub enum ExecutorError {
     #[error("Cannot open files manager: {0}")]
     CannotOpenFilesManager(#[from] FilesManagerError),
+}
+
+/// Error for internal executor operations, shouldn't be exported outside of this module.
+#[derive(Error, Debug)]
+enum InternalExecutorError {
+    #[error("Table '{table_name}' does not exist.")]
+    TableDoesNotExist { table_name: String },
+    #[error("Cannot create heap file: {reason}")]
+    CannotCreateHeapFile { reason: String },
+    #[error("{0}")]
+    HeapFileError(#[from] HeapFileError),
 }
 
 #[derive(Debug)]
@@ -90,6 +105,7 @@ impl Executor {
         })
     }
 
+    /// Parses `query` and returns iterator over results for each statement in the `query`.
     pub fn execute<'e>(&'e self, query: &str) -> QueryResultIter<'e> {
         let parse_output = planner::process_query(query, self.catalog.clone());
         match parse_output {
@@ -98,25 +114,109 @@ impl Executor {
         }
     }
 
+    /// Executes single statement by delegating work to [`StatementExecutor`].
     fn execute_statement(&self, statement: &StatementPlan, ast: &ResolvedTree) -> StatementResult {
-        let root = statement.item(statement.root());
-        match root {
+        let se = StatementExecutor::new(self, statement, ast);
+        se.execute()
+    }
+
+    /// Helper to create [`StatementResult::RuntimeError`] with provided message.
+    fn runtime_error(&self, msg: String) -> StatementResult {
+        StatementResult::RuntimeError { error: msg }
+    }
+
+    /// Returns heap file for given table. If heap file wasn't used yet it opens it
+    /// and inserts to [`Executor::heap_files`].
+    ///
+    /// It is possible that table was removed just before we started processing current statement
+    /// (so [`Analyzer`] didn't report any problem) - in such case we just return an error that
+    /// table does not exist.
+    fn get_heap_file(
+        &self,
+        table_name: impl Into<String> + Clone + AsRef<str>,
+    ) -> Result<Ref<'_, String, HeapFile<HEAP_FILE_BUCKET_SIZE>>, InternalExecutorError> {
+        self.heap_files
+            .entry(table_name.clone().into())
+            .or_try_insert_with(|| self.open_heap_file(table_name.clone()))?;
+        self.heap_files
+            .get(table_name.as_ref())
+            .ok_or(InternalExecutorError::TableDoesNotExist {
+                table_name: table_name.clone().into(),
+            })
+    }
+
+    /// Creates new heap file for given table.
+    ///
+    /// As in [`Executor::get_heap_file`] if table was removed just before we started processing
+    /// current statement we just return error that table does not exist.
+    fn open_heap_file(
+        &self,
+        table_name: impl Into<String> + Clone + AsRef<str>,
+    ) -> Result<HeapFile<HEAP_FILE_BUCKET_SIZE>, InternalExecutorError> {
+        let file_key = FileKey::data(table_name.clone());
+        let cache = self.cache.clone();
+        let columns_metadata = self
+            .catalog
+            .read()
+            .table(table_name.as_ref())
+            .map_err(|_| InternalExecutorError::TableDoesNotExist {
+                table_name: table_name.clone().into(),
+            })?
+            .columns()
+            .collect();
+        let heap_file_factory = HeapFileFactory::new(file_key, cache, columns_metadata);
+        let heap_file = heap_file_factory.create_heap_file().map_err(|err| {
+            InternalExecutorError::CannotCreateHeapFile {
+                reason: err.to_string(),
+            }
+        })?;
+        Ok(heap_file)
+    }
+}
+
+struct StatementExecutor<'e, 'q> {
+    executor: &'e Executor,
+    statement: &'q StatementPlan,
+    ast: &'q ResolvedTree,
+}
+
+impl<'e, 'q> StatementExecutor<'e, 'q> {
+    fn new(executor: &'e Executor, statement: &'q StatementPlan, ast: &'q ResolvedTree) -> Self {
+        StatementExecutor {
+            executor,
+            statement,
+            ast,
+        }
+    }
+
+    fn root_statement(&self) -> &StatementPlanItem {
+        self.statement.item(self.statement.root())
+    }
+
+    fn execute(&self) -> StatementResult {
+        match self.root_statement() {
             StatementPlanItem::TableScan(table_scan) => todo!(),
             StatementPlanItem::IndexScan(index_scan) => todo!(),
             StatementPlanItem::Filter(filter) => todo!(),
             StatementPlanItem::Projection(projection) => todo!(),
             StatementPlanItem::Insert(insert) => todo!(),
-            StatementPlanItem::CreateTable(create_table) => {
-                self.execute_create_table_statement(create_table)
-            }
+            StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
         }
     }
 
-    fn execute_create_table_statement(&self, create_table: &CreateTable) -> StatementResult {
+    fn table_scan(&self, table_scan: &TableScan) -> Result<Vec<Record>, InternalExecutorError> {
+        let hf = self.executor.get_heap_file(&table_scan.table_name)?;
+        let records = hf.all_records()?;
+        Ok(records)
+    }
+
+    fn create_table(&self, create_table: &CreateTable) -> StatementResult {
         let column_metadatas = match self.process_columns(create_table) {
             Ok(cm) => cm,
             Err(err) => {
-                return self.runtime_error(format!("Failed to create column: {err}"));
+                return self
+                    .executor
+                    .runtime_error(format!("Failed to create column: {err}"));
             }
         };
 
@@ -126,13 +226,19 @@ impl Executor {
             &create_table.primary_key_column.name,
         ) {
             Ok(tm) => tm,
-            Err(err) => return self.runtime_error(format!("Failed to create table: {}", err)),
+            Err(err) => {
+                return self
+                    .executor
+                    .runtime_error(format!("Failed to create table: {}", err));
+            }
         };
 
-        let mut catalog = self.catalog.write();
+        let mut catalog = self.executor.catalog.write();
 
         if let Err(err) = catalog.add_table(table_metadata) {
-            return self.runtime_error(format!("Failed to create table: {}", err));
+            return self
+                .executor
+                .runtime_error(format!("Failed to create table: {}", err));
         }
 
         match catalog.sync_to_disk() {
@@ -140,16 +246,14 @@ impl Executor {
                 rows_affected: 0,
                 ty: StatementType::Create,
             },
-            Err(err) => {
-                self.runtime_error(format!("Failed to save catalog content to disk: {err}"))
-            }
+            Err(err) => self
+                .executor
+                .runtime_error(format!("Failed to save catalog content to disk: {err}")),
         }
     }
 
-    fn runtime_error(&self, msg: String) -> StatementResult {
-        StatementResult::RuntimeError { error: msg }
-    }
-
+    /// Creates iterator over all columns in [`CreateTable`] (including primary key column)
+    /// and sorts them by whether they are fixed-size (fixed-size columns are first).
     fn sort_columns_by_fixed_size<'c>(
         &self,
         create_table: &'c CreateTable,
@@ -165,6 +269,7 @@ impl Executor {
             })
     }
 
+    /// Returns vector of [`ColumnMetadata`] that maps to columns in [`CreateTable`].
     fn process_columns(
         &self,
         create_table: &CreateTable,
