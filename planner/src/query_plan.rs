@@ -28,9 +28,9 @@ impl StatementPlan {
         StatementPlanItemId::new(self.items.len() - 1)
     }
 
-    /// Returns the [`StatementPlanItemId`] of item that should be executed first.
-    pub fn root(&self) -> StatementPlanItemId {
-        StatementPlanItemId::new(self.items.len() - 1)
+    /// Returns the [`StatementPlanItem`] that should be executed first.
+    pub fn root(&self) -> &StatementPlanItem {
+        &self.items[self.items.len() - 1]
     }
 
     pub fn item(&self, id: StatementPlanItemId) -> &StatementPlanItem {
@@ -53,12 +53,24 @@ impl StatementPlanItemId {
 /// The building block used to describe [`StatementPlan`].
 #[derive(Debug)]
 pub enum StatementPlanItem {
+    // Data sources
     TableScan(TableScan),
     IndexScan(IndexScan),
+
+    // Operators (can be chained)
     Filter(Filter),
+
+    // Terminal operators (must always be root)
     Projection(Projection),
     Insert(Insert),
     CreateTable(CreateTable),
+}
+
+impl StatementPlanItem {
+    /// Returns `true` if [`StatementPlanItem`] can be root and returns result set.
+    pub fn produces_result_set(&self) -> bool {
+        matches!(self, StatementPlanItem::Projection(_))
+    }
 }
 
 /// Functions for constructing each [`StatementPlanItem`].
@@ -67,12 +79,21 @@ impl StatementPlanItem {
         StatementPlanItem::TableScan(TableScan { table_name })
     }
 
-    pub(crate) fn filter(data: StatementPlanItemId, predicate: ResolvedNodeId) -> Self {
-        StatementPlanItem::Filter(Filter { data, predicate })
+    pub(crate) fn filter(data_source: StatementPlanItemId, predicate: ResolvedNodeId) -> Self {
+        StatementPlanItem::Filter(Filter {
+            data_source,
+            predicate,
+        })
     }
 
-    pub(crate) fn projection(data: StatementPlanItemId, columns: Vec<ResolvedNodeId>) -> Self {
-        StatementPlanItem::Projection(Projection { data, columns })
+    pub(crate) fn projection(
+        data_source: StatementPlanItemId,
+        columns: Vec<ResolvedNodeId>,
+    ) -> Self {
+        StatementPlanItem::Projection(Projection {
+            data_source,
+            columns,
+        })
     }
 
     pub(crate) fn insert(
@@ -114,17 +135,17 @@ pub struct IndexScan {
     pub end: Option<ResolvedNodeId>,
 }
 
-/// Applies filter defined in `predicate` to `data`.
+/// Applies filter defined in `predicate` to `data_source`.
 #[derive(Debug)]
 pub struct Filter {
-    pub data: StatementPlanItemId,
+    pub data_source: StatementPlanItemId,
     pub predicate: ResolvedNodeId,
 }
 
-/// Returns only `columns` from `data`.
+/// Returns only `columns` from `data_source`.
 #[derive(Debug)]
 pub struct Projection {
-    pub data: StatementPlanItemId,
+    pub data_source: StatementPlanItemId,
     pub columns: Vec<ResolvedNodeId>,
 }
 

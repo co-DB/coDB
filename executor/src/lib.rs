@@ -1,13 +1,13 @@
 mod consts;
 mod iterators;
 
-use std::{iter::once, path::Path, sync::Arc};
+use std::{iter, path::Path, sync::Arc};
 
 use dashmap::{DashMap, mapref::one::Ref};
 use engine::{
     data_types,
     heap_file::{HeapFile, HeapFileError, HeapFileFactory},
-    record::Record,
+    record::{Field, Record},
 };
 use itertools::Itertools;
 use metadata::{
@@ -16,8 +16,11 @@ use metadata::{
 };
 use parking_lot::RwLock;
 use planner::{
-    query_plan::{CreateTable, StatementPlan, StatementPlanItem, TableScan},
-    resolved_tree::{ResolvedCreateColumnDescriptor, ResolvedTree},
+    query_plan::{CreateTable, Projection, StatementPlan, StatementPlanItem, TableScan},
+    resolved_tree::{
+        ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
+        ResolvedTree,
+    },
 };
 use storage::{
     cache::Cache,
@@ -52,12 +55,23 @@ enum InternalExecutorError {
     CannotCreateHeapFile { reason: String },
     #[error("{0}")]
     HeapFileError(#[from] HeapFileError),
+    #[error("Used invalid operation ({operation}) for data source")]
+    InvalidOperationInDataSource { operation: String },
 }
 
 #[derive(Debug)]
 pub struct ColumnData {
     pub name: String,
     pub ty: Type,
+}
+
+impl From<&ResolvedColumn> for ColumnData {
+    fn from(value: &ResolvedColumn) -> Self {
+        ColumnData {
+            name: value.name.clone(),
+            ty: value.ty,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -180,6 +194,11 @@ struct StatementExecutor<'e, 'q> {
     ast: &'q ResolvedTree,
 }
 
+struct ProjectedRecords {
+    records: Vec<Record>,
+    columns: Vec<ColumnData>,
+}
+
 impl<'e, 'q> StatementExecutor<'e, 'q> {
     fn new(executor: &'e Executor, statement: &'q StatementPlan, ast: &'q ResolvedTree) -> Self {
         StatementExecutor {
@@ -189,27 +208,115 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         }
     }
 
-    fn root_statement(&self) -> &StatementPlanItem {
-        self.statement.item(self.statement.root())
-    }
-
+    /// Executes [`StatementExecutor::statement`] and returns its result.
     fn execute(&self) -> StatementResult {
-        match self.root_statement() {
-            StatementPlanItem::TableScan(table_scan) => todo!(),
-            StatementPlanItem::IndexScan(index_scan) => todo!(),
-            StatementPlanItem::Filter(filter) => todo!(),
-            StatementPlanItem::Projection(projection) => todo!(),
-            StatementPlanItem::Insert(insert) => todo!(),
-            StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
+        let root = self.statement.root();
+
+        match root.produces_result_set() {
+            true => self.execute_query(root),
+            false => self.execute_mutation(root),
         }
     }
 
+    /// Handler for all statements that only return data.
+    fn execute_query(&self, item: &StatementPlanItem) -> StatementResult {
+        match item {
+            StatementPlanItem::Projection(projection) => self.projection(projection),
+            _ => self.executor.runtime_error(format!(
+                "Invalid root operation ({:?}) for query statement",
+                item
+            )),
+        }
+    }
+
+    /// Handler for all statements that mutate data.
+    fn execute_mutation(&self, item: &StatementPlanItem) -> StatementResult {
+        match item {
+            StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
+            _ => self.executor.runtime_error(format!(
+                "Invalid root operation ({:?}) for mutation statement",
+                item
+            )),
+        }
+    }
+
+    /// Handler for all statements that are source of data.
+    fn execute_data_source(
+        &self,
+        data_source: &StatementPlanItem,
+    ) -> Result<Vec<Record>, InternalExecutorError> {
+        match data_source {
+            StatementPlanItem::TableScan(table_scan) => self.table_scan(table_scan),
+            _ => Err(InternalExecutorError::InvalidOperationInDataSource {
+                operation: format!("{:?}", data_source),
+            }),
+        }
+    }
+
+    /// Handler for [`TableScan`] statement.
     fn table_scan(&self, table_scan: &TableScan) -> Result<Vec<Record>, InternalExecutorError> {
         let hf = self.executor.get_heap_file(&table_scan.table_name)?;
         let records = hf.all_records()?;
         Ok(records)
     }
 
+    /// Handler for [`Projection`] statement.
+    fn projection(&self, projection: &Projection) -> StatementResult {
+        let data_source = self.statement.item(projection.data_source);
+        let records = match self.execute_data_source(data_source) {
+            Ok(records) => records,
+            Err(err) => {
+                return StatementResult::RuntimeError {
+                    error: err.to_string(),
+                };
+            }
+        };
+        match self.project_records(records, &projection.columns) {
+            Ok(projected_records) => StatementResult::SelectSuccessful {
+                columns: projected_records.columns,
+                rows: projected_records.records,
+            },
+            Err(err) => {
+                return StatementResult::RuntimeError {
+                    error: err.to_string(),
+                };
+            }
+        }
+    }
+
+    /// Transforms `records` so that they only contain specified `columns`.
+    fn project_records(
+        &self,
+        records: Vec<Record>,
+        columns: &[ResolvedNodeId],
+    ) -> Result<ProjectedRecords, InternalExecutorError> {
+        let mut projected_records: Vec<Vec<Field>> =
+            iter::repeat_with(|| Vec::with_capacity(columns.len()))
+                .take(records.len())
+                .collect();
+        let mut columns_data = Vec::with_capacity(columns.len());
+
+        for col in self.map_expressions_to_column_refs(columns) {
+            for (idx, record) in records.iter().enumerate() {
+                // TODO: If we assume that each column can be used exactly once per projection
+                // then we can consume this field instead of calling clone.
+                // Might be worth considering if query execution time takes longer than expected.
+                projected_records[idx].push(record.fields[col.pos as usize].clone());
+            }
+            columns_data.push(ColumnData::from(col));
+        }
+
+        let projected_records = projected_records
+            .into_iter()
+            .map(|value| Record::new(value))
+            .collect();
+        Ok(ProjectedRecords {
+            records: projected_records,
+            columns: columns_data,
+        })
+    }
+
+    /// Handler for [`CreateTable`] table statement.
     fn create_table(&self, create_table: &CreateTable) -> StatementResult {
         let column_metadatas = match self.process_columns(create_table) {
             Ok(cm) => cm,
@@ -261,7 +368,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         create_table
             .columns
             .iter()
-            .chain(once(&create_table.primary_key_column))
+            .chain(iter::once(&create_table.primary_key_column))
             .sorted_by(|a, b| {
                 let a_fixed = a.ty.is_fixed_size();
                 let b_fixed = b.ty.is_fixed_size();
@@ -294,20 +401,32 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         }
         Ok(column_metadatas)
     }
+
+    /// Creates iterator that maps `expressions` into [`ResolvedColumn`]s.
+    /// It assumes that each expression points to [`ResolvedExpression::ColumnRef`].
+    fn map_expressions_to_column_refs(
+        &self,
+        expressions: &'q [ResolvedNodeId],
+    ) -> impl Iterator<Item = &'q ResolvedColumn> {
+        expressions.iter().map(|&expr| match self.ast.node(expr) {
+            ResolvedExpression::ColumnRef(cr) => cr,
+            _ => unreachable!(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use planner::resolved_tree::ResolvedCreateColumnAddon;
     use tempfile::TempDir;
 
     use super::*;
 
     const METADATA_FILE_NAME: &str = "metadata.coDB";
-    // Helper to create a test executor
-    fn create_test_executor() -> (Executor, TempDir) {
+
+    // Helper to create a test catalog
+    fn create_catalog() -> (Catalog, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let catalog = Catalog::new(temp_dir.path(), "test_db").unwrap_or_else(|_| {
             let db_dir = temp_dir.path().join("test_db");
@@ -317,37 +436,24 @@ mod tests {
             fs::write(db_path, r#"{"tables":[]}"#).unwrap();
             Catalog::new(temp_dir.path(), "test_db").unwrap()
         });
+        (catalog, temp_dir)
+    }
 
+    // Helper to create a test executor
+    fn create_test_executor() -> (Executor, TempDir) {
+        let (catalog, temp_dir) = create_catalog();
         let executor = Executor::new(temp_dir.path(), "test_db", catalog).unwrap();
         (executor, temp_dir)
     }
 
-    // Helper to create a valid CreateTable plan
-    fn create_table_plan(
-        name: &str,
-        columns: Vec<(&str, Type)>,
-        pk_column: (&str, Type),
-    ) -> CreateTable {
-        let primary_key_column = ResolvedCreateColumnDescriptor {
-            name: pk_column.0.to_string(),
-            ty: pk_column.1,
-            addon: ResolvedCreateColumnAddon::PrimaryKey,
-        };
+    // Helper to transform query to single statement
+    fn create_single_statement(query: &str, executor: &Executor) -> (StatementPlan, ResolvedTree) {
+        let query_plan = planner::process_query(query, executor.catalog.clone()).unwrap();
 
-        let other_columns = columns
-            .iter()
-            .map(|(n, ty)| ResolvedCreateColumnDescriptor {
-                name: n.to_string(),
-                ty: *ty,
-                addon: ResolvedCreateColumnAddon::None,
-            })
-            .collect();
-
-        CreateTable {
-            name: name.to_string(),
-            columns: other_columns,
-            primary_key_column,
-        }
+        (
+            query_plan.plans.into_iter().next().unwrap(),
+            query_plan.tree,
+        )
     }
 
     fn assert_operation_successful(
@@ -367,13 +473,12 @@ mod tests {
     #[test]
     fn test_execute_create_table_statement_happy_path() {
         let (executor, _temp_dir) = create_test_executor();
-        let create_table = create_table_plan(
-            "users",
-            vec![("name", Type::String), ("age", Type::I32)],
-            ("id", Type::I32),
+        let (plan, ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
         );
 
-        let result = executor.execute_create_table_statement(&create_table);
+        let result = executor.execute_statement(&plan, &ast);
 
         assert_operation_successful(result, 0, StatementType::Create);
 
@@ -389,18 +494,12 @@ mod tests {
     #[test]
     fn test_execute_create_table_statement_with_mixed_column_types() {
         let (executor, _temp_dir) = create_test_executor();
-        let create_table = create_table_plan(
-            "mixed_table",
-            vec![
-                ("name", Type::String),
-                ("score", Type::F64),
-                ("description", Type::String),
-                ("active", Type::Bool),
-            ],
-            ("id", Type::I32),
+        let (plan, ast) = create_single_statement(
+            "CREATE TABLE mixed_table (name STRING, score FLOAT64, description STRING, active BOOL, id INT32 PRIMARY_KEY);",
+            &executor,
         );
 
-        let result = executor.execute_create_table_statement(&create_table);
+        let result = executor.execute_statement(&plan, &ast);
 
         assert_operation_successful(result, 0, StatementType::Create);
 
@@ -419,18 +518,18 @@ mod tests {
     #[test]
     fn test_process_columns_calculates_correct_offsets() {
         let (executor, _temp_dir) = create_test_executor();
-        let create_table = create_table_plan(
-            "test",
-            vec![
-                ("name", Type::String),
-                ("score", Type::F64),
-                ("surname", Type::String),
-                ("active", Type::Bool),
-            ],
-            ("id", Type::I32),
+        let (plan, ast) = create_single_statement(
+            "CREATE TABLE test (name STRING, score FLOAT64, surname STRING, active BOOL, id INT32 PRIMARY_KEY);",
+            &executor,
         );
 
-        let columns = executor.process_columns(&create_table).unwrap();
+        let se = StatementExecutor::new(&executor, &plan, &ast);
+
+        let create_table = match plan.root() {
+            StatementPlanItem::CreateTable(ct) => ct,
+            _ => panic!("invalid item"),
+        };
+        let columns = se.process_columns(create_table).unwrap();
 
         let score_col = columns.iter().find(|c| c.name() == "score").unwrap();
         assert_eq!(score_col.base_offset(), 0);
