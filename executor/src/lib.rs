@@ -460,7 +460,7 @@ mod tests {
     fn expect_select_successful(result: StatementResult) -> (Vec<ColumnData>, Vec<Record>) {
         match result {
             StatementResult::SelectSuccessful { columns, rows } => (columns, rows),
-            _ => panic!("Expected SelectSuccessful"),
+            other => panic!("Expected SelectSuccessful, got {:?}", other),
         }
     }
 
@@ -664,5 +664,145 @@ mod tests {
         assert_eq!(charlie.fields.len(), 3);
         assert!(matches!(&charlie.fields[1], Field::String(s) if s == "Charlie"));
         assert!(matches!(charlie.fields[2], Field::Int32(35)));
+    }
+
+    #[test]
+    fn test_execute_select_statement_subset_of_columns() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert records directly using heap file
+        let record1 = Record::new(vec![
+            Field::Int32(1),
+            Field::Int32(25),
+            Field::String("Alice".into()),
+        ]);
+        let record2 = Record::new(vec![
+            Field::Int32(2),
+            Field::Int32(30),
+            Field::String("Bob".into()),
+        ]);
+        executor
+            .with_heap_file("users", |hf| {
+                hf.insert(record1).unwrap();
+                hf.insert(record2).unwrap();
+            })
+            .unwrap();
+
+        // Execute SELECT with only name and age
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT name, age FROM users;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "name");
+        assert_eq!(columns[0].ty, Type::String);
+        assert_eq!(columns[1].name, "age");
+        assert_eq!(columns[1].ty, Type::I32);
+
+        assert_eq!(rows.len(), 2);
+
+        let alice = rows
+            .iter()
+            .find(|r| r.fields[1] == Field::Int32(25))
+            .unwrap();
+        assert_eq!(alice.fields.len(), 2);
+        assert!(matches!(&alice.fields[0], Field::String(s) if s == "Alice"));
+
+        let bob = rows
+            .iter()
+            .find(|r| r.fields[1] == Field::Int32(30))
+            .unwrap();
+        assert_eq!(bob.fields.len(), 2);
+        assert!(matches!(&bob.fields[0], Field::String(s) if s == "Bob"));
+    }
+
+    #[test]
+    fn test_execute_select_statement_star_all_columns() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        let create_result = executor.execute_statement(&create_plan, &create_ast);
+        assert_operation_successful(create_result, 0, StatementType::Create);
+
+        // Insert records directly using heap file
+        let record1 = Record::new(vec![
+            Field::Int32(1),
+            Field::Int32(25),
+            Field::String("Alice".into()),
+        ]);
+
+        let record2 = Record::new(vec![
+            Field::Int32(2),
+            Field::Int32(30),
+            Field::String("Bob".into()),
+        ]);
+
+        let record3 = Record::new(vec![
+            Field::Int32(3),
+            Field::Int32(35),
+            Field::String("Charlie".into()),
+        ]);
+
+        executor
+            .with_heap_file("users", |hf| {
+                hf.insert(record1).unwrap();
+                hf.insert(record2).unwrap();
+                hf.insert(record3).unwrap();
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) = create_single_statement("SELECT * FROM users;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].ty, Type::I32);
+        assert_eq!(columns[1].name, "age");
+        assert_eq!(columns[1].ty, Type::I32);
+        assert_eq!(columns[2].name, "name");
+        assert_eq!(columns[2].ty, Type::String);
+
+        assert_eq!(rows.len(), 3);
+
+        let alice = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(1))
+            .unwrap();
+        assert_eq!(alice.fields.len(), 3);
+        assert!(matches!(alice.fields[1], Field::Int32(25)));
+        assert!(matches!(&alice.fields[2], Field::String(s) if s == "Alice"));
+
+        let bob = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(2))
+            .unwrap();
+        assert_eq!(bob.fields.len(), 3);
+        assert!(matches!(bob.fields[1], Field::Int32(30)));
+        assert!(matches!(&bob.fields[2], Field::String(s) if s == "Bob"));
+
+        let charlie = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(3))
+            .unwrap();
+        assert_eq!(charlie.fields.len(), 3);
+        assert!(matches!(charlie.fields[1], Field::Int32(35)));
+        assert!(matches!(&charlie.fields[2], Field::String(s) if s == "Charlie"));
     }
 }
