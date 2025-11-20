@@ -344,7 +344,7 @@ impl CatalogJson {
         Ok(catalog_json)
     }
 
-    pub(crate) fn write_to_json(&self, path: impl AsRef<Path>) -> Result<(), CatalogManagerError> {
+    pub(crate) fn write_to_json(&self, path: impl AsRef<Path>) -> Result<(), CatalogError> {
         let content = serde_json::to_string(self)?;
         fs::write(path, content)?;
         Ok(())

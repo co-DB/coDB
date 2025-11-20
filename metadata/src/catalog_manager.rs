@@ -14,7 +14,7 @@ pub enum CatalogManagerError {
     NoValidCatalogDirectory,
     #[error("the database {database_name} you are trying to create already exists")]
     DatabaseAlreadyExists { database_name: String },
-    #[error("the database {database_name} you are trying to access doesn't exist")]
+    #[error("the database {database_name} you are trying to access does not exist")]
     DatabaseDoesntExist { database_name: String },
     #[error("io error occurred: {0}")]
     IoError(#[from] io::Error),
@@ -103,7 +103,15 @@ impl CatalogManager {
             return Err(e);
         }
 
-        self.initialize_database_metadata(&db_name)?;
+        if let Err(e) = self.initialize_database_metadata(&db_name) {
+            self.database_list.names.remove(&db_name);
+            let _ = MetadataFileHelper::sync_to_disk::<DatabaseList, CatalogManagerError>(
+                &self.metadata_path(),
+                &self.database_list,
+                |p| Ok(serde_json::to_string_pretty(p)?),
+            );
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -208,7 +216,7 @@ mod tests {
     }
 
     impl CatalogManager {
-        pub fn new_with_path(base_path: &Path) -> Result<Self, CatalogManagerError> {
+        fn new_with_path(base_path: &Path) -> Result<Self, CatalogManagerError> {
             let path = base_path.join(METADATA_FILE_NAME);
 
             let result = MetadataFileHelper::latest_catalog_json(base_path, |path| {
@@ -237,7 +245,6 @@ mod tests {
     impl TestContext {
         fn new() -> Self {
             let temp_dir = TempDir::new().unwrap();
-            println!("temp dir path: {:?}", temp_dir.path());
             let manager = CatalogManager::new_with_path(temp_dir.path()).unwrap();
             Self { temp_dir, manager }
         }
@@ -332,22 +339,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_path_buf();
 
-        println!("Temp dir: {:?}", path);
-        println!("Temp dir exists: {}", path.exists());
-        println!("Temp dir is_dir: {}", path.is_dir());
-
         {
             let mut manager = CatalogManager::new_with_path(&path).unwrap();
-            println!(
-                "Manager created, metadata path: {:?}",
-                manager.metadata_path()
-            );
-
             manager.create_database("persistent_db").unwrap();
-
-            println!("Database created");
-            println!("DB path: {:?}", path.join("persistent_db"));
-            println!("DB exists: {}", path.join("persistent_db").exists());
         }
 
         {
@@ -364,7 +358,6 @@ mod tests {
         fs::write(&metadata_path, "{ invalid json ").unwrap();
 
         let result = CatalogManager::new_with_path(temp_dir.path());
-        let x = 1;
         assert!(matches!(
             result.err().unwrap(),
             CatalogManagerError::JsonError(_)
