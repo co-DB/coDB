@@ -652,7 +652,10 @@ impl Parser {
     /// `CREATE TABLE <table> (column_descriptor_1, column_descriptor_2,...)`
     fn parse_create_statement(&mut self) -> Result<Statement, ParserError> {
         self.expect_token(TokenType::Table)?;
-        let table_name = self.parse_table_name()?;
+        // Here we don't use `Self::parse_table_name` because in create table statement
+        // table does not exist yet.
+        let table_ident = self.expect_ident()?;
+        let table_name = self.add_identifier_node(table_ident);
         let columns = self.parse_create_column_descriptors()?;
         Ok(Statement::Create(CreateStatement {
             table_name,
@@ -683,7 +686,10 @@ impl Parser {
     fn parse_create_single_column_descriptor(
         &mut self,
     ) -> Result<CreateColumnDescriptor, ParserError> {
-        let name = self.parse_column_name()?;
+        // Here we don't use [`Self::parse_column_name`], because
+        // at this point column does not exist yet.
+        let ident = self.expect_ident()?;
+        let name = self.add_identifier_node(ident);
         let ty = self.parse_type()?;
         let addon = self.parse_create_addon()?;
         Ok(CreateColumnDescriptor { name, ty, addon })
@@ -912,6 +918,15 @@ mod tests {
                 }
             }
             other => panic!("Expected ColumnIdentifier node, got {other:?}"),
+        }
+    }
+
+    fn assert_identifier_node(ast: &Ast, node_id: NodeId, expected_identifier: &str) {
+        match ast.node(node_id) {
+            Expression::Identifier(ident) => {
+                assert_eq!(ident.value, expected_identifier)
+            }
+            other => panic!("Expected Identifier, got {other:?}"),
         }
     }
 
@@ -1289,17 +1304,17 @@ mod tests {
             panic!("Expected Create statement, got {:#?}", ast.statements[0]);
         };
 
-        assert_table_identifier_node(&ast, create_stmt.table_name, "users", None);
+        assert_identifier_node(&ast, create_stmt.table_name, "users");
 
         assert_eq!(create_stmt.columns.len(), 2);
 
         let col0 = &create_stmt.columns[0];
-        assert_column_identifier_node(&ast, col0.name, "id", None);
+        assert_identifier_node(&ast, col0.name, "id");
         assert!(matches!(col0.ty, Type::I64));
         assert!(matches!(col0.addon, CreateColumnAddon::PrimaryKey));
 
         let col1 = &create_stmt.columns[1];
-        assert_column_identifier_node(&ast, col1.name, "name", None);
+        assert_identifier_node(&ast, col1.name, "name");
         assert!(matches!(col1.ty, Type::String));
         assert!(matches!(col1.addon, CreateColumnAddon::None));
     }
