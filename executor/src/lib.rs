@@ -3,7 +3,7 @@ mod iterators;
 
 use std::{iter, path::Path, sync::Arc};
 
-use dashmap::{DashMap, mapref::one::Ref};
+use dashmap::DashMap;
 use engine::{
     data_types,
     heap_file::{HeapFile, HeapFileError, HeapFileFactory},
@@ -139,24 +139,26 @@ impl Executor {
         StatementResult::RuntimeError { error: msg }
     }
 
-    /// Returns heap file for given table. If heap file wasn't used yet it opens it
-    /// and inserts to [`Executor::heap_files`].
+    /// Gets heap file for given table and passes it to function `f`.
+    /// If heap file wasn't used yet it opens it and inserts to [`Executor::heap_files`].
     ///
     /// It is possible that table was removed just before we started processing current statement
     /// (so [`Analyzer`] didn't report any problem) - in such case we just return an error that
     /// table does not exist.
-    fn get_heap_file(
+    fn with_heap_file<R>(
         &self,
         table_name: impl Into<String> + Clone + AsRef<str>,
-    ) -> Result<Ref<'_, String, HeapFile<HEAP_FILE_BUCKET_SIZE>>, InternalExecutorError> {
+        f: impl FnOnce(&HeapFile<HEAP_FILE_BUCKET_SIZE>) -> R,
+    ) -> Result<R, InternalExecutorError> {
         self.heap_files
             .entry(table_name.clone().into())
             .or_try_insert_with(|| self.open_heap_file(table_name.clone()))?;
-        self.heap_files
-            .get(table_name.as_ref())
-            .ok_or(InternalExecutorError::TableDoesNotExist {
+        let hf = self.heap_files.get(table_name.as_ref()).ok_or(
+            InternalExecutorError::TableDoesNotExist {
                 table_name: table_name.clone().into(),
-            })
+            },
+        )?;
+        Ok(f(hf.value()))
     }
 
     /// Creates new heap file for given table.
@@ -255,8 +257,9 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
     /// Handler for [`TableScan`] statement.
     fn table_scan(&self, table_scan: &TableScan) -> Result<Vec<Record>, InternalExecutorError> {
-        let hf = self.executor.get_heap_file(&table_scan.table_name)?;
-        let records = hf.all_records()?;
+        let records = self
+            .executor
+            .with_heap_file(&table_scan.table_name, |hf| hf.all_records())??;
         Ok(records)
     }
 
@@ -365,10 +368,8 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         &self,
         create_table: &'c CreateTable,
     ) -> impl Iterator<Item = &'c ResolvedCreateColumnDescriptor> {
-        create_table
-            .columns
-            .iter()
-            .chain(iter::once(&create_table.primary_key_column))
+        iter::once(&create_table.primary_key_column)
+            .chain(create_table.columns.iter())
             .sorted_by(|a, b| {
                 let a_fixed = a.ty.is_fixed_size();
                 let b_fixed = b.ty.is_fixed_size();
@@ -456,6 +457,13 @@ mod tests {
         )
     }
 
+    fn expect_select_successful(result: StatementResult) -> (Vec<ColumnData>, Vec<Record>) {
+        match result {
+            StatementResult::SelectSuccessful { columns, rows } => (columns, rows),
+            _ => panic!("Expected SelectSuccessful"),
+        }
+    }
+
     fn assert_operation_successful(
         result: StatementResult,
         expected_rows: usize,
@@ -508,9 +516,9 @@ mod tests {
         let columns: Vec<_> = table.columns().collect();
 
         // Here it's important that first we have fixed-size elements and only then we have variable-size ones.
-        assert_eq!(columns[0].name(), "score");
-        assert_eq!(columns[1].name(), "active");
-        assert_eq!(columns[2].name(), "id");
+        assert_eq!(columns[0].name(), "id");
+        assert_eq!(columns[1].name(), "score");
+        assert_eq!(columns[2].name(), "active");
         assert_eq!(columns[3].name(), "name");
         assert_eq!(columns[4].name(), "description");
     }
@@ -531,20 +539,20 @@ mod tests {
         };
         let columns = se.process_columns(create_table).unwrap();
 
+        let id_col = columns.iter().find(|c| c.name() == "id").unwrap();
+        assert_eq!(id_col.base_offset(), 0);
+        assert_eq!(id_col.base_offset_pos(), 0);
+        assert_eq!(id_col.pos(), 0);
+
         let score_col = columns.iter().find(|c| c.name() == "score").unwrap();
-        assert_eq!(score_col.base_offset(), 0);
-        assert_eq!(score_col.base_offset_pos(), 0);
-        assert_eq!(score_col.pos(), 0);
+        assert_eq!(score_col.base_offset(), 4);
+        assert_eq!(score_col.base_offset_pos(), 1);
+        assert_eq!(score_col.pos(), 1);
 
         let active_col = columns.iter().find(|c| c.name() == "active").unwrap();
-        assert_eq!(active_col.base_offset(), 8);
-        assert_eq!(active_col.base_offset_pos(), 1);
-        assert_eq!(active_col.pos(), 1);
-
-        let id_col = columns.iter().find(|c| c.name() == "id").unwrap();
-        assert_eq!(id_col.base_offset(), 9);
-        assert_eq!(id_col.base_offset_pos(), 2);
-        assert_eq!(id_col.pos(), 2);
+        assert_eq!(active_col.base_offset(), 12);
+        assert_eq!(active_col.base_offset_pos(), 2);
+        assert_eq!(active_col.pos(), 2);
 
         let name_col = columns.iter().find(|c| c.name() == "name").unwrap();
         assert_eq!(name_col.base_offset(), 13);
@@ -555,5 +563,106 @@ mod tests {
         assert_eq!(surname_col.base_offset(), 13);
         assert_eq!(surname_col.base_offset_pos(), 3);
         assert_eq!(surname_col.pos(), 4);
+    }
+
+    #[test]
+    fn test_execute_select_statement_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_execute_select_statement_all_columns() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        let create_result = executor.execute_statement(&create_plan, &create_ast);
+        assert_operation_successful(create_result, 0, StatementType::Create);
+
+        // Insert records directly using heap file
+        let record1 = Record::new(vec![
+            Field::Int32(1),
+            Field::Int32(25),
+            Field::String("Alice".into()),
+        ]);
+
+        let record2 = Record::new(vec![
+            Field::Int32(2),
+            Field::Int32(30),
+            Field::String("Bob".into()),
+        ]);
+
+        let record3 = Record::new(vec![
+            Field::Int32(3),
+            Field::Int32(35),
+            Field::String("Charlie".into()),
+        ]);
+        executor
+            .with_heap_file("users", |hf| {
+                hf.insert(record1).unwrap();
+                hf.insert(record2).unwrap();
+                hf.insert(record3).unwrap();
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].ty, Type::I32);
+        assert_eq!(columns[1].name, "name");
+        assert_eq!(columns[1].ty, Type::String);
+        assert_eq!(columns[2].name, "age");
+        assert_eq!(columns[2].ty, Type::I32);
+
+        assert_eq!(rows.len(), 3);
+
+        let alice = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(1))
+            .unwrap();
+        assert_eq!(alice.fields.len(), 3);
+        assert!(matches!(&alice.fields[1], Field::String(s) if s == "Alice"));
+        assert!(matches!(alice.fields[2], Field::Int32(25)));
+
+        let bob = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(2))
+            .unwrap();
+        assert_eq!(bob.fields.len(), 3);
+        assert!(matches!(&bob.fields[1], Field::String(s) if s == "Bob"));
+        assert!(matches!(bob.fields[2], Field::Int32(30)));
+
+        let charlie = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(3))
+            .unwrap();
+        assert_eq!(charlie.fields.len(), 3);
+        assert!(matches!(&charlie.fields[1], Field::String(s) if s == "Charlie"));
+        assert!(matches!(charlie.fields[2], Field::Int32(35)));
     }
 }
