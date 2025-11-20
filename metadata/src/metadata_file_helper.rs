@@ -155,11 +155,14 @@ impl MetadataFileHelper {
     /// The `serialize_fn` should convert the data into a string format (e.g., JSON).
     ///
     /// Can fail if io error occurs or serialization fails.
-    pub(crate) fn sync_to_disk<T>(
+    pub(crate) fn sync_to_disk<T, TErr>(
         file_path: impl AsRef<Path>,
         data: &T,
-        serialize_fn: impl Fn(&T) -> Result<String, CatalogError>,
-    ) -> Result<(), CatalogError> {
+        serialize_fn: impl Fn(&T) -> Result<String, TErr>,
+    ) -> Result<(), TErr>
+    where
+        TErr: From<io::Error>,
+    {
         let content = serialize_fn(data)?;
 
         // We can unwrap here, because we know `UNIX_EPOCH` was before `SystemTime::now`

@@ -12,6 +12,7 @@ use crate::consts::METADATA_FILE_NAME;
 use crate::metadata_file_helper::MetadataFileHelper;
 use crate::types::Type;
 
+use crate::catalog_manager::CatalogManagerError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -54,12 +55,12 @@ pub enum CatalogError {
 impl Catalog {
     /// Creates new instance of [`Catalog`] for database `database_name`.
     /// Can fail if database does not exist or io error occurs.
-    pub fn new<P>(main_dir_path: P, database_name: &str) -> Result<Self, CatalogError>
+    pub fn new<P>(main_dir_path: P, database_name: impl AsRef<str>) -> Result<Self, CatalogError>
     where
         P: AsRef<Path>,
     {
         let catalog_json = MetadataFileHelper::latest_catalog_json(
-            &main_dir_path.as_ref().join(database_name),
+            &main_dir_path.as_ref().join(database_name.as_ref()),
             |path| CatalogJson::read_from_file(path),
         )?;
         let tables = catalog_json
@@ -72,7 +73,7 @@ impl Catalog {
             .collect::<Result<HashMap<_, _>, _>>()?;
         let file_path = main_dir_path
             .as_ref()
-            .join(database_name)
+            .join(database_name.as_ref())
             .join(METADATA_FILE_NAME);
         Ok(Catalog { file_path, tables })
     }
@@ -332,15 +333,27 @@ impl ColumnMetadata {
 
 /// [`CatalogJson`] is a representation of [`Catalog`] on disk. Used only for serializing to/deserializing from JSON file.
 #[derive(Serialize, Deserialize)]
-struct CatalogJson {
+pub(crate) struct CatalogJson {
     tables: Vec<TableJson>,
 }
 
 impl CatalogJson {
-    pub fn read_from_file(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
+    pub(crate) fn read_from_file(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
         let content = fs::read_to_string(path)?;
         let catalog_json = serde_json::from_str(&content)?;
         Ok(catalog_json)
+    }
+
+    pub(crate) fn write_to_json(&self, path: impl AsRef<Path>) -> Result<(), CatalogManagerError> {
+        let content = serde_json::to_string(self)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+impl Default for CatalogJson {
+    fn default() -> Self {
+        Self { tables: Vec::new() }
     }
 }
 
