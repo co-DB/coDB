@@ -686,7 +686,7 @@ impl Parser {
     fn parse_create_single_column_descriptor(
         &mut self,
     ) -> Result<CreateColumnDescriptor, ParserError> {
-        // Here we don't use [`Self::parse_column_name`], because
+        // Here we don't use `Self::parse_column_name`, because
         // at this point column does not exist yet.
         let ident = self.expect_ident()?;
         let name = self.add_identifier_node(ident);

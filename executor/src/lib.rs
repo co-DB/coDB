@@ -163,7 +163,7 @@ impl Executor {
 
     /// Creates new heap file for given table.
     ///
-    /// As in [`Executor::get_heap_file`] if table was removed just before we started processing
+    /// As in [`Executor::with_heap_file`] if table was removed just before we started processing
     /// current statement we just return error that table does not exist.
     fn open_heap_file(
         &self,
