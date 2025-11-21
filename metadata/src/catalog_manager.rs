@@ -24,23 +24,43 @@ pub enum CatalogManagerError {
     CatalogError(#[from] CatalogError),
 }
 
+/// Manages the catalog of databases in the coDB system.
+///
+/// The `CatalogManager` is responsible for:
+/// - Creating and deleting databases
+/// - Maintaining a list of all databases in the system
+/// - Persisting database metadata to disk
+/// - Opening catalogs for individual databases
+///
+/// All database metadata is stored in the system's local data directory,
+/// determined by the platform-specific conventions (e.g., `AppData/Local` on Windows).
 pub struct CatalogManager {
+    /// In-memory list of all database names in the system.
     database_list: DatabaseList,
+    /// Path to the main directory where the main metadata and all database directories are stored.
     main_directory_path: PathBuf,
 }
 
 impl CatalogManager {
+    /// Creates a new `CatalogManager` instance.
+    ///
+    /// This method:
+    /// 1. Determines the platform-specific data directory for coDB
+    /// 2. Creates the directory structure if it doesn't exist
+    /// 3. Loads the list of existing databases from disk
+    /// 4. Initializes a new catalog if no existing data is found
     pub fn new() -> Result<Self, CatalogManagerError> {
         match ProjectDirs::from("", "", "coDB") {
             None => Err(CatalogManagerError::NoValidCatalogDirectory),
             Some(project_dir) => {
                 let base_path = project_dir.data_local_dir().to_path_buf();
+
+                // If the directory doesn't exist yet, initialize a fresh catalog
                 if !base_path.exists() {
                     return Self::initialize_catalog(base_path);
                 }
 
-                let path = base_path.join(METADATA_FILE_NAME);
-
+                // Try to load existing database list from disk
                 let result = MetadataFileHelper::latest_catalog_json(&base_path, |path| {
                     DatabaseList::read_from_json(path)
                 });
@@ -50,12 +70,14 @@ impl CatalogManager {
                         main_directory_path: base_path,
                         database_list,
                     }),
+                    // If metadata file doesn't exist, create an empty catalog
                     Err(CatalogManagerError::IoError(ref e))
                         if e.kind() == io::ErrorKind::NotFound =>
                     {
                         let database_list = DatabaseList {
                             names: HashSet::new(),
                         };
+                        let path = base_path.join(METADATA_FILE_NAME);
                         database_list.write_to_json(&path)?;
                         Ok(Self {
                             main_directory_path: base_path,
@@ -68,6 +90,10 @@ impl CatalogManager {
         }
     }
 
+    /// Initializes a new catalog directory structure.
+    ///
+    /// Creates the base directory and an empty database list file.
+    /// This is called when no existing catalog is found.
     fn initialize_catalog(base_path: PathBuf) -> Result<Self, CatalogManagerError> {
         fs::create_dir_all(&base_path)?;
         let path = base_path.join(METADATA_FILE_NAME);
@@ -80,6 +106,16 @@ impl CatalogManager {
             database_list: initial_list,
         })
     }
+
+    /// Creates a new database with the given name.
+    ///
+    /// This operation follows a specific order to ensure consistency:
+    /// 1. Create the database directory and metadata files on disk
+    /// 2. Add the database name to the in-memory list
+    /// 3. Persist the updated list to disk
+    ///
+    /// If step 3 fails, the in-memory state is rolled back and orphaned
+    /// files are cleaned up.
     pub fn create_database(
         &mut self,
         database_name: impl Into<String>,
@@ -90,32 +126,38 @@ impl CatalogManager {
                 database_name: db_name,
             });
         }
+
+        // Step 1: Create database directory and metadata files
+        // If this fails, nothing has changed yet - clean failure
+        self.initialize_database_metadata(&db_name)?;
+
+        // Step 2: Update in-memory state
         self.database_list.names.insert(db_name.clone());
 
-        let result = MetadataFileHelper::sync_to_disk::<DatabaseList, CatalogManagerError>(
+        // Step 3: Persist the updated database list to disk
+        if let Err(e) = MetadataFileHelper::sync_to_disk::<DatabaseList, CatalogManagerError>(
             &self.metadata_path(),
             &self.database_list,
             |p| Ok(serde_json::to_string_pretty(p)?),
-        );
-
-        if let Err(e) = result {
+        ) {
+            // Rollback: Remove from in-memory list
             self.database_list.names.remove(&db_name);
-            return Err(e);
-        }
 
-        if let Err(e) = self.initialize_database_metadata(&db_name) {
-            self.database_list.names.remove(&db_name);
-            let _ = MetadataFileHelper::sync_to_disk::<DatabaseList, CatalogManagerError>(
-                &self.metadata_path(),
-                &self.database_list,
-                |p| Ok(serde_json::to_string_pretty(p)?),
-            );
+            // Cleanup: Remove orphaned database directory
+            let db_path = self.main_directory_path.join(&db_name);
+            let _ = fs::remove_dir_all(db_path);
+
             return Err(e);
         }
 
         Ok(())
     }
 
+    /// Initializes the metadata structure for a new database.
+    ///
+    /// Creates:
+    /// - A directory for the database
+    /// - An initial metadata file with default catalog structure
     fn initialize_database_metadata(
         &self,
         database_name: impl AsRef<str>,
@@ -130,6 +172,18 @@ impl CatalogManager {
 
         Ok(())
     }
+
+    /// Deletes a database and all its associated data.
+    ///
+    /// This operation:
+    /// 1. Removes the database from the in-memory list
+    /// 2. Persists the updated list to disk
+    /// 3. Deletes the database directory and all its contents
+    ///
+    /// The order prioritizes metadata consistency: the database is marked
+    /// as deleted before files are removed. If file deletion fails, the
+    /// database is still considered deleted (orphaned files remain but
+    /// are inaccessible).
     pub fn delete_database(
         &mut self,
         database_name: impl Into<String>,
@@ -140,7 +194,11 @@ impl CatalogManager {
                 database_name: db_name,
             });
         }
+
+        // Step 1: Remove from in-memory list
         self.database_list.names.remove(&db_name);
+
+        // Step 2: Persist the change
         let result = MetadataFileHelper::sync_to_disk::<DatabaseList, CatalogManagerError>(
             &self.metadata_path(),
             &self.database_list,
@@ -148,10 +206,14 @@ impl CatalogManager {
         );
 
         if let Err(e) = result {
+            // Rollback: Restore the database name
             self.database_list.names.insert(db_name);
             return Err(e);
         }
 
+        // Step 3: Delete the physical files
+        // If this fails, the database is still marked as deleted
+        // (orphaned files remain but are inaccessible)
         let db_path = self.main_directory_path.join(&db_name);
         if db_path.exists() {
             fs::remove_dir_all(db_path)?;
@@ -160,13 +222,17 @@ impl CatalogManager {
         Ok(())
     }
 
+    /// Returns the path to the main metadata file.
     fn metadata_path(&self) -> PathBuf {
         self.main_directory_path.join(METADATA_FILE_NAME)
     }
+
+    /// Returns a list of all databases in the system.
     pub fn list_databases(&self) -> DatabaseList {
         self.database_list.clone()
     }
 
+    /// Opens a catalog for the specified database.
     pub fn open_catalog(
         &self,
         database_name: impl AsRef<str>,
