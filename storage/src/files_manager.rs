@@ -61,7 +61,7 @@ pub struct FilesManager {
     /// (Almost) All public api of [`PagedFile`] takes `&mut self`, so there is
     /// no point in using [`RwLock`] instead of [`Mutex`] here.
     open_files: DashMap<FileKey, Arc<Mutex<PagedFile>>>,
-    base_path: PathBuf,
+    database_path: PathBuf,
 }
 
 /// Error for [`FilesManager`] related operations
@@ -74,22 +74,17 @@ pub enum FilesManagerError {
 }
 
 impl FilesManager {
-    /// Creates a new [`FilesManager`] that handles files for a single database, whose name is passed to
-    /// this function as an argument
+    /// Creates a new [`FilesManager`] that handles files for a single database.
     ///
     /// Can fail if the directory in which we want to store the data (refer to `docs/file_structure.md` for
     /// OS-specific details) doesn't exist.
-    pub fn new<P>(base_path: P, database_name: &str) -> Result<Self, FilesManagerError>
-    where
-        P: AsRef<Path>,
-    {
-        let base_path = base_path.as_ref().join(database_name);
-        if let Ok(exists) = base_path.try_exists()
+    pub fn new(database_path: impl AsRef<Path>) -> Result<Self, FilesManagerError> {
+        if let Ok(exists) = database_path.as_ref().try_exists()
             && exists
         {
             Ok(FilesManager {
                 open_files: DashMap::new(),
-                base_path,
+                database_path: database_path.as_ref().into(),
             })
         } else {
             Err(FilesManagerError::DirectoryNotFound)
@@ -105,7 +100,10 @@ impl FilesManager {
         &self,
         key: &FileKey,
     ) -> Result<Arc<Mutex<PagedFile>>, FilesManagerError> {
-        let file_path = self.base_path.join(&key.table_name).join(key.file_name());
+        let file_path = self
+            .database_path
+            .join(&key.table_name)
+            .join(key.file_name());
         Ok(self
             .open_files
             .entry(key.clone())

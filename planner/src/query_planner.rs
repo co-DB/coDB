@@ -200,14 +200,14 @@ mod tests {
         assert_eq!(select_plan.items.len(), 2);
 
         // Assert projection is correct
-        let projection_item = select_plan.item(select_plan.root());
+        let projection_item = select_plan.root();
         let projection = assert_projection_item(projection_item);
         assert_eq!(projection.columns.len(), 2);
         assert_eq!(projection.columns[0], col1);
         assert_eq!(projection.columns[1], col2);
 
         // Assert scan table is correct
-        let scan_table_item = select_plan.item(projection.data);
+        let scan_table_item = select_plan.item(projection.data_source);
         let scan_table = assert_table_scan_item(scan_table_item);
         assert_eq!(scan_table.table_name, "test")
     }
@@ -270,19 +270,19 @@ mod tests {
         assert_eq!(select_plan.items.len(), 3);
 
         // Assert projection is correct
-        let projection_item = select_plan.item(select_plan.root());
+        let projection_item = select_plan.root();
         let projection = assert_projection_item(projection_item);
         assert_eq!(projection.columns.len(), 2);
         assert_eq!(projection.columns[0], col1_id);
         assert_eq!(projection.columns[1], col2_id);
 
         // Assert filter is correct
-        let filter_item = select_plan.item(projection.data);
+        let filter_item = select_plan.item(projection.data_source);
         let filter = assert_filter_item(filter_item);
         assert_eq!(filter.predicate, where_expr);
 
         // Assert table scan is correct
-        let scan_table_item = select_plan.item(filter.data);
+        let scan_table_item = select_plan.item(filter.data_source);
         let scan_table = assert_table_scan_item(scan_table_item);
         assert_eq!(scan_table.table_name, "test");
     }
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(insert_plan.items.len(), 1);
 
         // Assert insert is correct
-        let insert_item = insert_plan.item(insert_plan.root());
+        let insert_item = insert_plan.root();
         let insert = assert_insert_item(insert_item);
         assert_eq!(insert.table_name, "test");
         assert_eq!(insert.columns.len(), 2);
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(create_plan.items.len(), 1);
 
         // Assert create table is correct
-        let create_item = create_plan.item(create_plan.root());
+        let create_item = create_plan.root();
         let create_table = assert_create_table_item(create_item);
 
         assert_eq!(create_table.name, "users");
