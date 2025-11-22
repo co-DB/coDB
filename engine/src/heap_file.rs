@@ -1789,7 +1789,7 @@ mod tests {
         let db_dir = temp_dir.path().join("test_db");
         fs::create_dir_all(&db_dir).unwrap();
 
-        let files_manager = Arc::new(FilesManager::new(temp_dir.path(), "test_db").unwrap());
+        let files_manager = Arc::new(FilesManager::new(db_dir).unwrap());
         let cache = Cache::new(100, files_manager.clone());
 
         // Use a unique file name for each test to avoid conflicts

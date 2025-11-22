@@ -88,8 +88,7 @@ impl Record {
 /// Represents a typed database field value.
 ///
 /// Each variant corresponds to a supported database column type.
-#[derive(PartialEq, Debug)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(PartialEq, Debug, Clone)]
 pub enum Field {
     Int32(i32),
     Int64(i64),
