@@ -1,7 +1,7 @@
 mod consts;
 mod iterators;
 
-use std::{iter, path::Path, sync::Arc};
+use std::{collections::HashMap, iter, mem, path::Path, sync::Arc};
 
 use dashmap::DashMap;
 use engine::{
@@ -186,15 +186,30 @@ impl Executor {
     }
 }
 
+/// Executes a single statement from a query plan.
+///
+/// This struct encapsulates all the logic needed to execute one statement, including
+/// query operations (SELECT) and mutation operations (CREATE TABLE, INSERT, etc.).
 struct StatementExecutor<'e, 'q> {
     executor: &'e Executor,
     statement: &'q StatementPlan,
     ast: &'q ResolvedTree,
 }
 
+/// Result of projection operation containing records and their column metadata.
+///
+/// The records vector contains transformed records with only the projected columns,
+/// while the columns vector describes the schema of those projected records.
 struct ProjectedRecords {
     records: Vec<Record>,
     columns: Vec<ColumnData>,
+}
+
+/// Column metadata used during projection operations.
+struct ProjectColumn<'c> {
+    rc: &'c ResolvedColumn,
+    /// Set to true if this is the last struct that references the [`ResolvedColumn`].
+    last: bool,
 }
 
 impl<'e, 'q> StatementExecutor<'e, 'q> {
@@ -289,26 +304,30 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         records: Vec<Record>,
         columns: &[ResolvedNodeId],
     ) -> Result<ProjectedRecords, InternalExecutorError> {
-        let mut projected_records: Vec<Vec<Field>> =
-            iter::repeat_with(|| Vec::with_capacity(columns.len()))
-                .take(records.len())
-                .collect();
-        let mut columns_data = Vec::with_capacity(columns.len());
-
-        for col in self.map_expressions_to_column_refs(columns) {
-            for (idx, record) in records.iter().enumerate() {
-                // TODO: If we assume that each column can be used exactly once per projection
-                // then we can consume this field instead of calling clone.
-                // Might be worth considering if query execution time takes longer than expected.
-                projected_records[idx].push(record.fields[col.pos as usize].clone());
-            }
-            columns_data.push(ColumnData::from(col));
-        }
-
-        let projected_records = projected_records
-            .into_iter()
-            .map(|value| Record::new(value))
+        let project_columns: Vec<_> = self.map_expressions_to_project_columns(columns).collect();
+        let columns_data: Vec<_> = project_columns
+            .iter()
+            .map(|sc| ColumnData::from(sc.rc))
             .collect();
+
+        let projected_records: Vec<_> = records
+            .into_iter()
+            .map(|record| {
+                let mut source_fields = record.fields;
+                let fields: Vec<_> = project_columns
+                    .iter()
+                    .map(|select_col| {
+                        let pos = select_col.rc.pos as usize;
+                        match select_col.last {
+                            true => mem::replace(&mut source_fields[pos], Field::Bool(false)),
+                            false => source_fields[pos].clone(),
+                        }
+                    })
+                    .collect();
+                Record::new(fields)
+            })
+            .collect();
+
         Ok(ProjectedRecords {
             records: projected_records,
             columns: columns_data,
@@ -399,15 +418,23 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         Ok(column_metadatas)
     }
 
-    /// Creates iterator that maps `expressions` into [`ResolvedColumn`]s.
+    /// Creates iterator that maps `expressions` into [`ProjectColumn`]s.
     /// It assumes that each expression points to [`ResolvedExpression::ColumnRef`].
-    fn map_expressions_to_column_refs(
+    fn map_expressions_to_project_columns(
         &self,
         expressions: &'q [ResolvedNodeId],
-    ) -> impl Iterator<Item = &'q ResolvedColumn> {
-        expressions.iter().map(|&expr| match self.ast.node(expr) {
-            ResolvedExpression::ColumnRef(cr) => cr,
-            _ => unreachable!(),
+    ) -> impl Iterator<Item = ProjectColumn<'q>> {
+        let mut last_occurrence = HashMap::new();
+        for (idx, &expr) in expressions.iter().enumerate() {
+            last_occurrence.insert(expr, idx);
+        }
+
+        expressions.iter().enumerate().map(move |(idx, &expr)| {
+            let last = last_occurrence.get(&expr) == Some(&idx);
+            match self.ast.node(expr) {
+                ResolvedExpression::ColumnRef(rc) => ProjectColumn { rc, last },
+                _ => unreachable!(),
+            }
         })
     }
 }
@@ -801,5 +828,67 @@ mod tests {
         assert_eq!(charlie.fields.len(), 3);
         assert!(matches!(charlie.fields[1], Field::Int32(35)));
         assert!(matches!(&charlie.fields[2], Field::String(s) if s == "Charlie"));
+    }
+
+    #[test]
+    fn test_execute_select_statement_duplicate_columns() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert records directly using heap file
+        let record1 = Record::new(vec![
+            Field::Int32(1),
+            Field::Int32(25),
+            Field::String("Alice".into()),
+        ]);
+        let record2 = Record::new(vec![
+            Field::Int32(2),
+            Field::Int32(30),
+            Field::String("Bob".into()),
+        ]);
+        executor
+            .with_heap_file("users", |hf| {
+                hf.insert(record1).unwrap();
+                hf.insert(record2).unwrap();
+            })
+            .unwrap();
+
+        // Execute SELECT with same column twice
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, id FROM users;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].ty, Type::I32);
+        assert_eq!(columns[1].name, "id");
+        assert_eq!(columns[1].ty, Type::I32);
+
+        assert_eq!(rows.len(), 2);
+
+        let alice = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(1))
+            .unwrap();
+        assert_eq!(alice.fields.len(), 2);
+        assert_eq!(alice.fields[0], Field::Int32(1));
+        assert_eq!(alice.fields[1], Field::Int32(1));
+
+        let bob = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(2))
+            .unwrap();
+        assert_eq!(bob.fields.len(), 2);
+        assert_eq!(bob.fields[0], Field::Int32(2));
+        assert_eq!(bob.fields[1], Field::Int32(2));
     }
 }
