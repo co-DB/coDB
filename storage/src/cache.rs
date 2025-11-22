@@ -562,8 +562,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let db_dir = tmp.path().join("db");
         std::fs::create_dir_all(&db_dir).unwrap();
-
-        let files = FilesManager::new(tmp.path(), "db").unwrap();
+        let files = FilesManager::new(db_dir).unwrap();
         Arc::new(files)
     }
 

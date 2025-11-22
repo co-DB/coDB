@@ -104,12 +104,8 @@ pub enum StatementResult {
 }
 
 impl Executor {
-    pub fn new(
-        base_path: impl AsRef<Path>,
-        database_name: &str,
-        catalog: Catalog,
-    ) -> Result<Self, ExecutorError> {
-        let files = Arc::new(FilesManager::new(base_path, database_name)?);
+    pub fn new(database_path: impl AsRef<Path>, catalog: Catalog) -> Result<Self, ExecutorError> {
+        let files = Arc::new(FilesManager::new(database_path)?);
         let cache = Cache::new(consts::CACHE_SIZE, files);
         let catalog = Arc::new(RwLock::new(catalog));
         Ok(Executor {
@@ -443,7 +439,8 @@ mod tests {
     // Helper to create a test executor
     fn create_test_executor() -> (Executor, TempDir) {
         let (catalog, temp_dir) = create_catalog();
-        let executor = Executor::new(temp_dir.path(), "test_db", catalog).unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let executor = Executor::new(db_path, catalog).unwrap();
         (executor, temp_dir)
     }
 
