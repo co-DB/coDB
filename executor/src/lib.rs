@@ -56,6 +56,12 @@ enum InternalExecutorError {
     InvalidNodeTypeInExpression { node_type: String },
     #[error("Invalid type (expected: {expected}, got: {got})")]
     UnexpectedType { expected: String, got: String },
+    #[error("'{lhs}' and '{rhs}' are incompatible")]
+    IncompatibleTypes { lhs: String, rhs: String },
+    #[error("{message}")]
+    ArithmeticOperationError { message: String },
+    #[error("cannot cast '{from}' to '{to}'")]
+    InvalidCast { from: String, to: String },
 }
 
 #[derive(Debug)]

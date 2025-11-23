@@ -101,7 +101,7 @@ pub enum Field {
 }
 
 impl Field {
-    pub(crate) fn ty(&self) -> Type {
+    pub fn ty(&self) -> Type {
         match self {
             Field::Int32(_) => Type::I32,
             Field::Int64(_) => Type::I64,
