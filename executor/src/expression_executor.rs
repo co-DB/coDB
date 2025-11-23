@@ -16,6 +16,10 @@ use planner::{
 
 use crate::{InternalExecutorError, error_factory};
 
+/// Evaluates expressions from the resolved query AST against record data.
+///
+/// The executor borrows both the record being evaluated and the AST,
+/// allowing it to reference fields without copying when possible.
 pub(crate) struct ExpressionExecutor<'r, 'q> {
     record: &'r Record,
     ast: &'q ResolvedTree,
@@ -29,6 +33,16 @@ where
         Self { record, ast }
     }
 
+    /// Evaluates an expression node from the AST and returns its computed value.
+    ///
+    /// This is the main entry point for expression evaluation. It recursively walks
+    /// the expression tree, dispatching to specialized handlers based on the node type.
+    ///
+    /// Returns `Cow<'r, Field>` to avoid unnecessary cloning:
+    /// - `Cow::Borrowed` is returned for column references, directly referencing
+    ///   the field from the record without copying
+    /// - `Cow::Owned` is returned for computed values (arithmetic, comparisons, literals)
+    ///   that must be newly allocated
     pub(crate) fn execute_expression(
         &self,
         expression: ResolvedNodeId,
@@ -152,6 +166,7 @@ where
         Ok(Cow::Owned(field))
     }
 
+    /// Computes `lhs + rhs`.
     fn arithmetic_add(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
         let field = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => Field::Int32(lhs + rhs),
@@ -164,6 +179,7 @@ where
         Ok(field)
     }
 
+    /// Computes `lhs - rhs`.
     fn arithmetic_sub(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
         let field = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => Field::Int32(lhs - rhs),
@@ -175,6 +191,7 @@ where
         Ok(field)
     }
 
+    /// Computes `lhs * rhs`.
     fn arithmetic_mul(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
         let field = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => Field::Int32(lhs * rhs),
@@ -186,6 +203,7 @@ where
         Ok(field)
     }
 
+    /// Computes `lhs / rhs`.
     fn arithmetic_div(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
         let field = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => {
@@ -217,6 +235,7 @@ where
         Ok(field)
     }
 
+    /// Computes `lhs % rhs`.
     fn arithmetic_mod(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
         let field = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => {
@@ -236,6 +255,7 @@ where
         Ok(field)
     }
 
+    /// Computes `lhs < rhs`.
     fn compare_lt(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
         let result = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => lhs < rhs,
@@ -250,6 +270,7 @@ where
         Ok(Field::Bool(result))
     }
 
+    /// Computes `lhs <= rhs`.
     fn compare_lte(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
         let result = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => lhs <= rhs,
@@ -264,6 +285,7 @@ where
         Ok(Field::Bool(result))
     }
 
+    /// Computes `!value`.
     fn logical_bang(&self, value: &Field) -> Result<Field, InternalExecutorError> {
         let value = value
             .as_bool()
@@ -271,6 +293,7 @@ where
         Ok(Field::Bool(!value))
     }
 
+    /// Computes `+value`.
     fn make_positive(&self, value: &Field) -> Result<Field, InternalExecutorError> {
         match value {
             Field::Int32(value) => Ok(Field::Int32(value.abs())),
@@ -281,6 +304,7 @@ where
         }
     }
 
+    /// Computes `-value`.
     fn make_negative(&self, value: &Field) -> Result<Field, InternalExecutorError> {
         match value {
             Field::Int32(value) => Ok(Field::Int32(-value)),

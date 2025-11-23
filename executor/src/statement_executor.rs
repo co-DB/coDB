@@ -116,12 +116,14 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         Ok(records)
     }
 
+    /// Handler for [`Filter`] statement.
     fn filter(&self, filter: &Filter) -> Result<Vec<Record>, InternalExecutorError> {
         let data_source = self.statement.item(filter.data_source);
         let records = self.execute_data_source(data_source)?;
         self.apply_filter(records.into_iter(), filter.predicate)
     }
 
+    /// Applies filter to `records`, returning only those where the `predicate` evaluates to `true`.
     fn apply_filter(
         &self,
         records: impl Iterator<Item = Record>,

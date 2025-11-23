@@ -1,3 +1,5 @@
+//! error_factory - provides helpers for creating errors across `executor` crate.
+
 use engine::{heap_file::HeapFileError, record::Field};
 use metadata::types::Type;
 use thiserror::Error;
