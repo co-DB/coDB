@@ -534,4 +534,189 @@ mod tests {
         assert_eq!(bob.fields[0], Field::Int32(2));
         assert_eq!(bob.fields[1], Field::Int32(2));
     }
+
+    #[test]
+    fn test_execute_select_with_where_clause_single_condition() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert test data
+        let records = vec![
+            Record::new(vec![
+                Field::Int32(1),
+                Field::Int32(25),
+                Field::String("Alice".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(2),
+                Field::Int32(30),
+                Field::String("Bob".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(3),
+                Field::Int32(25),
+                Field::String("Charlie".into()),
+            ]),
+        ];
+
+        executor
+            .with_heap_file("users", |hf| {
+                for record in records {
+                    hf.insert(record).unwrap();
+                }
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users WHERE age = 25;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 2);
+
+        assert!(rows.iter().all(|r| r.fields[2] == Field::Int32(25)));
+        assert!(
+            rows.iter()
+                .any(|r| matches!(&r.fields[1], Field::String(s) if s == "Alice"))
+        );
+        assert!(
+            rows.iter()
+                .any(|r| matches!(&r.fields[1], Field::String(s) if s == "Charlie"))
+        );
+    }
+
+    #[test]
+    fn test_execute_select_with_where_clause_comparison_operators() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        let records = vec![
+            Record::new(vec![
+                Field::Int32(1),
+                Field::Int32(100),
+                Field::String("Product A".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(2),
+                Field::Int32(200),
+                Field::String("Product B".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(3),
+                Field::Int32(150),
+                Field::String("Product C".into()),
+            ]),
+        ];
+
+        executor
+            .with_heap_file("products", |hf| {
+                for record in records {
+                    hf.insert(record).unwrap();
+                }
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, name FROM products WHERE price > 100;",
+            &executor,
+        );
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.fields[0] == Field::Int32(2)));
+        assert!(rows.iter().any(|r| r.fields[0] == Field::Int32(3)));
+    }
+
+    #[test]
+    fn test_execute_select_with_where_clause_no_matches() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        let record = Record::new(vec![
+            Field::Int32(1),
+            Field::Int32(25),
+            Field::String("Alice".into()),
+        ]);
+
+        executor
+            .with_heap_file("users", |hf| {
+                hf.insert(record).unwrap();
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM users WHERE age = 99;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_execute_select_with_where_clause_all_match() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        let records = vec![
+            Record::new(vec![
+                Field::Int32(1),
+                Field::Int32(25),
+                Field::String("Alice".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(2),
+                Field::Int32(25),
+                Field::String("Bob".into()),
+            ]),
+        ];
+
+        executor
+            .with_heap_file("users", |hf| {
+                for record in records {
+                    hf.insert(record).unwrap();
+                }
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM users WHERE TRUE;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 2);
+    }
 }
