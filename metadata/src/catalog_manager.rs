@@ -227,6 +227,11 @@ impl CatalogManager {
         self.main_directory_path.join(METADATA_FILE_NAME)
     }
 
+    /// Returns the main directory path.
+    pub fn main_directory_path(&self) -> PathBuf {
+        self.main_directory_path.clone()
+    }
+
     /// Returns a list of all databases in the system.
     pub fn list_databases(&self) -> DatabaseList {
         self.database_list.clone()

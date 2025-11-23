@@ -1,4 +1,5 @@
-﻿use serde::{Deserialize, Serialize};
+﻿use metadata::types::Type;
+use serde::{Deserialize, Serialize};
 
 /// This file contains definitions of all requests and responses in the text protocol of coDB.
 /// The type of request/response is distinguished by the appropriately named 'type' field in the
@@ -57,22 +58,18 @@ pub enum Response {
     /// Contains the metadata of all the columns of the current query's result set. Sent before
     /// sending the rows with the [`Row`] response.
     ColumnInfo {
-        // TODO: Change to column metadata type probably,
-        column_metadata: Vec<String>,
+        column_metadata: Vec<ColumnMetadata>,
     },
 
     /// Contains all the column values of a single batch of rows from the current query's result set.
-    Rows {
-        // TODO: Change to record type probably,
-        records: Vec<Vec<String>>,
-    },
+    Rows { records: Vec<Record>, count: usize },
 
     /// Lets the client know that all the result for this statement have been sent and that the
     /// server is proceeding onto the next statement. Multiple instances of this may be sent
     /// during the course of a query execution if it contains multiple statements.
     StatementCompleted {
         /// The amount of selected/modified records.
-        rows_affected: u32,
+        rows_affected: usize,
         /// For allowing the client to display different messages (e.g. for table drop 'TABLE DROPPED'
         /// and for select '({rows_affected} rows)').
         statement_type: StatementType,
@@ -102,7 +99,7 @@ pub enum Response {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum StatementType {
+pub enum StatementType {
     Select,
     Insert,
     Update,
@@ -113,10 +110,73 @@ enum StatementType {
     AlterTable,
 }
 
+impl From<executor::StatementType> for StatementType {
+    fn from(value: executor::StatementType) -> Self {
+        match value {
+            executor::StatementType::Insert => StatementType::Insert,
+            executor::StatementType::Update => StatementType::Update,
+            executor::StatementType::Delete => StatementType::Delete,
+            executor::StatementType::Create => StatementType::CreateTable,
+            executor::StatementType::Alter => StatementType::AlterTable,
+            executor::StatementType::Truncate => StatementType::TruncateTable,
+            executor::StatementType::Drop => StatementType::DropTable,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorType {
     Query,
     Execution,
+    Catalog,
     Communication,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ColumnMetadata {
+    pub(crate) name: String,
+    pub(crate) ty: ColumnType,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnType {
+    String,
+    F32,
+    F64,
+    I32,
+    I64,
+    Bool,
+    Date,
+    DateTime,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Record {
+    pub fields: Vec<Field>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Field {
+    Int32(i32),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
+    DateTime(DateTime),
+    Date(Date),
+    String(String),
+    Bool(bool),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Date {
+    pub days_since_epoch: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DateTime {
+    pub days_since_epoch: i32,
+    pub milliseconds_since_midnight: u32,
 }

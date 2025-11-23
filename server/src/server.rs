@@ -1,42 +1,59 @@
-﻿use crate::text_protocol::{ErrorType, Request, Response};
+﻿use crate::text_client_handler::TextClientHandler;
 use dashmap::DashMap;
-use executor::{Executor, StatementResult};
+use executor::Executor;
+use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
+use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Error, Debug)]
 pub(crate) enum ServerError {
-    #[error(transparent)]
+    #[error("io error occurred: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("error occurred while using catalog manager: {0}")]
+    CatalogManagerError(#[from] CatalogManagerError),
 }
 pub(crate) struct Server {
     binary_addr: SocketAddr,
     text_addr: SocketAddr,
+    catalog_manager: Arc<RwLock<CatalogManager>>,
     executors: Arc<DashMap<String, Arc<Executor>>>,
 }
 impl Server {
-    fn new(binary_addr: SocketAddr, text_addr: SocketAddr) -> Self {
-        Self {
+    pub(crate) fn new(binary_addr: SocketAddr, text_addr: SocketAddr) -> Result<Self, ServerError> {
+        Ok(Self {
             binary_addr,
             text_addr,
+            catalog_manager: Arc::new(RwLock::new(CatalogManager::new()?)),
             executors: Arc::new(DashMap::new()),
-        }
+        })
     }
-    async fn run_loop(&self) -> Result<(), ServerError> {
+
+    pub(crate) async fn run_loop(&self) -> Result<(), ServerError> {
         let text_listener = TcpListener::bind(self.text_addr).await?;
         let binary_listener = TcpListener::bind(self.binary_addr).await?;
 
         let text_executors = self.executors.clone();
+        let catalog_manager = self.catalog_manager.clone();
+
+        println!(
+            "Listening to text protocol communication on {}",
+            self.text_addr
+        );
         tokio::spawn(async move {
             loop {
                 match text_listener.accept().await {
-                    Ok((socket, _)) => {
-                        let exec = text_executors.clone();
+                    Ok((socket, addr)) => {
+                        println!("Accepted connection from {}", addr);
+                        let handler = TextClientHandler::new(
+                            socket,
+                            text_executors.clone(),
+                            catalog_manager.clone(),
+                        );
                         tokio::spawn(async move {
-                            Self::handle_text_client(socket, exec).await;
+                            handler.run().await;
                         });
                     }
                     Err(err) => {
@@ -47,13 +64,19 @@ impl Server {
         });
 
         let binary_executors = self.executors.clone();
+        let catalog_manager = self.catalog_manager.clone();
+        println!(
+            "Listening to binary protocol communication on {}",
+            self.binary_addr
+        );
         tokio::spawn(async move {
             loop {
                 match binary_listener.accept().await {
                     Ok((socket, _)) => {
                         let exec = binary_executors.clone();
+                        let manager = catalog_manager.clone();
                         tokio::spawn(async move {
-                            let _ = Self::handle_binary_client(socket, exec).await;
+                            let _ = Self::handle_binary_client(socket, exec, manager).await;
                         });
                     }
                     Err(err) => {
@@ -65,58 +88,12 @@ impl Server {
 
         Ok(())
     }
-    async fn handle_text_client(socket: TcpStream, executors: Arc<DashMap<String, Arc<Executor>>>) {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StatementResult>(16);
 
-        let (read_socket, write_socket) = socket.into_split();
-
-        let mut reader = BufReader::new(read_socket);
-        let mut writer = BufWriter::new(write_socket);
-
-        let mut buffer = String::new();
-
-        while reader.read_line(&mut buffer).await.is_ok() {
-            let request = serde_json::from_str::<Request>(buffer.as_str());
-            let deserialized_request = match request {
-                Ok(req) => req,
-                Err(err) => {
-                    let error_response = Response::Error {
-                        message: err.to_string(),
-                        error_type: ErrorType::Communication,
-                    };
-                    writer
-                        .write_all(serde_json::to_string(&error_response).unwrap().as_bytes())
-                        .await
-                        .unwrap();
-                    writer.write_all("\n".as_bytes()).await.unwrap();
-                    writer.flush().await.unwrap();
-                    continue;
-                }
-            };
-
-            match deserialized_request {
-                Request::CreateDatabase { database_name } => {}
-                Request::DeleteDatabase { database_name } => {}
-                Request::ListDatabases => {}
-                Request::Connect { database_name } => {}
-                Request::Query { database_name, sql } => {}
-            }
-        }
-        tokio::task::spawn_blocking(move || {
-            /*if let Some(exec_arc) = executors.get("db1") {
-                let exec = exec_arc.clone(); // clone Arc to get ownership
-                for i in exec.execute("query") {
-                    tx.blocking_send(i).unwrap();
-                } // call method on Executor
-            }*/
-        });
-
-        while let Some(result) = rx.recv().await {}
-    }
-
+    // TODO: Move that to its own file and create it similiarly to text client handler.
     async fn handle_binary_client(
-        socket: TcpStream,
-        executors: Arc<DashMap<String, Arc<Executor>>>,
+        _socket: TcpStream,
+        _executors: Arc<DashMap<String, Arc<Executor>>>,
+        _catalog_manager: Arc<RwLock<CatalogManager>>,
     ) {
     }
 }
