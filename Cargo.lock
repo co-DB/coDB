@@ -570,6 +570,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -700,6 +707,7 @@ dependencies = [
  "itertools",
  "metadata",
  "parking_lot",
+ "protocol",
  "serde",
  "serde_json",
  "thiserror",

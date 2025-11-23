@@ -8,6 +8,7 @@ rust-version.workspace = true
 executor = { path = "../executor" }
 metadata = { path = "../metadata" }
 engine = { path = "../engine" }
+protocol = { path = "../protocol" }
 
 tokio.workspace = true
 thiserror.workspace = true
