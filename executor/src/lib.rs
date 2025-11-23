@@ -2,21 +2,16 @@ mod consts;
 mod error_factory;
 mod expression_executor;
 mod iterators;
+mod response;
 mod statement_executor;
 
 use std::{path::Path, sync::Arc};
 
 use dashmap::DashMap;
-use engine::{
-    heap_file::{HeapFile, HeapFileFactory},
-    record::Record,
-};
-use metadata::{catalog::Catalog, types::Type};
+use engine::heap_file::{HeapFile, HeapFileFactory};
+use metadata::catalog::Catalog;
 use parking_lot::RwLock;
-use planner::{
-    query_plan::StatementPlan,
-    resolved_tree::{ResolvedColumn, ResolvedTree},
-};
+use planner::{query_plan::StatementPlan, resolved_tree::ResolvedTree};
 use storage::{
     cache::Cache,
     files_manager::{FileKey, FilesManager, FilesManagerError},
@@ -27,6 +22,7 @@ use crate::{
     consts::HEAP_FILE_BUCKET_SIZE,
     error_factory::InternalExecutorError,
     iterators::{ParseErrorIter, QueryResultIter, StatementIter},
+    response::StatementResult,
     statement_executor::StatementExecutor,
 };
 
@@ -41,50 +37,6 @@ pub struct Executor {
 pub enum ExecutorError {
     #[error("Cannot open files manager: {0}")]
     CannotOpenFilesManager(#[from] FilesManagerError),
-}
-
-#[derive(Debug)]
-pub struct ColumnData {
-    pub name: String,
-    pub ty: Type,
-}
-
-impl From<&ResolvedColumn> for ColumnData {
-    fn from(value: &ResolvedColumn) -> Self {
-        ColumnData {
-            name: value.name.clone(),
-            ty: value.ty,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum StatementType {
-    Insert,
-    Update,
-    Delete,
-    Create,
-    Alter,
-    Truncate,
-    Drop,
-}
-
-#[derive(Debug)]
-pub enum StatementResult {
-    OperationSuccessful {
-        rows_affected: usize,
-        ty: StatementType,
-    },
-    SelectSuccessful {
-        columns: Vec<ColumnData>,
-        rows: Vec<Record>,
-    },
-    ParseError {
-        error: String,
-    },
-    RuntimeError {
-        error: String,
-    },
 }
 
 impl Executor {
@@ -169,8 +121,11 @@ impl Executor {
 mod tests {
     use std::fs;
 
-    use engine::record::Field;
+    use engine::record::{Field, Record};
+    use metadata::types::Type;
     use tempfile::TempDir;
+
+    use crate::response::{ColumnData, StatementType};
 
     use super::*;
 

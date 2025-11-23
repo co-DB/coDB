@@ -15,8 +15,9 @@ use planner::{
 };
 
 use crate::{
-    ColumnData, Executor, InternalExecutorError, StatementResult, StatementType, error_factory,
+    Executor, InternalExecutorError, StatementResult, error_factory,
     expression_executor::ExpressionExecutor,
+    response::{ColumnData, StatementType},
 };
 
 /// Executes a single statement from a query plan.
@@ -94,12 +95,13 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     fn execute_data_source(
         &self,
         data_source: &StatementPlanItem,
-    ) -> Result<impl Iterator<Item = Record>, InternalExecutorError> {
+    ) -> Result<Vec<Record>, InternalExecutorError> {
         match data_source {
             StatementPlanItem::TableScan(table_scan) => {
                 let records = self.table_scan(table_scan)?;
-                Ok(records.into_iter())
+                Ok(records)
             }
+            StatementPlanItem::Filter(filter) => self.filter(filter),
             _ => Err(InternalExecutorError::InvalidOperationInDataSource {
                 operation: format!("{:?}", data_source),
             }),
@@ -114,21 +116,18 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         Ok(records)
     }
 
-    fn filter(
-        &self,
-        filter: &Filter,
-    ) -> Result<impl Iterator<Item = Record>, InternalExecutorError> {
+    fn filter(&self, filter: &Filter) -> Result<Vec<Record>, InternalExecutorError> {
         let data_source = self.statement.item(filter.data_source);
         let records = self.execute_data_source(data_source)?;
-        self.apply_filter(records, filter.predicate)
+        self.apply_filter(records.into_iter(), filter.predicate)
     }
 
     fn apply_filter(
         &self,
         records: impl Iterator<Item = Record>,
         predicate: ResolvedNodeId,
-    ) -> Result<impl Iterator<Item = Record>, InternalExecutorError> {
-        let filtered: Result<Vec<_>, _> = records
+    ) -> Result<Vec<Record>, InternalExecutorError> {
+        records
             .filter_map(|record| {
                 let e = ExpressionExecutor::new(&record, self.ast);
                 match e.execute_expression(predicate) {
@@ -140,9 +139,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                     Err(e) => Some(Err(e)),
                 }
             })
-            .collect();
-
-        Ok(filtered?.into_iter())
+            .collect()
     }
 
     /// Handler for [`Projection`] statement.
@@ -151,21 +148,15 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         let records = match self.execute_data_source(data_source) {
             Ok(records) => records,
             Err(err) => {
-                return StatementResult::RuntimeError {
-                    error: err.to_string(),
-                };
+                return StatementResult::from(&err);
             }
         };
-        match self.project_records(records, &projection.columns) {
+        match self.project_records(records.into_iter(), &projection.columns) {
             Ok(projected_records) => StatementResult::SelectSuccessful {
                 columns: projected_records.columns,
                 rows: projected_records.records,
             },
-            Err(err) => {
-                return StatementResult::RuntimeError {
-                    error: err.to_string(),
-                };
-            }
+            Err(err) => StatementResult::from(&err),
         }
     }
 
