@@ -1,4 +1,5 @@
 mod consts;
+mod expression_executor;
 mod iterators;
 
 use std::{collections::HashMap, iter, mem, path::Path, sync::Arc};
@@ -16,7 +17,7 @@ use metadata::{
 };
 use parking_lot::RwLock;
 use planner::{
-    query_plan::{CreateTable, Projection, StatementPlan, StatementPlanItem, TableScan},
+    query_plan::{CreateTable, Filter, Projection, StatementPlan, StatementPlanItem, TableScan},
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
         ResolvedTree,
@@ -57,6 +58,10 @@ enum InternalExecutorError {
     HeapFileError(#[from] HeapFileError),
     #[error("Used invalid operation ({operation}) for data source")]
     InvalidOperationInDataSource { operation: String },
+    #[error("Received unexpected node type ({node_type}) while processing expression")]
+    InvalidNodeTypeInExpression { node_type: String },
+    #[error("Invalid type (expected: {expected}, got: {got})")]
+    UnexpectedType { expected: String, got: String },
 }
 
 #[derive(Debug)]
@@ -257,9 +262,12 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     fn execute_data_source(
         &self,
         data_source: &StatementPlanItem,
-    ) -> Result<Vec<Record>, InternalExecutorError> {
+    ) -> Result<impl Iterator<Item = Record>, InternalExecutorError> {
         match data_source {
-            StatementPlanItem::TableScan(table_scan) => self.table_scan(table_scan),
+            StatementPlanItem::TableScan(table_scan) => {
+                let records = self.table_scan(table_scan)?;
+                Ok(records.into_iter())
+            }
             _ => Err(InternalExecutorError::InvalidOperationInDataSource {
                 operation: format!("{:?}", data_source),
             }),
@@ -272,6 +280,23 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             .executor
             .with_heap_file(&table_scan.table_name, |hf| hf.all_records())??;
         Ok(records)
+    }
+
+    fn filter(
+        &self,
+        filter: &Filter,
+    ) -> Result<impl Iterator<Item = Record>, InternalExecutorError> {
+        let data_source = self.statement.item(filter.data_source);
+        let records = self.execute_data_source(data_source)?;
+        self.apply_filter(records, filter.predicate)
+    }
+
+    fn apply_filter(
+        &self,
+        records: impl Iterator<Item = Record>,
+        predicate: ResolvedNodeId,
+    ) -> Result<impl Iterator<Item = Record>, InternalExecutorError> {
+        Ok(vec![].into_iter())
     }
 
     /// Handler for [`Projection`] statement.
@@ -301,7 +326,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     /// Transforms `records` so that they only contain specified `columns`.
     fn project_records(
         &self,
-        records: Vec<Record>,
+        records: impl Iterator<Item = Record>,
         columns: &[ResolvedNodeId],
     ) -> Result<ProjectedRecords, InternalExecutorError> {
         let project_columns: Vec<_> = self.map_expressions_to_project_columns(columns).collect();
@@ -311,7 +336,6 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             .collect();
 
         let projected_records: Vec<_> = records
-            .into_iter()
             .map(|record| {
                 let mut source_fields = record.fields;
                 let fields: Vec<_> = project_columns
