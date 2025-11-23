@@ -1,4 +1,5 @@
 mod consts;
+mod error_factory;
 mod expression_executor;
 mod iterators;
 mod statement_executor;
@@ -7,7 +8,7 @@ use std::{path::Path, sync::Arc};
 
 use dashmap::DashMap;
 use engine::{
-    heap_file::{HeapFile, HeapFileError, HeapFileFactory},
+    heap_file::{HeapFile, HeapFileFactory},
     record::Record,
 };
 use metadata::{catalog::Catalog, types::Type};
@@ -24,6 +25,7 @@ use thiserror::Error;
 
 use crate::{
     consts::HEAP_FILE_BUCKET_SIZE,
+    error_factory::InternalExecutorError,
     iterators::{ParseErrorIter, QueryResultIter, StatementIter},
     statement_executor::StatementExecutor,
 };
@@ -39,29 +41,6 @@ pub struct Executor {
 pub enum ExecutorError {
     #[error("Cannot open files manager: {0}")]
     CannotOpenFilesManager(#[from] FilesManagerError),
-}
-
-/// Error for internal executor operations, shouldn't be exported outside of this module.
-#[derive(Error, Debug)]
-enum InternalExecutorError {
-    #[error("Table '{table_name}' does not exist.")]
-    TableDoesNotExist { table_name: String },
-    #[error("Cannot create heap file: {reason}")]
-    CannotCreateHeapFile { reason: String },
-    #[error("{0}")]
-    HeapFileError(#[from] HeapFileError),
-    #[error("Used invalid operation ({operation}) for data source")]
-    InvalidOperationInDataSource { operation: String },
-    #[error("Received unexpected node type ({node_type}) while processing expression")]
-    InvalidNodeTypeInExpression { node_type: String },
-    #[error("Invalid type (expected: {expected}, got: {got})")]
-    UnexpectedType { expected: String, got: String },
-    #[error("'{lhs}' and '{rhs}' are incompatible")]
-    IncompatibleTypes { lhs: String, rhs: String },
-    #[error("{message}")]
-    ArithmeticOperationError { message: String },
-    #[error("cannot cast '{from}' to '{to}'")]
-    InvalidCast { from: String, to: String },
 }
 
 #[derive(Debug)]
@@ -133,11 +112,6 @@ impl Executor {
     fn execute_statement(&self, statement: &StatementPlan, ast: &ResolvedTree) -> StatementResult {
         let se = StatementExecutor::new(self, statement, ast);
         se.execute()
-    }
-
-    /// Helper to create [`StatementResult::RuntimeError`] with provided message.
-    fn runtime_error(&self, msg: String) -> StatementResult {
-        StatementResult::RuntimeError { error: msg }
     }
 
     /// Gets heap file for given table and passes it to function `f`.

@@ -14,9 +14,9 @@ use planner::{
     },
 };
 
-use crate::InternalExecutorError;
+use crate::{InternalExecutorError, error_factory};
 
-struct ExpressionExecutor<'r, 'q> {
+pub(crate) struct ExpressionExecutor<'r, 'q> {
     record: &'r Record,
     ast: &'q ResolvedTree,
 }
@@ -25,11 +25,11 @@ impl<'r, 'q> ExpressionExecutor<'r, 'q>
 where
     'q: 'r,
 {
-    fn new(record: &'r Record, ast: &'q ResolvedTree) -> Self {
+    pub(crate) fn new(record: &'r Record, ast: &'q ResolvedTree) -> Self {
         Self { record, ast }
     }
 
-    fn execute_expression(
+    pub(crate) fn execute_expression(
         &self,
         expression: ResolvedNodeId,
     ) -> Result<Cow<'r, Field>, InternalExecutorError> {
@@ -61,7 +61,7 @@ where
         let left_expr = self.execute_expression(logical.left)?;
         let left = left_expr
             .as_bool()
-            .ok_or(self.unexpected_type("bool", &left_expr))?;
+            .ok_or(error_factory::unexpected_type("bool", &left_expr))?;
 
         match logical.op {
             LogicalOperator::And if !left => return Ok(Cow::Owned(Field::Bool(false))),
@@ -72,7 +72,7 @@ where
         let right_expr = self.execute_expression(logical.right)?;
         let right = right_expr
             .as_bool()
-            .ok_or(self.unexpected_type("bool", &right_expr))?;
+            .ok_or(error_factory::unexpected_type("bool", &right_expr))?;
         let result = match logical.op {
             LogicalOperator::And => left && right,
             LogicalOperator::Or => left || right,
@@ -128,7 +128,7 @@ where
         let field = match (child, cast.new_ty) {
             (Field::Int32(previous), Type::I64) => Field::Int64(*previous as i64),
             (Field::Float32(previous), Type::F64) => Field::Float64(*previous as f64),
-            _ => return Err(self.invalid_cast(child, &cast.new_ty)),
+            _ => return Err(error_factory::invalid_cast(child, &cast.new_ty)),
         };
         Ok(Cow::Owned(field))
     }
@@ -159,7 +159,7 @@ where
             (Field::Float32(lhs), Field::Float32(rhs)) => Field::Float32(lhs + rhs),
             (Field::Float64(lhs), Field::Float64(rhs)) => Field::Float64(lhs + rhs),
             (Field::String(lhs), Field::String(rhs)) => Field::String(format!("{lhs}{rhs}")),
-            _ => return Err(self.incompatible_types(lhs, rhs)),
+            _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
         Ok(field)
     }
@@ -170,7 +170,7 @@ where
             (Field::Int64(lhs), Field::Int64(rhs)) => Field::Int64(lhs - rhs),
             (Field::Float32(lhs), Field::Float32(rhs)) => Field::Float32(lhs - rhs),
             (Field::Float64(lhs), Field::Float64(rhs)) => Field::Float64(lhs - rhs),
-            _ => return Err(self.incompatible_types(lhs, rhs)),
+            _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
         Ok(field)
     }
@@ -181,7 +181,7 @@ where
             (Field::Int64(lhs), Field::Int64(rhs)) => Field::Int64(lhs * rhs),
             (Field::Float32(lhs), Field::Float32(rhs)) => Field::Float32(lhs * rhs),
             (Field::Float64(lhs), Field::Float64(rhs)) => Field::Float64(lhs * rhs),
-            _ => return Err(self.incompatible_types(lhs, rhs)),
+            _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
         Ok(field)
     }
@@ -190,29 +190,29 @@ where
         let field = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => {
                 if *rhs == 0 {
-                    return Err(self.div_by_zero());
+                    return Err(error_factory::div_by_zero());
                 }
                 Field::Int32(lhs / rhs)
             }
             (Field::Int64(lhs), Field::Int64(rhs)) => {
                 if *rhs == 0 {
-                    return Err(self.div_by_zero());
+                    return Err(error_factory::div_by_zero());
                 }
                 Field::Int64(lhs / rhs)
             }
             (Field::Float32(lhs), Field::Float32(rhs)) => {
                 if *rhs == 0.0 {
-                    return Err(self.div_by_zero());
+                    return Err(error_factory::div_by_zero());
                 }
                 Field::Float32(lhs / rhs)
             }
             (Field::Float64(lhs), Field::Float64(rhs)) => {
                 if *rhs == 0.0 {
-                    return Err(self.div_by_zero());
+                    return Err(error_factory::div_by_zero());
                 }
                 Field::Float64(lhs / rhs)
             }
-            _ => return Err(self.incompatible_types(lhs, rhs)),
+            _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
         Ok(field)
     }
@@ -221,17 +221,17 @@ where
         let field = match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => {
                 if *rhs == 0 {
-                    return Err(self.mod_by_zero());
+                    return Err(error_factory::mod_by_zero());
                 }
                 Field::Int32(lhs % rhs)
             }
             (Field::Int64(lhs), Field::Int64(rhs)) => {
                 if *rhs == 0 {
-                    return Err(self.mod_by_zero());
+                    return Err(error_factory::mod_by_zero());
                 }
                 Field::Int64(lhs % rhs)
             }
-            _ => return Err(self.incompatible_types(lhs, rhs)),
+            _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
         Ok(field)
     }
@@ -245,7 +245,7 @@ where
             (Field::String(lhs), Field::String(rhs)) => lhs < rhs,
             (Field::Date(lhs), Field::Date(rhs)) => lhs < rhs,
             (Field::DateTime(lhs), Field::DateTime(rhs)) => lhs < rhs,
-            _ => return Err(self.incompatible_types(lhs, rhs)),
+            _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
         Ok(Field::Bool(result))
     }
@@ -259,13 +259,15 @@ where
             (Field::String(lhs), Field::String(rhs)) => lhs <= rhs,
             (Field::Date(lhs), Field::Date(rhs)) => lhs <= rhs,
             (Field::DateTime(lhs), Field::DateTime(rhs)) => lhs <= rhs,
-            _ => return Err(self.incompatible_types(lhs, rhs)),
+            _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
         Ok(Field::Bool(result))
     }
 
     fn logical_bang(&self, value: &Field) -> Result<Field, InternalExecutorError> {
-        let value = value.as_bool().ok_or(self.unexpected_type("bool", value))?;
+        let value = value
+            .as_bool()
+            .ok_or(error_factory::unexpected_type("bool", value))?;
         Ok(Field::Bool(!value))
     }
 
@@ -275,7 +277,7 @@ where
             Field::Int64(value) => Ok(Field::Int64(value.abs())),
             Field::Float32(value) => Ok(Field::Float32(value.abs())),
             Field::Float64(value) => Ok(Field::Float64(value.abs())),
-            _ => Err(self.unexpected_type("any numeric type", value)),
+            _ => Err(error_factory::unexpected_type("any numeric type", value)),
         }
     }
 
@@ -285,40 +287,7 @@ where
             Field::Int64(value) => Ok(Field::Int64(-value)),
             Field::Float32(value) => Ok(Field::Float32(-value)),
             Field::Float64(value) => Ok(Field::Float64(-value)),
-            _ => Err(self.unexpected_type("any numeric type", value)),
-        }
-    }
-
-    fn unexpected_type(&self, expected: impl Into<String>, got: &Field) -> InternalExecutorError {
-        InternalExecutorError::UnexpectedType {
-            expected: expected.into(),
-            got: format!("{:?}", got),
-        }
-    }
-
-    fn incompatible_types(&self, lhs: &Field, rhs: &Field) -> InternalExecutorError {
-        InternalExecutorError::IncompatibleTypes {
-            lhs: format!("{:?}", lhs),
-            rhs: format!("{:?}", rhs),
-        }
-    }
-
-    fn mod_by_zero(&self) -> InternalExecutorError {
-        InternalExecutorError::ArithmeticOperationError {
-            message: "cannot modulo by 0".into(),
-        }
-    }
-
-    fn div_by_zero(&self) -> InternalExecutorError {
-        InternalExecutorError::ArithmeticOperationError {
-            message: "cannot divide by 0".into(),
-        }
-    }
-
-    fn invalid_cast(&self, child: &Field, new_type: &Type) -> InternalExecutorError {
-        InternalExecutorError::InvalidCast {
-            from: child.ty().to_string(),
-            to: new_type.to_string(),
+            _ => Err(error_factory::unexpected_type("any numeric type", value)),
         }
     }
 }

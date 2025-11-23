@@ -14,7 +14,10 @@ use planner::{
     },
 };
 
-use crate::{ColumnData, Executor, InternalExecutorError, StatementResult, StatementType};
+use crate::{
+    ColumnData, Executor, InternalExecutorError, StatementResult, StatementType, error_factory,
+    expression_executor::ExpressionExecutor,
+};
 
 /// Executes a single statement from a query plan.
 ///
@@ -69,7 +72,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     fn execute_query(&self, item: &StatementPlanItem) -> StatementResult {
         match item {
             StatementPlanItem::Projection(projection) => self.projection(projection),
-            _ => self.executor.runtime_error(format!(
+            _ => error_factory::runtime_error(format!(
                 "Invalid root operation ({:?}) for query statement",
                 item
             )),
@@ -80,7 +83,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     fn execute_mutation(&self, item: &StatementPlanItem) -> StatementResult {
         match item {
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
-            _ => self.executor.runtime_error(format!(
+            _ => error_factory::runtime_error(format!(
                 "Invalid root operation ({:?}) for mutation statement",
                 item
             )),
@@ -125,7 +128,21 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         records: impl Iterator<Item = Record>,
         predicate: ResolvedNodeId,
     ) -> Result<impl Iterator<Item = Record>, InternalExecutorError> {
-        Ok(vec![].into_iter())
+        let filtered: Result<Vec<_>, _> = records
+            .filter_map(|record| {
+                let e = ExpressionExecutor::new(&record, self.ast);
+                match e.execute_expression(predicate) {
+                    Ok(result) => match result.as_bool() {
+                        Some(true) => Some(Ok(record)),
+                        Some(false) => None,
+                        None => Some(Err(error_factory::unexpected_type("bool", result.as_ref()))),
+                    },
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .collect();
+
+        Ok(filtered?.into_iter())
     }
 
     /// Handler for [`Projection`] statement.
@@ -192,9 +209,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         let column_metadatas = match self.process_columns(create_table) {
             Ok(cm) => cm,
             Err(err) => {
-                return self
-                    .executor
-                    .runtime_error(format!("Failed to create column: {err}"));
+                return error_factory::runtime_error(format!("Failed to create column: {err}"));
             }
         };
 
@@ -205,18 +220,14 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         ) {
             Ok(tm) => tm,
             Err(err) => {
-                return self
-                    .executor
-                    .runtime_error(format!("Failed to create table: {}", err));
+                return error_factory::runtime_error(format!("Failed to create table: {}", err));
             }
         };
 
         let mut catalog = self.executor.catalog.write();
 
         if let Err(err) = catalog.add_table(table_metadata) {
-            return self
-                .executor
-                .runtime_error(format!("Failed to create table: {}", err));
+            return error_factory::runtime_error(format!("Failed to create table: {}", err));
         }
 
         match catalog.sync_to_disk() {
@@ -224,9 +235,9 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 rows_affected: 0,
                 ty: StatementType::Create,
             },
-            Err(err) => self
-                .executor
-                .runtime_error(format!("Failed to save catalog content to disk: {err}")),
+            Err(err) => error_factory::runtime_error(format!(
+                "Failed to save catalog content to disk: {err}"
+            )),
         }
     }
 
