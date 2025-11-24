@@ -1705,7 +1705,10 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs, thread,
+        collections::HashSet,
+        fs,
+        sync::atomic::AtomicUsize,
+        thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -4876,6 +4879,7 @@ mod tests {
             HeapFileError::SlottedPageError(_)
         ));
     }
+
     #[test]
     fn heap_file_delete_concurrent_read_multi_page_record() {
         let (cache, _, file_key) = setup_test_cache();
@@ -4944,5 +4948,311 @@ mod tests {
             result.unwrap_err(),
             HeapFileError::SlottedPageError(_)
         ));
+    }
+
+    #[ignore = "TODO: need to figure out better way to handle benchmark tests"]
+    #[test]
+    fn heap_file_stress_test_concurrent_inserts_many_threads() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let heap_file = Arc::new(factory.create_heap_file().unwrap());
+
+        let num_threads = 16;
+        let records_per_thread = 3000;
+        let total_records = num_threads * records_per_thread;
+
+        println!("\n=== HeapFile Concurrent Insert Stress Test ===");
+        println!(
+            "Threads: {}, Records per thread: {}, Total: {}",
+            num_threads, records_per_thread, total_records
+        );
+
+        let successful_inserts = Arc::new(AtomicUsize::new(0));
+        let failed_inserts = Arc::new(AtomicUsize::new(0));
+
+        // Track which thread/operation failed
+        let error_details = Arc::new(Mutex::new(Vec::new()));
+
+        let start = std::time::Instant::now();
+
+        let mut handles = vec![];
+
+        for thread_id in 0..num_threads {
+            let heap_file_clone = heap_file.clone();
+            let successful_clone = successful_inserts.clone();
+            let failed_clone = failed_inserts.clone();
+            let error_details_clone = error_details.clone();
+
+            let handle = thread::spawn(move || {
+                let mut local_ptrs = Vec::with_capacity(records_per_thread);
+
+                for i in 0..records_per_thread {
+                    let record_id = (thread_id * records_per_thread + i) as i32;
+                    let name = format!("thread_{}_record_{}", thread_id, i);
+
+                    let record =
+                        Record::new(vec![Field::Int32(record_id), Field::String(name.clone())]);
+
+                    match heap_file_clone.insert(record) {
+                        Ok(ptr) => {
+                            successful_clone.fetch_add(1, Ordering::Relaxed);
+                            local_ptrs.push((ptr, record_id, name));
+                        }
+                        Err(e) => {
+                            println!(
+                                "[Thread {}] INSERT FAILED at record {}: {}",
+                                thread_id, i, e
+                            );
+                            println!("[Thread {}] Error details: {:?}", thread_id, e);
+                            error_details_clone
+                                .lock()
+                                .push(format!("Thread {} insert {} failed: {}", thread_id, i, e));
+                            failed_clone.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    // Occasionally verify some previously inserted records
+                    if i > 0 && i % 100 == 0 {
+                        let check_idx = i / 2;
+                        if let Some((ptr, expected_id, expected_name)) = local_ptrs.get(check_idx) {
+                            match heap_file_clone.record(ptr) {
+                                Ok(retrieved) => {
+                                    assert_eq!(retrieved.fields.len(), 2);
+                                    assert_i32(*expected_id, &retrieved.fields[0]);
+                                    assert_string(expected_name, &retrieved.fields[1]);
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "[Thread {}] RE-READ FAILED at index {} (record {}): {}",
+                                        thread_id, check_idx, i, e
+                                    );
+                                    println!(
+                                        "[Thread {}] Tried to read ptr: page_id={}, slot_id={}",
+                                        thread_id, ptr.page_id, ptr.slot_id
+                                    );
+                                    println!("[Thread {}] Error details: {:?}", thread_id, e);
+                                    error_details_clone.lock().push(format!(
+                                        "Thread {} re-read at index {} failed: {}",
+                                        thread_id, check_idx, e
+                                    ));
+                                    panic!(
+                                        "Thread {} failed to re-read record at index {}: {}",
+                                        thread_id, check_idx, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                local_ptrs
+            });
+
+            handles.push(handle);
+        }
+
+        // Collect all record pointers from all threads
+        let mut all_record_ptrs = Vec::new();
+        for (thread_idx, handle) in handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(thread_ptrs) => {
+                    all_record_ptrs.extend(thread_ptrs);
+                }
+                Err(e) => {
+                    println!("Thread {} panicked: {:?}", thread_idx, e);
+
+                    // Print all collected errors before panicking
+                    let errors = error_details.lock();
+                    println!("\n=== All Errors Collected ===");
+                    for err in errors.iter() {
+                        println!("{}", err);
+                    }
+
+                    panic!("Thread {} panicked during execution", thread_idx);
+                }
+            }
+        }
+
+        let duration = start.elapsed();
+        let successful = successful_inserts.load(Ordering::Relaxed);
+        let failed = failed_inserts.load(Ordering::Relaxed);
+
+        println!("\n=== Insert Phase Results ===");
+        println!("Duration: {:?}", duration);
+        println!("Successful inserts: {}", successful);
+        println!("Failed inserts: {}", failed);
+        println!(
+            "Throughput: {:.2} records/sec",
+            successful as f64 / duration.as_secs_f64()
+        );
+
+        // Print all errors if any
+        let errors = error_details.lock();
+        if !errors.is_empty() {
+            println!("\n=== Errors Encountered ===");
+            for err in errors.iter() {
+                println!("{}", err);
+            }
+        }
+
+        // Verify all inserts succeeded
+        if successful != total_records || failed != 0 {
+            panic!(
+                "Expected {} successful inserts, got {}. Failed: {}",
+                total_records, successful, failed
+            );
+        }
+
+        // Verification phase: read back all records concurrently
+        println!("\n=== Verification Phase ===");
+        let verify_start = std::time::Instant::now();
+        let verification_errors = Arc::new(AtomicUsize::new(0));
+        let verify_error_details = Arc::new(Mutex::new(Vec::new()));
+
+        let chunks: Vec<_> = all_record_ptrs
+            .chunks(all_record_ptrs.len() / num_threads)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        let mut verify_handles = vec![];
+
+        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+            let heap_file_clone = heap_file.clone();
+            let errors_clone = verification_errors.clone();
+            let verify_error_details_clone = verify_error_details.clone();
+
+            let handle = thread::spawn(move || {
+                for (idx, (ptr, expected_id, expected_name)) in chunk.iter().enumerate() {
+                    match heap_file_clone.record(ptr) {
+                        Ok(record) => {
+                            if record.fields.len() != 2 {
+                                println!(
+                                    "[Verify chunk {}] Wrong field count at idx {}: expected 2, got {}",
+                                    chunk_idx,
+                                    idx,
+                                    record.fields.len()
+                                );
+                                errors_clone.fetch_add(1, Ordering::Relaxed);
+                                verify_error_details_clone.lock().push(format!(
+                                    "Chunk {} idx {}: wrong field count",
+                                    chunk_idx, idx
+                                ));
+                                continue;
+                            }
+
+                            match &record.fields[0] {
+                                Field::Int32(id) if *id == *expected_id => {}
+                                Field::Int32(id) => {
+                                    println!(
+                                        "[Verify chunk {}] Wrong ID at idx {}: expected {}, got {}",
+                                        chunk_idx, idx, expected_id, id
+                                    );
+                                    errors_clone.fetch_add(1, Ordering::Relaxed);
+                                    verify_error_details_clone
+                                        .lock()
+                                        .push(format!("Chunk {} idx {}: wrong ID", chunk_idx, idx));
+                                    continue;
+                                }
+                                _ => {
+                                    println!(
+                                        "[Verify chunk {}] Wrong field type at idx {}: expected Int32",
+                                        chunk_idx, idx
+                                    );
+                                    errors_clone.fetch_add(1, Ordering::Relaxed);
+                                    verify_error_details_clone.lock().push(format!(
+                                        "Chunk {} idx {}: wrong field type",
+                                        chunk_idx, idx
+                                    ));
+                                    continue;
+                                }
+                            }
+
+                            match &record.fields[1] {
+                                Field::String(name) if name == expected_name => {}
+                                Field::String(name) => {
+                                    println!(
+                                        "[Verify chunk {}] Wrong name at idx {}: expected {}, got {}",
+                                        chunk_idx, idx, expected_name, name
+                                    );
+                                    errors_clone.fetch_add(1, Ordering::Relaxed);
+                                    verify_error_details_clone.lock().push(format!(
+                                        "Chunk {} idx {}: wrong name",
+                                        chunk_idx, idx
+                                    ));
+                                }
+                                _ => {
+                                    println!(
+                                        "[Verify chunk {}] Wrong field type at idx {}: expected String",
+                                        chunk_idx, idx
+                                    );
+                                    errors_clone.fetch_add(1, Ordering::Relaxed);
+                                    verify_error_details_clone.lock().push(format!(
+                                        "Chunk {} idx {}: wrong field type for name",
+                                        chunk_idx, idx
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!(
+                                "[Verify chunk {}] Failed to read at idx {} (page_id={}, slot_id={}): {}",
+                                chunk_idx, idx, ptr.page_id, ptr.slot_id, e
+                            );
+                            errors_clone.fetch_add(1, Ordering::Relaxed);
+                            verify_error_details_clone.lock().push(format!(
+                                "Chunk {} idx {}: read failed: {}",
+                                chunk_idx, idx, e
+                            ));
+                        }
+                    }
+                }
+            });
+
+            verify_handles.push(handle);
+        }
+
+        for handle in verify_handles {
+            handle.join().unwrap();
+        }
+
+        let verify_duration = verify_start.elapsed();
+        let errors = verification_errors.load(Ordering::Relaxed);
+
+        println!("Verification duration: {:?}", verify_duration);
+        println!("Verification errors: {}", errors);
+        println!(
+            "Read throughput: {:.2} records/sec",
+            total_records as f64 / verify_duration.as_secs_f64()
+        );
+
+        // Print verification errors if any
+        let verify_errors = verify_error_details.lock();
+        if !verify_errors.is_empty() {
+            println!("\n=== Verification Errors ===");
+            for err in verify_errors.iter() {
+                println!("{}", err);
+            }
+        }
+
+        assert_eq!(errors, 0, "Found {} verification errors", errors);
+
+        // Verify all_records returns correct count
+        let all_records = heap_file.all_records().unwrap();
+        assert_eq!(all_records.len(), total_records);
+
+        // Verify no duplicate IDs
+        let mut seen_ids = HashSet::new();
+        for record in &all_records {
+            match &record.fields[0] {
+                Field::Int32(id) => {
+                    assert!(seen_ids.insert(*id), "Found duplicate record ID: {}", id);
+                }
+                _ => panic!("Expected Int32 field"),
+            }
+        }
+
+        println!("\n=== Test Passed ===");
     }
 }

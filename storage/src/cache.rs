@@ -311,9 +311,12 @@ impl Cache {
     fn get_pinned_frame(&self, id: &FilePageRef) -> Result<Arc<PageFrame>, CacheError> {
         if let Some(frame) = self.frames.get(id) {
             frame.pin();
+            let f = frame.clone();
+            // Explicitly drop the reference to release the shard lock before acquiring LRU lock
+            // to avoid deadlocks (LRU lock -> Shard lock in eviction vs Shard lock -> LRU lock here)
+            drop(frame);
             self.push_to_lru(id);
-            let frame = frame.clone();
-            return Ok(frame);
+            return Ok(f);
         }
 
         let pf = self.files.get_or_open_new_file(&id.file_key)?;
@@ -322,32 +325,34 @@ impl Cache {
 
         // This entry() locks exclusively the slot in `frames`, so when we are inside this match statement we are sure that no other thread will modify it.
         // Check here: https://docs.rs/dashmap/6.1.0/src/dashmap/lib.rs.html#1185-1204
-        let frame = match self.frames.entry(id.clone()) {
+        let (frame, inserted) = match self.frames.entry(id.clone()) {
             Entry::Occupied(occupied_entry) => {
                 // Already inserted by other thread.
                 // We don't want to reinsert it, as we will lose the information about [`PageFrame::pin_count`]. We need to get the already existing entry and
                 // update its pin count.
                 let existing = occupied_entry.get().clone();
                 existing.pin();
-                self.push_to_lru(id);
-                existing
+                (existing, false)
             }
             Entry::Vacant(vacant_entry) => {
                 // Not yet inserted.
                 // Pin immediately so it's not evicted right after insertion.
                 new_frame.pin();
                 vacant_entry.insert(new_frame.clone());
-
-                if self.frames.len() > self.capacity && !self.try_evict_frame()? {
-                    warn!(
-                        "Cache: cannot evict frame - every frame in cache is pinned or lru is empty."
-                    );
-                }
-
-                self.push_to_lru(id);
-                new_frame
+                (new_frame, true)
             }
         };
+
+        if inserted {
+            // We call this outside of the `frames` lock to avoid deadlocks.
+            if self.frames.len() > self.capacity && !self.try_evict_frame()? {
+                warn!(
+                    "Cache: cannot evict frame - every frame in cache is pinned or lru is empty."
+                );
+            }
+        }
+
+        self.push_to_lru(id);
         Ok(frame)
     }
 
@@ -387,6 +392,12 @@ impl Cache {
     where
         F: FnOnce(&FilePageRef, &Arc<PageFrame>) -> bool,
     {
+        // We need to lock the file to prevent race with get_pinned_frame loading from disk.
+        // If we don't lock here, get_pinned_frame might load the page from disk (which is old)
+        // just after we removed it from frames but before we flushed it.
+        let pf = self.files.get_or_open_new_file(&victim_id.file_key)?;
+        let file_lock = pf.lock();
+
         // `remove_if` exclusively locks shard that contains the frame. This means that `predicate` can assume that while it's running
         // no other thread is capable of editing the frame
         // Check here: https://docs.rs/dashmap/6.1.0/src/dashmap/lib.rs.html#978-1000
@@ -398,16 +409,7 @@ impl Cache {
             if !frame.dirty.load(Ordering::Acquire) {
                 return Ok(true);
             }
-            // We lock the file here so that we are sure that no other thread will access this file while we are flushing it.
-            // Other thread will not be able to access it, as we have a exclusive lock on shard that holds this element in dashmap.
-            // When getting page from file (look at [`Cache::get_pinned_frame`]), the order is:
-            // - get exclusive lock on the shard
-            // - lock the file
-            // If we have a exclusive lock on the shard we know other thread cannot have it, thus we are the only thread that can access this page via [`PagedFile`].
-            let pf = self
-                .files
-                .get_or_open_new_file(&frame.file_page_ref.file_key)?;
-            let file_lock = pf.lock();
+            // We pass the already acquired lock to flush_frame
             self.flush_frame(frame, file_lock)?;
             return Ok(true);
         };
@@ -948,6 +950,37 @@ mod tests {
         let page = pf_lock.read_page(pid).expect("read_page");
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&page[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xBEEFu64);
+    }
+
+    #[test]
+    fn cache_eviction_and_reload_preserves_writes() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("table1");
+
+        let cache = Cache::new(1, files.clone());
+
+        // Allocate page via cache
+        let (mut w, pid) = cache.allocate_page(&file_key).expect("allocate_page");
+        w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+        drop(w); // unpin
+
+        // Trigger eviction by loading another page
+        let pid2 = alloc_page_with_u64(&files, &file_key, 0x2222);
+        let id2 = FilePageRef {
+            page_id: pid2,
+            file_key: file_key.clone(),
+        };
+        let _p = cache.pin_read(&id2).expect("pin_read");
+
+        // Re-read the evicted page through cache
+        let r = cache.pin_read(&id).expect("pin_read evicted page");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.page()[0..8]);
         assert_eq!(u64::from_be_bytes(buf), 0xBEEFu64);
     }
 
