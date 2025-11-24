@@ -108,6 +108,7 @@ pub enum StatementType {
     DropTable,
     AlterTable,
 }
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorType {
@@ -119,8 +120,8 @@ pub enum ErrorType {
 
 #[derive(Serialize, Deserialize)]
 pub struct ColumnMetadata {
-    pub(crate) name: String,
-    pub(crate) ty: ColumnType,
+    pub name: String,
+    pub ty: ColumnType,
 }
 
 #[derive(Serialize, Deserialize)]

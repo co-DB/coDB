@@ -1,7 +1,4 @@
-﻿use crate::text_protocol::{
-    ColumnMetadata, ColumnType, Date, DateTime, ErrorType, Field, Record, Request, Response,
-    StatementType,
-};
+﻿use crate::text_protocol_mappings::IntoTextProtocol;
 use dashmap::DashMap;
 use engine::data_types::{DbDate, DbDateTime};
 use executor::{ColumnData, Executor, ExecutorError, StatementResult};
@@ -9,6 +6,7 @@ use itertools::Itertools;
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use metadata::types::Type;
 use parking_lot::RwLock;
+use protocol::text_protocol::{ErrorType, Record, Request, Response, StatementType};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -224,14 +222,17 @@ impl TextClientHandler {
             StatementResult::OperationSuccessful { rows_affected, ty } => {
                 self.send_response(Response::StatementCompleted {
                     rows_affected,
-                    statement_type: ty.into(),
+                    statement_type: ty.into_text_protocol(),
                 })
                 .await?;
             }
 
             StatementResult::SelectSuccessful { rows, columns } => {
                 self.send_response(Response::ColumnInfo {
-                    column_metadata: columns.into_iter().map(|cm| cm.into()).collect(),
+                    column_metadata: columns
+                        .into_iter()
+                        .map(|cm| cm.into_text_protocol())
+                        .collect(),
                 })
                 .await?;
 
@@ -247,8 +248,10 @@ impl TextClientHandler {
 
                 for batch in batches {
                     let count = batch.len();
-                    let mapped_records: Vec<Record> =
-                        batch.into_iter().map(|record| record.into()).collect();
+                    let mapped_records: Vec<Record> = batch
+                        .into_iter()
+                        .map(|record| record.into_text_protocol())
+                        .collect();
                     self.send_response(Response::Rows {
                         records: mapped_records,
                         count,
@@ -293,69 +296,5 @@ impl TextClientHandler {
             error_type,
         };
         self.send_response(error_response).await
-    }
-}
-
-impl From<Type> for ColumnType {
-    fn from(value: Type) -> Self {
-        match value {
-            Type::String => ColumnType::String,
-            Type::F32 => ColumnType::F32,
-            Type::F64 => ColumnType::F64,
-            Type::I32 => ColumnType::I32,
-            Type::I64 => ColumnType::I64,
-            Type::Bool => ColumnType::Bool,
-            Type::Date => ColumnType::Date,
-            Type::DateTime => ColumnType::DateTime,
-        }
-    }
-}
-
-impl From<ColumnData> for ColumnMetadata {
-    fn from(value: ColumnData) -> Self {
-        Self {
-            name: value.name,
-            ty: value.ty.into(),
-        }
-    }
-}
-
-impl From<engine::record::Record> for Record {
-    fn from(value: engine::record::Record) -> Self {
-        Self {
-            fields: value.fields.into_iter().map(|field| field.into()).collect(),
-        }
-    }
-}
-
-impl From<engine::record::Field> for Field {
-    fn from(value: engine::record::Field) -> Self {
-        match value {
-            engine::record::Field::Int32(i) => Field::Int32(i),
-            engine::record::Field::Int64(i) => Field::Int64(i),
-            engine::record::Field::Float32(f) => Field::Float32(f),
-            engine::record::Field::Float64(f) => Field::Float64(f),
-            engine::record::Field::DateTime(dt) => Field::DateTime(dt.into()),
-            engine::record::Field::Date(d) => Field::Date(d.into()),
-            engine::record::Field::String(s) => Field::String(s),
-            engine::record::Field::Bool(b) => Field::Bool(b),
-        }
-    }
-}
-
-impl From<DbDateTime> for DateTime {
-    fn from(value: DbDateTime) -> Self {
-        Self {
-            days_since_epoch: value.days_since_epoch(),
-            milliseconds_since_midnight: value.milliseconds_since_midnight(),
-        }
-    }
-}
-
-impl From<DbDate> for Date {
-    fn from(value: DbDate) -> Self {
-        Self {
-            days_since_epoch: value.days_since_epoch(),
-        }
     }
 }
