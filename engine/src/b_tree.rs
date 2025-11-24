@@ -843,6 +843,7 @@ mod test {
         reader.join().unwrap();
     }
 
+    #[ignore = "TODO: need to figure out better way to handle benchmark tests"]
     #[test]
     fn benchmark_concurrent_inserts_random() {
         use rand::{rng, seq::SliceRandom};
