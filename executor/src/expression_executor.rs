@@ -129,9 +129,9 @@ where
         let expr = self.execute_expression(unary.expression)?;
         let value = expr.as_ref();
         let result = match unary.op {
-            UnaryOperator::Plus => self.make_positive(value)?,
-            UnaryOperator::Minus => self.make_negative(value)?,
-            UnaryOperator::Bang => self.logical_bang(value)?,
+            UnaryOperator::Plus => self.identity(value)?,
+            UnaryOperator::Minus => self.negate(value)?,
+            UnaryOperator::Bang => self.logical_negate(value)?,
         };
         Ok(Cow::Owned(result))
     }
@@ -286,7 +286,7 @@ where
     }
 
     /// Computes `!value`.
-    fn logical_bang(&self, value: &Field) -> Result<Field, InternalExecutorError> {
+    fn logical_negate(&self, value: &Field) -> Result<Field, InternalExecutorError> {
         let value = value
             .as_bool()
             .ok_or(error_factory::unexpected_type("bool", value))?;
@@ -294,18 +294,18 @@ where
     }
 
     /// Computes `+value`.
-    fn make_positive(&self, value: &Field) -> Result<Field, InternalExecutorError> {
+    fn identity(&self, value: &Field) -> Result<Field, InternalExecutorError> {
         match value {
-            Field::Int32(value) => Ok(Field::Int32(value.abs())),
-            Field::Int64(value) => Ok(Field::Int64(value.abs())),
-            Field::Float32(value) => Ok(Field::Float32(value.abs())),
-            Field::Float64(value) => Ok(Field::Float64(value.abs())),
+            Field::Int32(value) => Ok(Field::Int32(*value)),
+            Field::Int64(value) => Ok(Field::Int64(*value)),
+            Field::Float32(value) => Ok(Field::Float32(*value)),
+            Field::Float64(value) => Ok(Field::Float64(*value)),
             _ => Err(error_factory::unexpected_type("any numeric type", value)),
         }
     }
 
     /// Computes `-value`.
-    fn make_negative(&self, value: &Field) -> Result<Field, InternalExecutorError> {
+    fn negate(&self, value: &Field) -> Result<Field, InternalExecutorError> {
         match value {
             Field::Int32(value) => Ok(Field::Int32(-value)),
             Field::Int64(value) => Ok(Field::Int64(-value)),
