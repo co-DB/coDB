@@ -1,7 +1,7 @@
 ﻿use crate::text_client_handler::TextClientHandler;
 use dashmap::DashMap;
 use executor::Executor;
-use log::error;
+use log::{error, info};
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use parking_lot::RwLock;
 use std::net::SocketAddr;
@@ -16,12 +16,14 @@ pub(crate) enum ServerError {
     #[error("error occurred while using catalog manager: {0}")]
     CatalogManagerError(#[from] CatalogManagerError),
 }
+
 pub(crate) struct Server {
     binary_addr: SocketAddr,
     text_addr: SocketAddr,
     catalog_manager: Arc<RwLock<CatalogManager>>,
     executors: Arc<DashMap<String, Arc<Executor>>>,
 }
+
 impl Server {
     pub(crate) fn new(binary_addr: SocketAddr, text_addr: SocketAddr) -> Result<Self, ServerError> {
         Ok(Self {
@@ -33,59 +35,30 @@ impl Server {
     }
 
     pub(crate) async fn run_loop(&self) -> Result<(), ServerError> {
-        let text_listener = TcpListener::bind(self.text_addr).await?;
-        let binary_listener = TcpListener::bind(self.binary_addr).await?;
+        self.start_listener(
+            self.text_addr,
+            self.executors.clone(),
+            self.catalog_manager.clone(),
+            |socket, executors, manager| {
+                tokio::spawn(async move {
+                    let handler = TextClientHandler::new(socket, executors, manager);
+                    handler.run().await;
+                });
+            },
+        )
+        .await?;
 
-        let text_executors = self.executors.clone();
-        let catalog_manager = self.catalog_manager.clone();
-
-        println!(
-            "Listening to text protocol communication on {}",
-            self.text_addr
-        );
-        tokio::spawn(async move {
-            loop {
-                match text_listener.accept().await {
-                    Ok((socket, addr)) => {
-                        println!("Accepted connection from {}", addr);
-                        let handler = TextClientHandler::new(
-                            socket,
-                            text_executors.clone(),
-                            catalog_manager.clone(),
-                        );
-                        tokio::spawn(async move {
-                            handler.run().await;
-                        });
-                    }
-                    Err(err) => {
-                        error!("Error while handling text protocol client: {}", err);
-                    }
-                }
-            }
-        });
-
-        let binary_executors = self.executors.clone();
-        let catalog_manager = self.catalog_manager.clone();
-        println!(
-            "Listening to binary protocol communication on {}",
-            self.binary_addr
-        );
-        tokio::spawn(async move {
-            loop {
-                match binary_listener.accept().await {
-                    Ok((socket, _)) => {
-                        let exec = binary_executors.clone();
-                        let manager = catalog_manager.clone();
-                        tokio::spawn(async move {
-                            let _ = Self::handle_binary_client(socket, exec, manager).await;
-                        });
-                    }
-                    Err(err) => {
-                        error!("Error while handling binary protocol client: {}", err);
-                    }
-                }
-            }
-        });
+        self.start_listener(
+            self.binary_addr,
+            self.executors.clone(),
+            self.catalog_manager.clone(),
+            |socket, executors, manager| {
+                tokio::spawn(async move {
+                    let _ = Self::handle_binary_client(socket, executors, manager).await;
+                });
+            },
+        )
+        .await?;
 
         tokio::signal::ctrl_c()
             .await
@@ -94,11 +67,50 @@ impl Server {
         Ok(())
     }
 
-    // TODO: Move that to its own file and create it similarly to text client handler.
+    async fn start_listener<F>(
+        &self,
+        addr: SocketAddr,
+        executors: Arc<DashMap<String, Arc<Executor>>>,
+        catalog_manager: Arc<RwLock<CatalogManager>>,
+        handler: F,
+    ) -> Result<(), ServerError>
+    where
+        F: Fn(TcpStream, Arc<DashMap<String, Arc<Executor>>>, Arc<RwLock<CatalogManager>>)
+            + Send
+            + Sync
+            + 'static,
+    {
+        let listener = TcpListener::bind(addr).await?;
+        info!("Listening on {}", addr);
+
+        let handler = Arc::new(handler);
+
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, addr)) => {
+                        info!("Accepted connection from {}", addr);
+                        let h = handler.clone();
+                        let exec = executors.clone();
+                        let manager = catalog_manager.clone();
+
+                        h(socket, exec, manager);
+                    }
+                    Err(err) => {
+                        error!("Error while accepting connection on {}: {}", addr, err);
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     async fn handle_binary_client(
         _socket: TcpStream,
         _executors: Arc<DashMap<String, Arc<Executor>>>,
         _catalog_manager: Arc<RwLock<CatalogManager>>,
     ) {
+        // ...
     }
 }
