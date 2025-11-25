@@ -215,9 +215,11 @@ impl TextClientHandler {
 
     fn get_or_create_executor(
         &self,
-        database: impl AsRef<str> + Into<String>,
+        database: impl AsRef<str> + Into<String> + Clone,
     ) -> Result<Arc<Executor>, ClientError> {
-        match self.executors.entry(database.as_ref()) {
+        let database_key = database.clone().into();
+
+        match self.executors.entry(database_key) {
             Entry::Occupied(executor) => Ok(executor.get().clone()),
             Entry::Vacant(vacant_entry) => {
                 let (catalog, main_path) = {
