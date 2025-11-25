@@ -366,14 +366,9 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 .runtime_error(format!("Failed to create table: {}", err));
         }
 
-        match catalog.sync_to_disk() {
-            Ok(_) => StatementResult::OperationSuccessful {
-                rows_affected: 0,
-                ty: StatementType::Create,
-            },
-            Err(err) => self
-                .executor
-                .runtime_error(format!("Failed to save catalog content to disk: {err}")),
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Create,
         }
     }
 
