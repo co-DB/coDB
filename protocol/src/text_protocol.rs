@@ -12,7 +12,8 @@
 ///    - `StatementCompleted` - Statement finished with row count and type
 /// 3. `QueryCompleted` - All statements in the query finished
 ///
-/// Errors can occur at any stage of the response and
+/// Errors can occur at any stage of the response and will be communicated immediately via an
+/// `Error` response. When an error occurs, no further responses for the current query will be sent.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -115,7 +116,8 @@ pub enum ErrorType {
     Query,
     Execution,
     Catalog,
-    Communication,
+    Network,
+    InvalidRequest,
 }
 
 #[derive(Serialize, Deserialize)]

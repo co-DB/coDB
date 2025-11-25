@@ -1,12 +1,14 @@
 ﻿use crate::text_protocol_mappings::IntoTextProtocol;
 use dashmap::DashMap;
-use engine::data_types::{DbDate, DbDateTime};
-use executor::{ColumnData, Executor, ExecutorError, StatementResult};
+use engine::record::Record as EngineRecord;
+use executor::response::StatementResult;
+use executor::{Executor, ExecutorError};
 use itertools::Itertools;
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
-use metadata::types::Type;
 use parking_lot::RwLock;
-use protocol::text_protocol::{ErrorType, Record, Request, Response, StatementType};
+use protocol::text_protocol::{
+    ErrorType, Record as ProtocolRecord, Request, Response, StatementType,
+};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -39,6 +41,9 @@ enum ClientError {
     #[error("no database selected")]
     NoDatabaseSelected,
 
+    #[error("database '{0}' does not exist")]
+    DatabaseDoesNotExist(String),
+
     #[error("catalog error: {0}")]
     CatalogError(#[from] CatalogManagerError),
 
@@ -49,9 +54,10 @@ enum ClientError {
 impl ClientError {
     fn to_error_type(&self) -> ErrorType {
         match self {
-            ClientError::InvalidJson(_) => ErrorType::Communication,
-            ClientError::IoError(_) => ErrorType::Communication,
-            ClientError::NoDatabaseSelected => ErrorType::Communication,
+            ClientError::InvalidJson(_) => ErrorType::InvalidRequest,
+            ClientError::NoDatabaseSelected => ErrorType::InvalidRequest,
+            ClientError::DatabaseDoesNotExist(_) => ErrorType::InvalidRequest,
+            ClientError::IoError(_) => ErrorType::Network,
             ClientError::CatalogError(_) => ErrorType::Catalog,
             ClientError::ExecutorError(_) => ErrorType::Execution,
         }
@@ -59,6 +65,10 @@ impl ClientError {
 }
 
 impl TextClientHandler {
+    const CHANNEL_BUFFER_CAPACITY: usize = 16;
+
+    const ROWS_CHUNK_SIZE: usize = 10000;
+
     pub(crate) fn new(
         socket: TcpStream,
         executors: Arc<DashMap<String, Arc<Executor>>>,
@@ -129,6 +139,10 @@ impl TextClientHandler {
                 self.catalog_manager
                     .write()
                     .delete_database(&database_name)?;
+                self.executors.remove(&database_name);
+                if self.current_database.as_deref() == Some(&database_name) {
+                    self.current_database = None;
+                }
                 self.send_response(Response::DatabaseDeleted { database_name })
                     .await?;
             }
@@ -143,6 +157,10 @@ impl TextClientHandler {
             }
 
             Request::Connect { database_name } => {
+                let database_exists = self.catalog_manager.read().database_exists(&database_name);
+                if !database_exists {
+                    return Err(ClientError::DatabaseDoesNotExist(database_name));
+                }
                 self.current_database = Some(database_name.clone());
                 self.send_response(Response::Connected { database_name })
                     .await?;
@@ -172,9 +190,10 @@ impl TextClientHandler {
 
         let executor = self.get_or_create_executor(&database)?;
 
-        let (sender, mut receiver) = mpsc::channel::<StatementResult>(16);
+        let (sender, mut receiver) =
+            mpsc::channel::<StatementResult>(Self::CHANNEL_BUFFER_CAPACITY);
 
-        tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             for result in executor.execute(&sql) {
                 if sender.blocking_send(result).is_err() {
                     break;
@@ -183,7 +202,10 @@ impl TextClientHandler {
         });
 
         while let Some(result) = receiver.recv().await {
-            self.handle_statement_result(result).await?;
+            if let Err(e) = self.handle_statement_result(result).await {
+                handle.abort();
+                return Err(e);
+            }
         }
 
         self.send_response(Response::QueryCompleted).await?;
@@ -237,27 +259,8 @@ impl TextClientHandler {
                 .await?;
 
                 let rows_affected = rows.len();
-                const CHUNK_SIZE: usize = 10_000;
 
-                let batches: Vec<Vec<_>> = rows
-                    .into_iter()
-                    .chunks(CHUNK_SIZE)
-                    .into_iter()
-                    .map(|chunk| chunk.collect::<Vec<_>>())
-                    .collect();
-
-                for batch in batches {
-                    let count = batch.len();
-                    let mapped_records: Vec<Record> = batch
-                        .into_iter()
-                        .map(|record| record.into_text_protocol())
-                        .collect();
-                    self.send_response(Response::Rows {
-                        records: mapped_records,
-                        count,
-                    })
-                    .await?;
-                }
+                self.batch_send_rows(rows).await?;
 
                 self.send_response(Response::StatementCompleted {
                     rows_affected,
@@ -278,6 +281,28 @@ impl TextClientHandler {
         Ok(())
     }
 
+    async fn batch_send_rows(&mut self, rows: Vec<EngineRecord>) -> Result<(), ClientError> {
+        let batches: Vec<Vec<_>> = rows
+            .into_iter()
+            .chunks(Self::ROWS_CHUNK_SIZE)
+            .into_iter()
+            .map(|chunk| chunk.collect::<Vec<_>>())
+            .collect();
+
+        for batch in batches {
+            let count = batch.len();
+            let mapped_records: Vec<ProtocolRecord> = batch
+                .into_iter()
+                .map(|record| record.into_text_protocol())
+                .collect();
+            self.send_response(Response::Rows {
+                records: mapped_records,
+                count,
+            })
+            .await?;
+        }
+        Ok(())
+    }
     async fn send_response(&mut self, response: Response) -> Result<(), ClientError> {
         let json = serde_json::to_string(&response)?;
         self.writer.write_all(json.as_bytes()).await?;

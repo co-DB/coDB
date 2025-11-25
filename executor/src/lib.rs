@@ -2,7 +2,7 @@ mod consts;
 mod error_factory;
 mod expression_executor;
 mod iterators;
-mod response;
+pub mod response;
 mod statement_executor;
 
 use std::{path::Path, sync::Arc};

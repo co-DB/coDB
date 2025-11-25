@@ -86,10 +86,14 @@ impl Server {
             }
         });
 
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
+
         Ok(())
     }
 
-    // TODO: Move that to its own file and create it similiarly to text client handler.
+    // TODO: Move that to its own file and create it similarly to text client handler.
     async fn handle_binary_client(
         _socket: TcpStream,
         _executors: Arc<DashMap<String, Arc<Executor>>>,

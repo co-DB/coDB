@@ -12,11 +12,5 @@ async fn main() -> Result<(), ServerError> {
 
     server.run_loop().await?;
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for Ctrl+C");
-
-    println!("Shutting down...");
-
     Ok(())
 }
