@@ -1,3 +1,16 @@
-fn main() {
-    println!("Hello server!");
+mod server;
+mod text_client_handler;
+mod text_protocol_mappings;
+
+use crate::server::{Server, ServerError};
+#[tokio::main]
+async fn main() -> Result<(), ServerError> {
+    let server = Server::new(
+        "0.0.0.0:5432".parse().unwrap(),
+        "0.0.0.0:5433".parse().unwrap(),
+    )?;
+
+    server.run_loop().await?;
+
+    Ok(())
 }
