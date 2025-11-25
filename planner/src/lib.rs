@@ -11,7 +11,7 @@ use crate::{
 mod analyzer;
 mod ast;
 mod lexer;
-mod operators;
+pub mod operators;
 mod parser;
 pub mod query_plan;
 mod query_planner;

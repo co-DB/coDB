@@ -101,7 +101,7 @@ pub enum Field {
 }
 
 impl Field {
-    pub(crate) fn ty(&self) -> Type {
+    pub fn ty(&self) -> Type {
         match self {
             Field::Int32(_) => Type::I32,
             Field::Int64(_) => Type::I64,
@@ -191,6 +191,62 @@ impl Field {
             Type::Date => Self::deserialize_and_wrap(buffer, Field::Date, name),
             Type::DateTime => Self::deserialize_and_wrap(buffer, Field::DateTime, name),
             Type::String => Self::deserialize_and_wrap(buffer, Field::String, name),
+        }
+    }
+
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Field::Int32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Field::Int64(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Field::Float32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Field::Float64(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            Field::String(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Field::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_date(&self) -> Option<&DbDate> {
+        match self {
+            Field::Date(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_datetime(&self) -> Option<&DbDateTime> {
+        match self {
+            Field::DateTime(v) => Some(v),
+            _ => None,
         }
     }
 }
