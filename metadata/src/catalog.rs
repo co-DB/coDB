@@ -2,17 +2,15 @@
 
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs::{self},
+    io::{self},
     path::{Path, PathBuf},
-    time,
 };
 
 use crate::consts::METADATA_FILE_NAME;
 use crate::metadata_file_helper::MetadataFileHelper;
 use crate::types::Type;
 
-use crate::catalog_manager::CatalogManagerError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -51,7 +49,6 @@ pub enum CatalogError {
 }
 
 // TODO: Add updating columns
-// TODO (2): Make table level api (column CRUD) callable from Catalog level
 impl Catalog {
     /// Creates new instance of [`Catalog`] for database `database_name`.
     /// Can fail if database does not exist or io error occurs.
@@ -87,6 +84,16 @@ impl Catalog {
             .cloned()
     }
 
+    /// Returns mutable reference to table. Only for internal usage.
+    fn table_mut<'c>(
+        &'c mut self,
+        table_name: &str,
+    ) -> Result<&'c mut TableMetadata, CatalogError> {
+        self.tables
+            .get_mut(table_name)
+            .ok_or(CatalogError::TableNotFound(table_name.into()))
+    }
+
     /// Adds `table` to list of tables in the catalog.
     /// IMPORTANT NOTE: this function is purely for changing contents of metadata file. It is NOT responsible for managing table related files (e.g. creating new b-tree).
     /// Can fail if table with same name already exists.
@@ -96,24 +103,59 @@ impl Catalog {
             true => Err(CatalogError::TableAlreadyExists(table.name)),
             false => {
                 self.tables.insert(table.name.clone(), table);
+                self.sync_to_disk()?;
                 Ok(())
             }
         }
     }
 
     /// Removes table with `table_name` name from list of tables in the catalog.
-    /// IMPORTANT NOTE: this function is purely for changing contents of metadata file. It is NOT responsible for managing table related files (e.g. removing folder `.{PATH_TO_CODB}/{DATABASE_NAME}/{TABLE_NAME}` and its files).
+    /// IMPORTANT NOTE: this function is purely for changing contents of metadata file. It is NOT responsible for managing table related files (e.g. removing folder `{PATH_TO_CODB}/{DATABASE_NAME}/{TABLE_NAME}` and its files).
     /// Can fail if table with `table_name` does not exist.
     pub fn remove_table(&mut self, table_name: &str) -> Result<(), CatalogError> {
         self.tables
             .remove(table_name)
             .ok_or(CatalogError::TableNotFound(table_name.into()))
-            .map(|_| ())
+            .map(|_| ())?;
+        self.sync_to_disk()?;
+        Ok(())
+    }
+
+    /// Adds column to the table.
+    /// It works by delegating this to [`TableMetadata::add_column`].
+    ///
+    /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
+    /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
+    pub fn add_column(
+        &mut self,
+        table_name: impl AsRef<str>,
+        column_metadata: ColumnMetadata,
+    ) -> Result<(), CatalogError> {
+        let table = self.table_mut(table_name.as_ref())?;
+        table.add_column(column_metadata)?;
+        self.sync_to_disk()?;
+        Ok(())
+    }
+
+    /// Removes column to the table.
+    /// It works by delegating this to [`TableMetadata::remove_column`].
+    ///
+    /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
+    /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
+    pub fn remove_column(
+        &mut self,
+        table_name: impl AsRef<str>,
+        column_name: impl AsRef<str>,
+    ) -> Result<(), CatalogError> {
+        let table = self.table_mut(table_name.as_ref())?;
+        table.remove_column(column_name.as_ref())?;
+        self.sync_to_disk()?;
+        Ok(())
     }
 
     /// Syncs in-memory [`Catalog`] instance with underlying file.
     /// Can fail if io error occurs.
-    pub fn sync_to_disk(&mut self) -> Result<(), CatalogError> {
+    fn sync_to_disk(&mut self) -> Result<(), CatalogError> {
         MetadataFileHelper::sync_to_disk(&self.file_path, self, |catalog| {
             let catalog_json = CatalogJson::from(catalog);
             Ok(serde_json::to_string_pretty(&catalog_json)?)
@@ -206,7 +248,7 @@ impl TableMetadata {
     /// Adds new column to the table.
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with same name already exists.
-    pub fn add_column(&mut self, column: ColumnMetadata) -> Result<(), TableMetadataError> {
+    fn add_column(&mut self, column: ColumnMetadata) -> Result<(), TableMetadataError> {
         let already_exists = self.columns_by_name.contains_key(&column.name);
         match already_exists {
             true => Err(TableMetadataError::ColumnAlreadyExists(column.name)),
@@ -222,7 +264,7 @@ impl TableMetadata {
     /// Removes column from the table.
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with provided name does not exist or the column is primary key.
-    pub fn remove_column(&mut self, column_name: &str) -> Result<(), TableMetadataError> {
+    fn remove_column(&mut self, column_name: &str) -> Result<(), TableMetadataError> {
         if column_name == self.primary_key_column_name() {
             return Err(TableMetadataError::InvalidColumnUsed(column_name.into()));
         }
@@ -435,7 +477,10 @@ impl TryFrom<ColumnJson> for ColumnMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::{
+        mem,
+        time::{Duration, SystemTime},
+    };
 
     use super::*;
     use crate::consts::METADATA_FILE_NAME;
@@ -510,7 +555,7 @@ mod tests {
             tables: tables.values().map(TableJson::from).collect(),
         };
         let content = serde_json::to_string_pretty(&catalog_json).unwrap();
-        std::fs::write(&path, content).unwrap();
+        fs::write(&path, content).unwrap();
 
         Catalog {
             file_path: path,
@@ -519,13 +564,14 @@ mod tests {
     }
 
     // Helper to write json to path
-    fn write_json<P: AsRef<std::path::Path>>(path: P, json: &str) {
-        std::fs::write(path, json).unwrap();
+    fn write_json(path: impl AsRef<Path>, json: &str) {
+        fs::write(path, json).unwrap();
     }
 
     // Helper to create path for tmp file
-    fn tmp_path(dir: &std::path::Path, db: &str, epoch: u64) -> std::path::PathBuf {
-        dir.join(db)
+    fn tmp_path(dir: impl AsRef<Path>, db: &str, epoch: u64) -> PathBuf {
+        dir.as_ref()
+            .join(db)
             .join(format!("{}.tmp-{epoch}", METADATA_FILE_NAME))
     }
 
@@ -539,9 +585,9 @@ mod tests {
     }
 
     // Helper to check if no tmp files are in the directory
-    fn assert_no_tmp_files(dir: &std::path::Path, db: &str) {
+    fn assert_no_tmp_files(dir: impl AsRef<Path>, db: &str) {
         let prefix = format!("{}.tmp-", METADATA_FILE_NAME);
-        let db_dir = dir.join(db);
+        let db_dir = dir.as_ref().join(db);
         for entry in fs::read_dir(&db_dir).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -555,8 +601,8 @@ mod tests {
     // Helper to check if error variant is as expected
     fn assert_catalog_error_variant(actual: &CatalogError, expected: &CatalogError) {
         assert_eq!(
-            std::mem::discriminant(actual),
-            std::mem::discriminant(expected),
+            mem::discriminant(actual),
+            mem::discriminant(expected),
             "CatalogError variant does not match"
         );
     }
@@ -582,9 +628,9 @@ mod tests {
         // given file with invalid json
         let tmp_dir = tempfile::tempdir().unwrap();
         let db_dir = tmp_dir.path().join("db");
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
-        std::fs::write(&db_path, b"not a json").unwrap();
+        fs::write(&db_path, b"not a json").unwrap();
 
         // when creating catalog
         let result = Catalog::new(&tmp_dir, "db");
@@ -602,9 +648,9 @@ mod tests {
         // given file with valid json but not CatalogJson
         let tmp_dir = tempfile::tempdir().unwrap();
         let db_dir = tmp_dir.path().join("db");
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
-        std::fs::write(&db_path, b"{\"foo\": 123}").unwrap();
+        fs::write(&db_path, b"{\"foo\": 123}").unwrap();
 
         // when creating catalog
         let result = Catalog::new(&tmp_dir, "db");
@@ -622,7 +668,7 @@ mod tests {
         // given file with valid CatalogJson
         let tmp_dir = tempfile::tempdir().unwrap();
         let db_dir = tmp_dir.path().join("db");
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let json = r#"
@@ -676,7 +722,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let db = "db";
         let db_dir = tmp_dir.path().join(db);
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let main_json = r#"{
@@ -731,7 +777,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let db = "db";
         let db_dir = tmp_dir.path().join(db);
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let main_json = r#"{
@@ -802,7 +848,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let db = "db";
         let db_dir = tmp_dir.path().join(db);
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let main_json = r#"{
@@ -865,7 +911,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let db = "db";
         let db_dir = tmp_dir.path().join(db);
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let main_json = r#"{
@@ -910,7 +956,7 @@ mod tests {
         // given file with a column that has invalid base_offset_pos > pos
         let tmp_dir = tempfile::tempdir().unwrap();
         let db_dir = tmp_dir.path().join("db");
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let json = r#"
@@ -946,7 +992,7 @@ mod tests {
         // given file with a table that has duplicate column names
         let tmp_dir = tempfile::tempdir().unwrap();
         let db_dir = tmp_dir.path().join("db");
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let json = r#"
@@ -1013,8 +1059,13 @@ mod tests {
     #[test]
     fn catalog_add_table_adds_new_table() {
         // given empty catalog and a new table
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+
         let tables = HashMap::new();
-        let mut c = in_memory_catalog(tables);
+        let mut c = file_backed_catalog(db_path.clone(), tables);
         let users = users_table();
 
         // when adding table
@@ -1023,6 +1074,14 @@ mod tests {
         // then table is present
         assert!(result.is_ok());
         assert_table(&users, c.tables.get("users").unwrap());
+
+        // and flushed to disk
+        let content = fs::read_to_string(&db_path).unwrap();
+        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.tables.len(), 1);
+        assert_eq!(loaded.tables[0].name, "users");
+        assert_eq!(loaded.tables[0].columns.len(), 2);
+        assert_eq!(loaded.tables[0].primary_key_column_name, "id");
     }
 
     #[test]
@@ -1047,10 +1106,15 @@ mod tests {
     #[test]
     fn catalog_remove_table_removes_existing_table() {
         // given catalog with table `users`
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+
         let users = users_table();
         let mut tables = HashMap::new();
         tables.insert(users.name.clone(), users);
-        let mut c = in_memory_catalog(tables);
+        let mut c = file_backed_catalog(db_path.clone(), tables);
 
         // when removing table with name `users`
         let result = c.remove_table("users");
@@ -1058,6 +1122,11 @@ mod tests {
         // then Ok(()) is returned and table is removed
         assert!(result.is_ok());
         assert!(!c.tables.contains_key("users"));
+
+        // and is removed from disk
+        let content = fs::read_to_string(&db_path).unwrap();
+        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.tables.len(), 0);
     }
 
     #[test]
@@ -1065,7 +1134,7 @@ mod tests {
         // given a catalog with one table
         let tmp_dir = tempfile::tempdir().unwrap();
         let db_dir = tmp_dir.path().join("db");
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let users = users_table();
@@ -1078,7 +1147,7 @@ mod tests {
         catalog.sync_to_disk().unwrap();
 
         // then file contains expected JSON
-        let content = std::fs::read_to_string(&db_path).unwrap();
+        let content = fs::read_to_string(&db_path).unwrap();
         let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
         assert_eq!(loaded.tables.len(), 1);
         assert_eq!(loaded.tables[0].name, "users");
@@ -1087,39 +1156,64 @@ mod tests {
     }
 
     #[test]
-    fn catalog_sync_to_disk_after_adding_table() {
-        // given a catalog with one table
+    fn catalog_add_column_persists_to_disk() {
+        // given catalog with table `users`
         let tmp_dir = tempfile::tempdir().unwrap();
         let db_dir = tmp_dir.path().join("db");
-        std::fs::create_dir(&db_dir).unwrap();
+        fs::create_dir(&db_dir).unwrap();
         let db_path = db_dir.join(METADATA_FILE_NAME);
 
         let users = users_table();
         let mut tables = HashMap::new();
-        tables.insert(users.name.clone(), users.clone());
+        tables.insert(users.name.clone(), users);
+        let mut c = file_backed_catalog(db_path.clone(), tables);
 
-        let mut catalog = file_backed_catalog(db_path.clone(), tables);
+        // when adding a new column
+        let new_col = dummy_column("email", Type::String, 2);
+        let result = c.add_column("users", new_col.clone());
 
-        // sync initial state
-        catalog.sync_to_disk().unwrap();
+        // then column is added
+        assert!(result.is_ok());
+        let table = c.table("users").unwrap();
+        assert!(table.column("email").is_ok());
 
-        // add another table
-        let columns = vec![
-            dummy_column("id", Type::I32, 0),
-            dummy_column("title", Type::String, 1),
-        ];
-        let posts = dummy_table("posts", &columns, "id");
-        catalog.add_table(posts.clone()).unwrap();
-
-        // sync again
-        catalog.sync_to_disk().unwrap();
-
-        // then file contains both tables
-        let content = std::fs::read_to_string(&db_path).unwrap();
+        // and persisted to disk
+        let content = fs::read_to_string(&db_path).unwrap();
         let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
-        assert_eq!(loaded.tables.len(), 2);
-        assert!(loaded.tables.iter().any(|t| t.name == "users"));
-        assert!(loaded.tables.iter().any(|t| t.name == "posts"));
+        assert_eq!(loaded.tables.len(), 1);
+        assert_eq!(loaded.tables[0].columns.len(), 3);
+        assert!(loaded.tables[0].columns.iter().any(|c| c.name == "email"));
+    }
+
+    #[test]
+    fn catalog_remove_column_persists_to_disk() {
+        // given catalog with table `users` that has 2 columns
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+
+        let users = users_table();
+        let mut tables = HashMap::new();
+        tables.insert(users.name.clone(), users);
+        let mut c = file_backed_catalog(db_path.clone(), tables);
+
+        // when removing column "name"
+        let result = c.remove_column("users", "name");
+
+        // then column is removed
+        assert!(result.is_ok());
+        let table = c.table("users").unwrap();
+        assert!(table.column("name").is_err());
+        assert!(table.column("id").is_ok());
+
+        // and persisted to disk
+        let content = fs::read_to_string(&db_path).unwrap();
+        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.tables.len(), 1);
+        assert_eq!(loaded.tables[0].columns.len(), 1);
+        assert_eq!(loaded.tables[0].columns[0].name, "id");
+        assert!(!loaded.tables[0].columns.iter().any(|c| c.name == "name"));
     }
 
     // Helper to check if error variant is as expected
@@ -1128,8 +1222,8 @@ mod tests {
         expected: &TableMetadataError,
     ) {
         assert_eq!(
-            std::mem::discriminant(actual),
-            std::mem::discriminant(expected),
+            mem::discriminant(actual),
+            mem::discriminant(expected),
             "TableMetadataError variant does not match"
         );
     }
