@@ -1,6 +1,7 @@
 ﻿use crate::text_client_handler::TextClientHandler;
 use dashmap::DashMap;
 use executor::Executor;
+use log::error;
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use parking_lot::RwLock;
 use std::net::SocketAddr;
@@ -57,7 +58,7 @@ impl Server {
                         });
                     }
                     Err(err) => {
-                        eprintln!("Error while handling text protocol client: {}", err);
+                        error!("Error while handling text protocol client: {}", err);
                     }
                 }
             }
@@ -80,7 +81,7 @@ impl Server {
                         });
                     }
                     Err(err) => {
-                        eprintln!("Error while handling binary protocol client: {}", err);
+                        error!("Error while handling binary protocol client: {}", err);
                     }
                 }
             }

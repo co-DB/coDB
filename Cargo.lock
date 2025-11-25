@@ -705,6 +705,7 @@ dependencies = [
  "engine",
  "executor",
  "itertools",
+ "log",
  "metadata",
  "parking_lot",
  "protocol",

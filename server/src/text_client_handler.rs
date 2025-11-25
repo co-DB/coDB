@@ -4,6 +4,7 @@ use engine::record::Record as EngineRecord;
 use executor::response::StatementResult;
 use executor::{Executor, ExecutorError};
 use itertools::Itertools;
+use log::error;
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use parking_lot::RwLock;
 use protocol::text_protocol::{
@@ -89,7 +90,7 @@ impl TextClientHandler {
             match self.read_request().await {
                 Ok(ReadResult::Request(request)) => {
                     if let Err(e) = self.handle_request(request).await {
-                        eprintln!("Error handling request: {}", e);
+                        error!("Error handling request: {}", e);
                         let _ = self.send_error(e.to_string(), e.to_error_type()).await;
                     }
                 }
@@ -100,7 +101,7 @@ impl TextClientHandler {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("Error reading request: {}", e);
+                    error!("Error reading request: {}", e);
                     let _ = self.send_error(e.to_string(), e.to_error_type()).await;
                 }
             }

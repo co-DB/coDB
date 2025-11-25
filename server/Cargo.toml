@@ -10,6 +10,7 @@ metadata = { path = "../metadata" }
 engine = { path = "../engine" }
 protocol = { path = "../protocol" }
 
+
 tokio.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -17,3 +18,4 @@ serde_json.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 itertools.workspace = true
+log.workspace = true
