@@ -1,5 +1,5 @@
 ﻿use crate::text_protocol_mappings::IntoTextProtocol;
-use dashmap::DashMap;
+use dashmap::{DashMap, Entry};
 use engine::record::Record as EngineRecord;
 use executor::response::StatementResult;
 use executor::{Executor, ExecutorError};
@@ -217,24 +217,26 @@ impl TextClientHandler {
         &self,
         database: impl AsRef<str> + Into<String>,
     ) -> Result<Arc<Executor>, ClientError> {
-        if let Some(executor) = self.executors.get(database.as_ref()) {
-            return Ok(executor.value().clone());
+        match self.executors.entry(database.as_ref()) {
+            Entry::Occupied(executor) => Ok(executor.get().clone()),
+            Entry::Vacant(vacant_entry) => {
+                let (catalog, main_path) = {
+                    let catalog_guard = self.catalog_manager.read();
+                    let main_path = catalog_guard.main_directory_path();
+                    let catalog = catalog_guard.open_catalog(database.as_ref())?;
+                    (catalog, main_path)
+                };
+
+                let db_directory_path = main_path.join(database.as_ref());
+                let executor = Arc::new(
+                    Executor::new(db_directory_path, catalog)
+                        .map_err(ClientError::ExecutorError)?,
+                );
+
+                vacant_entry.insert(executor.clone());
+                Ok(executor)
+            }
         }
-
-        let (catalog, main_path) = {
-            let catalog_guard = self.catalog_manager.read();
-            let main_path = catalog_guard.main_directory_path();
-            let catalog = catalog_guard.open_catalog(database.as_ref())?;
-            (catalog, main_path)
-        };
-
-        let db_directory_path = main_path.join(database.as_ref());
-        let executor = Arc::new(
-            Executor::new(db_directory_path, catalog).map_err(ClientError::ExecutorError)?,
-        );
-
-        self.executors.insert(database.into(), executor.clone());
-        Ok(executor)
     }
 
     async fn handle_statement_result(
