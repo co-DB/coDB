@@ -488,6 +488,147 @@ mod tests {
     use serde::de::Error;
     use tempfile::NamedTempFile;
 
+    /// Test fixture that provides a file-backed catalog setup
+    struct CatalogTestFixture {
+        /// Temporary directory - must be kept alive for the duration of the test
+        _tmp_dir: tempfile::TempDir,
+        /// Path to the catalog metadata file
+        db_path: PathBuf,
+        /// The catalog instance
+        catalog: Catalog,
+    }
+
+    impl CatalogTestFixture {
+        /// Creates a new test fixture with an empty catalog
+        fn new() -> Self {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let db_dir = tmp_dir.path().join("db");
+            fs::create_dir(&db_dir).unwrap();
+            let db_path = db_dir.join(METADATA_FILE_NAME);
+
+            let tables = HashMap::new();
+            let catalog = file_backed_catalog(db_path.clone(), tables);
+
+            Self {
+                _tmp_dir: tmp_dir,
+                db_path,
+                catalog,
+            }
+        }
+
+        /// Creates a new test fixture with a catalog containing the given table
+        fn with_table(table: TableMetadata) -> Self {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let db_dir = tmp_dir.path().join("db");
+            fs::create_dir(&db_dir).unwrap();
+            let db_path = db_dir.join(METADATA_FILE_NAME);
+
+            let mut tables = HashMap::new();
+            tables.insert(table.name.clone(), table);
+            let catalog = file_backed_catalog(db_path.clone(), tables);
+
+            Self {
+                _tmp_dir: tmp_dir,
+                db_path,
+                catalog,
+            }
+        }
+
+        /// Creates a new test fixture with an in-memory catalog (no disk I/O)
+        fn in_memory() -> Self {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let tables = HashMap::new();
+            let catalog = in_memory_catalog(tables);
+
+            Self {
+                _tmp_dir: tmp_dir,
+                db_path: PathBuf::new(), // won't be used
+                catalog,
+            }
+        }
+
+        /// Creates a new test fixture with an in-memory catalog containing the given table
+        fn in_memory_with_table(table: TableMetadata) -> Self {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let mut tables = HashMap::new();
+            tables.insert(table.name.clone(), table);
+            let catalog = in_memory_catalog(tables);
+
+            Self {
+                _tmp_dir: tmp_dir,
+                db_path: PathBuf::new(), // won't be used
+                catalog,
+            }
+        }
+
+        /// Returns a reference to the catalog
+        fn catalog(&self) -> &Catalog {
+            &self.catalog
+        }
+
+        /// Returns a mutable reference to the catalog
+        fn catalog_mut(&mut self) -> &mut Catalog {
+            &mut self.catalog
+        }
+
+        /// Returns the path to the database metadata file
+        fn db_path(&self) -> &Path {
+            &self.db_path
+        }
+    }
+
+    /// Helper to set up a database with main file and multiple tmp files
+    struct TmpFileSetup {
+        tmp_dir: tempfile::TempDir,
+        db: String,
+        db_path: PathBuf,
+    }
+
+    impl TmpFileSetup {
+        fn new(db_name: &str, main_json: &str) -> Self {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let db_dir = tmp_dir.path().join(db_name);
+            fs::create_dir(&db_dir).unwrap();
+            let db_path = db_dir.join(METADATA_FILE_NAME);
+            write_json(&db_path, main_json);
+
+            Self {
+                tmp_dir,
+                db: db_name.to_string(),
+                db_path,
+            }
+        }
+
+        /// Adds a tmp file with the given epoch and content, setting its mtime
+        fn add_tmp_file(&self, epoch: u64, content: &str, seconds_offset: u64) -> PathBuf {
+            let tmp_path = tmp_path(self.tmp_dir.path(), &self.db, epoch);
+            write_json(&tmp_path, content);
+            let mtime =
+                FileTime::from_system_time(SystemTime::now() + Duration::from_secs(seconds_offset));
+            set_file_mtime(&tmp_path, mtime).unwrap();
+            tmp_path
+        }
+
+        /// Sets the mtime of the main database file
+        fn set_main_mtime(&self, seconds_offset: u64) {
+            let mtime =
+                FileTime::from_system_time(SystemTime::now() + Duration::from_secs(seconds_offset));
+            set_file_mtime(&self.db_path, mtime).unwrap();
+        }
+
+        fn path(&self) -> &Path {
+            self.tmp_dir.path()
+        }
+
+        fn db_name(&self) -> &str {
+            &self.db
+        }
+
+        fn db_path(&self) -> &Path {
+            &self.db_path
+        }
+    }
+
     // Helper to create a dummy column
     fn dummy_column(name: &str, ty: Type, pos: u16) -> ColumnMetadata {
         ColumnMetadata::new(name.to_string(), ty, pos, pos as usize * 4, pos).unwrap()
@@ -563,6 +704,16 @@ mod tests {
         }
     }
 
+    /// Helper to create a test database directory with a metadata file containing the given JSON
+    fn setup_db_with_json(json: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+        write_json(&db_path, json);
+        (tmp_dir, db_path)
+    }
+
     // Helper to write json to path
     fn write_json(path: impl AsRef<Path>, json: &str) {
         fs::write(path, json).unwrap();
@@ -598,6 +749,18 @@ mod tests {
         }
     }
 
+    /// Helper to assert that [`Catalog`] on disk is as expected
+    fn assert_catalog_on_disk(
+        db_path: &Path,
+        expected_table_count: usize,
+        table_assertions: impl FnOnce(&[TableJson]),
+    ) {
+        let content = fs::read_to_string(db_path).unwrap();
+        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.tables.len(), expected_table_count);
+        table_assertions(&loaded.tables);
+    }
+
     // Helper to check if error variant is as expected
     fn assert_catalog_error_variant(actual: &CatalogError, expected: &CatalogError) {
         assert_eq!(
@@ -626,11 +789,7 @@ mod tests {
     #[test]
     fn catalog_new_returns_error_when_file_is_not_json() {
         // given file with invalid json
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-        fs::write(&db_path, b"not a json").unwrap();
+        let (tmp_dir, _) = setup_db_with_json("not a json");
 
         // when creating catalog
         let result = Catalog::new(&tmp_dir, "db");
@@ -646,11 +805,8 @@ mod tests {
     #[test]
     fn catalog_new_returns_error_when_file_is_json_but_not_catalog_json() {
         // given file with valid json but not CatalogJson
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-        fs::write(&db_path, b"{\"foo\": 123}").unwrap();
+        let json = r#"{"foo": 123}"#;
+        let (tmp_dir, _) = setup_db_with_json(json);
 
         // when creating catalog
         let result = Catalog::new(&tmp_dir, "db");
@@ -666,11 +822,6 @@ mod tests {
     #[test]
     fn catalog_new_loads_proper_catalog_json() {
         // given file with valid CatalogJson
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
         let json = r#"
     {
         "tables": [
@@ -702,7 +853,7 @@ mod tests {
     }
     "#;
 
-        write_json(&db_path, json);
+        let (tmp_dir, _) = setup_db_with_json(json);
 
         // when creating catalog
         let result = Catalog::new(&tmp_dir, "db");
@@ -719,12 +870,6 @@ mod tests {
     #[test]
     fn catalog_new_picks_latest_tmp_over_main_file() {
         // given one tmp file with mtime > main and valid json
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db = "db";
-        let db_dir = tmp_dir.path().join(db);
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
         let main_json = r#"{
     "tables":[
         {
@@ -736,7 +881,6 @@ mod tests {
         }
     ]
 }"#;
-        write_json(&db_path, main_json);
 
         let tmp_json = r#"{
     "tables":[
@@ -749,37 +893,26 @@ mod tests {
         }
     ]
 }"#;
-        let tmp_epoch = 12345;
-        let tmp_path = tmp_path(tmp_dir.path(), db, tmp_epoch);
-        write_json(&tmp_path, tmp_json);
 
-        // ensure tmp file mtime > main mtime
-        let now = FileTime::from_system_time(SystemTime::now());
-        set_file_mtime(&db_path, now).unwrap();
-        let later = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
-        set_file_mtime(&tmp_path, later).unwrap();
+        let setup = TmpFileSetup::new("db", main_json);
+        setup.set_main_mtime(0);
+        setup.add_tmp_file(12345, tmp_json, 10);
 
         // when loading `Catalog`
-        let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
+        let catalog = Catalog::new(setup.path(), setup.db_name()).unwrap();
 
         // tmp file should be loaded
         assert!(catalog.tables.contains_key("tmp"));
         assert!(!catalog.tables.contains_key("main"));
-        assert_no_tmp_files(tmp_dir.path(), db);
+        assert_no_tmp_files(setup.path(), setup.db_name());
 
         // main file should now contain the newest tmp json
-        assert_file_json_eq(&db_path, tmp_json);
+        assert_file_json_eq(setup.db_path(), tmp_json);
     }
 
     #[test]
     fn catalog_new_picks_newest_of_multiple_tmp_files() {
         // given multiple tmp files with valid json
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db = "db";
-        let db_dir = tmp_dir.path().join(db);
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
         let main_json = r#"{
         "tables":[
             {
@@ -791,7 +924,6 @@ mod tests {
             }
         ]
     }"#;
-        write_json(&db_path, main_json);
 
         let tmp_json1 = r#"{
         "tables":[
@@ -804,6 +936,7 @@ mod tests {
             }
         ]
     }"#;
+
         let tmp_json2 = r#"{
         "tables":[
             {
@@ -816,41 +949,27 @@ mod tests {
         ]
     }"#;
 
-        let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
-        let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
-        write_json(&tmp_path1, tmp_json1);
-        write_json(&tmp_path2, tmp_json2);
-
-        // ensure proper mtimes
-        let now = FileTime::from_system_time(SystemTime::now());
-        set_file_mtime(&db_path, now).unwrap();
-        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
-        set_file_mtime(&tmp_path1, later1).unwrap();
-        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
-        set_file_mtime(&tmp_path2, later2).unwrap();
+        let setup = TmpFileSetup::new("db", main_json);
+        setup.set_main_mtime(0);
+        setup.add_tmp_file(100, tmp_json1, 10);
+        setup.add_tmp_file(200, tmp_json2, 20);
 
         // when loading `Catalog`
-        let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
+        let catalog = Catalog::new(setup.path(), setup.db_name()).unwrap();
 
         // newest tmp file should be loaded and renamed
         assert!(catalog.tables.contains_key("tmp2"));
         assert!(!catalog.tables.contains_key("main"));
         assert!(!catalog.tables.contains_key("tmp1"));
-        assert_no_tmp_files(tmp_dir.path(), db);
+        assert_no_tmp_files(setup.path(), setup.db_name());
 
         // main file should now contain the newest tmp json
-        assert_file_json_eq(&db_path, tmp_json2);
+        assert_file_json_eq(setup.db_path(), tmp_json2);
     }
 
     #[test]
     fn catalog_new_picks_latest_valid_json_among_tmp_files() {
         // given multiple tmp files with only one in the middle with valid json
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db = "db";
-        let db_dir = tmp_dir.path().join(db);
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
         let main_json = r#"{
         "tables":[
             {
@@ -862,7 +981,6 @@ mod tests {
             }
         ]
     }"#;
-        write_json(&db_path, main_json);
 
         let tmp_json_valid = r#"{
         "tables":[
@@ -876,44 +994,27 @@ mod tests {
         ]
     }"#;
 
-        let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
-        let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
-        let tmp_path3 = tmp_path(tmp_dir.path(), db, 300);
-        write_json(&tmp_path1, "not json");
-        write_json(&tmp_path2, tmp_json_valid);
-        write_json(&tmp_path3, "not json");
-
-        // ensure proper mtimes
-        let now = FileTime::from_system_time(SystemTime::now());
-        set_file_mtime(&db_path, now).unwrap();
-        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
-        set_file_mtime(&tmp_path1, later1).unwrap();
-        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
-        set_file_mtime(&tmp_path2, later2).unwrap();
-        let later3 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(30));
-        set_file_mtime(&tmp_path3, later3).unwrap();
+        let setup = TmpFileSetup::new("db", main_json);
+        setup.set_main_mtime(0);
+        setup.add_tmp_file(100, "not json", 10);
+        setup.add_tmp_file(200, tmp_json_valid, 20);
+        setup.add_tmp_file(300, "not json", 30);
 
         // when loading `Catalog`
-        let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
+        let catalog = Catalog::new(setup.path(), setup.db_name()).unwrap();
 
         // valid tmp file should be loaded and renamed
         assert!(catalog.tables.contains_key("valid"));
         assert!(!catalog.tables.contains_key("main"));
-        assert_no_tmp_files(tmp_dir.path(), db);
+        assert_no_tmp_files(setup.path(), setup.db_name());
 
         // main file should now contain the valid tmp json
-        assert_file_json_eq(&db_path, tmp_json_valid);
+        assert_file_json_eq(setup.db_path(), tmp_json_valid);
     }
 
     #[test]
     fn catalog_new_falls_back_to_main_file_if_no_valid_tmp() {
         // given multiple tmp files, none of them with valid json
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db = "db";
-        let db_dir = tmp_dir.path().join(db);
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
         let main_json = r#"{
         "tables":[
             {
@@ -925,40 +1026,26 @@ mod tests {
             }
         ]
     }"#;
-        write_json(&db_path, main_json);
 
-        let tmp_path1 = tmp_path(tmp_dir.path(), db, 100);
-        let tmp_path2 = tmp_path(tmp_dir.path(), db, 200);
-        write_json(&tmp_path1, "not json");
-        write_json(&tmp_path2, "not json");
-
-        // ensure proper mtimes
-        let now = FileTime::from_system_time(SystemTime::now());
-        set_file_mtime(&db_path, now).unwrap();
-        let later1 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10));
-        set_file_mtime(&tmp_path1, later1).unwrap();
-        let later2 = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(20));
-        set_file_mtime(&tmp_path2, later2).unwrap();
+        let setup = TmpFileSetup::new("db", main_json);
+        setup.set_main_mtime(0);
+        setup.add_tmp_file(100, "not json", 10);
+        setup.add_tmp_file(200, "not json", 20);
 
         // when loading `Catalog`
-        let catalog = Catalog::new(tmp_dir.path(), db).unwrap();
+        let catalog = Catalog::new(setup.path(), setup.db_name()).unwrap();
 
         // main file should be loaded
         assert!(catalog.tables.contains_key("main"));
-        assert_no_tmp_files(tmp_dir.path(), db);
+        assert_no_tmp_files(setup.path(), setup.db_name());
 
         // main file should still contain the original json
-        assert_file_json_eq(&db_path, main_json);
+        assert_file_json_eq(setup.db_path(), main_json);
     }
 
     #[test]
     fn catalog_new_returns_error_when_column_is_invalid() {
         // given file with a column that has invalid base_offset_pos > pos
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
         let json = r#"
     {
         "tables": [
@@ -972,7 +1059,7 @@ mod tests {
         ]
     }
     "#;
-        write_json(&db_path, json);
+        let (tmp_dir, _) = setup_db_with_json(json);
 
         // when creating catalog
         let result = Catalog::new(&tmp_dir, "db");
@@ -990,11 +1077,6 @@ mod tests {
     #[test]
     fn catalog_new_returns_error_when_table_has_duplicate_column_names() {
         // given file with a table that has duplicate column names
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
         let json = r#"
     {
         "tables": [
@@ -1009,7 +1091,7 @@ mod tests {
         ]
     }
     "#;
-        write_json(&db_path, json);
+        let (tmp_dir, _) = setup_db_with_json(json);
 
         // when creating catalog
         let result = Catalog::new(&tmp_dir, "db");
@@ -1025,28 +1107,23 @@ mod tests {
     #[test]
     fn catalog_table_returns_existing_table() {
         // given catalog with table `users`
-        let users = users_table();
-        let mut tables = HashMap::new();
-        tables.insert(users.name.clone(), users.clone());
-
-        let c = in_memory_catalog(tables);
+        let fixture = CatalogTestFixture::in_memory_with_table(users_table());
 
         // when getting table with name `users`
-        let result = c.table("users");
+        let result = fixture.catalog().table("users");
 
         // then table `users` is returned
         assert!(result.is_ok());
-        assert_table(&users, &result.unwrap());
+        assert_table(&users_table(), &result.unwrap());
     }
 
     #[test]
     fn catalog_table_returns_error_when_missing_table() {
         // given empty catalog
-        let tables = HashMap::new();
-        let c = in_memory_catalog(tables);
+        let fixture = CatalogTestFixture::in_memory();
 
         // when getting non existing table
-        let result = c.table("missing");
+        let result = fixture.catalog().table("missing");
 
         // then Err(CatalogError::TableNotFound) is returned
         assert!(result.is_err());
@@ -1059,41 +1136,31 @@ mod tests {
     #[test]
     fn catalog_add_table_adds_new_table() {
         // given empty catalog and a new table
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
-        let tables = HashMap::new();
-        let mut c = file_backed_catalog(db_path.clone(), tables);
+        let mut fixture = CatalogTestFixture::new();
         let users = users_table();
 
         // when adding table
-        let result = c.add_table(users.clone());
+        let result = fixture.catalog_mut().add_table(users.clone());
 
         // then table is present
         assert!(result.is_ok());
-        assert_table(&users, c.tables.get("users").unwrap());
+        assert_table(&users, fixture.catalog().tables.get("users").unwrap());
 
         // and flushed to disk
-        let content = fs::read_to_string(&db_path).unwrap();
-        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
-        assert_eq!(loaded.tables.len(), 1);
-        assert_eq!(loaded.tables[0].name, "users");
-        assert_eq!(loaded.tables[0].columns.len(), 2);
-        assert_eq!(loaded.tables[0].primary_key_column_name, "id");
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].name, "users");
+            assert_eq!(tables[0].columns.len(), 2);
+            assert_eq!(tables[0].primary_key_column_name, "id");
+        });
     }
 
     #[test]
     fn catalog_add_table_returns_error_when_table_exists() {
         // given catalog with table `users`
-        let users = users_table();
-        let mut tables = HashMap::new();
-        tables.insert(users.name.clone(), users.clone());
-        let mut c = in_memory_catalog(tables);
+        let mut fixture = CatalogTestFixture::in_memory_with_table(users_table());
 
         // when adding table with same name
-        let result = c.add_table(users.clone());
+        let result = fixture.catalog_mut().add_table(users_table());
 
         // then Err(CatalogError::TableAlreadyExists) is returned
         assert!(result.is_err());
@@ -1106,114 +1173,85 @@ mod tests {
     #[test]
     fn catalog_remove_table_removes_existing_table() {
         // given catalog with table `users`
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
-        let users = users_table();
-        let mut tables = HashMap::new();
-        tables.insert(users.name.clone(), users);
-        let mut c = file_backed_catalog(db_path.clone(), tables);
+        let mut fixture = CatalogTestFixture::with_table(users_table());
 
         // when removing table with name `users`
-        let result = c.remove_table("users");
+        let result = fixture.catalog_mut().remove_table("users");
 
         // then Ok(()) is returned and table is removed
         assert!(result.is_ok());
-        assert!(!c.tables.contains_key("users"));
+        assert!(!fixture.catalog().tables.contains_key("users"));
 
         // and is removed from disk
-        let content = fs::read_to_string(&db_path).unwrap();
-        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
-        assert_eq!(loaded.tables.len(), 0);
+        assert_catalog_on_disk(fixture.db_path(), 0, |_| {});
     }
 
     #[test]
     fn catalog_sync_to_disk_saves_to_file() {
         // given a catalog with one table
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
-        let users = users_table();
-        let mut tables = HashMap::new();
-        tables.insert(users.name.clone(), users.clone());
-
-        let mut catalog = file_backed_catalog(db_path.clone(), tables);
+        let mut fixture = CatalogTestFixture::with_table(users_table());
 
         // when syncing to disk
-        catalog.sync_to_disk().unwrap();
+        let result = fixture.catalog_mut().sync_to_disk();
 
-        // then file contains expected JSON
-        let content = fs::read_to_string(&db_path).unwrap();
-        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
-        assert_eq!(loaded.tables.len(), 1);
-        assert_eq!(loaded.tables[0].name, "users");
-        assert_eq!(loaded.tables[0].columns.len(), 2);
-        assert_eq!(loaded.tables[0].primary_key_column_name, "id");
+        // then sync succeeds
+        assert!(result.is_ok());
+
+        // and file contains expected JSON
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].name, "users");
+            assert_eq!(tables[0].columns.len(), 2);
+            assert_eq!(tables[0].primary_key_column_name, "id");
+        });
     }
 
     #[test]
     fn catalog_add_column_persists_to_disk() {
         // given catalog with table `users`
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
-        let users = users_table();
-        let mut tables = HashMap::new();
-        tables.insert(users.name.clone(), users);
-        let mut c = file_backed_catalog(db_path.clone(), tables);
+        let mut fixture = CatalogTestFixture::with_table(users_table());
 
         // when adding a new column
         let new_col = dummy_column("email", Type::String, 2);
-        let result = c.add_column("users", new_col.clone());
+        let result = fixture.catalog_mut().add_column("users", new_col.clone());
 
         // then column is added
         assert!(result.is_ok());
-        let table = c.table("users").unwrap();
-        assert!(table.column("email").is_ok());
+        assert!(
+            fixture
+                .catalog()
+                .table("users")
+                .unwrap()
+                .column("email")
+                .is_ok()
+        );
 
         // and persisted to disk
-        let content = fs::read_to_string(&db_path).unwrap();
-        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
-        assert_eq!(loaded.tables.len(), 1);
-        assert_eq!(loaded.tables[0].columns.len(), 3);
-        assert!(loaded.tables[0].columns.iter().any(|c| c.name == "email"));
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 3);
+            assert!(tables[0].columns.iter().any(|c| c.name == "email"));
+        });
     }
 
     #[test]
     fn catalog_remove_column_persists_to_disk() {
         // given catalog with table `users` that has 2 columns
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let db_dir = tmp_dir.path().join("db");
-        fs::create_dir(&db_dir).unwrap();
-        let db_path = db_dir.join(METADATA_FILE_NAME);
-
-        let users = users_table();
-        let mut tables = HashMap::new();
-        tables.insert(users.name.clone(), users);
-        let mut c = file_backed_catalog(db_path.clone(), tables);
+        let mut fixture = CatalogTestFixture::with_table(users_table());
 
         // when removing column "name"
-        let result = c.remove_column("users", "name");
+        let result = fixture.catalog_mut().remove_column("users", "name");
 
         // then column is removed
         assert!(result.is_ok());
-        let table = c.table("users").unwrap();
+        let table = fixture.catalog().table("users").unwrap();
         assert!(table.column("name").is_err());
         assert!(table.column("id").is_ok());
 
         // and persisted to disk
-        let content = fs::read_to_string(&db_path).unwrap();
-        let loaded: CatalogJson = serde_json::from_str(&content).unwrap();
-        assert_eq!(loaded.tables.len(), 1);
-        assert_eq!(loaded.tables[0].columns.len(), 1);
-        assert_eq!(loaded.tables[0].columns[0].name, "id");
-        assert!(!loaded.tables[0].columns.iter().any(|c| c.name == "name"));
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 1);
+            assert_eq!(tables[0].columns[0].name, "id");
+            assert!(!tables[0].columns.iter().any(|c| c.name == "name"));
+        });
     }
 
     // Helper to check if error variant is as expected
