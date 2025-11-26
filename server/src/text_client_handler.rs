@@ -4,7 +4,7 @@ use engine::record::Record as EngineRecord;
 use executor::response::StatementResult;
 use executor::{Executor, ExecutorError};
 use itertools::Itertools;
-use log::{error, info};
+use log::error;
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use parking_lot::RwLock;
 use protocol::text_protocol::{
@@ -127,8 +127,6 @@ impl TextClientHandler {
     }
 
     async fn handle_request(&mut self, request: Request) -> Result<(), ClientError> {
-        info!("Handling request: {:?}", request);
-
         match request {
             Request::CreateDatabase { database_name } => {
                 self.catalog_manager
