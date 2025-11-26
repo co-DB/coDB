@@ -35,7 +35,7 @@ use crate::{
 
 /// Error for [`Analyzer`] related operations.
 #[derive(Debug, Error)]
-pub(crate) enum AnalyzerError {
+pub enum AnalyzerError {
     #[error("table '{table}' was not found in database")]
     TableNotFound { table: String },
     #[error("column '{column}' was not found")]
