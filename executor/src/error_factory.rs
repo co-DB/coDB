@@ -27,6 +27,8 @@ pub(crate) enum InternalExecutorError {
     ArithmeticOperationError { message: String },
     #[error("cannot cast '{from}' to '{to}'")]
     InvalidCast { from: String, to: String },
+    #[error("failed to load column ({column_name}) value from context")]
+    CannotLoadColumnValueFromContext { column_name: String },
 }
 
 /// Helper to create [`StatementResult::RuntimeError`] with provided message.
@@ -64,5 +66,19 @@ pub(crate) fn invalid_cast(child: &Field, new_type: &Type) -> InternalExecutorEr
     InternalExecutorError::InvalidCast {
         from: child.ty().to_string(),
         to: new_type.to_string(),
+    }
+}
+
+pub(crate) fn invalid_node_type(node_type: impl Into<String>) -> InternalExecutorError {
+    InternalExecutorError::InvalidNodeTypeInExpression {
+        node_type: node_type.into(),
+    }
+}
+
+pub(crate) fn cannot_load_column_from_context(
+    column_name: impl Into<String>,
+) -> InternalExecutorError {
+    InternalExecutorError::CannotLoadColumnValueFromContext {
+        column_name: column_name.into(),
     }
 }

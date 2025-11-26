@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap};
 
 use engine::{
     data_types::{DbDate, DbDateTime},
@@ -16,12 +16,39 @@ use planner::{
 
 use crate::{InternalExecutorError, error_factory};
 
-/// Evaluates expressions from the resolved query AST against record data.
+// TODO: once joins are implemented add tests for cases in which ExpressionContext::Multiple is used
+
+/// Context for expression evaluation, containing the record(s) being evaluated.
+pub(crate) enum ExpressionContext<'r, 'q> {
+    /// No record context (e.g., evaluating constants)
+    Empty,
+    /// Single record context (e.g., filter, projection)
+    /// Uses direct position-based field access
+    Single(&'r Record),
+    /// Multiple record context (e.g., joins)
+    /// Maps table name to record for table-aware column resolution
+    Multiple(HashMap<&'q str, &'r Record>),
+}
+
+impl<'r, 'q> ExpressionContext<'r, 'q> {
+    /// Get a field from the context.
+    fn get_field(&self, table_name: &str, pos: u16) -> Option<&'r Field> {
+        match self {
+            ExpressionContext::Empty => None,
+            ExpressionContext::Single(record) => record.fields.get(pos as usize),
+            ExpressionContext::Multiple(tables) => tables
+                .get(table_name)
+                .and_then(|record| record.fields.get(pos as usize)),
+        }
+    }
+}
+
+/// Evaluates expressions from the resolved query AST against context.
 ///
-/// The executor borrows both the record being evaluated and the AST,
+/// The executor borrows both the record(s) being evaluated and the AST,
 /// allowing it to reference fields without copying when possible.
 pub(crate) struct ExpressionExecutor<'r, 'q> {
-    record: &'r Record,
+    context: ExpressionContext<'r, 'q>,
     ast: &'q ResolvedTree,
 }
 
@@ -29,8 +56,23 @@ impl<'r, 'q> ExpressionExecutor<'r, 'q>
 where
     'q: 'r,
 {
-    pub(crate) fn new(record: &'r Record, ast: &'q ResolvedTree) -> Self {
-        Self { record, ast }
+    pub(crate) fn new(context: ExpressionContext<'r, 'q>, ast: &'q ResolvedTree) -> Self {
+        Self { context, ast }
+    }
+
+    pub(crate) fn with_single_record(record: &'r Record, ast: &'q ResolvedTree) -> Self {
+        Self::new(ExpressionContext::Single(record), ast)
+    }
+
+    pub(crate) fn with_multiple_records(
+        tables: HashMap<&'q str, &'r Record>,
+        ast: &'q ResolvedTree,
+    ) -> Self {
+        Self::new(ExpressionContext::Multiple(tables), ast)
+    }
+
+    pub(crate) fn empty(ast: &'q ResolvedTree) -> Self {
+        Self::new(ExpressionContext::Empty, ast)
     }
 
     /// Evaluates an expression node from the AST and returns its computed value.
@@ -55,9 +97,7 @@ where
             ResolvedExpression::Unary(unary) => self.execute_unary(unary),
             ResolvedExpression::Cast(cast) => self.execute_cast(cast),
             ResolvedExpression::Literal(literal) => self.execute_literal(literal),
-            _ => Err(InternalExecutorError::InvalidNodeTypeInExpression {
-                node_type: format!("{:?}", node),
-            }),
+            _ => Err(error_factory::invalid_node_type(format!("{:?}", node))),
         }
     }
 
@@ -65,7 +105,11 @@ where
         &self,
         column: &'r ResolvedColumn,
     ) -> Result<Cow<'r, Field>, InternalExecutorError> {
-        Ok(Cow::Borrowed(&self.record.fields[column.pos as usize]))
+        let table_name = self.table_name(column.table)?;
+        self.context
+            .get_field(table_name, column.pos)
+            .map(Cow::Borrowed)
+            .ok_or(error_factory::cannot_load_column_from_context(&column.name))
     }
 
     fn execute_logical(
@@ -314,7 +358,16 @@ where
             _ => Err(error_factory::unexpected_type("any numeric type", value)),
         }
     }
+
+    /// Returns name of the table pointed by `table_id`.
+    fn table_name(&self, table_id: ResolvedNodeId) -> Result<&'q str, InternalExecutorError> {
+        match self.ast.node(table_id) {
+            ResolvedExpression::TableRef(table_ref) => Ok(&table_ref.name),
+            other => Err(error_factory::invalid_node_type(format!("{:?}", other))),
+        }
+    }
 }
+
 #[cfg(test)]
 mod tests {
     use planner::query_plan::StatementPlanItem;
@@ -365,7 +418,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("age = age");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -374,9 +427,8 @@ mod tests {
     #[test]
     fn test_execute_literal_int() {
         let (tree, expr_id) = parse_expression("42 = 42");
-        let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::empty(&tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -385,9 +437,8 @@ mod tests {
     #[test]
     fn test_arithmetic_add() {
         let (tree, expr_id) = parse_expression("5 + 3 = 8");
-        let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::empty(&tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -396,9 +447,8 @@ mod tests {
     #[test]
     fn test_comparison_greater_than() {
         let (tree, expr_id) = parse_expression("10 > 5");
-        let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::empty(&tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -409,7 +459,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("name = 'Alice'");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -420,7 +470,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("age > 20 AND active = true");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -429,9 +479,8 @@ mod tests {
     #[test]
     fn test_division_by_zero() {
         let (tree, expr_id) = parse_expression("10 / 0 = 0");
-        let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::empty(&tree);
         let result = executor.execute_expression(expr_id);
 
         assert!(result.is_err());
@@ -446,9 +495,8 @@ mod tests {
     #[test]
     fn test_modulo_by_zero() {
         let (tree, expr_id) = parse_expression("10 % 0 = 0");
-        let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::empty(&tree);
         let result = executor.execute_expression(expr_id);
 
         assert!(result.is_err());
@@ -465,7 +513,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("-age = -25");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -476,7 +524,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("!active");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(false));
@@ -487,7 +535,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("age + 5 = 30");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -498,7 +546,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("score + 0.5 > 100.0");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -509,7 +557,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("age > 20 AND score > 90.0");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -520,7 +568,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("active = true OR age < 0");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         // Should be true due to short-circuit (first condition is true)
@@ -532,7 +580,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("!active AND age > 0");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         // Should be false due to short-circuit (first condition is false)
@@ -544,7 +592,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("(age + 5) * 2 = 60");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
@@ -555,7 +603,7 @@ mod tests {
         let (tree, expr_id) = parse_expression("name + ' Smith' = 'Alice Smith'");
         let record = create_test_record();
 
-        let executor = ExpressionExecutor::new(&record, &tree);
+        let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
         assert_eq!(result.as_ref(), &Field::Bool(true));
