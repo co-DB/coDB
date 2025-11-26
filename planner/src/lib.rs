@@ -29,7 +29,7 @@ pub enum PlannerError {
     Analyzer(#[from] AnalyzerError),
 }
 
-/// Helper trait for parsing `Vec<E> -> Vec<F>`, where `E` and `F` are errors.
+/// Helper trait for converting `Result<T, Vec<E>>` to `Result<T, Vec<F>>`.
 trait VecErrorExt<T, E> {
     fn map_errors<F>(self) -> Result<T, Vec<F>>
     where
