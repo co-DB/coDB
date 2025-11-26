@@ -9,7 +9,7 @@ use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
 
 /// Error for [`Ast`] related operations.
 #[derive(Error, Debug)]
-pub(crate) enum AstError {
+pub enum AstError {
     #[error("invalid node type(expected {expected}, got: {got})")]
     InvalidNodeType { expected: String, got: String },
 }
