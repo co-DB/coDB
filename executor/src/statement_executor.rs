@@ -1,13 +1,16 @@
-use std::{collections::HashMap, iter, mem};
+use std::{borrow::Cow, collections::HashMap, iter, mem};
 
 use engine::{
     data_types,
+    heap_file::{HeapFileError, RecordPtr},
     record::{Field, Record},
 };
 use itertools::Itertools;
 use metadata::catalog::{ColumnMetadata, ColumnMetadataError, TableMetadata};
 use planner::{
-    query_plan::{CreateTable, Filter, Projection, StatementPlan, StatementPlanItem, TableScan},
+    query_plan::{
+        CreateTable, Filter, Insert, Projection, StatementPlan, StatementPlanItem, TableScan,
+    },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
         ResolvedTree,
@@ -83,6 +86,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     /// Handler for all statements that mutate data.
     fn execute_mutation(&self, item: &StatementPlanItem) -> StatementResult {
         match item {
+            StatementPlanItem::Insert(insert) => self.insert(insert),
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
             _ => error_factory::runtime_error(format!(
                 "Invalid root operation ({:?}) for mutation statement",
@@ -131,7 +135,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     ) -> Result<Vec<Record>, InternalExecutorError> {
         records
             .filter_map(|record| {
-                let e = ExpressionExecutor::new(&record, self.ast);
+                let e = ExpressionExecutor::with_single_record(&record, self.ast);
                 match e.execute_expression(predicate) {
                     Ok(result) => match result.as_bool() {
                         Some(true) => Some(Ok(record)),
@@ -195,6 +199,60 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             records: projected_records,
             columns: columns_data,
         })
+    }
+
+    /// Handler for [`Insert`] statement.
+    fn insert(&self, insert: &Insert) -> StatementResult {
+        if let Err(e) = self.process_insert(insert) {
+            return StatementResult::from(&e);
+        }
+        StatementResult::OperationSuccessful {
+            rows_affected: 1,
+            ty: StatementType::Insert,
+        }
+    }
+
+    fn process_insert(&self, insert: &Insert) -> Result<(), InternalExecutorError> {
+        let record = self.build_record(&insert.columns, &insert.values)?;
+
+        let _ptr = self.executor.with_heap_file(&insert.table_name, |hf| {
+            let ptr = hf.insert(record)?;
+            Ok::<RecordPtr, HeapFileError>(ptr)
+        })??;
+        // TODO: we should insert this `_ptr` into btree
+
+        Ok(())
+    }
+
+    /// Sorts `values` by their corresponding `column` position and evaluates them.
+    /// Returns [`Record`] containing those fields.
+    fn build_record(
+        &self,
+        columns: &[ResolvedNodeId],
+        values: &[ResolvedNodeId],
+    ) -> Result<Record, InternalExecutorError> {
+        let fields: Result<Vec<_>, _> = columns
+            .iter()
+            .zip(values.iter())
+            .sorted_by(|&(lhs_col, _), &(rhs_col, _)| {
+                let left_col = match self.ast.node(*lhs_col) {
+                    ResolvedExpression::ColumnRef(rc) => rc,
+                    _ => unreachable!(),
+                };
+                let right_col = match self.ast.node(*rhs_col) {
+                    ResolvedExpression::ColumnRef(rc) => rc,
+                    _ => unreachable!(),
+                };
+                left_col.pos.cmp(&right_col.pos)
+            })
+            .map(|(_, &expression)| {
+                let e = ExpressionExecutor::empty(self.ast);
+                e.execute_expression(expression)
+            })
+            .collect();
+        let fields = fields?.into_iter().map(Cow::into_owned).collect();
+        let record = Record::new(fields);
+        Ok(record)
     }
 
     /// Handler for [`CreateTable`] table statement.

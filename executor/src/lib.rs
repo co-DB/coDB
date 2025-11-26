@@ -719,4 +719,135 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
     }
+
+    #[test]
+    fn test_execute_insert_single_row() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert a single row
+        let (insert_plan, insert_ast) = create_single_statement(
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+            &executor,
+        );
+        let insert_result = executor.execute_statement(&insert_plan, &insert_ast);
+        assert_operation_successful(insert_result, 1, StatementType::Insert);
+
+        // Verify the data was inserted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.fields[0], Field::Int32(1));
+        assert!(matches!(&row.fields[1], Field::String(s) if s == "Alice"));
+        assert_eq!(row.fields[2], Field::Int32(25));
+    }
+
+    #[test]
+    fn test_execute_insert_multiple_rows() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert multiple rows
+        let (insert1_plan, insert1_ast) = create_single_statement(
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+            &executor,
+        );
+        executor.execute_statement(&insert1_plan, &insert1_ast);
+
+        let (insert2_plan, insert2_ast) = create_single_statement(
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+            &executor,
+        );
+        executor.execute_statement(&insert2_plan, &insert2_ast);
+
+        let (insert3_plan, insert3_ast) = create_single_statement(
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+            &executor,
+        );
+        let insert_result = executor.execute_statement(&insert3_plan, &insert3_ast);
+        assert_operation_successful(insert_result, 1, StatementType::Insert);
+
+        // Verify all data was inserted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 3);
+
+        let alice = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(1))
+            .unwrap();
+        assert!(matches!(&alice.fields[1], Field::String(s) if s == "Alice"));
+        assert_eq!(alice.fields[2], Field::Int32(25));
+
+        let bob = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(2))
+            .unwrap();
+        assert!(matches!(&bob.fields[1], Field::String(s) if s == "Bob"));
+        assert_eq!(bob.fields[2], Field::Int32(30));
+
+        let charlie = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(3))
+            .unwrap();
+        assert!(matches!(&charlie.fields[1], Field::String(s) if s == "Charlie"));
+        assert_eq!(charlie.fields[2], Field::Int32(35));
+    }
+
+    #[test]
+    fn test_execute_insert_with_different_column_order() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert with columns in different order
+        let (insert_plan, insert_ast) = create_single_statement(
+            "INSERT INTO users (age, name, id) VALUES (25, 'Alice', 1);",
+            &executor,
+        );
+        let insert_result = executor.execute_statement(&insert_plan, &insert_ast);
+        assert_operation_successful(insert_result, 1, StatementType::Insert);
+
+        // Verify the data was inserted correctly
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.fields[0], Field::Int32(1));
+        assert!(matches!(&row.fields[1], Field::String(s) if s == "Alice"));
+        assert_eq!(row.fields[2], Field::Int32(25));
+    }
 }
