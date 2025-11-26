@@ -1,7 +1,7 @@
 use clap::Parser;
 use log::info;
 use protocol::text_protocol::Request::Query;
-use protocol::text_protocol::{Request, Response};
+use protocol::text_protocol::{ErrorType, Request, Response};
 use std::io;
 use std::io::{BufRead, Write};
 use thiserror::Error;
@@ -137,7 +137,15 @@ impl ConsoleHandler {
                         match resp {
                             Response::Acknowledge
                             | Response::ColumnInfo { .. }
-                            | Response::Rows { .. } => continue,
+                            | Response::Rows { .. }
+                            | Response::StatementCompleted { .. } => continue,
+                            Response::Error {
+                                message: _message,
+                                error_type,
+                            } => match error_type {
+                                ErrorType::Network => break,
+                                _ => continue,
+                            },
                             _ => break,
                         }
                     }
