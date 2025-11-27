@@ -43,6 +43,7 @@ CoSQL includes a set of essential data types suitable for building production-gr
 - WHERE, FROM, INTO, SET, VALUES, AS
 - TABLE, COLUMN, PRIMARY_KEY
 - TRUE, FALSE
+- ORDER, BY, ASC, DESC, LIMIT, OFFSET
 
 ### Identifiers
 
@@ -140,8 +141,14 @@ Precedence (from lowest to highest)
 #### Select
 
 ```
- <select_stmt> :: SELECT <column_list_select> FROM <table_name> <where_clause>
+ <select_stmt> :: SELECT <column_list_select> FROM <table_name> <select_clauses>
  <column_list_select> :: <column_name>(,<column_name>)* | *
+ <select_clauses> :: <select_where_clause> <order_by_clause> <limit_clause> <offset_clause>
+ <select_where_clause> :: <where_clause> | ε
+ <order_by_clause> :: ORDER BY <column_name> <order_direction> | ε
+ <order_direction> :: ASC | DESC | ε
+ <limit_clause> :: LIMIT <int> | ε
+ <offset_clause> :: OFFSET <int> | ε
 ```
 
 #### Insert
