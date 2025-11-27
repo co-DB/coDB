@@ -14,7 +14,7 @@
 ///
 /// Errors can occur at any stage of the response and will be communicated immediately via an
 /// `Error` response. When an error occurs, no further responses for the current query will be sent.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
@@ -97,7 +97,7 @@ pub enum Response {
     DatabasesListed { database_names: Vec<String> },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum StatementType {
     Select,
@@ -110,7 +110,7 @@ pub enum StatementType {
     AlterTable,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorType {
     Query,
@@ -120,13 +120,13 @@ pub enum ErrorType {
     InvalidRequest,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ColumnMetadata {
     pub name: String,
     pub ty: ColumnType,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ColumnType {
     String,
@@ -139,12 +139,12 @@ pub enum ColumnType {
     DateTime,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Record {
     pub fields: Vec<Field>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Field {
     Int32(i32),
@@ -157,12 +157,12 @@ pub enum Field {
     Bool(bool),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Date {
     pub days_since_epoch: i32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct DateTime {
     pub days_since_epoch: i32,
     pub milliseconds_since_midnight: u32,
