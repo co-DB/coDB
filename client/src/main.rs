@@ -39,6 +39,8 @@ enum ClientError {
     InvalidJson(#[from] serde_json::Error),
     #[error("invalid command: {reason}")]
     InvalidCommand { reason: String },
+    #[error("server error: {message}")]
+    ServerError { message: String },
 }
 
 enum ReadResult {
@@ -81,12 +83,8 @@ impl DbClient {
             Ok(0) => Ok(ReadResult::Disconnected),
             Ok(_) => {
                 let trimmed = buffer.trim();
-                if trimmed.is_empty() {
-                    Ok(ReadResult::Empty)
-                } else {
-                    let response = serde_json::from_str(trimmed)?;
-                    Ok(ReadResult::Response(response))
-                }
+                let response = serde_json::from_str(trimmed)?;
+                Ok(ReadResult::Response(response))
             }
             Err(e) => Err(ClientError::IoError(e)),
         }
@@ -123,6 +121,10 @@ impl ConsoleHandler {
             let trimmed = self.current_input.trim();
 
             if trimmed.is_empty() {
+                continue;
+            }
+
+            if trimmed.starts_with(Self::ENDING_INPUT) {
                 break;
             }
 
@@ -136,32 +138,28 @@ impl ConsoleHandler {
 
             self.db_client.send_request(request).await?;
 
-            loop {
-                match self.db_client.read_response().await? {
-                    ReadResult::Disconnected => break,
-                    ReadResult::Empty => continue,
-                    ReadResult::Response(resp) => {
-                        ConsoleHandler::display_response(&resp);
+            self.handle_response().await?;
+        }
 
-                        match resp {
-                            Response::Acknowledge
-                            | Response::ColumnInfo { .. }
-                            | Response::Rows { .. }
-                            | Response::StatementCompleted { .. } => continue,
-                            Response::Error {
-                                message: _message,
-                                error_type,
-                            } => match error_type {
-                                ErrorType::Network => break,
-                                _ => continue,
-                            },
-                            _ => break,
-                        }
+        Ok(())
+    }
+
+    async fn handle_response(&mut self) -> Result<(), ClientError> {
+        loop {
+            match self.db_client.read_response().await? {
+                ReadResult::Disconnected => break,
+                ReadResult::Empty => continue,
+                ReadResult::Response(resp) => {
+                    ConsoleHandler::display_response(&resp);
+
+                    if resp.is_final_message() {
+                        break;
+                    } else {
+                        continue;
                     }
                 }
             }
         }
-
         Ok(())
     }
 
@@ -333,6 +331,26 @@ impl ConsoleHandler {
                     }
                 }
             }
+        }
+    }
+}
+
+trait IsFinalMessage {
+    fn is_final_message(&self) -> bool;
+}
+
+impl IsFinalMessage for Response {
+    fn is_final_message(&self) -> bool {
+        match self {
+            Response::Acknowledge
+            | Response::ColumnInfo { .. }
+            | Response::Rows { .. }
+            | Response::StatementCompleted { .. } => false,
+            Response::Error {
+                message: _message,
+                error_type,
+            } => matches!(error_type, ErrorType::Network),
+            _ => true,
         }
     }
 }
