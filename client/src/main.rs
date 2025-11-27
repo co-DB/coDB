@@ -112,7 +112,7 @@ impl ConsoleHandler {
         let mut read_handle = io::stdin().lock();
         let mut write_handle = io::stdout().lock();
 
-        while self.current_input != Self::ENDING_INPUT {
+        loop {
             self.current_input.clear();
 
             print!("> ");
@@ -121,6 +121,10 @@ impl ConsoleHandler {
             read_handle.read_line(&mut self.current_input)?;
 
             let trimmed = self.current_input.trim();
+
+            if trimmed.is_empty() {
+                break;
+            }
 
             let request = match Self::parse_request(trimmed) {
                 Ok(request) => request,
@@ -169,7 +173,7 @@ impl ConsoleHandler {
             Self::parse_command(command)
         } else {
             Ok(Request::Query {
-                sql: request.as_ref().to_string(),
+                sql: request.as_ref().trim().to_string(),
                 database_name: None,
             })
         }
@@ -178,6 +182,12 @@ impl ConsoleHandler {
     fn parse_command(command: impl AsRef<str>) -> Result<Request, ClientError> {
         let command = command.as_ref();
         let command_segments = command.split_whitespace().collect::<Vec<_>>();
+
+        if command_segments.is_empty() {
+            return Err(ClientError::InvalidCommand {
+                reason: "empty command".to_string(),
+            });
+        }
 
         match command_segments[0] {
             "create" => Self::parse_create_database(command_segments),
@@ -244,7 +254,7 @@ impl ConsoleHandler {
         {
             return Ok(Request::Query {
                 database_name: Some(db_name.to_string()),
-                sql: sql_start.to_string(),
+                sql: sql_start.trim().to_string(),
             });
         }
 
