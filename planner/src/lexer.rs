@@ -116,6 +116,12 @@ impl Lexer {
             "date" => self.create_token(TokenType::DateType),
             "datetime" => self.create_token(TokenType::DateTimeType),
             "as" => self.create_token(TokenType::As),
+            "order" => self.create_token(TokenType::Order),
+            "by" => self.create_token(TokenType::By),
+            "limit" => self.create_token(TokenType::Limit),
+            "asc" => self.create_token(TokenType::Asc),
+            "desc" => self.create_token(TokenType::Desc),
+            "offset" => self.create_token(TokenType::Offset),
             _ => self.create_token(TokenType::Ident(ident)),
         }
     }
@@ -504,7 +510,8 @@ mod tests {
 
     #[test]
     fn test_valid_escape_sequences() {
-        let input = "select 'Tab:\\t' from users where desc = 'Quote:\\' and slash:\\\\ \\x';";
+        let input =
+            "select 'Tab:\\t' from users where description = 'Quote:\\' and slash:\\\\ \\x';";
 
         let mut lexer = Lexer::new(input);
 
@@ -514,7 +521,7 @@ mod tests {
             TokenType::From,
             TokenType::Ident(String::from("users")),
             TokenType::Where,
-            TokenType::Ident(String::from("desc")),
+            TokenType::Ident(String::from("description")),
             TokenType::Equal,
             TokenType::String(String::from("Quote:' and slash:\\ \\x")),
             TokenType::Semicolon,
@@ -668,6 +675,24 @@ mod tests {
             TokenType::Ident("id".into()),
             TokenType::Equal,
             TokenType::Int(200),
+        ];
+
+        let mut lexer = Lexer::new(input);
+
+        assert_works(&mut lexer, &expected_tokens);
+    }
+
+    #[test]
+    fn select_clauses() {
+        let input = "ORDER BY ASC DESC LIMIT OFFSET";
+
+        let expected_tokens = [
+            TokenType::Order,
+            TokenType::By,
+            TokenType::Asc,
+            TokenType::Desc,
+            TokenType::Limit,
+            TokenType::Offset,
         ];
 
         let mut lexer = Lexer::new(input);
