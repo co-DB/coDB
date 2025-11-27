@@ -565,10 +565,16 @@ impl Parser {
         self.expect_token(TokenType::From)?;
         let table_name = self.parse_table_name()?;
         let where_clause = self.parse_where_clause()?;
+        let order_by = self.parse_order_by_clause()?;
+        let limit = self.parse_limit_clause()?;
+        let offset = self.parse_offset_clause()?;
         Ok(Statement::Select(SelectStatement {
             columns,
             table_name,
             where_clause,
+            order_by,
+            limit,
+            offset,
         }))
     }
 
@@ -579,6 +585,51 @@ impl Parser {
         }
         self.expect_token(TokenType::Where)?;
         Ok(Some(self.parse_expression(Precedence::Lowest)?))
+    }
+
+    /// Parses an optional WHERE clause, returning the [`OrderByDetails`] if present.
+    fn parse_order_by_clause(&mut self) -> Result<Option<OrderByDetails>, ParserError> {
+        if self.peek_token.token_type != TokenType::Order {
+            return Ok(None);
+        }
+        self.expect_token(TokenType::Order)?;
+        self.expect_token(TokenType::By)?;
+        let order_by = self.parse_column_name()?;
+        let order_dir = match self.peek_token.token_type {
+            TokenType::Asc => {
+                self.expect_token(TokenType::Asc)?;
+                OrderDirection::Ascending
+            }
+            TokenType::Desc => {
+                self.expect_token(TokenType::Desc)?;
+                OrderDirection::Descending
+            }
+            _ => OrderDirection::Ascending,
+        };
+        Ok(Some(OrderByDetails {
+            column: order_by,
+            direction: order_dir,
+        }))
+    }
+
+    /// Parses an optional LIMIT clause, returning the limit value if present.
+    fn parse_limit_clause(&mut self) -> Result<Option<i64>, ParserError> {
+        if self.peek_token.token_type != TokenType::Limit {
+            return Ok(None);
+        }
+        self.expect_token(TokenType::Limit)?;
+        let value = self.expect_int()?;
+        Ok(Some(value))
+    }
+
+    /// Parses an optional OFFSET clause, returning the offset value if present.
+    fn parse_offset_clause(&mut self) -> Result<Option<i64>, ParserError> {
+        if self.peek_token.token_type != TokenType::Offset {
+            return Ok(None);
+        }
+        self.expect_token(TokenType::Offset)?;
+        let value = self.expect_int()?;
+        Ok(Some(value))
     }
 
     /// Parses a table name as a table identifier expression.
@@ -832,6 +883,16 @@ impl Parser {
             Ok(value)
         } else {
             Err(self.unexpected_token_error("string"))
+        }
+    }
+
+    /// Consumes the next token if it’s an int and returns its value.
+    fn expect_int(&mut self) -> Result<i64, ParserError> {
+        if let TokenType::Int(value) = self.peek_token.token_type {
+            self.read_token()?;
+            Ok(value)
+        } else {
+            Err(self.unexpected_token_error("int"))
         }
     }
 
@@ -1425,5 +1486,125 @@ mod tests {
         };
 
         assert_table_identifier_node(&ast, drop_stmt.table_name, "sessions", None);
+    }
+
+    #[test]
+    fn parses_select_with_order_by_asc() {
+        let parser = Parser::new("SELECT * FROM users ORDER BY id ASC;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:?}", ast.statements[0]);
+        };
+
+        assert_table_identifier_node(&ast, select_stmt.table_name, "users", None);
+
+        let order_by = select_stmt
+            .order_by
+            .as_ref()
+            .expect("Expected ORDER BY clause");
+        assert_column_identifier_node(&ast, order_by.column, "id", None);
+        assert!(matches!(order_by.direction, OrderDirection::Ascending));
+    }
+
+    #[test]
+    fn parses_select_with_order_by_desc() {
+        let parser = Parser::new("SELECT * FROM users ORDER BY age DESC;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:?}", ast.statements[0]);
+        };
+
+        let order_by = select_stmt
+            .order_by
+            .as_ref()
+            .expect("Expected ORDER BY clause");
+        assert_column_identifier_node(&ast, order_by.column, "age", None);
+        assert!(matches!(order_by.direction, OrderDirection::Descending));
+    }
+
+    #[test]
+    fn parses_select_with_order_by_default_direction() {
+        let parser = Parser::new("SELECT * FROM users ORDER BY name;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:?}", ast.statements[0]);
+        };
+
+        let order_by = select_stmt
+            .order_by
+            .as_ref()
+            .expect("Expected ORDER BY clause");
+        assert_column_identifier_node(&ast, order_by.column, "name", None);
+        assert!(matches!(order_by.direction, OrderDirection::Ascending));
+    }
+
+    #[test]
+    fn parses_select_with_limit() {
+        let parser = Parser::new("SELECT * FROM users LIMIT 100;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:?}", ast.statements[0]);
+        };
+
+        assert_table_identifier_node(&ast, select_stmt.table_name, "users", None);
+        assert_eq!(select_stmt.limit, Some(100));
+    }
+
+    #[test]
+    fn parses_select_with_offset() {
+        let parser = Parser::new("SELECT * FROM users OFFSET 50;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:?}", ast.statements[0]);
+        };
+
+        assert_table_identifier_node(&ast, select_stmt.table_name, "users", None);
+        assert_eq!(select_stmt.offset, Some(50));
+    }
+
+    #[test]
+    fn parses_select_with_where_order_limit_offset() {
+        let parser =
+            Parser::new("SELECT * FROM users WHERE age > 18 ORDER BY id DESC LIMIT 100 OFFSET 50;");
+        let ast = parser.parse_program().unwrap();
+        assert_eq!(ast.statements.len(), 1);
+
+        let Statement::Select(select_stmt) = &ast.statements[0] else {
+            panic!("Expected Select statement, got {:?}", ast.statements[0]);
+        };
+
+        assert_table_identifier_node(&ast, select_stmt.table_name, "users", None);
+
+        // Check WHERE clause
+        assert!(select_stmt.where_clause.is_some());
+        let where_id = select_stmt.where_clause.unwrap();
+        let Expression::Binary(where_expr) = ast.node(where_id) else {
+            panic!("Expected Binary expression in WHERE clause");
+        };
+        assert!(matches!(where_expr.op, BinaryOperator::Greater));
+
+        // Check ORDER BY clause
+        let order_by = select_stmt
+            .order_by
+            .as_ref()
+            .expect("Expected ORDER BY clause");
+        assert_column_identifier_node(&ast, order_by.column, "id", None);
+        assert!(matches!(order_by.direction, OrderDirection::Descending));
+
+        // Check LIMIT
+        assert_eq!(select_stmt.limit, Some(100));
+
+        // Check OFFSET
+        assert_eq!(select_stmt.offset, Some(50));
     }
 }

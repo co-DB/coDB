@@ -1215,6 +1215,9 @@ mod tests {
             table_name,
             columns: Some(vec![col_id, col_name]),
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
         ast
@@ -1762,6 +1765,9 @@ mod tests {
             table_name,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -1818,6 +1824,9 @@ mod tests {
             table_name,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -1863,6 +1872,9 @@ mod tests {
             table_name,
             columns: Some(vec![col_id, col_fake]),
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -1973,6 +1985,9 @@ mod tests {
             table_name,
             columns: Some(vec![id_col]),
             where_clause: Some(where_node),
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -2061,6 +2076,9 @@ mod tests {
             table_name,
             columns: Some(vec![col_u_id, col_name]),
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
 
         // SELECT u.id, name FROM users AS u;
@@ -2118,6 +2136,9 @@ mod tests {
             table_name,
             columns: Some(vec![col_k_id]),
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
 
         // SELECT k.id FROM users AS u;
@@ -3348,6 +3369,9 @@ mod tests {
             table_name: t1,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(s1));
 
@@ -3363,6 +3387,9 @@ mod tests {
             table_name: t2,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(s2));
 
@@ -3413,6 +3440,9 @@ mod tests {
             table_name: t1,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -3461,6 +3491,9 @@ mod tests {
             table_name: t1,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
