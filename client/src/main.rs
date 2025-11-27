@@ -39,13 +39,10 @@ enum ClientError {
     InvalidJson(#[from] serde_json::Error),
     #[error("invalid command: {reason}")]
     InvalidCommand { reason: String },
-    #[error("server error: {message}")]
-    ServerError { message: String },
 }
 
 enum ReadResult {
     Disconnected,
-    Empty,
     Response(Response),
 }
 
@@ -124,7 +121,7 @@ impl ConsoleHandler {
                 continue;
             }
 
-            if trimmed.starts_with(Self::ENDING_INPUT) {
+            if trimmed == Self::ENDING_INPUT {
                 break;
             }
 
@@ -148,7 +145,6 @@ impl ConsoleHandler {
         loop {
             match self.db_client.read_response().await? {
                 ReadResult::Disconnected => break,
-                ReadResult::Empty => continue,
                 ReadResult::Response(resp) => {
                     ConsoleHandler::display_response(&resp);
 
