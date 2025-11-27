@@ -75,6 +75,11 @@ pub enum AnalyzerError {
     UnexpectedTableMetadataError(#[from] TableMetadataError),
     #[error("unexpected ast error: {0}")]
     UnexpectedAstError(#[from] AstError),
+    #[error("mixed statement types in query: found both {first_type} and {second_type}")]
+    MixedStatementTypes {
+        first_type: String,
+        second_type: String,
+    },
 }
 
 /// Used as a key type for [`StatementContext::inserted_columns`].
@@ -160,6 +165,36 @@ impl StatementContext {
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum StatementCategory {
+    DDL,
+    DML,
+}
+
+impl From<&Statement> for StatementCategory {
+    fn from(value: &Statement) -> Self {
+        match value {
+            Statement::Create(_)
+            | Statement::Alter(_)
+            | Statement::Drop(_)
+            | Statement::Truncate(_) => StatementCategory::DDL,
+            Statement::Select(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_) => StatementCategory::DML,
+        }
+    }
+}
+
+impl Display for StatementCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StatementCategory::DDL => write!(f, "DDL"),
+            StatementCategory::DML => write!(f, "DML"),
+        }
+    }
+}
+
 /// [`Analyzer`] is responsible for performing semantic analysis on [`Ast`]. As the result it produces the [`ResolvedTree`].
 pub(crate) struct Analyzer<'a> {
     /// [`Ast`] being analyzed.
@@ -186,6 +221,11 @@ impl<'a> Analyzer<'a> {
     /// Analyzes [`Ast`] and returns resolved version of it - [`ResolvedTree`].
     pub(crate) fn analyze(mut self) -> Result<ResolvedTree, Vec<AnalyzerError>> {
         let mut errors = vec![];
+
+        if let Err(e) = self.validate_statements_types() {
+            errors.push(e);
+        }
+
         for statement in self.ast.statements() {
             self.statement_context.clear();
             if let Err(e) = self.analyze_statement(statement) {
@@ -1076,6 +1116,26 @@ impl<'a> Analyzer<'a> {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Checks if all statements are of the same category (DML or DDL).
+    fn validate_statements_types(&self) -> Result<(), AnalyzerError> {
+        let statements = self.ast.statements();
+        if statements.is_empty() {
+            return Ok(());
+        }
+
+        let first = StatementCategory::from(&statements[0]);
+        for statement in &statements[1..] {
+            let category = StatementCategory::from(statement);
+            if first != category {
+                return Err(AnalyzerError::MixedStatementTypes {
+                    first_type: first.to_string(),
+                    second_type: category.to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3306,26 +3366,19 @@ mod tests {
         };
         ast.add_statement(Statement::Select(s2));
 
-        // third statement (adding existing column "name")
+        // third statement (delete from non-existing table)
         let t3_ident = ast.add_node(Expression::Identifier(IdentifierNode {
-            value: "users".into(),
+            value: "nonexistent_table".into(),
         }));
         let t3 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
             identifier: t3_ident,
             alias: None,
         }));
-        let existing_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
-            value: "name".into(),
-        }));
-        let add_action = AddAlterAction {
-            column_name: existing_col_ident,
-            column_type: Type::String,
-        };
-        let alter = AlterStatement {
+        let delete = DeleteStatement {
             table_name: t3,
-            action: AlterAction::Add(add_action),
+            where_clause: None,
         };
-        ast.add_statement(Statement::Alter(alter));
+        ast.add_statement(Statement::Delete(delete));
 
         let analyzer = Analyzer::new(&ast, catalog);
         let errs = analyzer.analyze().unwrap_err();
@@ -3338,11 +3391,129 @@ mod tests {
         }
 
         match &errs[1] {
-            AnalyzerError::ColumnAlreadyExists { column } => assert_eq!(column, "name"),
-            other => panic!(
-                "expected ColumnAlreadyExists as second error, got: {:?}",
-                other
-            ),
+            AnalyzerError::TableNotFound { table } => assert_eq!(table, "nonexistent_table"),
+            other => panic!("expected TableNotFound as second error, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn analyze_mixed_statement_types_errors() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // First statement: DML (SELECT)
+        let t1_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t1 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t1_ident,
+            alias: None,
+        }));
+        let select = SelectStatement {
+            table_name: t1,
+            columns: None,
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        // Second statement: DDL (DROP)
+        let t2_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t2 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t2_ident,
+            alias: None,
+        }));
+        let drop = DropStatement { table_name: t2 };
+        ast.add_statement(Statement::Drop(drop));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+
+        assert_eq!(errs.len(), 1);
+
+        match &errs[0] {
+            AnalyzerError::MixedStatementTypes {
+                first_type,
+                second_type,
+            } => {
+                assert_eq!(first_type, "DML");
+                assert_eq!(second_type, "DDL");
+            }
+            other => panic!("expected MixedStatementTypes, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_all_dml_statements_succeeds() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT
+        let t1_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t1 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t1_ident,
+            alias: None,
+        }));
+        let select = SelectStatement {
+            table_name: t1,
+            columns: None,
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        // DELETE
+        let t2_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t2 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t2_ident,
+            alias: None,
+        }));
+        let delete = DeleteStatement {
+            table_name: t2,
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Delete(delete));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("all DML should succeed");
+
+        assert_eq!(rt.statements.len(), 2);
+    }
+
+    #[test]
+    fn analyze_all_ddl_statements_succeeds() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // TRUNCATE
+        let t1_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t1 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t1_ident,
+            alias: None,
+        }));
+        let truncate = TruncateStatement { table_name: t1 };
+        ast.add_statement(Statement::Truncate(truncate));
+
+        // DROP
+        let t2_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t2 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t2_ident,
+            alias: None,
+        }));
+        let drop = DropStatement { table_name: t2 };
+        ast.add_statement(Statement::Drop(drop));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("all DDL should succeed");
+
+        assert_eq!(rt.statements.len(), 2);
     }
 }
