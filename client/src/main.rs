@@ -1,6 +1,5 @@
 use clap::Parser;
-use log::info;
-use protocol::text_protocol::Request::Query;
+use log::{error, info};
 use protocol::text_protocol::{ErrorType, Request, Response};
 use std::io;
 use std::io::{BufRead, Write};
@@ -123,7 +122,13 @@ impl ConsoleHandler {
 
             let trimmed = self.current_input.trim();
 
-            let request = Self::parse_request(trimmed)?;
+            let request = match Self::parse_request(trimmed) {
+                Ok(request) => request,
+                Err(e) => {
+                    error!("{}", e);
+                    continue;
+                }
+            };
 
             self.db_client.send_request(request).await?;
 
@@ -163,7 +168,7 @@ impl ConsoleHandler {
             let (_, command) = request.as_ref().split_at(1);
             Self::parse_command(command)
         } else {
-            Ok(Query {
+            Ok(Request::Query {
                 sql: request.as_ref().to_string(),
                 database_name: None,
             })
@@ -181,7 +186,7 @@ impl ConsoleHandler {
             "connect" => Self::parse_connect(command_segments),
             "query" => Self::parse_query(command),
             _ => Err(ClientError::InvalidCommand {
-                reason: format!("invalid command: {}", command_segments[0]),
+                reason: format!("{} is not a command", command_segments[0]),
             }),
         }
     }
