@@ -1,4 +1,4 @@
-use storage::paged_file::{Page, PageId};
+use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_node::{
     BTreeInternalNode, BTreeKey, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult,
@@ -8,10 +8,9 @@ use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::heap_file::RecordPtr;
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
-use storage::cache::{Cache, CacheError, FilePageRef, PinnedReadPage, PinnedWritePage};
+use storage::cache::{Cache, CacheError, FilePageRef, PageWrite, PinnedReadPage, PinnedWritePage};
 use storage::files_manager::FileKey;
 use thiserror::Error;
 
@@ -49,6 +48,12 @@ impl BTreeMetadata {
             magic_number: BTreeMetadata::CODB_MAGIC_NUMBER,
             root_page_id,
         }
+    }
+
+    fn save_to_page(&self, page: &mut impl PageWrite) {
+        let metadata = BTreeMetadata::new(self.root_page_id);
+        let metadata_bytes = bytemuck::bytes_of(&metadata);
+        page.data_mut()[0..metadata_bytes.len()].copy_from_slice(metadata_bytes);
     }
 }
 
@@ -117,8 +122,7 @@ impl<Key: BTreeKey> PessimisticPath<Key> {
 /// Structure responsible for managing on-disk index files.
 ///
 /// Each [`BTree`] instance corresponds to a single physical file on disk.
-pub(crate) struct BTree<Key: BTreeKey> {
-    _key_marker: PhantomData<Key>,
+pub(crate) struct BTree {
     file_key: FileKey,
     cache: Arc<Cache>,
     /// A concurrent hash map for storing the current structural version numbers (how many times a
@@ -127,13 +131,13 @@ pub(crate) struct BTree<Key: BTreeKey> {
     structural_version_numbers: DashMap<PageId, AtomicU16>,
 }
 
-impl<Key: BTreeKey> BTree<Key> {
+impl BTree {
     const METADATA_PAGE_ID: PageId = 1;
 
     /// Reads the root page ID from the metadata page.
     fn read_root_page_id(&self) -> Result<PageId, BTreeError> {
         let metadata_page = self.cache.pin_read(&FilePageRef::new(
-            BTree::<Key>::METADATA_PAGE_ID,
+            BTree::METADATA_PAGE_ID,
             self.file_key.clone(),
         ))?;
 
@@ -146,7 +150,6 @@ impl<Key: BTreeKey> BTree<Key> {
         Ok(Self {
             cache,
             file_key,
-            _key_marker: PhantomData,
             structural_version_numbers: DashMap::new(),
         })
     }
@@ -163,7 +166,7 @@ impl<Key: BTreeKey> BTree<Key> {
         Ok(self.cache.pin_read(&self.page_ref(page_id))?)
     }
 
-    fn pin_leaf_for_write(
+    fn pin_leaf_for_write<Key: BTreeKey>(
         &self,
         leaf_page_id: PageId,
     ) -> Result<BTreeLeafNode<PinnedWritePage, Key>, BTreeError> {
@@ -173,7 +176,7 @@ impl<Key: BTreeKey> BTree<Key> {
 
     /// Searches for a key in the B-tree and returns the corresponding record pointer (to heap
     /// file record) if the key was found.
-    pub fn search(&self, key: &Key) -> Result<Option<RecordPtr>, BTreeError> {
+    pub fn search<Key: BTreeKey>(&self, key: &Key) -> Result<Option<RecordPtr>, BTreeError> {
         let mut current_page_id = self.read_root_page_id()?;
 
         loop {
@@ -213,7 +216,11 @@ impl<Key: BTreeKey> BTree<Key> {
     /// their child, that we descend into, has enough space to fit another key. That's because
     /// we know that the child can't become full and won't need to be split. If we reach the leaf
     /// and the node is still full we start the recursive split operation.
-    pub(crate) fn insert(&self, key: Key, record_pointer: RecordPtr) -> Result<(), BTreeError> {
+    pub(crate) fn insert<Key: BTreeKey>(
+        &self,
+        key: Key,
+        record_pointer: RecordPtr,
+    ) -> Result<(), BTreeError> {
         let optimistic_result = self.insert_optimistic(&key, &record_pointer)?;
         match optimistic_result {
             OptimisticInsertResult::InsertSucceeded => Ok(()),
@@ -230,7 +237,10 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Traverses the tree to the leaf while recording page versions for optimistic concurrency checks.
-    fn traverse_with_versions(&self, key: &Key) -> Result<(PageId, Vec<PageVersion>), BTreeError> {
+    fn traverse_with_versions<Key: BTreeKey>(
+        &self,
+        key: &Key,
+    ) -> Result<(PageId, Vec<PageVersion>), BTreeError> {
         let mut current_page_id = self.read_root_page_id()?;
         let mut path_versions = Vec::new();
 
@@ -272,7 +282,7 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Performs an optimistic insert attempt at the leaf node.
-    fn insert_optimistic(
+    fn insert_optimistic<Key: BTreeKey>(
         &self,
         key: &Key,
         record_pointer: &RecordPtr,
@@ -296,7 +306,10 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     ///  Traverses the tree while keeping write latches on nodes that may need to split.
-    fn traverse_pessimistic(&self, key: &Key) -> Result<PessimisticPath<Key>, BTreeError> {
+    fn traverse_pessimistic<Key: BTreeKey>(
+        &self,
+        key: &Key,
+    ) -> Result<PessimisticPath<Key>, BTreeError> {
         // Pin the metadata (in case root splits)
         let mut metadata_page = Some(self.pin_write(Self::METADATA_PAGE_ID)?);
         let mut current_page_id =
@@ -335,7 +348,11 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Performs a pessimistic insert, splitting nodes as necessary.
-    fn insert_pessimistic(&self, key: Key, record_pointer: RecordPtr) -> Result<(), BTreeError> {
+    fn insert_pessimistic<Key: BTreeKey>(
+        &self,
+        key: Key,
+        record_pointer: RecordPtr,
+    ) -> Result<(), BTreeError> {
         let path = self.traverse_pessimistic(&key)?;
 
         let mut leaf = self.pin_leaf_for_write(path.leaf_page_id)?;
@@ -361,7 +378,7 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Allocates a new leaf page and initializes it with the given `next_leaf_id`.
-    fn allocate_and_init_leaf(
+    fn allocate_and_init_leaf<Key: BTreeKey>(
         &self,
         next_leaf_id: Option<PageId>,
     ) -> Result<(PageId, BTreeLeafNode<PinnedWritePage, Key>), BTreeError> {
@@ -373,7 +390,7 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Allocates a new internal page and initializes it with the given `leftmost_child_id`.
-    fn allocate_and_init_internal(
+    fn allocate_and_init_internal<Key: BTreeKey>(
         &self,
         leftmost_child_id: PageId,
     ) -> Result<(PageId, BTreeInternalNode<PinnedWritePage, Key>), BTreeError> {
@@ -385,7 +402,7 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Splits a leaf node and propagates the separator up the tree.
-    fn split_and_propagate(
+    fn split_and_propagate<Key: BTreeKey>(
         &self,
         internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage, Key>)>,
         leaf_node: (PageId, BTreeLeafNode<PinnedWritePage, Key>),
@@ -404,7 +421,7 @@ impl<Key: BTreeKey> BTree<Key> {
 
     /// Splits the provided leaf node and creates a new one with the split keys. Returns a pair
     /// of separator key and the new leaf node's page id.
-    fn split_leaf(
+    fn split_leaf<Key: BTreeKey>(
         &self,
         leaf_page_id: PageId,
         mut leaf_node: BTreeLeafNode<PinnedWritePage, Key>,
@@ -442,7 +459,7 @@ impl<Key: BTreeKey> BTree<Key> {
 
     /// Propagates a separator key upwards through internal nodes, splitting parents as needed and
     /// creating a new root if necessary.
-    fn propagate_separator_up(
+    fn propagate_separator_up<Key: BTreeKey>(
         &self,
         mut internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage, Key>)>,
         mut current_separator_key: Key,
@@ -522,7 +539,7 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Creates a new root and updates the metadata page.
-    fn create_new_root(
+    fn create_new_root<Key: BTreeKey>(
         &self,
         left_child_id: PageId,
         separator_key: Key,
@@ -549,6 +566,64 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 }
 
+struct BTreeFactory {
+    file_key: FileKey,
+    cache: Arc<Cache>,
+}
+
+impl BTreeFactory {
+    pub fn new(file_key: FileKey, cache: Arc<Cache>) -> Self {
+        BTreeFactory { file_key, cache }
+    }
+
+    pub fn create_btree(self) -> Result<BTree, BTreeError> {
+        self.initialize_metadata_and_root_if_not_exist()?;
+
+        BTree::new(self.cache, self.file_key)
+    }
+
+    fn initialize_metadata_and_root_if_not_exist(&self) -> Result<(), BTreeError> {
+        let key = self.file_page_ref(BTree::METADATA_PAGE_ID);
+        match self.cache.pin_read(&key) {
+            Ok(page) => {
+                // Check that it is the correct metadata
+                BTreeMetadata::try_from(page.page())?;
+                Ok(())
+            }
+            Err(e) => {
+                if let CacheError::PagedFileError(PagedFileError::InvalidPageId(
+                    BTree::METADATA_PAGE_ID,
+                )) = e
+                {
+                    // This mean that metadata page was not allocated yet, so the file was just created
+                    let (mut metadata_page, metadata_page_id) =
+                        self.cache.allocate_page(key.file_key())?;
+
+                    if metadata_page_id != BTree::METADATA_PAGE_ID {
+                        return Ok(());
+                    }
+
+                    let (root_page, root_page_id) = self.cache.allocate_page(key.file_key())?;
+
+                    BTreeLeafNode::<PinnedWritePage, i32>::initialize(root_page, None)?;
+
+                    let metadata = BTreeMetadata::new(root_page_id);
+
+                    metadata.save_to_page(&mut metadata_page);
+
+                    Ok(())
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
+    /// Creates a `FilePageRef` for `page_id` using b-tree file key.
+    fn file_page_ref(&self, page_id: PageId) -> FilePageRef {
+        FilePageRef::new(page_id, self.file_key.clone())
+    }
+}
 #[cfg(test)]
 mod test {
     use super::*;
@@ -581,10 +656,10 @@ mod test {
     fn create_empty_btree<Key: BTreeKey>(
         cache: Arc<Cache>,
         file_key: FileKey,
-    ) -> Result<BTree<Key>, BTreeError> {
+    ) -> Result<BTree, BTreeError> {
         let (mut metadata_page, metadata_page_id) = cache.allocate_page(&file_key)?;
 
-        assert_eq!(metadata_page_id, BTree::<Key>::METADATA_PAGE_ID);
+        assert_eq!(metadata_page_id, BTree::METADATA_PAGE_ID);
 
         let (root_page, root_id) = cache.allocate_page(&file_key)?;
 
@@ -603,8 +678,8 @@ mod test {
         cache: Arc<Cache>,
         file_key: FileKey,
         data: Vec<(Key, RecordPtr)>,
-    ) -> Result<BTree<Key>, BTreeError> {
-        let btree = create_empty_btree(cache, file_key)?;
+    ) -> Result<BTree, BTreeError> {
+        let btree = create_empty_btree::<Key>(cache, file_key)?;
 
         for (key, record_ptr) in data {
             btree.insert(key, record_ptr)?;
