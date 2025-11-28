@@ -27,8 +27,8 @@ use crate::{
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedCreateColumnAddon,
         ResolvedCreateColumnDescriptor, ResolvedCreateStatement, ResolvedDeleteStatement,
         ResolvedDropStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral,
-        ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
-        ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
+        ResolvedLogicalExpression, ResolvedNodeId, ResolvedOrderByDetails, ResolvedSelectStatement,
+        ResolvedStatement, ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
         ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
@@ -80,6 +80,8 @@ pub enum AnalyzerError {
         first_type: String,
         second_type: String,
     },
+    #[error("value '{got}' cannot be used in {context}")]
+    ValueOutOfBounds { got: i64, context: String },
 }
 
 /// Used as a key type for [`StatementContext::inserted_columns`].
@@ -266,10 +268,32 @@ impl<'a> Analyzer<'a> {
             .where_clause
             .map(|node_id| self.resolve_expression(node_id))
             .transpose()?;
+        let resolved_order_by = select
+            .order_by
+            .as_ref()
+            .map(|order_by_details| {
+                let column = self.resolve_expression(order_by_details.column)?;
+                Ok::<ResolvedOrderByDetails, AnalyzerError>(ResolvedOrderByDetails {
+                    column,
+                    direction: order_by_details.direction,
+                })
+            })
+            .transpose()?;
+        let resolved_limit = select
+            .limit
+            .map(|limit| self.resolve_u32(limit, "LIMIT"))
+            .transpose()?;
+        let resolved_offset = select
+            .offset
+            .map(|offset| self.resolve_u32(offset, "OFFSET"))
+            .transpose()?;
         let select_statement = ResolvedSelectStatement {
             table: resolved_table,
             columns: resolved_columns,
             where_clause: resolved_where_clause,
+            order_by: resolved_order_by,
+            limit: resolved_limit,
+            offset: resolved_offset,
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Select(select_statement));
@@ -1137,13 +1161,24 @@ impl<'a> Analyzer<'a> {
         }
         Ok(())
     }
+
+    fn resolve_u32(&self, value: i64, ctx: impl Into<String>) -> Result<u32, AnalyzerError> {
+        if value >= u32::MIN as i64 && value <= u32::MAX as i64 {
+            return Ok(value as u32);
+        }
+        Err(AnalyzerError::ValueOutOfBounds {
+            got: value,
+            context: ctx.into(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::{
-        Ast, CreateColumnDescriptor, Expression, IdentifierNode, SelectStatement, Statement,
+        Ast, CreateColumnDescriptor, Expression, IdentifierNode, OrderByDetails, OrderDirection,
+        SelectStatement, Statement,
     };
     use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
     use metadata::catalog::Catalog;
@@ -2039,6 +2074,182 @@ mod tests {
         assert!(matches!(b4.op, BinaryOperator::Greater));
         let v300 = expect_literal_i32(&resolved_tree, b4.right);
         assert_eq!(v300, 300);
+    }
+
+    #[test]
+    fn analyze_select_with_order_by_asc() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let order_by_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: Some(OrderByDetails {
+                column: order_by_col,
+                direction: OrderDirection::Ascending,
+            }),
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+        let select = expect_select(&rt, 0);
+
+        let order_by = select
+            .order_by
+            .as_ref()
+            .expect("order_by should be present");
+        let col = expect_column(&rt, order_by.column);
+        assert_eq!(col.name, "id");
+        assert_eq!(col.ty, Type::I32);
+        assert!(matches!(
+            order_by.direction,
+            crate::ast::OrderDirection::Ascending
+        ));
+    }
+
+    #[test]
+    fn analyze_select_with_order_by_desc() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let order_by_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: Some(OrderByDetails {
+                column: order_by_col,
+                direction: OrderDirection::Descending,
+            }),
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+        let select = expect_select(&rt, 0);
+
+        let order_by = select
+            .order_by
+            .as_ref()
+            .expect("order_by should be present");
+        let col = expect_column(&rt, order_by.column);
+        assert_eq!(col.name, "name");
+        assert_eq!(col.ty, Type::String);
+        assert!(matches!(
+            order_by.direction,
+            crate::ast::OrderDirection::Descending
+        ));
+    }
+
+    #[test]
+    fn analyze_select_with_limit_and_offset() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: Some(25),
+            offset: Some(10),
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+        let select = expect_select(&rt, 0);
+
+        assert_eq!(select.limit, Some(25));
+        assert_eq!(select.offset, Some(10));
+    }
+
+    #[test]
+    fn analyze_select_limit_out_of_bounds() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // limit exceeds u32::MAX
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: Some(u32::MAX as i64 + 1),
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+
+        match &errs[0] {
+            AnalyzerError::ValueOutOfBounds { got, context } => {
+                assert_eq!(*got, u32::MAX as i64 + 1);
+                assert_eq!(context, "LIMIT");
+            }
+            other => panic!("expected ValueOutOfBounds, got: {:?}", other),
+        }
     }
 
     #[test]

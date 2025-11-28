@@ -110,11 +110,13 @@ mod tests {
     use metadata::types::Type;
 
     use crate::{
+        operators::BinaryOperator,
         query_plan::{CreateTable, Filter, Insert, Projection, StatementPlanItem, TableScan},
         query_planner::QueryPlanner,
         resolved_tree::{
-            ResolvedColumn, ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral,
-            ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
+            ResolvedBinaryExpression, ResolvedColumn, ResolvedExpression, ResolvedInsertStatement,
+            ResolvedLiteral, ResolvedSelectStatement, ResolvedStatement, ResolvedTable,
+            ResolvedTree,
         },
     };
 
@@ -184,6 +186,9 @@ mod tests {
             table: table_id,
             columns: vec![col1, col2],
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
 
         tree.add_statement(ResolvedStatement::Select(select));
@@ -214,8 +219,6 @@ mod tests {
 
     #[test]
     fn query_planner_select_statement_with_where_clause() {
-        use crate::{operators::BinaryOperator, resolved_tree::ResolvedBinaryExpression};
-
         // Setup tree
         let mut tree = ResolvedTree::default();
 
@@ -254,6 +257,9 @@ mod tests {
             table: table_id,
             columns: vec![col1_id, col2_id],
             where_clause: Some(where_expr),
+            order_by: None,
+            limit: None,
+            offset: None,
         };
 
         tree.add_statement(ResolvedStatement::Select(select));

@@ -101,7 +101,7 @@ pub struct OrderByDetails {
     pub direction: OrderDirection,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum OrderDirection {
     Ascending,
     Descending,
