@@ -1,5 +1,6 @@
 use crate::{
-    query_plan::{QueryPlan, StatementPlan, StatementPlanItem},
+    ast::OrderDirection,
+    query_plan::{QueryPlan, SortOrder, StatementPlan, StatementPlanItem},
     resolved_tree::{
         ResolvedCreateStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedNodeId,
         ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
@@ -60,9 +61,31 @@ impl QueryPlanner {
         // TODO: if possible we should check if where clause contain only primary_key (index) and
         // in that case use IndexScan with proper range
         let mut root = plan.add_item(StatementPlanItem::table_scan(table.name.clone()));
+
+        // Handle where
         if let Some(where_node) = select.where_clause {
             root = plan.add_item(StatementPlanItem::filter(root, where_node));
         }
+
+        // Handle order by
+        if let Some(order_by) = &select.order_by {
+            root = plan.add_item(StatementPlanItem::sort(
+                root,
+                order_by.column,
+                self.map_order(&order_by.direction),
+            ));
+        }
+
+        // Handle offset
+        if let Some(offset) = select.offset {
+            root = plan.add_item(StatementPlanItem::skip(root, offset));
+        }
+
+        // Handle limit
+        if let Some(limit) = select.limit {
+            root = plan.add_item(StatementPlanItem::limit(root, limit));
+        }
+
         plan.add_item(StatementPlanItem::projection(root, select.columns.clone()));
 
         plan
@@ -103,6 +126,13 @@ impl QueryPlanner {
         };
         table
     }
+
+    fn map_order(&self, order: &OrderDirection) -> SortOrder {
+        match order {
+            OrderDirection::Ascending => SortOrder::Ascending,
+            OrderDirection::Descending => SortOrder::Descending,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -110,13 +140,17 @@ mod tests {
     use metadata::types::Type;
 
     use crate::{
+        ast::OrderDirection,
         operators::BinaryOperator,
-        query_plan::{CreateTable, Filter, Insert, Projection, StatementPlanItem, TableScan},
+        query_plan::{
+            CreateTable, Filter, Insert, Limit, Projection, Skip, Sort, SortOrder,
+            StatementPlanItem, TableScan,
+        },
         query_planner::QueryPlanner,
         resolved_tree::{
             ResolvedBinaryExpression, ResolvedColumn, ResolvedExpression, ResolvedInsertStatement,
-            ResolvedLiteral, ResolvedSelectStatement, ResolvedStatement, ResolvedTable,
-            ResolvedTree,
+            ResolvedLiteral, ResolvedOrderByDetails, ResolvedSelectStatement, ResolvedStatement,
+            ResolvedTable, ResolvedTree,
         },
     };
 
@@ -131,6 +165,27 @@ mod tests {
         match item {
             StatementPlanItem::Filter(filter) => filter,
             _ => panic!("expected: filter, got: {:?}", item),
+        }
+    }
+
+    fn assert_sort_item(item: &StatementPlanItem) -> &Sort {
+        match item {
+            StatementPlanItem::Sort(sort) => sort,
+            _ => panic!("expected: sort, got: {:?}", item),
+        }
+    }
+
+    fn assert_limit_item(item: &StatementPlanItem) -> &Limit {
+        match item {
+            StatementPlanItem::Limit(limit) => limit,
+            _ => panic!("expected: limit, got: {:?}", item),
+        }
+    }
+
+    fn assert_skip_item(item: &StatementPlanItem) -> &Skip {
+        match item {
+            StatementPlanItem::Skip(skip) => skip,
+            _ => panic!("expected: skip, got: {:?}", item),
         }
     }
 
@@ -288,6 +343,200 @@ mod tests {
         assert_eq!(filter.predicate, where_expr);
 
         // Assert table scan is correct
+        let scan_table_item = select_plan.item(filter.data_source);
+        let scan_table = assert_table_scan_item(scan_table_item);
+        assert_eq!(scan_table.table_name, "test");
+    }
+
+    #[test]
+    fn query_planner_select_with_order_by_desc() {
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "test".into(),
+            primary_key_name: "test_pk".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let col1 = ResolvedColumn {
+            table: table_id,
+            name: "col1".into(),
+            ty: Type::String,
+            pos: 0,
+        };
+        let col1_id = tree.add_node(ResolvedExpression::ColumnRef(col1));
+
+        let select = ResolvedSelectStatement {
+            table: table_id,
+            columns: vec![col1_id],
+            where_clause: None,
+            order_by: Some(ResolvedOrderByDetails {
+                column: col1_id,
+                direction: OrderDirection::Descending,
+            }),
+            limit: None,
+            offset: None,
+        };
+
+        tree.add_statement(ResolvedStatement::Select(select));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        assert_eq!(plan.plans.len(), 1);
+        let select_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains three items (projection -> sort -> table scan)
+        assert_eq!(select_plan.items.len(), 3);
+
+        let projection_item = select_plan.root();
+        let projection = assert_projection_item(projection_item);
+
+        let sort_item = select_plan.item(projection.data_source);
+        let sort = assert_sort_item(sort_item);
+        assert_eq!(sort.column, col1_id);
+        assert!(matches!(sort.order, SortOrder::Descending));
+    }
+
+    #[test]
+    fn query_planner_select_with_limit_and_offset() {
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "test".into(),
+            primary_key_name: "test_pk".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let col1 = ResolvedColumn {
+            table: table_id,
+            name: "col1".into(),
+            ty: Type::I32,
+            pos: 0,
+        };
+        let col1_id = tree.add_node(ResolvedExpression::ColumnRef(col1));
+
+        let select = ResolvedSelectStatement {
+            table: table_id,
+            columns: vec![col1_id],
+            where_clause: None,
+            order_by: None,
+            limit: Some(25),
+            offset: Some(10),
+        };
+
+        tree.add_statement(ResolvedStatement::Select(select));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        assert_eq!(plan.plans.len(), 1);
+        let select_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains four items (projection -> limit -> offset -> table scan)
+        assert_eq!(select_plan.items.len(), 4);
+
+        let projection_item = select_plan.root();
+        let projection = assert_projection_item(projection_item);
+
+        let limit_item = select_plan.item(projection.data_source);
+        let limit = assert_limit_item(limit_item);
+        assert_eq!(limit.count, 25);
+
+        let skip_item = select_plan.item(limit.data_source);
+        let skip = assert_skip_item(skip_item);
+        assert_eq!(skip.count, 10);
+
+        let scan_table_item = select_plan.item(skip.data_source);
+        let scan_table = assert_table_scan_item(scan_table_item);
+        assert_eq!(scan_table.table_name, "test");
+    }
+
+    #[test]
+    fn query_planner_select_with_all_clauses() {
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "test".into(),
+            primary_key_name: "test_pk".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let col1 = ResolvedColumn {
+            table: table_id,
+            name: "col1".into(),
+            ty: Type::I32,
+            pos: 0,
+        };
+        let col1_id = tree.add_node(ResolvedExpression::ColumnRef(col1));
+
+        let col2 = ResolvedColumn {
+            table: table_id,
+            name: "col2".into(),
+            ty: Type::String,
+            pos: 1,
+        };
+        let col2_id = tree.add_node(ResolvedExpression::ColumnRef(col2));
+
+        // WHERE clause: col1 > 10
+        let literal = tree.add_node(ResolvedExpression::Literal(ResolvedLiteral::Int32(10)));
+        let where_expr = tree.add_node(ResolvedExpression::Binary(ResolvedBinaryExpression {
+            left: col1_id,
+            right: literal,
+            op: BinaryOperator::Greater,
+            ty: Type::Bool,
+        }));
+
+        let select = ResolvedSelectStatement {
+            table: table_id,
+            columns: vec![col1_id, col2_id],
+            where_clause: Some(where_expr),
+            order_by: Some(ResolvedOrderByDetails {
+                column: col2_id,
+                direction: OrderDirection::Descending,
+            }),
+            limit: Some(50),
+            offset: Some(5),
+        };
+
+        tree.add_statement(ResolvedStatement::Select(select));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        assert_eq!(plan.plans.len(), 1);
+        let select_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains six items (projection -> limit -> offset -> sort -> filter -> table scan)
+        assert_eq!(select_plan.items.len(), 6);
+
+        let projection_item = select_plan.root();
+        let projection = assert_projection_item(projection_item);
+        assert_eq!(projection.columns.len(), 2);
+
+        let limit_item = select_plan.item(projection.data_source);
+        let limit = assert_limit_item(limit_item);
+        assert_eq!(limit.count, 50);
+
+        let skip_item = select_plan.item(limit.data_source);
+        let skip = assert_skip_item(skip_item);
+        assert_eq!(skip.count, 5);
+
+        let sort_item = select_plan.item(skip.data_source);
+        let sort = assert_sort_item(sort_item);
+        assert_eq!(sort.column, col2_id);
+        assert!(matches!(sort.order, SortOrder::Descending));
+
+        let filter_item = select_plan.item(sort.data_source);
+        let filter = assert_filter_item(filter_item);
+        assert_eq!(filter.predicate, where_expr);
+
         let scan_table_item = select_plan.item(filter.data_source);
         let scan_table = assert_table_scan_item(scan_table_item);
         assert_eq!(scan_table.table_name, "test");
