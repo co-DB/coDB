@@ -40,8 +40,8 @@ pub(crate) enum NodeInsertResult {
 }
 
 /// Type aliases for making things a little more readable
-pub(crate) type BTreeLeafNode<Page, Key> = BTreeNode<Page, BTreeLeafHeader, Key>;
-pub(crate) type BTreeInternalNode<Page, Key> = BTreeNode<Page, BTreeInternalHeader, Key>;
+pub(crate) type BTreeLeafNode<Page> = BTreeNode<Page, BTreeLeafHeader>;
+pub(crate) type BTreeInternalNode<Page> = BTreeNode<Page, BTreeInternalHeader>;
 
 /// Header of internal B-Tree nodes,
 #[repr(C)]
@@ -148,17 +148,12 @@ impl BTreeKey for String {
 }
 /// Struct representing a B-Tree node. It is a wrapper on a slotted page, that uses its api for
 /// lower level operations.
-pub(crate) struct BTreeNode<Page, Header, Key>
+pub(crate) struct BTreeNode<Page, Header>
 where
-    Key: BTreeKey,
     Header: SlottedPageHeader,
 {
     /// Slotted page whose operations B-Tree node depends on.
     slotted_page: SlottedPage<Page, Header>,
-    /// We need to tie a B-Tree node to specific key type, but since there is no sensible field of
-    /// type Key that we can create, we need to use PhantomData just to mark that we are using this
-    /// type.
-    _key_marker: PhantomData<Key>,
 }
 
 /// Gets the type of given page without creating an instance the B-Tree node struct.
@@ -170,26 +165,14 @@ pub fn get_node_type<Page: PageRead>(page: Page) -> Result<NodeType, BTreeNodeEr
     }
 }
 
-impl<Page, Header, Key> BTreeNode<Page, Header, Key>
-where
-    Header: SlottedPageHeader,
-    Key: BTreeKey,
-{
-    pub const fn max_insert_size() -> u16 {
-        Key::MAX_KEY_SIZE + (size_of::<RecordPtr>() + size_of::<Slot>()) as u16
-    }
-}
-
-impl<Page, Header, Key> BTreeNode<Page, Header, Key>
+impl<Page, Header> BTreeNode<Page, Header>
 where
     Page: PageRead,
     Header: SlottedPageHeader,
-    Key: BTreeKey,
 {
     pub fn new(page: Page) -> Result<Self, BTreeNodeError> {
         Ok(Self {
             slotted_page: SlottedPage::new(page)?,
-            _key_marker: PhantomData,
         })
     }
 
@@ -203,19 +186,6 @@ where
 
     fn has_deleted_slots(&self) -> Result<bool, BTreeNodeError> {
         Ok(self.get_base_header()?.base().has_free_slot())
-    }
-
-    /// Gets the key stored in the given slot.
-    fn get_key(&self, slot_id: SlotId) -> Result<Key, BTreeNodeError> {
-        let record_bytes = self.slotted_page.read_record(slot_id)?;
-        let (key, _) = Key::deserialize(record_bytes)?;
-        Ok(key)
-    }
-
-    /// Returns whether another key can fit in this node. This assumes the worst-case scenario
-    /// for String keys (meaning the key is 512 bytes).
-    pub fn can_fit_another(&self) -> Result<bool, BTreeNodeError> {
-        Ok(self.slotted_page.free_space()? >= Self::max_insert_size())
     }
 
     /// Finds a new mid for binary search in the case where the slot in the base mid (left + right / 2)
@@ -237,11 +207,10 @@ where
     }
 }
 
-impl<Page, Header, Key> BTreeNode<Page, Header, Key>
+impl<Page, Header> BTreeNode<Page, Header>
 where
     Page: PageRead + PageWrite,
     Header: SlottedPageHeader,
-    Key: BTreeKey,
 {
     fn get_btree_header_mut(&mut self) -> Result<&mut Header, BTreeNodeError> {
         Ok(self.slotted_page.get_header_mut()?)
@@ -255,7 +224,7 @@ where
         Ok(())
     }
 
-    pub fn split_keys(&mut self) -> Result<(Vec<Vec<u8>>, Key), BTreeNodeError> {
+    pub fn split_keys(&mut self) -> Result<(Vec<Vec<u8>>, Vec<u8>), BTreeNodeError> {
         let valid_records = self
             .slotted_page
             .read_all_records_enumerated()?
@@ -294,7 +263,7 @@ where
         self.slotted_page.compact_slots()?;
         self.slotted_page.compact_records()?;
 
-        let (separator_key, _) = Key::deserialize(copied_split_records.first().unwrap())?;
+        let separator_key = copied_split_records.first().unwrap().to_vec();
         Ok((copied_split_records, separator_key))
     }
 
@@ -319,13 +288,28 @@ where
     }
 }
 
-impl<Page, Key> BTreeNode<Page, BTreeInternalHeader, Key>
+impl<Page> BTreeNode<Page, BTreeInternalHeader>
 where
     Page: PageRead,
-    Key: BTreeKey,
 {
+    /// Gets the key stored in the given slot.
+    fn get_key(&self, slot_id: SlotId) -> Result<&[u8], BTreeNodeError> {
+        let record_bytes = self.slotted_page.read_record(slot_id)?;
+        let key_bytes_end = record_bytes.len() - size_of::<PageId>();
+        let key_bytes = &record_bytes[..key_bytes_end];
+        Ok(key_bytes)
+    }
+
+    /// Gets the child pointer stored in the given slot
+    fn get_child_ptr(&self, slot_id: SlotId) -> Result<PageId, BTreeNodeError> {
+        let record_bytes = self.slotted_page.read_record(slot_id)?;
+        let key_bytes_end = record_bytes.len() - size_of::<PageId>();
+        let (child_ptr, _) = PageId::deserialize(&record_bytes[key_bytes_end..])?;
+        Ok(child_ptr)
+    }
+
     /// Search returns which child to follow.
-    pub fn search(&self, target_key: &Key) -> Result<InternalNodeSearchResult, BTreeNodeError> {
+    pub fn search(&self, target_key: &[u8]) -> Result<InternalNodeSearchResult, BTreeNodeError> {
         let num_slots = self.slotted_page.num_slots()?;
 
         if num_slots == 0 {
@@ -352,13 +336,12 @@ where
                     }
                 }
             }
-            let record_bytes = self.slotted_page.read_record(mid)?;
-            let (key, child_page_id_bytes) = Key::deserialize(record_bytes)?;
+            let key = self.get_key(mid)?;
 
             match key.cmp(target_key) {
                 Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
-                    let (child_ptr, _) = PageId::deserialize(child_page_id_bytes)?;
+                    let child_ptr = self.get_child_ptr(mid)?;
                     return Ok(InternalNodeSearchResult {
                         child_ptr,
                         insert_pos: None,
@@ -385,19 +368,11 @@ where
             insert_pos: Some(insert_pos),
         })
     }
-
-    fn get_child_ptr(&self, slot_id: SlotId) -> Result<PageId, BTreeNodeError> {
-        let record_bytes = self.slotted_page.read_record(slot_id)?;
-        let (_, child_ptr_bytes) = Key::deserialize(record_bytes)?;
-        let (child_ptr, _) = PageId::deserialize(child_ptr_bytes)?;
-        Ok(child_ptr)
-    }
 }
 
-impl<Page, Key> BTreeNode<Page, BTreeInternalHeader, Key>
+impl<Page> BTreeNode<Page, BTreeInternalHeader>
 where
     Page: PageWrite + PageRead,
-    Key: BTreeKey,
 {
     pub fn initialize(page: Page, leftmost_child_pointer: PageId) -> Result<Self, BTreeNodeError> {
         let header = BTreeInternalHeader {
@@ -411,15 +386,12 @@ where
 
         let slotted_page = SlottedPage::initialize_with_header(page, header)?;
 
-        Ok(Self {
-            slotted_page,
-            _key_marker: PhantomData,
-        })
+        Ok(Self { slotted_page })
     }
 
     pub fn insert(
         &mut self,
-        key: Key,
+        key: &[u8],
         new_child_id: PageId,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let position = match self.search(&key)?.insert_pos {
@@ -427,7 +399,7 @@ where
             Some(pos) => pos,
         };
         let mut buffer = Vec::new();
-        key.serialize(&mut buffer);
+        buffer.extend_from_slice(key);
         new_child_id.serialize(&mut buffer);
         let insert_result = self.slotted_page.insert_at(&buffer, position)?;
         self.handle_insert_result(insert_result, &buffer, position)
@@ -439,13 +411,31 @@ where
         Ok(())
     }
 }
-impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
+impl<Page> BTreeNode<Page, BTreeLeafHeader>
 where
     Page: PageRead,
-    Key: BTreeKey,
 {
+    /// Gets the key stored in the given slot.
+    fn get_key(&self, slot_id: SlotId) -> Result<&[u8], BTreeNodeError> {
+        let record_bytes = self.slotted_page.read_record(slot_id)?;
+        // RecordPtr is serialized as PageId + SlotId (no padding)
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = record_bytes.len() - serialized_record_ptr_size;
+        let key_bytes = &record_bytes[..key_bytes_end];
+        Ok(key_bytes)
+    }
+
+    fn get_record_ptr(&self, slot_id: SlotId) -> Result<RecordPtr, BTreeNodeError> {
+        let record_bytes = self.slotted_page.read_record(slot_id)?;
+        // RecordPtr is serialized as PageId + SlotId (no padding)
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = record_bytes.len() - serialized_record_ptr_size;
+        let (record_ptr, _) = RecordPtr::deserialize(&record_bytes[key_bytes_end..])?;
+        Ok(record_ptr)
+    }
+
     /// Search either finds record or insert slot.
-    pub fn search(&self, target_key: &Key) -> Result<LeafNodeSearchResult, BTreeNodeError> {
+    pub fn search(&self, target_key: &[u8]) -> Result<LeafNodeSearchResult, BTreeNodeError> {
         let num_slots = self.slotted_page.num_slots()?;
         if num_slots == 0 {
             return Ok(LeafNodeSearchResult::NotFoundLeaf { insert_slot_id: 0 });
@@ -468,13 +458,13 @@ where
                     }
                 }
             }
-            let record_bytes = self.slotted_page.read_record(mid)?;
-            let (key, record_ptr_bytes) = Key::deserialize(record_bytes)?;
+
+            let key = self.get_key(mid)?;
 
             match key.cmp(target_key) {
                 Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
-                    let (record_ptr, _) = RecordPtr::deserialize(record_ptr_bytes)?;
+                    let record_ptr = self.get_record_ptr(mid)?;
                     return Ok(LeafNodeSearchResult::Found { record_ptr });
                 }
                 Ordering::Greater => {
@@ -499,10 +489,9 @@ where
     }
 }
 
-impl<Page, Key> BTreeNode<Page, BTreeLeafHeader, Key>
+impl<Page> BTreeNode<Page, BTreeLeafHeader>
 where
     Page: PageWrite + PageRead,
-    Key: BTreeKey,
 {
     pub fn initialize(page: Page, next_leaf: Option<PageId>) -> Result<Self, BTreeNodeError> {
         let header = BTreeLeafHeader {
@@ -514,15 +503,12 @@ where
             next_leaf_pointer: next_leaf.unwrap_or(BTreeLeafHeader::NO_NEXT_LEAF),
         };
         let slotted_page = SlottedPage::initialize_with_header(page, header)?;
-        Ok(Self {
-            slotted_page,
-            _key_marker: PhantomData,
-        })
+        Ok(Self { slotted_page })
     }
 
     pub fn insert(
         &mut self,
-        key: Key,
+        key: &[u8],
         record_pointer: RecordPtr,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let position = match self.search(&key)? {
@@ -531,7 +517,7 @@ where
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => insert_slot_id,
         };
         let mut buffer = Vec::new();
-        key.serialize(&mut buffer);
+        buffer.extend_from_slice(key);
         record_pointer.serialize(&mut buffer);
         let insert_result = self.slotted_page.insert_at(&buffer, position)?;
         self.handle_insert_result(insert_result, &buffer, position)
@@ -546,11 +532,14 @@ where
         Ok(())
     }
 }
+#[cfg(test)]
 mod test {
     use super::*;
     use crate::slotted_page::InsertResult;
 
     const PAGE_SIZE: usize = 4096;
+
+    // ===== Test Page Implementation =====
 
     struct TestPage {
         data: Vec<u8>,
@@ -576,10 +565,18 @@ mod test {
         }
     }
 
-    type LeafNode = BTreeNode<TestPage, BTreeLeafHeader, i32>;
+    type LeafNode = BTreeNode<TestPage, BTreeLeafHeader>;
+    type InternalNode = BTreeNode<TestPage, BTreeInternalHeader>;
+    
+    /// Serializes an i32 to a lexicographically comparable byte representation.
+    /// This allows proper ordering when comparing keys as byte slices.
+    fn serialize_i32_lexicographically(value: i32) -> Vec<u8> {
+        let transformed_value = (value as u32) ^ 0x80000000;
+        Vec::from(transformed_value.to_be_bytes())
+    }
 
-    type InternalNode = BTreeNode<TestPage, BTreeInternalHeader, i32>;
-
+    /// Creates a leaf node with the given keys and record pointers.
+    /// Keys are inserted directly into the slotted page (not using the insert method).
     fn make_leaf_node(keys: &[i32], record_ptrs: &[RecordPtr]) -> LeafNode {
         assert_eq!(keys.len(), record_ptrs.len());
 
@@ -588,59 +585,86 @@ mod test {
 
         for (k, rec) in keys.iter().zip(record_ptrs.iter()) {
             let mut buf = Vec::new();
-            k.serialize(&mut buf);
+            buf.extend_from_slice(serialize_i32_lexicographically(*k).as_slice());
             rec.serialize(&mut buf);
-            node.slotted_page.insert(&buf).unwrap();
+            match node.slotted_page.insert(&buf).unwrap() {
+                InsertResult::Success(_) => {}
+                _ => panic!("Failed to insert key {} into leaf node", k),
+            };
         }
 
-        let mut buf = Vec::new();
-        let key = 1;
-        key.serialize(&mut buf);
-        let insert_result = node.slotted_page.insert(&buf).unwrap();
-        match insert_result {
-            InsertResult::Success(slot) => node.slotted_page.delete(slot).unwrap(),
-            _ => panic!(),
-        };
         node
     }
 
+    /// Creates an internal node with the given keys and child pointers.
+    /// Note: child_ptrs.len() should be keys.len() + 1
     fn make_internal_node(keys: &[i32], child_ptrs: &[PageId]) -> InternalNode {
-        assert_eq!(keys.len() + 1, child_ptrs.len());
+        assert_eq!(
+            keys.len() + 1,
+            child_ptrs.len(),
+            "Internal node must have n+1 child pointers for n keys"
+        );
 
         let page = TestPage::new(PAGE_SIZE);
         let mut node = InternalNode::initialize(page, child_ptrs[0]).unwrap();
 
-        let header: &mut BTreeInternalHeader = node.get_btree_header_mut().unwrap();
-        header.leftmost_child_pointer = child_ptrs[0];
-
         for (i, k) in keys.iter().enumerate() {
             let mut buf = Vec::new();
-            k.serialize(&mut buf);
+            buf.extend_from_slice(serialize_i32_lexicographically(*k).as_slice());
             child_ptrs[i + 1].serialize(&mut buf);
-            let result = node.slotted_page.insert(&buf).unwrap();
-            match result {
+            match node.slotted_page.insert(&buf).unwrap() {
                 InsertResult::Success(_) => {}
-                _ => panic!("insert failed"),
-            }
+                _ => panic!("Failed to insert key {} into internal node", k),
+            };
         }
 
         node
     }
+    
 
     #[test]
     fn test_leaf_search_empty_node() {
         let page = TestPage::new(PAGE_SIZE);
         let node = LeafNode::initialize(page, None).unwrap();
 
-        let res = node.search(&10).unwrap();
+        let key = serialize_i32_lexicographically(10);
+        let res = node.search(key.as_slice()).unwrap();
+        
         match res {
-            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 0),
-            _ => panic!("expected NotFoundLeaf"),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => {
+                assert_eq!(insert_slot_id, 0, "Empty node should return insert position 0");
+            }
+            _ => panic!("Expected NotFoundLeaf for empty node"),
         }
     }
 
     #[test]
-    fn test_leaf_search_found_and_not_found() {
+    fn test_leaf_search_found() {
+        let keys = vec![10i32, 20i32, 30i32, 40i32];
+        let recs = vec![
+            RecordPtr::new(1, 1),
+            RecordPtr::new(1, 2),
+            RecordPtr::new(2, 3),
+            RecordPtr::new(3, 4),
+        ];
+
+        let node = make_leaf_node(&keys, &recs);
+
+        // Test that all inserted keys are found
+        for (k, rec) in keys.iter().zip(recs.iter()) {
+            let res = node.search(serialize_i32_lexicographically(*k).as_slice()).unwrap();
+            match res {
+                LeafNodeSearchResult::Found { record_ptr } => {
+                    assert_eq!(record_ptr.page_id, rec.page_id);
+                    assert_eq!(record_ptr.slot_id, rec.slot_id);
+                }
+                _ => panic!("Expected to find key {}", k),
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaf_search_not_found() {
         let keys = vec![10i32, 20i32, 30i32];
         let recs = vec![
             RecordPtr::new(1, 1),
@@ -649,54 +673,373 @@ mod test {
         ];
 
         let node = make_leaf_node(&keys, &recs);
-
-        for (k, rec) in keys.iter().zip(recs.iter()) {
-            let res = node.search(k).unwrap();
-            match res {
-                LeafNodeSearchResult::Found { record_ptr } => {
-                    assert_eq!(record_ptr.page_id, rec.page_id);
-                    assert_eq!(record_ptr.slot_id, rec.slot_id);
-                }
-                _ => panic!("expected Found got {:?}", res),
+        
+        let res = node.search(serialize_i32_lexicographically(5).as_slice()).unwrap();
+        match res {
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => {
+                assert_eq!(insert_slot_id, 0, "Key 5 should insert at position 0");
             }
+            _ => panic!("Expected NotFoundLeaf"),
         }
-
-        let res = node.search(&15).unwrap();
+        
+        let res = node.search(serialize_i32_lexicographically(15).as_slice()).unwrap();
         match res {
-            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 1),
-            _ => panic!("expected NotFoundLeaf"),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => {
+                assert_eq!(insert_slot_id, 1, "Key 15 should insert at position 1");
+            }
+            _ => panic!("Expected NotFoundLeaf"),
         }
-
-        let res = node.search(&5).unwrap();
+        
+        let res = node.search(serialize_i32_lexicographically(40).as_slice()).unwrap();
         match res {
-            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 0),
-            _ => panic!("expected NotFoundLeaf"),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => {
+                assert_eq!(insert_slot_id, 3, "Key 40 should insert at position 3");
+            }
+            _ => panic!("Expected NotFoundLeaf"),
         }
+    }
+    
+    #[test]
+    fn test_internal_search_empty_node() {
+        let page = TestPage::new(PAGE_SIZE);
+        let node = InternalNode::initialize(page, 100).unwrap();
 
-        let res = node.search(&40).unwrap();
-        match res {
-            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => assert_eq!(insert_slot_id, 3),
-            _ => panic!("expected NotFoundLeaf"),
-        }
+        let key = serialize_i32_lexicographically(10);
+        let res = node.search(key.as_slice()).unwrap();
+        
+        assert_eq!(res.child_ptr, 100, "Empty internal node should return leftmost child");
+        assert_eq!(res.insert_pos, Some(0), "Insert position should be 0");
     }
 
     #[test]
-    fn test_internal_search_follow_child() {
+    fn test_internal_search_routing() {
         let keys = vec![10i32, 20i32, 30i32];
         let children = vec![100, 200, 300, 400];
 
         let node = make_internal_node(&keys, &children);
+        
+        let res = node.search(serialize_i32_lexicographically(5).as_slice()).unwrap();
+        assert_eq!(res.child_ptr, 100, "Key 5 should route to leftmost child");
+        
+        let res = node.search(serialize_i32_lexicographically(10).as_slice()).unwrap();
+        assert_eq!(res.child_ptr, 200, "Key 10 should route to its child pointer");
+        
+        let res = node.search(serialize_i32_lexicographically(15).as_slice()).unwrap();
+        assert_eq!(res.child_ptr, 200, "Key 15 should route to child after 10");
 
-        let res = node.search(&5).unwrap();
-        assert_eq!(res.child_ptr, 100);
+        let res = node.search(serialize_i32_lexicographically(25).as_slice()).unwrap();
+        assert_eq!(res.child_ptr, 300, "Key 25 should route to child after 20");
+        
+        let res = node.search(serialize_i32_lexicographically(35).as_slice()).unwrap();
+        assert_eq!(res.child_ptr, 400, "Key 35 should route to rightmost child");
+    }
+    
+    #[test]
+    fn test_leaf_insert_into_empty() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
 
-        let res = node.search(&10).unwrap();
-        assert_eq!(res.child_ptr, 200);
+        let key = serialize_i32_lexicographically(10);
+        let rec = RecordPtr::new(1, 1);
+        
+        let result = node.insert(&key, rec).unwrap();
+        assert!(matches!(result, NodeInsertResult::Success));
+        
+        let search_result = node.search(&key).unwrap();
+        match search_result {
+            LeafNodeSearchResult::Found { record_ptr } => {
+                assert_eq!(record_ptr, rec);
+            }
+            _ => panic!("Expected to find inserted key"),
+        }
+    }
 
-        let res = node.search(&15).unwrap();
-        assert_eq!(res.child_ptr, 200);
+    #[test]
+    fn test_leaf_insert_multiple_ordered() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
 
-        let res = node.search(&35).unwrap();
-        assert_eq!(res.child_ptr, 400);
+        let keys_and_recs = vec![
+            (10, RecordPtr::new(1, 1)),
+            (20, RecordPtr::new(1, 2)),
+            (30, RecordPtr::new(2, 3)),
+            (40, RecordPtr::new(2, 4)),
+        ];
+
+        for (key_val, rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let result = node.insert(&key, *rec).unwrap();
+            assert!(matches!(result, NodeInsertResult::Success));
+        }
+        
+        for (key_val, expected_rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let search_result = node.search(&key).unwrap();
+            match search_result {
+                LeafNodeSearchResult::Found { record_ptr } => {
+                    assert_eq!(record_ptr, *expected_rec);
+                }
+                _ => panic!("Expected to find key {}", key_val),
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaf_insert_multiple_unordered() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let keys_and_recs = vec![
+            (30, RecordPtr::new(2, 3)),
+            (10, RecordPtr::new(1, 1)),
+            (40, RecordPtr::new(2, 4)),
+            (20, RecordPtr::new(1, 2)),
+        ];
+
+        for (key_val, rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let result = node.insert(&key, *rec).unwrap();
+            assert!(matches!(result, NodeInsertResult::Success));
+        }
+        
+        for (key_val, expected_rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let search_result = node.search(&key).unwrap();
+            match search_result {
+                LeafNodeSearchResult::Found { record_ptr } => {
+                    assert_eq!(record_ptr, *expected_rec);
+                }
+                _ => panic!("Expected to find key {}", key_val),
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaf_insert_duplicate_key() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+        let rec1 = RecordPtr::new(1, 1);
+        let rec2 = RecordPtr::new(2, 2);
+        
+        let result = node.insert(&key, rec1).unwrap();
+        assert!(matches!(result, NodeInsertResult::Success));
+        
+        let result = node.insert(&key, rec2).unwrap();
+        assert!(matches!(result, NodeInsertResult::KeyAlreadyExists));
+        
+        let search_result = node.search(&key).unwrap();
+        match search_result {
+            LeafNodeSearchResult::Found { record_ptr } => {
+                assert_eq!(record_ptr, rec1);
+            }
+            _ => panic!("Expected to find original key"),
+        }
+    }
+    
+    #[test]
+    fn test_internal_insert_into_empty() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = InternalNode::initialize(page, 100).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+        let child_id = 200;
+
+        let result = node.insert(&key, child_id).unwrap();
+        assert!(matches!(result, NodeInsertResult::Success));
+        
+        let search_result = node.search(&key).unwrap();
+        assert_eq!(search_result.child_ptr, child_id);
+    }
+
+    #[test]
+    fn test_internal_insert_multiple() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = InternalNode::initialize(page, 100).unwrap();
+
+        let keys_and_children = vec![
+            (10, 200),
+            (20, 300),
+            (30, 400),
+        ];
+
+        for (key_val, child) in &keys_and_children {
+            let key = serialize_i32_lexicographically(*key_val);
+            let result = node.insert(&key, *child).unwrap();
+            assert!(matches!(result, NodeInsertResult::Success));
+        }
+        
+        for (key_val, expected_child) in &keys_and_children {
+            let key = serialize_i32_lexicographically(*key_val);
+            let search_result = node.search(&key).unwrap();
+            assert_eq!(search_result.child_ptr, *expected_child);
+        }
+    }
+    
+    #[test]
+    fn test_leaf_next_pointer_none() {
+        let page = TestPage::new(PAGE_SIZE);
+        let node = LeafNode::initialize(page, None).unwrap();
+
+        let next_id = node.next_leaf_id().unwrap();
+        assert_eq!(next_id, None);
+    }
+
+    #[test]
+    fn test_leaf_next_pointer_some() {
+        let page = TestPage::new(PAGE_SIZE);
+        let node = LeafNode::initialize(page, Some(42)).unwrap();
+
+        let next_id = node.next_leaf_id().unwrap();
+        assert_eq!(next_id, Some(42));
+    }
+
+    #[test]
+    fn test_leaf_set_next_pointer() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+        
+        assert_eq!(node.next_leaf_id().unwrap(), None);
+        
+        node.set_next_leaf_id(Some(99)).unwrap();
+        assert_eq!(node.next_leaf_id().unwrap(), Some(99));
+
+        node.set_next_leaf_id(None).unwrap();
+        assert_eq!(node.next_leaf_id().unwrap(), None);
+    }
+    
+    #[test]
+    fn test_internal_leftmost_child() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = InternalNode::initialize(page, 100).unwrap();
+        
+        let header = node.get_btree_header().unwrap();
+        assert_eq!(header.leftmost_child_pointer, 100);
+        
+        node.set_leftmost_child_id(200).unwrap();
+        let header = node.get_btree_header().unwrap();
+        assert_eq!(header.leftmost_child_pointer, 200);
+    }
+    
+    #[test]
+    fn test_batch_insert_leaf() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let records = vec![
+            {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&serialize_i32_lexicographically(10));
+                RecordPtr::new(1, 1).serialize(&mut buf);
+                buf
+            },
+            {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&serialize_i32_lexicographically(20));
+                RecordPtr::new(1, 2).serialize(&mut buf);
+                buf
+            },
+            {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&serialize_i32_lexicographically(30));
+                RecordPtr::new(2, 3).serialize(&mut buf);
+                buf
+            },
+        ];
+
+        node.batch_insert(records).unwrap();
+
+        for (i, key_val) in [10, 20, 30].iter().enumerate() {
+            let key = serialize_i32_lexicographically(*key_val);
+            let search_result = node.search(&key).unwrap();
+            match search_result {
+                LeafNodeSearchResult::Found { record_ptr } => {
+                    assert_eq!(record_ptr.slot_id, (i + 1) as u16);
+                }
+                _ => panic!("Expected to find key {}", key_val),
+            }
+        }
+    }
+
+    #[test]
+    fn test_split_keys_leaf() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+        
+        for i in 0..20 {
+            let key = serialize_i32_lexicographically(i * 10);
+            let rec = RecordPtr::new(i as u32, i as u16);
+            node.insert(&key, rec).unwrap();
+        }
+        
+        let (split_records, separator_key) = node.split_keys().unwrap();
+        
+        assert!(!split_records.is_empty(), "Split should produce records to move");
+        
+        assert!(!separator_key.is_empty(), "Separator key should not be empty");
+        
+        let original_count = node.slotted_page.num_slots().unwrap();
+        assert!(original_count > 0, "Original node should retain some keys");
+        
+        assert_eq!(
+            split_records.len() + original_count as usize,
+            20,
+            "Split should preserve all records"
+        );
+    }
+
+    #[test]
+    fn test_split_keys_with_minimum_keys() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        for i in 0..2 {
+            let key = serialize_i32_lexicographically(i * 10);
+            let rec = RecordPtr::new(i as u32, i as u16);
+            node.insert(&key, rec).unwrap();
+        }
+
+        let result = node.split_keys();
+        assert!(result.is_ok(), "Split with 2 keys should succeed");
+    }
+
+    #[test]
+    fn test_split_keys_insufficient_keys() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        // Insert only 1 key
+        let key = serialize_i32_lexicographically(10);
+        let rec = RecordPtr::new(1, 1);
+        node.insert(&key, rec).unwrap();
+
+        let result = node.split_keys();
+        assert!(result.is_err(), "Split with 1 key should fail");
+        assert!(matches!(result.unwrap_err(), BTreeNodeError::InvalidSplit));
+    }
+    
+    #[test]
+    fn test_leaf_insert_at_boundaries() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+        
+        let key = serialize_i32_lexicographically(i32::MAX);
+        let rec = RecordPtr::new(1, 1);
+        let result = node.insert(&key, rec).unwrap();
+        assert!(matches!(result, NodeInsertResult::Success));
+        
+        let key = serialize_i32_lexicographically(i32::MIN);
+        let rec = RecordPtr::new(1, 2);
+        let result = node.insert(&key, rec).unwrap();
+        assert!(matches!(result, NodeInsertResult::Success));
+        
+        let key_max = serialize_i32_lexicographically(i32::MAX);
+        let search_result = node.search(&key_max).unwrap();
+        assert!(matches!(search_result, LeafNodeSearchResult::Found { .. }));
+
+        let key_min = serialize_i32_lexicographically(i32::MIN);
+        let search_result = node.search(&key_min).unwrap();
+        assert!(matches!(search_result, LeafNodeSearchResult::Found { .. }));
     }
 }
