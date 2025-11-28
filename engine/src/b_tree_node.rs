@@ -567,7 +567,7 @@ mod test {
 
     type LeafNode = BTreeNode<TestPage, BTreeLeafHeader>;
     type InternalNode = BTreeNode<TestPage, BTreeInternalHeader>;
-    
+
     /// Serializes an i32 to a lexicographically comparable byte representation.
     /// This allows proper ordering when comparing keys as byte slices.
     fn serialize_i32_lexicographically(value: i32) -> Vec<u8> {
@@ -620,7 +620,6 @@ mod test {
 
         node
     }
-    
 
     #[test]
     fn test_leaf_search_empty_node() {
@@ -629,10 +628,13 @@ mod test {
 
         let key = serialize_i32_lexicographically(10);
         let res = node.search(key.as_slice()).unwrap();
-        
+
         match res {
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => {
-                assert_eq!(insert_slot_id, 0, "Empty node should return insert position 0");
+                assert_eq!(
+                    insert_slot_id, 0,
+                    "Empty node should return insert position 0"
+                );
             }
             _ => panic!("Expected NotFoundLeaf for empty node"),
         }
@@ -649,10 +651,10 @@ mod test {
         ];
 
         let node = make_leaf_node(&keys, &recs);
-
-        // Test that all inserted keys are found
         for (k, rec) in keys.iter().zip(recs.iter()) {
-            let res = node.search(serialize_i32_lexicographically(*k).as_slice()).unwrap();
+            let res = node
+                .search(serialize_i32_lexicographically(*k).as_slice())
+                .unwrap();
             match res {
                 LeafNodeSearchResult::Found { record_ptr } => {
                     assert_eq!(record_ptr.page_id, rec.page_id);
@@ -673,24 +675,30 @@ mod test {
         ];
 
         let node = make_leaf_node(&keys, &recs);
-        
-        let res = node.search(serialize_i32_lexicographically(5).as_slice()).unwrap();
+
+        let res = node
+            .search(serialize_i32_lexicographically(5).as_slice())
+            .unwrap();
         match res {
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => {
                 assert_eq!(insert_slot_id, 0, "Key 5 should insert at position 0");
             }
             _ => panic!("Expected NotFoundLeaf"),
         }
-        
-        let res = node.search(serialize_i32_lexicographically(15).as_slice()).unwrap();
+
+        let res = node
+            .search(serialize_i32_lexicographically(15).as_slice())
+            .unwrap();
         match res {
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => {
                 assert_eq!(insert_slot_id, 1, "Key 15 should insert at position 1");
             }
             _ => panic!("Expected NotFoundLeaf"),
         }
-        
-        let res = node.search(serialize_i32_lexicographically(40).as_slice()).unwrap();
+
+        let res = node
+            .search(serialize_i32_lexicographically(40).as_slice())
+            .unwrap();
         match res {
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => {
                 assert_eq!(insert_slot_id, 3, "Key 40 should insert at position 3");
@@ -698,7 +706,7 @@ mod test {
             _ => panic!("Expected NotFoundLeaf"),
         }
     }
-    
+
     #[test]
     fn test_internal_search_empty_node() {
         let page = TestPage::new(PAGE_SIZE);
@@ -706,8 +714,11 @@ mod test {
 
         let key = serialize_i32_lexicographically(10);
         let res = node.search(key.as_slice()).unwrap();
-        
-        assert_eq!(res.child_ptr, 100, "Empty internal node should return leftmost child");
+
+        assert_eq!(
+            res.child_ptr, 100,
+            "Empty internal node should return leftmost child"
+        );
         assert_eq!(res.insert_pos, Some(0), "Insert position should be 0");
     }
 
@@ -717,23 +728,36 @@ mod test {
         let children = vec![100, 200, 300, 400];
 
         let node = make_internal_node(&keys, &children);
-        
-        let res = node.search(serialize_i32_lexicographically(5).as_slice()).unwrap();
+
+        let res = node
+            .search(serialize_i32_lexicographically(5).as_slice())
+            .unwrap();
         assert_eq!(res.child_ptr, 100, "Key 5 should route to leftmost child");
-        
-        let res = node.search(serialize_i32_lexicographically(10).as_slice()).unwrap();
-        assert_eq!(res.child_ptr, 200, "Key 10 should route to its child pointer");
-        
-        let res = node.search(serialize_i32_lexicographically(15).as_slice()).unwrap();
+
+        let res = node
+            .search(serialize_i32_lexicographically(10).as_slice())
+            .unwrap();
+        assert_eq!(
+            res.child_ptr, 200,
+            "Key 10 should route to its child pointer"
+        );
+
+        let res = node
+            .search(serialize_i32_lexicographically(15).as_slice())
+            .unwrap();
         assert_eq!(res.child_ptr, 200, "Key 15 should route to child after 10");
 
-        let res = node.search(serialize_i32_lexicographically(25).as_slice()).unwrap();
+        let res = node
+            .search(serialize_i32_lexicographically(25).as_slice())
+            .unwrap();
         assert_eq!(res.child_ptr, 300, "Key 25 should route to child after 20");
-        
-        let res = node.search(serialize_i32_lexicographically(35).as_slice()).unwrap();
+
+        let res = node
+            .search(serialize_i32_lexicographically(35).as_slice())
+            .unwrap();
         assert_eq!(res.child_ptr, 400, "Key 35 should route to rightmost child");
     }
-    
+
     #[test]
     fn test_leaf_insert_into_empty() {
         let page = TestPage::new(PAGE_SIZE);
@@ -741,10 +765,10 @@ mod test {
 
         let key = serialize_i32_lexicographically(10);
         let rec = RecordPtr::new(1, 1);
-        
+
         let result = node.insert(&key, rec).unwrap();
         assert!(matches!(result, NodeInsertResult::Success));
-        
+
         let search_result = node.search(&key).unwrap();
         match search_result {
             LeafNodeSearchResult::Found { record_ptr } => {
@@ -771,7 +795,7 @@ mod test {
             let result = node.insert(&key, *rec).unwrap();
             assert!(matches!(result, NodeInsertResult::Success));
         }
-        
+
         for (key_val, expected_rec) in &keys_and_recs {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
@@ -801,7 +825,7 @@ mod test {
             let result = node.insert(&key, *rec).unwrap();
             assert!(matches!(result, NodeInsertResult::Success));
         }
-        
+
         for (key_val, expected_rec) in &keys_and_recs {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
@@ -822,13 +846,13 @@ mod test {
         let key = serialize_i32_lexicographically(10);
         let rec1 = RecordPtr::new(1, 1);
         let rec2 = RecordPtr::new(2, 2);
-        
+
         let result = node.insert(&key, rec1).unwrap();
         assert!(matches!(result, NodeInsertResult::Success));
-        
+
         let result = node.insert(&key, rec2).unwrap();
         assert!(matches!(result, NodeInsertResult::KeyAlreadyExists));
-        
+
         let search_result = node.search(&key).unwrap();
         match search_result {
             LeafNodeSearchResult::Found { record_ptr } => {
@@ -837,7 +861,7 @@ mod test {
             _ => panic!("Expected to find original key"),
         }
     }
-    
+
     #[test]
     fn test_internal_insert_into_empty() {
         let page = TestPage::new(PAGE_SIZE);
@@ -848,7 +872,7 @@ mod test {
 
         let result = node.insert(&key, child_id).unwrap();
         assert!(matches!(result, NodeInsertResult::Success));
-        
+
         let search_result = node.search(&key).unwrap();
         assert_eq!(search_result.child_ptr, child_id);
     }
@@ -858,25 +882,21 @@ mod test {
         let page = TestPage::new(PAGE_SIZE);
         let mut node = InternalNode::initialize(page, 100).unwrap();
 
-        let keys_and_children = vec![
-            (10, 200),
-            (20, 300),
-            (30, 400),
-        ];
+        let keys_and_children = vec![(10, 200), (20, 300), (30, 400)];
 
         for (key_val, child) in &keys_and_children {
             let key = serialize_i32_lexicographically(*key_val);
             let result = node.insert(&key, *child).unwrap();
             assert!(matches!(result, NodeInsertResult::Success));
         }
-        
+
         for (key_val, expected_child) in &keys_and_children {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
             assert_eq!(search_result.child_ptr, *expected_child);
         }
     }
-    
+
     #[test]
     fn test_leaf_next_pointer_none() {
         let page = TestPage::new(PAGE_SIZE);
@@ -899,29 +919,29 @@ mod test {
     fn test_leaf_set_next_pointer() {
         let page = TestPage::new(PAGE_SIZE);
         let mut node = LeafNode::initialize(page, None).unwrap();
-        
+
         assert_eq!(node.next_leaf_id().unwrap(), None);
-        
+
         node.set_next_leaf_id(Some(99)).unwrap();
         assert_eq!(node.next_leaf_id().unwrap(), Some(99));
 
         node.set_next_leaf_id(None).unwrap();
         assert_eq!(node.next_leaf_id().unwrap(), None);
     }
-    
+
     #[test]
     fn test_internal_leftmost_child() {
         let page = TestPage::new(PAGE_SIZE);
         let mut node = InternalNode::initialize(page, 100).unwrap();
-        
+
         let header = node.get_btree_header().unwrap();
         assert_eq!(header.leftmost_child_pointer, 100);
-        
+
         node.set_leftmost_child_id(200).unwrap();
         let header = node.get_btree_header().unwrap();
         assert_eq!(header.leftmost_child_pointer, 200);
     }
-    
+
     #[test]
     fn test_batch_insert_leaf() {
         let page = TestPage::new(PAGE_SIZE);
@@ -966,22 +986,28 @@ mod test {
     fn test_split_keys_leaf() {
         let page = TestPage::new(PAGE_SIZE);
         let mut node = LeafNode::initialize(page, None).unwrap();
-        
+
         for i in 0..20 {
             let key = serialize_i32_lexicographically(i * 10);
             let rec = RecordPtr::new(i as u32, i as u16);
             node.insert(&key, rec).unwrap();
         }
-        
+
         let (split_records, separator_key) = node.split_keys().unwrap();
-        
-        assert!(!split_records.is_empty(), "Split should produce records to move");
-        
-        assert!(!separator_key.is_empty(), "Separator key should not be empty");
-        
+
+        assert!(
+            !split_records.is_empty(),
+            "Split should produce records to move"
+        );
+
+        assert!(
+            !separator_key.is_empty(),
+            "Separator key should not be empty"
+        );
+
         let original_count = node.slotted_page.num_slots().unwrap();
         assert!(original_count > 0, "Original node should retain some keys");
-        
+
         assert_eq!(
             split_records.len() + original_count as usize,
             20,
@@ -1018,22 +1044,22 @@ mod test {
         assert!(result.is_err(), "Split with 1 key should fail");
         assert!(matches!(result.unwrap_err(), BTreeNodeError::InvalidSplit));
     }
-    
+
     #[test]
     fn test_leaf_insert_at_boundaries() {
         let page = TestPage::new(PAGE_SIZE);
         let mut node = LeafNode::initialize(page, None).unwrap();
-        
+
         let key = serialize_i32_lexicographically(i32::MAX);
         let rec = RecordPtr::new(1, 1);
         let result = node.insert(&key, rec).unwrap();
         assert!(matches!(result, NodeInsertResult::Success));
-        
+
         let key = serialize_i32_lexicographically(i32::MIN);
         let rec = RecordPtr::new(1, 2);
         let result = node.insert(&key, rec).unwrap();
         assert!(matches!(result, NodeInsertResult::Success));
-        
+
         let key_max = serialize_i32_lexicographically(i32::MAX);
         let search_result = node.search(&key_max).unwrap();
         assert!(matches!(search_result, LeafNodeSearchResult::Found { .. }));
