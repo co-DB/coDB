@@ -58,6 +58,12 @@ pub enum TokenType {
     DateTimeType,
     As,
     Dot,
+    Order,
+    By,
+    Limit,
+    Asc,
+    Desc,
+    Offset,
 }
 
 impl TokenType {
@@ -147,6 +153,12 @@ impl fmt::Display for TokenType {
             TokenType::DateTimeType => write!(f, "DATETIME"),
             TokenType::As => write!(f, "AS"),
             TokenType::Dot => write!(f, "."),
+            TokenType::Order => write!(f, "ORDER"),
+            TokenType::By => write!(f, "BY"),
+            TokenType::Limit => write!(f, "LIMIT"),
+            TokenType::Asc => write!(f, "ASC"),
+            TokenType::Desc => write!(f, "DESC"),
+            TokenType::Offset => write!(f, "OFFSET"),
         }
     }
 }
