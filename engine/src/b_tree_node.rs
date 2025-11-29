@@ -37,6 +37,12 @@ pub(crate) enum NodeInsertResult {
     KeyAlreadyExists,
 }
 
+pub(crate) enum NodeDeleteResult {
+    Success,
+    SuccessUnderflow,
+    KeyDoesNotExist,
+}
+
 /// Type aliases for making things a little more readable
 pub(crate) type BTreeLeafNode<Page> = BTreeNode<Page, BTreeLeafHeader>;
 pub(crate) type BTreeInternalNode<Page> = BTreeNode<Page, BTreeInternalHeader>;
@@ -114,7 +120,10 @@ impl Default for BTreeLeafHeader {
 /// Enum representing possible outcomes of a search operation in leaf node.
 pub(crate) enum LeafNodeSearchResult {
     /// Exact match found.
-    Found { record_ptr: RecordPtr },
+    Found {
+        position: u16,
+        record_ptr: RecordPtr,
+    },
 
     /// Key not found, but insertion point identified.
     NotFoundLeaf { insert_slot_id: SlotId },
@@ -453,7 +462,10 @@ where
                 Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
                     let record_ptr = self.get_record_ptr(mid)?;
-                    return Ok(LeafNodeSearchResult::Found { record_ptr });
+                    return Ok(LeafNodeSearchResult::Found {
+                        position: mid,
+                        record_ptr,
+                    });
                 }
                 Ordering::Greater => {
                     if mid == 0 {
@@ -494,7 +506,7 @@ where
         Ok(Self { slotted_page })
     }
 
-    pub fn insert(
+    pub(crate) fn insert(
         &mut self,
         key: &[u8],
         record_pointer: RecordPtr,
@@ -511,7 +523,29 @@ where
         self.handle_insert_result(insert_result, &buffer, position)
     }
 
-    pub fn set_next_leaf_id(&mut self, next_leaf_id: Option<PageId>) -> Result<(), BTreeNodeError> {
+    pub(crate) fn delete(&mut self, key: &[u8]) -> Result<NodeDeleteResult, BTreeNodeError> {
+        let position = match self.search(key)? {
+            LeafNodeSearchResult::Found { position, .. } => position,
+            LeafNodeSearchResult::NotFoundLeaf { .. } => {
+                return Ok(NodeDeleteResult::KeyDoesNotExist);
+            }
+        };
+
+        self.slotted_page.delete(position)?;
+
+        const UNDERFLOW_BOUNDARY: f32 = 0.33;
+
+        if self.slotted_page.fraction_filled()? > UNDERFLOW_BOUNDARY {
+            Ok(NodeDeleteResult::Success)
+        } else {
+            Ok(NodeDeleteResult::SuccessUnderflow)
+        }
+    }
+
+    pub(crate) fn set_next_leaf_id(
+        &mut self,
+        next_leaf_id: Option<PageId>,
+    ) -> Result<(), BTreeNodeError> {
         let header = self.get_btree_header_mut()?;
         match next_leaf_id {
             Some(next_leaf) => header.next_leaf_pointer = next_leaf,
@@ -690,7 +724,7 @@ mod test {
                 .search(serialize_i32_lexicographically(*k).as_slice())
                 .unwrap();
             match res {
-                LeafNodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
                     assert_eq!(record_ptr.page_id, rec.page_id);
                     assert_eq!(record_ptr.slot_id, rec.slot_id);
                 }
@@ -805,7 +839,7 @@ mod test {
 
         let search_result = node.search(&key).unwrap();
         match search_result {
-            LeafNodeSearchResult::Found { record_ptr } => {
+            LeafNodeSearchResult::Found { record_ptr, .. } => {
                 assert_eq!(record_ptr, rec);
             }
             _ => panic!("Expected to find inserted key"),
@@ -834,7 +868,7 @@ mod test {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
             match search_result {
-                LeafNodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
                     assert_eq!(record_ptr, *expected_rec);
                 }
                 _ => panic!("Expected to find key {}", key_val),
@@ -864,7 +898,7 @@ mod test {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
             match search_result {
-                LeafNodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
                     assert_eq!(record_ptr, *expected_rec);
                 }
                 _ => panic!("Expected to find key {}", key_val),
@@ -889,7 +923,7 @@ mod test {
 
         let search_result = node.search(&key).unwrap();
         match search_result {
-            LeafNodeSearchResult::Found { record_ptr } => {
+            LeafNodeSearchResult::Found { record_ptr, .. } => {
                 assert_eq!(record_ptr, rec1);
             }
             _ => panic!("Expected to find original key"),
@@ -1008,7 +1042,7 @@ mod test {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
             match search_result {
-                LeafNodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
                     assert_eq!(record_ptr.slot_id, (i + 1) as u16);
                 }
                 _ => panic!("Expected to find key {}", key_val),
@@ -1101,5 +1135,205 @@ mod test {
         let key_min = serialize_i32_lexicographically(i32::MIN);
         let search_result = node.search(&key_min).unwrap();
         assert!(matches!(search_result, LeafNodeSearchResult::Found { .. }));
+    }
+
+    #[test]
+    fn test_leaf_delete_single_key() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+        let rec = RecordPtr::new(1, 1);
+
+        node.insert(&key, rec).unwrap();
+
+        let result = node.delete(&key).unwrap();
+
+        // Don't care about this here.
+        assert!(matches!(result, NodeDeleteResult::SuccessUnderflow));
+
+        let search_result = node.search(&key).unwrap();
+        assert!(matches!(
+            search_result,
+            LeafNodeSearchResult::NotFoundLeaf { .. }
+        ));
+    }
+
+    #[test]
+    fn test_leaf_delete_nonexistent_key() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+
+        let result = node.delete(&key).unwrap();
+        assert!(matches!(result, NodeDeleteResult::KeyDoesNotExist));
+    }
+
+    #[test]
+    fn test_leaf_delete_maintains_order() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let keys_and_recs = vec![
+            (10, RecordPtr::new(1, 1)),
+            (20, RecordPtr::new(1, 2)),
+            (30, RecordPtr::new(2, 3)),
+            (40, RecordPtr::new(2, 4)),
+            (50, RecordPtr::new(3, 5)),
+        ];
+
+        for (key_val, rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            node.insert(&key, *rec).unwrap();
+        }
+
+        let key_to_delete = serialize_i32_lexicographically(30);
+        let result = node.delete(&key_to_delete).unwrap();
+
+        // Don't care about this here.
+        assert!(matches!(result, NodeDeleteResult::SuccessUnderflow));
+
+        let search_result = node.search(&key_to_delete).unwrap();
+        assert!(matches!(
+            search_result,
+            LeafNodeSearchResult::NotFoundLeaf { .. }
+        ));
+
+        for (key_val, expected_rec) in &keys_and_recs {
+            if *key_val == 30 {
+                continue;
+            }
+            let key = serialize_i32_lexicographically(*key_val);
+            let search_result = node.search(&key).unwrap();
+            match search_result {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
+                    assert_eq!(record_ptr, *expected_rec);
+                }
+                _ => panic!("Expected to find key {}", key_val),
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaf_delete_all_keys_sequentially() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let keys_and_recs = vec![
+            (10, RecordPtr::new(1, 1)),
+            (20, RecordPtr::new(1, 2)),
+            (30, RecordPtr::new(2, 3)),
+        ];
+
+        for (key_val, rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            node.insert(&key, *rec).unwrap();
+        }
+
+        for (key_val, _) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let result = node.delete(&key).unwrap();
+            assert!(matches!(
+                result,
+                NodeDeleteResult::Success | NodeDeleteResult::SuccessUnderflow
+            ));
+        }
+
+        for (key_val, _) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let search_result = node.search(&key).unwrap();
+            assert!(matches!(
+                search_result,
+                LeafNodeSearchResult::NotFoundLeaf { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_leaf_delete_triggers_underflow() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let mut keys_and_recs = vec![];
+        for i in 0..84 {
+            keys_and_recs.push((i * 10, RecordPtr::new(1, i as u16)));
+        }
+
+        let mut i = 0;
+        for (key_val, rec) in &keys_and_recs {
+            i += 1;
+            let key = serialize_i32_lexicographically(*key_val);
+            node.insert(&key, *rec).unwrap();
+        }
+
+        assert!(node.slotted_page.fraction_filled().unwrap() > 0.33);
+
+        let mut deletion_count = 0;
+        for (key_val, _) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let result = node.delete(&key).unwrap();
+            deletion_count += 1;
+
+            match result {
+                NodeDeleteResult::SuccessUnderflow => {
+                    assert!(node.slotted_page.fraction_filled().unwrap() <= 0.33);
+                    break;
+                }
+                NodeDeleteResult::Success => {}
+                NodeDeleteResult::KeyDoesNotExist => {
+                    panic!("Unexpected delete result - key doesn't exist {deletion_count}")
+                }
+            }
+        }
+
+        assert!(deletion_count < keys_and_recs.len());
+    }
+
+    #[test]
+    fn test_leaf_delete_and_reinsert() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+        let rec1 = RecordPtr::new(1, 1);
+        let rec2 = RecordPtr::new(2, 2);
+
+        node.insert(&key, rec1).unwrap();
+        node.delete(&key).unwrap();
+        let result = node.insert(&key, rec2).unwrap();
+
+        assert!(matches!(result, NodeInsertResult::Success));
+
+        let search_result = node.search(&key).unwrap();
+        match search_result {
+            LeafNodeSearchResult::Found { record_ptr, .. } => {
+                assert_eq!(record_ptr, rec2);
+            }
+            _ => panic!("Expected to find re-inserted key"),
+        }
+    }
+
+    #[test]
+    fn test_leaf_delete_multiple_times() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+        let rec = RecordPtr::new(1, 1);
+
+        node.insert(&key, rec).unwrap();
+
+        let result = node.delete(&key).unwrap();
+        assert!(matches!(
+            result,
+            NodeDeleteResult::Success | NodeDeleteResult::SuccessUnderflow
+        ));
+
+        let result = node.delete(&key).unwrap();
+        assert!(matches!(result, NodeDeleteResult::KeyDoesNotExist));
+
+        let result = node.delete(&key).unwrap();
+        assert!(matches!(result, NodeDeleteResult::KeyDoesNotExist));
     }
 }

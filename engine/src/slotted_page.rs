@@ -393,6 +393,10 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(header.total_free_space)
     }
 
+    pub fn fraction_filled(&self) -> Result<f32, SlottedPageError> {
+        Ok(1.0 - (self.free_space()? as f32 / Self::MAX_FREE_SPACE as f32))
+    }
+
     /// Returns a slice containing all slots (cast) in the slot directory
     fn get_slots(&self) -> Result<&[Slot], SlottedPageError> {
         let header = self.get_base_header()?;

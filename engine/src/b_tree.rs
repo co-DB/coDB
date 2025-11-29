@@ -192,7 +192,7 @@ impl BTree {
                 NodeType::Leaf => {
                     let node = BTreeLeafNode::<PinnedReadPage>::new(page)?;
                     return match node.search(key)? {
-                        LeafNodeSearchResult::Found { record_ptr } => Ok(Some(record_ptr)),
+                        LeafNodeSearchResult::Found { record_ptr, .. } => Ok(Some(record_ptr)),
                         LeafNodeSearchResult::NotFoundLeaf { .. } => Ok(None),
                     };
                 }
