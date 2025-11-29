@@ -620,8 +620,6 @@ mod test {
     use storage::files_manager::FilesManager;
     use tempfile::{TempDir, tempdir};
 
-    // ===== Test Helpers =====
-
     /// Creates a test cache and files manager in a temporary directory
     fn setup_test_cache() -> (Arc<Cache>, FileKey, TempDir) {
         let temp_dir = tempdir().unwrap();

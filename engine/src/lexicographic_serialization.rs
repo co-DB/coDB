@@ -18,9 +18,44 @@ trait SortableSerialize: Sized {
     fn decode_key(bytes: &[u8]) -> Result<Self, DecodeError>;
 }
 
+const NEGATION_BIT_I32: u32 = 1 << 31;
+
+/// Converts i32 to u32, such that the negative values of i32 are smaller than the positives, and
+/// thus keeping the same order.
+fn convert_i32_to_sortable_u32(value: i32) -> u32 {
+    const NEGATION_BIT: u32 = 1 << 31;
+
+    // Casting i32 as u32 makes the negative values of i32 be bigger than the positives so we
+    // must flip the most significant bit (the one responsible for a number being plus or minus in i32).
+    (value as u32) ^ NEGATION_BIT
+}
+
+/// Converts a sortable u32 back into the original u32.
+fn convert_sortable_u32_back_to_i32(value: u32) -> i32 {
+    // We flip the bit back and cast back to i32
+    (value ^ NEGATION_BIT_I32) as i32
+}
+
+const NEGATION_BIT_I64: u64 = 1 << 63;
+
+/// Converts i64 to u64, such that the negative values of i64 are smaller than the positives, and
+/// thus keeping the same order.
+fn convert_i64_to_sortable_u64(value: i64) -> u64 {
+    const NEGATION_BIT: u64 = 1 << 63;
+
+    // Same idea as with i32: cast to u64, then flip the sign bit to make negative values come
+    // before positives.
+    (value as u64) ^ NEGATION_BIT
+}
+
+/// Converts a sortable u64 back into the original i64.
+fn convert_sortable_u64_back_to_i64(value: u64) -> i64 {
+    (value ^ NEGATION_BIT_I64) as i64
+}
+
 impl SortableSerialize for DbDate {
     fn encode_key(self) -> Vec<u8> {
-        let repr = (self.days_since_epoch() as u32) ^ 0x80000000;
+        let repr = convert_i32_to_sortable_u32(self.days_since_epoch());
         Vec::from(repr.to_be_bytes())
     }
 
@@ -32,7 +67,7 @@ impl SortableSerialize for DbDate {
             });
         }
         let bits = u32::from_be_bytes(bytes[..4].try_into()?);
-        let days = (bits ^ 0x80000000) as i32;
+        let days = convert_sortable_u32_back_to_i32(bits);
         Ok(DbDate::new(days))
     }
 }
@@ -60,7 +95,7 @@ impl SortableSerialize for DbDateTime {
 
 impl SortableSerialize for i32 {
     fn encode_key(self) -> Vec<u8> {
-        let repr = (self as u32) ^ 0x80000000;
+        let repr = convert_i32_to_sortable_u32(self);
         Vec::from(repr.to_be_bytes())
     }
 
@@ -72,13 +107,13 @@ impl SortableSerialize for i32 {
             });
         }
         let bits = u32::from_be_bytes(bytes[..4].try_into()?);
-        Ok((bits ^ 0x80000000) as i32)
+        Ok(convert_sortable_u32_back_to_i32(bits))
     }
 }
 
 impl SortableSerialize for i64 {
     fn encode_key(self) -> Vec<u8> {
-        let repr = (self as u64) ^ 0x8000000000000000;
+        let repr = convert_i64_to_sortable_u64(self);
         Vec::from(repr.to_be_bytes())
     }
 
@@ -90,7 +125,7 @@ impl SortableSerialize for i64 {
             });
         }
         let bits = u64::from_be_bytes(bytes[..8].try_into()?);
-        Ok((bits ^ 0x8000000000000000) as i64)
+        Ok(convert_sortable_u64_back_to_i64(bits))
     }
 }
 

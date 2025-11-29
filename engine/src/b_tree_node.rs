@@ -575,8 +575,6 @@ mod test {
 
     const PAGE_SIZE: usize = 4096;
 
-    // ===== Test Page Implementation =====
-
     struct TestPage {
         data: Vec<u8>,
     }
