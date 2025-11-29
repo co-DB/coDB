@@ -153,12 +153,12 @@ impl fmt::Display for TokenType {
             TokenType::DateTimeType => write!(f, "DATETIME"),
             TokenType::As => write!(f, "AS"),
             TokenType::Dot => write!(f, "."),
-            TokenType::Order => write!(f, "Order"),
-            TokenType::By => write!(f, "By"),
-            TokenType::Limit => write!(f, "Limit"),
-            TokenType::Asc => write!(f, "Asc"),
-            TokenType::Desc => write!(f, "Desc"),
-            TokenType::Offset => write!(f, "Offset"),
+            TokenType::Order => write!(f, "ORDER"),
+            TokenType::By => write!(f, "BY"),
+            TokenType::Limit => write!(f, "LIMIT"),
+            TokenType::Asc => write!(f, "ASC"),
+            TokenType::Desc => write!(f, "DESC"),
+            TokenType::Offset => write!(f, "OFFSET"),
         }
     }
 }

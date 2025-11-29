@@ -1163,7 +1163,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn resolve_u32(&self, value: i64, ctx: impl Into<String>) -> Result<u32, AnalyzerError> {
-        if value >= u32::MIN as i64 && value <= u32::MAX as i64 {
+        if value >= 0 && value <= u32::MAX as i64 {
             return Ok(value as u32);
         }
         Err(AnalyzerError::ValueOutOfBounds {
@@ -2247,6 +2247,43 @@ mod tests {
             AnalyzerError::ValueOutOfBounds { got, context } => {
                 assert_eq!(*got, u32::MAX as i64 + 1);
                 assert_eq!(context, "LIMIT");
+            }
+            other => panic!("expected ValueOutOfBounds, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_select_offset_out_of_bounds() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // offset is negative
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: Some(-1),
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+
+        match &errs[0] {
+            AnalyzerError::ValueOutOfBounds { got, context } => {
+                assert_eq!(*got, -1);
+                assert_eq!(context, "OFFSET");
             }
             other => panic!("expected ValueOutOfBounds, got: {:?}", other),
         }

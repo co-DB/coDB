@@ -587,7 +587,7 @@ impl Parser {
         Ok(Some(self.parse_expression(Precedence::Lowest)?))
     }
 
-    /// Parses an optional WHERE clause, returning the [`OrderByDetails`] if present.
+    /// Parses an optional ORDER BY clause, returning the [`OrderByDetails`] if present.
     fn parse_order_by_clause(&mut self) -> Result<Option<OrderByDetails>, ParserError> {
         if self.peek_token.token_type != TokenType::Order {
             return Ok(None);
