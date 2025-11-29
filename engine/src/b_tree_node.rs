@@ -1,4 +1,4 @@
-﻿use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
+﻿use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::heap_file::RecordPtr;
 use crate::slotted_page::{
     InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
@@ -6,8 +6,6 @@ use crate::slotted_page::{
 };
 use bytemuck::{Pod, Zeroable};
 use std::cmp::Ordering;
-use std::fmt::Debug;
-use std::marker::PhantomData;
 use storage::cache::{PageRead, PageWrite};
 use storage::paged_file::PageId;
 use thiserror::Error;
@@ -127,25 +125,6 @@ pub(crate) struct InternalNodeSearchResult {
     pub(crate) insert_pos: Option<u16>,
 }
 
-/// Helper trait that every key of a b-tree must implement.
-pub(crate) trait BTreeKey: DbSerializable + Ord + Clone + Debug {
-    const MAX_KEY_SIZE: u16;
-}
-
-macro_rules! impl_btree_key {
-    ($($t:ty),*) => {
-        $(impl BTreeKey for $t {
-            const MAX_KEY_SIZE: u16 = (size_of::<$t>() + size_of::<RecordPtr>() + size_of::<Slot>()) as u16;
-        })*
-    };
-}
-
-impl_btree_key!(i32, i64, DbDateTime, DbDate);
-
-impl BTreeKey for String {
-    // 512 is the max size of the string itself, but we also need to store its length when serializing.
-    const MAX_KEY_SIZE: u16 = (512 + size_of::<u16>()) as u16;
-}
 /// Struct representing a B-Tree node. It is a wrapper on a slotted page, that uses its api for
 /// lower level operations.
 pub(crate) struct BTreeNode<Page, Header>
@@ -174,6 +153,11 @@ where
         Ok(Self {
             slotted_page: SlottedPage::new(page)?,
         })
+    }
+
+    pub fn can_fit_another(&self) -> Result<bool, BTreeNodeError> {
+        // TODO: Figure out how to do this.
+        Ok(self.slotted_page.free_space()? > 512)
     }
 
     fn get_btree_header(&self) -> Result<&Header, BTreeNodeError> {
@@ -222,49 +206,6 @@ where
                 .insert_at(value.as_slice(), index as SlotId)?;
         }
         Ok(())
-    }
-
-    pub fn split_keys(&mut self) -> Result<(Vec<Vec<u8>>, Vec<u8>), BTreeNodeError> {
-        let valid_records = self
-            .slotted_page
-            .read_all_records_enumerated()?
-            .collect::<Vec<_>>();
-
-        if valid_records.len() < 2 {
-            return Err(BTreeNodeError::InvalidSplit);
-        }
-
-        let mut current_size = 0;
-
-        let split_position = valid_records
-            .iter()
-            .position(|(_, record)| {
-                current_size += record.len();
-                current_size > SlottedPage::<Page, Header>::MAX_FREE_SPACE as usize / 2
-            })
-            .unwrap_or(valid_records.len() / 2);
-
-        let (_, split_records) = valid_records.split_at(split_position);
-
-        let copied_split_records = split_records
-            .iter()
-            .map(|(_, record)| record.to_vec())
-            .collect::<Vec<_>>();
-
-        let split_indexes = split_records
-            .iter()
-            .map(|(index, _)| *index)
-            .collect::<Vec<_>>();
-
-        for index in split_indexes {
-            self.slotted_page.delete(index)?;
-        }
-
-        self.slotted_page.compact_slots()?;
-        self.slotted_page.compact_records()?;
-
-        let separator_key = copied_split_records.first().unwrap().to_vec();
-        Ok((copied_split_records, separator_key))
     }
 
     fn handle_insert_result(
@@ -410,6 +351,53 @@ where
         header.leftmost_child_pointer = child_id;
         Ok(())
     }
+
+    pub fn split_keys(&mut self) -> Result<(Vec<Vec<u8>>, Vec<u8>), BTreeNodeError> {
+        let valid_records = self
+            .slotted_page
+            .read_all_records_enumerated()?
+            .collect::<Vec<_>>();
+
+        if valid_records.len() < 2 {
+            return Err(BTreeNodeError::InvalidSplit);
+        }
+
+        let mut current_size = 0;
+
+        let split_position = valid_records
+            .iter()
+            .position(|(_, record)| {
+                current_size += record.len();
+                current_size > SlottedPage::<Page, BTreeInternalHeader>::MAX_FREE_SPACE as usize / 2
+            })
+            .unwrap_or(valid_records.len() / 2);
+
+        let (_, split_records) = valid_records.split_at(split_position);
+
+        let copied_split_records = split_records
+            .iter()
+            .map(|(_, record)| record.to_vec())
+            .collect::<Vec<_>>();
+
+        let split_indexes = split_records
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+
+        for index in split_indexes {
+            self.slotted_page.delete(index)?;
+        }
+
+        self.slotted_page.compact_slots()?;
+        self.slotted_page.compact_records()?;
+
+        // For internal nodes, extract only the key portion (exclude PageId at the end)
+        let first_record = copied_split_records.first().unwrap();
+        let key_bytes_end = first_record.len() - size_of::<PageId>();
+        let separator_key = first_record[..key_bytes_end].to_vec();
+        
+        Ok((copied_split_records, separator_key))
+    }
 }
 impl<Page> BTreeNode<Page, BTreeLeafHeader>
 where
@@ -530,6 +518,54 @@ where
             None => header.next_leaf_pointer = BTreeLeafHeader::NO_NEXT_LEAF,
         };
         Ok(())
+    }
+
+    pub fn split_keys(&mut self) -> Result<(Vec<Vec<u8>>, Vec<u8>), BTreeNodeError> {
+        let valid_records = self
+            .slotted_page
+            .read_all_records_enumerated()?
+            .collect::<Vec<_>>();
+
+        if valid_records.len() < 2 {
+            return Err(BTreeNodeError::InvalidSplit);
+        }
+
+        let mut current_size = 0;
+
+        let split_position = valid_records
+            .iter()
+            .position(|(_, record)| {
+                current_size += record.len();
+                current_size > SlottedPage::<Page, BTreeLeafHeader>::MAX_FREE_SPACE as usize / 2
+            })
+            .unwrap_or(valid_records.len() / 2);
+
+        let (_, split_records) = valid_records.split_at(split_position);
+
+        let copied_split_records = split_records
+            .iter()
+            .map(|(_, record)| record.to_vec())
+            .collect::<Vec<_>>();
+
+        let split_indexes = split_records
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+
+        for index in split_indexes {
+            self.slotted_page.delete(index)?;
+        }
+
+        self.slotted_page.compact_slots()?;
+        self.slotted_page.compact_records()?;
+
+        // For leaf nodes, extract only the key portion (exclude RecordPtr at the end)
+        let first_record = copied_split_records.first().unwrap();
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = first_record.len() - serialized_record_ptr_size;
+        let separator_key = first_record[..key_bytes_end].to_vec();
+        
+        Ok((copied_split_records, separator_key))
     }
 }
 #[cfg(test)]
