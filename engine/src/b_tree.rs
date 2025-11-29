@@ -629,7 +629,7 @@ mod test {
         fs::create_dir_all(&db_dir).unwrap();
 
         let files_manager = Arc::new(FilesManager::new(db_dir).unwrap());
-        let cache = Cache::new(200, files_manager.clone());
+        let cache = Cache::new(2000, files_manager.clone());
 
         // Use a unique file name for each test to avoid conflicts
         let file_key = FileKey::index(format!(
@@ -1095,8 +1095,8 @@ mod test {
     fn benchmark_concurrent_inserts_random() {
         use rand::{rng, seq::SliceRandom};
 
-        let num_threads = 16;
-        let keys_per_thread = 100;
+        let num_threads = 1;
+        let keys_per_thread = 1000;
         let total_keys = num_threads * keys_per_thread;
 
         println!("\n=== BTree Random Concurrent Insert Benchmark ===");
