@@ -1,8 +1,8 @@
 ﻿use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::heap_file::RecordPtr;
 use crate::slotted_page::{
-    InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
-    SlottedPageError, SlottedPageHeader, get_base_header,
+    InsertResult, PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
+    SlottedPageHeader, get_base_header,
 };
 use bytemuck::{Pod, Zeroable};
 use std::cmp::Ordering;
@@ -335,7 +335,7 @@ where
         key: &[u8],
         new_child_id: PageId,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
-        let position = match self.search(&key)?.insert_pos {
+        let position = match self.search(key)?.insert_pos {
             None => return Err(BTreeNodeError::InternalNodeDuplicateKey),
             Some(pos) => pos,
         };
@@ -395,7 +395,7 @@ where
         let first_record = copied_split_records.first().unwrap();
         let key_bytes_end = first_record.len() - size_of::<PageId>();
         let separator_key = first_record[..key_bytes_end].to_vec();
-        
+
         Ok((copied_split_records, separator_key))
     }
 }
@@ -499,7 +499,7 @@ where
         key: &[u8],
         record_pointer: RecordPtr,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
-        let position = match self.search(&key)? {
+        let position = match self.search(key)? {
             // TODO (For indexes): handle duplicated keys
             LeafNodeSearchResult::Found { .. } => return Ok(NodeInsertResult::KeyAlreadyExists),
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => insert_slot_id,
@@ -564,7 +564,7 @@ where
         let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
         let key_bytes_end = first_record.len() - serialized_record_ptr_size;
         let separator_key = first_record[..key_bytes_end].to_vec();
-        
+
         Ok((copied_split_records, separator_key))
     }
 }

@@ -20,7 +20,6 @@ trait SortableSerialize: Sized {
 
 impl SortableSerialize for DbDate {
     fn encode_key(self) -> Vec<u8> {
-        // Apply sign-bit flip like i32 to make it sortable
         let repr = (self.days_since_epoch() as u32) ^ 0x80000000;
         Vec::from(repr.to_be_bytes())
     }
