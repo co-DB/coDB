@@ -279,13 +279,13 @@ impl<'a> Analyzer<'a> {
                 })
             })
             .transpose()?;
-        let resolved_limit = select
-            .limit
-            .map(|limit| self.resolve_u32(limit, "LIMIT"))
-            .transpose()?;
         let resolved_offset = select
             .offset
             .map(|offset| self.resolve_u32(offset, "OFFSET"))
+            .transpose()?;
+        let resolved_limit = select
+            .limit
+            .map(|limit| self.resolve_u32(limit, "LIMIT"))
             .transpose()?;
         let select_statement = ResolvedSelectStatement {
             table: resolved_table,
@@ -2183,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_select_with_limit_and_offset() {
+    fn analyze_select_with_offset_and_limit() {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
 

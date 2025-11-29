@@ -566,8 +566,8 @@ impl Parser {
         let table_name = self.parse_table_name()?;
         let where_clause = self.parse_where_clause()?;
         let order_by = self.parse_order_by_clause()?;
-        let limit = self.parse_limit_clause()?;
         let offset = self.parse_offset_clause()?;
+        let limit = self.parse_limit_clause()?;
         Ok(Statement::Select(SelectStatement {
             columns,
             table_name,
@@ -612,22 +612,22 @@ impl Parser {
         }))
     }
 
-    /// Parses an optional LIMIT clause, returning the limit value if present.
-    fn parse_limit_clause(&mut self) -> Result<Option<i64>, ParserError> {
-        if self.peek_token.token_type != TokenType::Limit {
-            return Ok(None);
-        }
-        self.expect_token(TokenType::Limit)?;
-        let value = self.expect_int()?;
-        Ok(Some(value))
-    }
-
     /// Parses an optional OFFSET clause, returning the offset value if present.
     fn parse_offset_clause(&mut self) -> Result<Option<i64>, ParserError> {
         if self.peek_token.token_type != TokenType::Offset {
             return Ok(None);
         }
         self.expect_token(TokenType::Offset)?;
+        let value = self.expect_int()?;
+        Ok(Some(value))
+    }
+
+    /// Parses an optional LIMIT clause, returning the limit value if present.
+    fn parse_limit_clause(&mut self) -> Result<Option<i64>, ParserError> {
+        if self.peek_token.token_type != TokenType::Limit {
+            return Ok(None);
+        }
+        self.expect_token(TokenType::Limit)?;
         let value = self.expect_int()?;
         Ok(Some(value))
     }
@@ -1573,9 +1573,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_select_with_where_order_limit_offset() {
+    fn parses_select_with_where_order_offset_limit() {
         let parser =
-            Parser::new("SELECT * FROM users WHERE age > 18 ORDER BY id DESC LIMIT 100 OFFSET 50;");
+            Parser::new("SELECT * FROM users WHERE age > 18 ORDER BY id DESC OFFSET 50 LIMIT 100;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 

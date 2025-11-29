@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn query_planner_select_with_limit_and_offset() {
+    fn query_planner_select_with_offset_and_limit() {
         let mut builder = SelectStatementBuilder::new();
         let col1 = builder.add_column("col1", Type::I32);
         builder.with_limit(25).with_offset(10);
