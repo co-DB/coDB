@@ -983,8 +983,8 @@ mod tests {
         );
 
         // Query: Get Electronics products with price > 50, ordered by price DESC, skip first result, take 2
-        // Expected: After filtering (Mouse excluded), sorted DESC: Laptop(1200), Monitor(300), Headphones(100), Keyboard(75), Webcam(80)
-        // After OFFSET 1: Monitor(300), Headphones(100), Keyboard(75), Webcam(80)
+        // Expected: After filtering (Mouse excluded), sorted DESC: Laptop(1200), Monitor(300), Headphones(100), Webcam(80), Keyboard(75)
+        // After OFFSET 1: Monitor(300), Headphones(100), Webcam(80), Keyboard(75),
         // After LIMIT 2: Monitor(300), Headphones(100)
         let (select_plan, select_ast) = create_single_statement(
             "SELECT id, name, price FROM products WHERE category = 'Electronics' AND price > 50 ORDER BY price DESC OFFSET 1 LIMIT 2;",

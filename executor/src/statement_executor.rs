@@ -410,16 +410,12 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         match (lhs, rhs) {
             (Field::Int32(lhs), Field::Int32(rhs)) => Ok(lhs.cmp(rhs)),
             (Field::Int64(lhs), Field::Int64(rhs)) => Ok(lhs.cmp(rhs)),
-            (Field::Float32(lhs), Field::Float32(rhs)) => {
-                Ok(lhs.partial_cmp(rhs).ok_or_else(|| {
-                    error_factory::comparing_nan_values(lhs.to_string(), rhs.to_string())
-                })?)
-            }
-            (Field::Float64(lhs), Field::Float64(rhs)) => {
-                Ok(lhs.partial_cmp(rhs).ok_or_else(|| {
-                    error_factory::comparing_nan_values(lhs.to_string(), rhs.to_string())
-                })?)
-            }
+            (Field::Float32(lhs), Field::Float32(rhs)) => lhs.partial_cmp(rhs).ok_or_else(|| {
+                error_factory::comparing_nan_values(lhs.to_string(), rhs.to_string())
+            }),
+            (Field::Float64(lhs), Field::Float64(rhs)) => lhs.partial_cmp(rhs).ok_or_else(|| {
+                error_factory::comparing_nan_values(lhs.to_string(), rhs.to_string())
+            }),
             (Field::Bool(lhs), Field::Bool(rhs)) => Ok(lhs.cmp(rhs)),
             (Field::String(lhs), Field::String(rhs)) => Ok(lhs.cmp(rhs)),
             (Field::Date(lhs), Field::Date(rhs)) => Ok(lhs.cmp(rhs)),
