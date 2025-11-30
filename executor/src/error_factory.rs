@@ -29,6 +29,8 @@ pub(crate) enum InternalExecutorError {
     InvalidCast { from: String, to: String },
     #[error("failed to load column ({column_name}) value from context")]
     CannotLoadColumnValueFromContext { column_name: String },
+    #[error("cannot compare NaN values ('{lhs}' and '{rhs}')")]
+    ComparingNaNValues { lhs: String, rhs: String },
 }
 
 /// Helper to create [`StatementResult::RuntimeError`] with provided message.
@@ -80,5 +82,15 @@ pub(crate) fn cannot_load_column_from_context(
 ) -> InternalExecutorError {
     InternalExecutorError::CannotLoadColumnValueFromContext {
         column_name: column_name.into(),
+    }
+}
+
+pub(crate) fn comparing_nan_values(
+    lhs: impl Into<String>,
+    rhs: impl Into<String>,
+) -> InternalExecutorError {
+    InternalExecutorError::ComparingNaNValues {
+        lhs: lhs.into(),
+        rhs: rhs.into(),
     }
 }

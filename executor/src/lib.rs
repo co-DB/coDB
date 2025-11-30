@@ -721,6 +721,215 @@ mod tests {
     }
 
     #[test]
+    fn test_sorting_integers_ascending() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let _ = executor
+            .execute("CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (1, 30);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (2, 10);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (3, 20);")
+            .next()
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test ORDER BY value ASC;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::Int32(10));
+        assert_eq!(rows[1].fields[1], Field::Int32(20));
+        assert_eq!(rows[2].fields[1], Field::Int32(30));
+    }
+
+    #[test]
+    fn test_sorting_integers_descending() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let _ = executor
+            .execute("CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (1, 30);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (2, 10);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (3, 20);")
+            .next()
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test ORDER BY value DESC;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::Int32(30));
+        assert_eq!(rows[1].fields[1], Field::Int32(20));
+        assert_eq!(rows[2].fields[1], Field::Int32(10));
+    }
+
+    #[test]
+    fn test_sorting_strings_ascending() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let _ = executor
+            .execute("CREATE TABLE test (id INT32 PRIMARY_KEY, name STRING);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, name) VALUES (1, 'zebra');")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, name) VALUES (2, 'apple');")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, name) VALUES (3, 'banana');")
+            .next()
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM test ORDER BY name ASC;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::String("apple".into()));
+        assert_eq!(rows[1].fields[1], Field::String("banana".into()));
+        assert_eq!(rows[2].fields[1], Field::String("zebra".into()));
+    }
+
+    #[test]
+    fn test_sorting_floats_implicit_ascending() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let _ = executor
+            .execute("CREATE TABLE test (id INT32 PRIMARY_KEY, score FLOAT64);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, score) VALUES (1, 3.75);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, score) VALUES (2, 1.5);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, score) VALUES (3, 2.25);")
+            .next()
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, score FROM test ORDER BY score;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::Float64(1.5));
+        assert_eq!(rows[1].fields[1], Field::Float64(2.25));
+        assert_eq!(rows[2].fields[1], Field::Float64(3.75));
+    }
+
+    #[test]
+    fn test_sorting_booleans() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let _ = executor
+            .execute("CREATE TABLE test (id INT32 PRIMARY_KEY, active BOOL);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, active) VALUES (1, TRUE);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, active) VALUES (2, FALSE);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, active) VALUES (3, TRUE);")
+            .next()
+            .unwrap();
+
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, active FROM test ORDER BY active ASC;",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::Bool(false));
+        assert_eq!(rows[1].fields[1], Field::Bool(true));
+        assert_eq!(rows[2].fields[1], Field::Bool(true));
+    }
+
+    #[test]
+    fn test_sorting_duplicate_values() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let _ = executor
+            .execute("CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (1, 10);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (2, 20);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (3, 10);")
+            .next()
+            .unwrap();
+        let _ = executor
+            .execute("INSERT INTO test (id, value) VALUES (4, 20);")
+            .next()
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test ORDER BY value ASC;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].fields[1], Field::Int32(10));
+        assert_eq!(rows[1].fields[1], Field::Int32(10));
+        assert_eq!(rows[2].fields[1], Field::Int32(20));
+        assert_eq!(rows[3].fields[1], Field::Int32(20));
+    }
+
+    // TODO: add tests for sorting date and datetimes once they are handled
+
+    #[test]
     fn test_execute_insert_single_row() {
         let (executor, _temp_dir) = create_test_executor();
 
