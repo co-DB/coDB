@@ -192,12 +192,16 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
     /// Handler for [`Skip`] statement.
     fn skip(&self, skip: &Skip) -> Result<Vec<Record>, InternalExecutorError> {
-        todo!()
+        let data_source = self.statement.item(skip.data_source);
+        let records = self.execute_data_source(data_source)?;
+        Ok(records.into_iter().skip(skip.count as _).collect())
     }
 
     /// Handler for [`Limit`] statement.
     fn limit(&self, limit: &Limit) -> Result<Vec<Record>, InternalExecutorError> {
-        todo!()
+        let data_source = self.statement.item(limit.data_source);
+        let records = self.execute_data_source(data_source)?;
+        Ok(records.into_iter().take(limit.count as _).collect())
     }
 
     /// Handler for [`Projection`] statement.

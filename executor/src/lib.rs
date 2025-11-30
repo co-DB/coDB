@@ -769,6 +769,257 @@ mod tests {
         assert_eq!(rows[3].fields[1], Field::Int32(20));
     }
 
+    #[test]
+    fn test_limit_fewer_rows_than_limit() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test LIMIT 5;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_limit_exact_number_of_rows() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test LIMIT 3;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_limit_more_rows_than_limit() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (4, 40);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (5, 50);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test LIMIT 3;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_limit_zero() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test LIMIT 0;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_offset_fewer_rows_than_offset() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test OFFSET 5;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_offset_exact_number_of_rows() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test OFFSET 3;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_offset_skip_some_rows() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (4, 40);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (5, 50);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test OFFSET 2;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_offset_zero() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test OFFSET 0;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_combined_where_order_limit_offset() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32, category STRING);",
+        );
+
+        // Insert test data
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (1, 'Laptop', 1200, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (2, 'Mouse', 25, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (3, 'Keyboard', 75, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (4, 'Monitor', 300, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (5, 'Desk', 200, 'Furniture');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (6, 'Chair', 150, 'Furniture');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (7, 'Headphones', 100, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (8, 'Webcam', 80, 'Electronics');",
+        );
+
+        // Query: Get Electronics products with price > 50, ordered by price DESC, skip first result, take 2
+        // Expected: After filtering (Mouse excluded), sorted DESC: Laptop(1200), Monitor(300), Headphones(100), Keyboard(75), Webcam(80)
+        // After OFFSET 1: Monitor(300), Headphones(100), Keyboard(75), Webcam(80)
+        // After LIMIT 2: Monitor(300), Headphones(100)
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, name, price FROM products WHERE category = 'Electronics' AND price > 50 ORDER BY price DESC OFFSET 1 LIMIT 2;",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[1].name, "name");
+        assert_eq!(columns[2].name, "price");
+
+        assert_eq!(rows.len(), 2);
+
+        // First row should be Monitor (300)
+        assert_eq!(rows[0].fields[0], Field::Int32(4));
+        assert_eq!(rows[0].fields[1], Field::String("Monitor".into()));
+        assert_eq!(rows[0].fields[2], Field::Int32(300));
+
+        // Second row should be Headphones (100)
+        assert_eq!(rows[1].fields[0], Field::Int32(7));
+        assert_eq!(rows[1].fields[1], Field::String("Headphones".into()));
+        assert_eq!(rows[1].fields[2], Field::Int32(100));
+
+        assert!(rows.iter().all(|r| {
+            if let Field::Int32(price) = r.fields[2] {
+                price > 50
+            } else {
+                false
+            }
+        }));
+    }
+
     // TODO: add tests for sorting date and datetimes once they are handled
 
     #[test]
