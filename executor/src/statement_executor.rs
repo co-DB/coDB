@@ -277,18 +277,12 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
         let mut catalog = self.executor.catalog.write();
 
-        if let Err(err) = catalog.add_table(table_metadata) {
-            return error_factory::runtime_error(format!("Failed to create table: {}", err));
-        }
-
-        match catalog.sync_to_disk() {
+        match catalog.add_table(table_metadata) {
             Ok(_) => StatementResult::OperationSuccessful {
                 rows_affected: 0,
                 ty: StatementType::Create,
             },
-            Err(err) => error_factory::runtime_error(format!(
-                "Failed to save catalog content to disk: {err}"
-            )),
+            Err(err) => error_factory::runtime_error(format!("Failed to create table: {}", err)),
         }
     }
 
