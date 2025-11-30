@@ -158,6 +158,9 @@ where
     Page: PageRead,
     Header: SlottedPageHeader,
 {
+    /// Boundary at which we consider the node to need merging/borrowing keys from sibling.
+    const UNDERFLOW_BOUNDARY: f32 = 0.33;
+
     pub fn new(page: Page) -> Result<Self, BTreeNodeError> {
         Ok(Self {
             slotted_page: SlottedPage::new(page)?,
@@ -317,6 +320,10 @@ where
             child_ptr,
             insert_pos: Some(insert_pos),
         })
+    }
+
+    pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY)
     }
 }
 
@@ -533,9 +540,7 @@ where
 
         self.slotted_page.delete(position)?;
 
-        const UNDERFLOW_BOUNDARY: f32 = 0.33;
-
-        if self.slotted_page.fraction_filled()? > UNDERFLOW_BOUNDARY {
+        if self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY {
             Ok(NodeDeleteResult::Success)
         } else {
             Ok(NodeDeleteResult::SuccessUnderflow)

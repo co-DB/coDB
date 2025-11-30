@@ -1,8 +1,8 @@
 use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult, NodeInsertResult,
-    NodeType, get_node_type,
+    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult, NodeDeleteResult,
+    NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
 use bytemuck::{Pod, Zeroable};
@@ -77,10 +77,10 @@ impl TryFrom<&Page> for BTreeMetadata {
     }
 }
 
-/// Result of an optimistic insert attempt
+/// Result of an optimistic operation (insert/delete) attempt
 #[derive(Debug)]
-enum OptimisticInsertResult {
-    InsertSucceeded,
+enum OptimisticOperationResult {
+    Success,
     StructuralChangeRetry,
     FullNodeRetry,
 }
@@ -117,6 +117,11 @@ impl PessimisticPath {
             metadata_page,
         }
     }
+}
+
+struct NodeLatch {
+    node_page_id: PageId,
+    node: BTreeInternalNode<PinnedWritePage>,
 }
 
 /// Structure responsible for managing on-disk index files.
@@ -219,16 +224,18 @@ impl BTree {
     pub(crate) fn insert(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
         let optimistic_result = self.insert_optimistic(key, &record_pointer)?;
         match optimistic_result {
-            OptimisticInsertResult::InsertSucceeded => Ok(()),
-            OptimisticInsertResult::StructuralChangeRetry => {
+            OptimisticOperationResult::Success => Ok(()),
+            OptimisticOperationResult::StructuralChangeRetry => {
                 // Retry optimistically before going to pessimistic insert. This makes sense as
                 // splits of a node in a given path shouldn't occur too often.
                 match self.insert_optimistic(key, &record_pointer)? {
-                    OptimisticInsertResult::InsertSucceeded => Ok(()),
+                    OptimisticOperationResult::Success => Ok(()),
                     _ => self.insert_pessimistic(key, record_pointer),
                 }
             }
-            OptimisticInsertResult::FullNodeRetry => self.insert_pessimistic(key, record_pointer),
+            OptimisticOperationResult::FullNodeRetry => {
+                self.insert_pessimistic(key, record_pointer)
+            }
         }
     }
 
@@ -279,7 +286,7 @@ impl BTree {
         &self,
         key: &[u8],
         record_pointer: &RecordPtr,
-    ) -> Result<OptimisticInsertResult, BTreeError> {
+    ) -> Result<OptimisticOperationResult, BTreeError> {
         // Traverse and collect version info.
         let (leaf_page_id, path_versions) = self.traverse_with_versions(key)?;
 
@@ -288,18 +295,22 @@ impl BTree {
 
         // Check if any node in the path changed structurally.
         if self.detect_structural_changes(&path_versions) {
-            return Ok(OptimisticInsertResult::StructuralChangeRetry);
+            return Ok(OptimisticOperationResult::StructuralChangeRetry);
         }
 
         match leaf_node.insert(key, *record_pointer)? {
-            NodeInsertResult::Success => Ok(OptimisticInsertResult::InsertSucceeded),
-            NodeInsertResult::PageFull => Ok(OptimisticInsertResult::FullNodeRetry),
+            NodeInsertResult::Success => Ok(OptimisticOperationResult::Success),
+            NodeInsertResult::PageFull => Ok(OptimisticOperationResult::FullNodeRetry),
             NodeInsertResult::KeyAlreadyExists => Err(BTreeError::DuplicateKey),
         }
     }
 
     ///  Traverses the tree while keeping write latches on nodes that may need to split.
-    fn traverse_pessimistic(&self, key: &[u8]) -> Result<PessimisticPath, BTreeError> {
+    fn traverse_pessimistic(
+        &self,
+        key: &[u8],
+        drop_lock_fn: impl Fn(&BTreeInternalNode<PinnedWritePage>) -> Result<bool, BTreeError>,
+    ) -> Result<PessimisticPath, BTreeError> {
         // Pin the metadata (in case root splits)
         let mut metadata_page = Some(self.pin_write(Self::METADATA_PAGE_ID)?);
         let mut current_page_id =
@@ -319,7 +330,7 @@ impl BTree {
                     current_page_id = node.search(key)?.child_ptr;
 
                     // If child can fit another, we can safely drop ancestors and metadata.
-                    if node.can_fit_another()? {
+                    if drop_lock_fn(&node)? {
                         drop(metadata_page.take());
                         latch_stack.clear();
                     }
@@ -339,7 +350,7 @@ impl BTree {
 
     /// Performs a pessimistic insert, splitting nodes as necessary.
     fn insert_pessimistic(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
-        let path = self.traverse_pessimistic(key)?;
+        let path = self.traverse_pessimistic(key, |node| Ok(node.can_fit_another()?))?;
 
         let mut leaf = self.pin_leaf_for_write(path.leaf_page_id)?;
 
@@ -550,6 +561,71 @@ impl BTree {
 
         metadata.root_page_id = new_root_id;
 
+        Ok(())
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<(), BTreeError> {
+        let optimistic_result = self.delete_optimistic(key)?;
+        match optimistic_result {
+            OptimisticOperationResult::Success => Ok(()),
+            OptimisticOperationResult::StructuralChangeRetry => {
+                // Retry optimistically before going to pessimistic delete. This makes sense as
+                // merges of a node in a given path shouldn't occur too often.
+                match self.delete_optimistic(key)? {
+                    OptimisticOperationResult::Success => Ok(()),
+                    _ => self.delete_pessimistic(key),
+                }
+            }
+            OptimisticOperationResult::FullNodeRetry => self.delete_pessimistic(key),
+        }
+    }
+
+    fn delete_optimistic(&self, key: &[u8]) -> Result<OptimisticOperationResult, BTreeError> {
+        // Traverse and collect version info.
+        let (leaf_page_id, path_versions) = self.traverse_with_versions(key)?;
+
+        // Try upgrading to a write latch on the leaf.
+        let mut leaf_node = self.pin_leaf_for_write(leaf_page_id)?;
+
+        // Check if any node in the path changed structurally.
+        if self.detect_structural_changes(&path_versions) {
+            return Ok(OptimisticOperationResult::StructuralChangeRetry);
+        }
+
+        match leaf_node.delete(key)? {
+            NodeDeleteResult::Success => Ok(OptimisticOperationResult::Success),
+            NodeDeleteResult::SuccessUnderflow => Ok(OptimisticOperationResult::FullNodeRetry),
+            NodeDeleteResult::KeyDoesNotExist => {
+                Ok(OptimisticOperationResult::StructuralChangeRetry)
+            }
+        }
+    }
+
+    fn delete_pessimistic(&self, key: &[u8]) -> Result<(), BTreeError> {
+        let path =
+            self.traverse_pessimistic(key, |node| Ok(node.will_not_underflow_after_delete()?))?;
+
+        let mut leaf = self.pin_leaf_for_write(path.leaf_page_id)?;
+
+        match leaf.delete(key)? {
+            NodeDeleteResult::Success => Ok(()),
+            NodeDeleteResult::SuccessUnderflow => self.redistribute_or_merge(
+                path.latch_stack,
+                (path.leaf_page_id, leaf),
+                key,
+                path.metadata_page,
+            ),
+            NodeDeleteResult::KeyDoesNotExist => Err(BTreeError::DuplicateKey),
+        }
+    }
+
+    fn redistribute_or_merge(
+        &self,
+        internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        leaf_node: (PageId, BTreeLeafNode<PinnedWritePage>),
+        key: &[u8],
+        metadata_page: Option<PinnedWritePage>,
+    ) -> Result<(), BTreeError> {
         Ok(())
     }
 }
