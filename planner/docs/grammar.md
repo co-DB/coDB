@@ -35,6 +35,7 @@ CoSQL includes a set of essential data types suitable for building production-gr
 - Number of spaces between tokens doesn't matter (E.g "Select \* FROM Users;" works just fine)
 - Strings are enclosed by a single quotation mark ('Text')
 - Identifiers must start with a letter and can use only letters, digits and underscores ('\_')
+- When the ORDER BY direction is omitted, ASC (ascending) is used by default.
 
 ### Reserved keywords
 
@@ -43,6 +44,7 @@ CoSQL includes a set of essential data types suitable for building production-gr
 - WHERE, FROM, INTO, SET, VALUES, AS
 - TABLE, COLUMN, PRIMARY_KEY
 - TRUE, FALSE
+- ORDER, BY, ASC, DESC, LIMIT, OFFSET
 
 ### Identifiers
 
@@ -140,8 +142,14 @@ Precedence (from lowest to highest)
 #### Select
 
 ```
- <select_stmt> :: SELECT <column_list_select> FROM <table_name> <where_clause>
+ <select_stmt> :: SELECT <column_list_select> FROM <table_name> <select_clauses>
  <column_list_select> :: <column_name>(,<column_name>)* | *
+ <select_clauses> :: <select_where_clause> <order_by_clause> <offset_clause> <limit_clause> 
+ <select_where_clause> :: <where_clause> | ε
+ <order_by_clause> :: ORDER BY <column_name> <order_direction> | ε
+ <order_direction> :: ASC | DESC | ε
+ <offset_clause> :: OFFSET <int> | ε
+ <limit_clause> :: LIMIT <int> | ε
 ```
 
 #### Insert

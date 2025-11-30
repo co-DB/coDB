@@ -27,15 +27,15 @@ use crate::{
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedCreateColumnAddon,
         ResolvedCreateColumnDescriptor, ResolvedCreateStatement, ResolvedDeleteStatement,
         ResolvedDropStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedLiteral,
-        ResolvedLogicalExpression, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
-        ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
+        ResolvedLogicalExpression, ResolvedNodeId, ResolvedOrderByDetails, ResolvedSelectStatement,
+        ResolvedStatement, ResolvedTable, ResolvedTree, ResolvedTruncateStatement, ResolvedType,
         ResolvedUnaryExpression, ResolvedUpdateStatement,
     },
 };
 
 /// Error for [`Analyzer`] related operations.
 #[derive(Debug, Error)]
-pub(crate) enum AnalyzerError {
+pub enum AnalyzerError {
     #[error("table '{table}' was not found in database")]
     TableNotFound { table: String },
     #[error("column '{column}' was not found")]
@@ -75,6 +75,13 @@ pub(crate) enum AnalyzerError {
     UnexpectedTableMetadataError(#[from] TableMetadataError),
     #[error("unexpected ast error: {0}")]
     UnexpectedAstError(#[from] AstError),
+    #[error("mixed statement types in query: found both {first_type} and {second_type}")]
+    MixedStatementTypes {
+        first_type: String,
+        second_type: String,
+    },
+    #[error("value '{got}' cannot be used in {context}")]
+    ValueOutOfBounds { got: i64, context: String },
 }
 
 /// Used as a key type for [`StatementContext::inserted_columns`].
@@ -160,6 +167,36 @@ impl StatementContext {
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum StatementCategory {
+    DDL,
+    DML,
+}
+
+impl From<&Statement> for StatementCategory {
+    fn from(value: &Statement) -> Self {
+        match value {
+            Statement::Create(_)
+            | Statement::Alter(_)
+            | Statement::Drop(_)
+            | Statement::Truncate(_) => StatementCategory::DDL,
+            Statement::Select(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_) => StatementCategory::DML,
+        }
+    }
+}
+
+impl Display for StatementCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StatementCategory::DDL => write!(f, "DDL"),
+            StatementCategory::DML => write!(f, "DML"),
+        }
+    }
+}
+
 /// [`Analyzer`] is responsible for performing semantic analysis on [`Ast`]. As the result it produces the [`ResolvedTree`].
 pub(crate) struct Analyzer<'a> {
     /// [`Ast`] being analyzed.
@@ -186,6 +223,11 @@ impl<'a> Analyzer<'a> {
     /// Analyzes [`Ast`] and returns resolved version of it - [`ResolvedTree`].
     pub(crate) fn analyze(mut self) -> Result<ResolvedTree, Vec<AnalyzerError>> {
         let mut errors = vec![];
+
+        if let Err(e) = self.validate_statements_types() {
+            errors.push(e);
+        }
+
         for statement in self.ast.statements() {
             self.statement_context.clear();
             if let Err(e) = self.analyze_statement(statement) {
@@ -226,10 +268,32 @@ impl<'a> Analyzer<'a> {
             .where_clause
             .map(|node_id| self.resolve_expression(node_id))
             .transpose()?;
+        let resolved_order_by = select
+            .order_by
+            .as_ref()
+            .map(|order_by_details| {
+                let column = self.resolve_expression(order_by_details.column)?;
+                Ok::<ResolvedOrderByDetails, AnalyzerError>(ResolvedOrderByDetails {
+                    column,
+                    direction: order_by_details.direction,
+                })
+            })
+            .transpose()?;
+        let resolved_offset = select
+            .offset
+            .map(|offset| self.resolve_u32(offset, "OFFSET"))
+            .transpose()?;
+        let resolved_limit = select
+            .limit
+            .map(|limit| self.resolve_u32(limit, "LIMIT"))
+            .transpose()?;
         let select_statement = ResolvedSelectStatement {
             table: resolved_table,
             columns: resolved_columns,
             where_clause: resolved_where_clause,
+            order_by: resolved_order_by,
+            limit: resolved_limit,
+            offset: resolved_offset,
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Select(select_statement));
@@ -1077,13 +1141,44 @@ impl<'a> Analyzer<'a> {
         }
         Ok(true)
     }
+
+    /// Checks if all statements are of the same category (DML or DDL).
+    fn validate_statements_types(&self) -> Result<(), AnalyzerError> {
+        let statements = self.ast.statements();
+        if statements.is_empty() {
+            return Ok(());
+        }
+
+        let first = StatementCategory::from(&statements[0]);
+        for statement in &statements[1..] {
+            let category = StatementCategory::from(statement);
+            if first != category {
+                return Err(AnalyzerError::MixedStatementTypes {
+                    first_type: first.to_string(),
+                    second_type: category.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_u32(&self, value: i64, ctx: impl Into<String>) -> Result<u32, AnalyzerError> {
+        if value >= 0 && value <= u32::MAX as i64 {
+            return Ok(value as u32);
+        }
+        Err(AnalyzerError::ValueOutOfBounds {
+            got: value,
+            context: ctx.into(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::{
-        Ast, CreateColumnDescriptor, Expression, IdentifierNode, SelectStatement, Statement,
+        Ast, CreateColumnDescriptor, Expression, IdentifierNode, OrderByDetails, OrderDirection,
+        SelectStatement, Statement,
     };
     use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
     use metadata::catalog::Catalog;
@@ -1155,6 +1250,9 @@ mod tests {
             table_name,
             columns: Some(vec![col_id, col_name]),
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
         ast
@@ -1702,6 +1800,9 @@ mod tests {
             table_name,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -1758,6 +1859,9 @@ mod tests {
             table_name,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -1803,6 +1907,9 @@ mod tests {
             table_name,
             columns: Some(vec![col_id, col_fake]),
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -1913,6 +2020,9 @@ mod tests {
             table_name,
             columns: Some(vec![id_col]),
             where_clause: Some(where_node),
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(select));
 
@@ -1967,6 +2077,219 @@ mod tests {
     }
 
     #[test]
+    fn analyze_select_with_order_by_asc() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let order_by_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: Some(OrderByDetails {
+                column: order_by_col,
+                direction: OrderDirection::Ascending,
+            }),
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+        let select = expect_select(&rt, 0);
+
+        let order_by = select
+            .order_by
+            .as_ref()
+            .expect("order_by should be present");
+        let col = expect_column(&rt, order_by.column);
+        assert_eq!(col.name, "id");
+        assert_eq!(col.ty, Type::I32);
+        assert!(matches!(
+            order_by.direction,
+            crate::ast::OrderDirection::Ascending
+        ));
+    }
+
+    #[test]
+    fn analyze_select_with_order_by_desc() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let order_by_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: Some(OrderByDetails {
+                column: order_by_col,
+                direction: OrderDirection::Descending,
+            }),
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+        let select = expect_select(&rt, 0);
+
+        let order_by = select
+            .order_by
+            .as_ref()
+            .expect("order_by should be present");
+        let col = expect_column(&rt, order_by.column);
+        assert_eq!(col.name, "name");
+        assert_eq!(col.ty, Type::String);
+        assert!(matches!(
+            order_by.direction,
+            crate::ast::OrderDirection::Descending
+        ));
+    }
+
+    #[test]
+    fn analyze_select_with_offset_and_limit() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: Some(25),
+            offset: Some(10),
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analyze should succeed");
+
+        assert_eq!(rt.statements.len(), 1);
+        let select = expect_select(&rt, 0);
+
+        assert_eq!(select.limit, Some(25));
+        assert_eq!(select.offset, Some(10));
+    }
+
+    #[test]
+    fn analyze_select_limit_out_of_bounds() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // limit exceeds u32::MAX
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: Some(u32::MAX as i64 + 1),
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+
+        match &errs[0] {
+            AnalyzerError::ValueOutOfBounds { got, context } => {
+                assert_eq!(*got, u32::MAX as i64 + 1);
+                assert_eq!(context, "LIMIT");
+            }
+            other => panic!("expected ValueOutOfBounds, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_select_offset_out_of_bounds() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // offset is negative
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: Some(-1),
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+
+        match &errs[0] {
+            AnalyzerError::ValueOutOfBounds { got, context } => {
+                assert_eq!(*got, -1);
+                assert_eq!(context, "OFFSET");
+            }
+            other => panic!("expected ValueOutOfBounds, got: {:?}", other),
+        }
+    }
+
+    #[test]
     fn analyze_select_with_table_alias() {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
@@ -2001,6 +2324,9 @@ mod tests {
             table_name,
             columns: Some(vec![col_u_id, col_name]),
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
 
         // SELECT u.id, name FROM users AS u;
@@ -2058,6 +2384,9 @@ mod tests {
             table_name,
             columns: Some(vec![col_k_id]),
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
 
         // SELECT k.id FROM users AS u;
@@ -3288,6 +3617,9 @@ mod tests {
             table_name: t1,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(s1));
 
@@ -3303,29 +3635,25 @@ mod tests {
             table_name: t2,
             columns: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
         };
         ast.add_statement(Statement::Select(s2));
 
-        // third statement (adding existing column "name")
+        // third statement (delete from non-existing table)
         let t3_ident = ast.add_node(Expression::Identifier(IdentifierNode {
-            value: "users".into(),
+            value: "nonexistent_table".into(),
         }));
         let t3 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
             identifier: t3_ident,
             alias: None,
         }));
-        let existing_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
-            value: "name".into(),
-        }));
-        let add_action = AddAlterAction {
-            column_name: existing_col_ident,
-            column_type: Type::String,
-        };
-        let alter = AlterStatement {
+        let delete = DeleteStatement {
             table_name: t3,
-            action: AlterAction::Add(add_action),
+            where_clause: None,
         };
-        ast.add_statement(Statement::Alter(alter));
+        ast.add_statement(Statement::Delete(delete));
 
         let analyzer = Analyzer::new(&ast, catalog);
         let errs = analyzer.analyze().unwrap_err();
@@ -3338,11 +3666,135 @@ mod tests {
         }
 
         match &errs[1] {
-            AnalyzerError::ColumnAlreadyExists { column } => assert_eq!(column, "name"),
-            other => panic!(
-                "expected ColumnAlreadyExists as second error, got: {:?}",
-                other
-            ),
+            AnalyzerError::TableNotFound { table } => assert_eq!(table, "nonexistent_table"),
+            other => panic!("expected TableNotFound as second error, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn analyze_mixed_statement_types_errors() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // First statement: DML (SELECT)
+        let t1_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t1 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t1_ident,
+            alias: None,
+        }));
+        let select = SelectStatement {
+            table_name: t1,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        // Second statement: DDL (DROP)
+        let t2_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t2 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t2_ident,
+            alias: None,
+        }));
+        let drop = DropStatement { table_name: t2 };
+        ast.add_statement(Statement::Drop(drop));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+
+        assert_eq!(errs.len(), 1);
+
+        match &errs[0] {
+            AnalyzerError::MixedStatementTypes {
+                first_type,
+                second_type,
+            } => {
+                assert_eq!(first_type, "DML");
+                assert_eq!(second_type, "DDL");
+            }
+            other => panic!("expected MixedStatementTypes, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_all_dml_statements_succeeds() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT
+        let t1_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t1 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t1_ident,
+            alias: None,
+        }));
+        let select = SelectStatement {
+            table_name: t1,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        // DELETE
+        let t2_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t2 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t2_ident,
+            alias: None,
+        }));
+        let delete = DeleteStatement {
+            table_name: t2,
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Delete(delete));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("all DML should succeed");
+
+        assert_eq!(rt.statements.len(), 2);
+    }
+
+    #[test]
+    fn analyze_all_ddl_statements_succeeds() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // TRUNCATE
+        let t1_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t1 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t1_ident,
+            alias: None,
+        }));
+        let truncate = TruncateStatement { table_name: t1 };
+        ast.add_statement(Statement::Truncate(truncate));
+
+        // DROP
+        let t2_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let t2 = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: t2_ident,
+            alias: None,
+        }));
+        let drop = DropStatement { table_name: t2 };
+        ast.add_statement(Statement::Drop(drop));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("all DDL should succeed");
+
+        assert_eq!(rt.statements.len(), 2);
     }
 }

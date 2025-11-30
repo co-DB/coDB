@@ -3,7 +3,10 @@ use std::fmt::{self, Display};
 use metadata::types::Type;
 use time::{Date, PrimitiveDateTime};
 
-use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
+use crate::{
+    ast::OrderDirection,
+    operators::{BinaryOperator, LogicalOperator, UnaryOperator},
+};
 
 /// [`ResolvedTree`] is a semantically analyzed version of [`Ast`].
 #[derive(Default, Debug)]
@@ -73,6 +76,9 @@ pub(crate) struct ResolvedSelectStatement {
     pub(crate) table: ResolvedNodeId,
     pub(crate) columns: Vec<ResolvedNodeId>,
     pub(crate) where_clause: Option<ResolvedNodeId>,
+    pub(crate) order_by: Option<ResolvedOrderByDetails>,
+    pub(crate) limit: Option<u32>,
+    pub(crate) offset: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -168,6 +174,12 @@ impl Display for ResolvedCreateColumnAddon {
             ResolvedCreateColumnAddon::None => write!(f, "<EMPTY_ADDON>"),
         }
     }
+}
+
+#[derive(Debug)]
+pub struct ResolvedOrderByDetails {
+    pub column: ResolvedNodeId,
+    pub direction: OrderDirection,
 }
 
 #[derive(Debug)]

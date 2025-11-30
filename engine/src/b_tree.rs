@@ -1,17 +1,16 @@
-use storage::paged_file::{Page, PageId};
+use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeKey, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult,
-    NodeInsertResult, NodeType, get_node_type,
+    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult, NodeInsertResult,
+    NodeType, get_node_type,
 };
 use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::heap_file::RecordPtr;
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
-use storage::cache::{Cache, CacheError, FilePageRef, PinnedReadPage, PinnedWritePage};
+use storage::cache::{Cache, CacheError, FilePageRef, PageWrite, PinnedReadPage, PinnedWritePage};
 use storage::files_manager::FileKey;
 use thiserror::Error;
 
@@ -49,6 +48,12 @@ impl BTreeMetadata {
             magic_number: BTreeMetadata::CODB_MAGIC_NUMBER,
             root_page_id,
         }
+    }
+
+    fn save_to_page(&self, page: &mut impl PageWrite) {
+        let metadata = BTreeMetadata::new(self.root_page_id);
+        let metadata_bytes = bytemuck::bytes_of(&metadata);
+        page.data_mut()[0..metadata_bytes.len()].copy_from_slice(metadata_bytes);
     }
 }
 
@@ -94,15 +99,15 @@ impl PageVersion {
 
 /// Stores information about the path from root to leaf during a pessimistic insert, including
 /// ancestor nodes and metadata page.
-struct PessimisticPath<Key: BTreeKey> {
-    latch_stack: Vec<(PageId, BTreeInternalNode<PinnedWritePage, Key>)>,
+struct PessimisticPath {
+    latch_stack: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
     leaf_page_id: PageId,
     metadata_page: Option<PinnedWritePage>,
 }
 
-impl<Key: BTreeKey> PessimisticPath<Key> {
+impl PessimisticPath {
     fn new(
-        latch_stack: Vec<(PageId, BTreeInternalNode<PinnedWritePage, Key>)>,
+        latch_stack: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
         leaf_page_id: PageId,
         metadata_page: Option<PinnedWritePage>,
     ) -> Self {
@@ -117,8 +122,7 @@ impl<Key: BTreeKey> PessimisticPath<Key> {
 /// Structure responsible for managing on-disk index files.
 ///
 /// Each [`BTree`] instance corresponds to a single physical file on disk.
-pub(crate) struct BTree<Key: BTreeKey> {
-    _key_marker: PhantomData<Key>,
+pub(crate) struct BTree {
     file_key: FileKey,
     cache: Arc<Cache>,
     /// A concurrent hash map for storing the current structural version numbers (how many times a
@@ -127,13 +131,13 @@ pub(crate) struct BTree<Key: BTreeKey> {
     structural_version_numbers: DashMap<PageId, AtomicU16>,
 }
 
-impl<Key: BTreeKey> BTree<Key> {
+impl BTree {
     const METADATA_PAGE_ID: PageId = 1;
 
     /// Reads the root page ID from the metadata page.
     fn read_root_page_id(&self) -> Result<PageId, BTreeError> {
         let metadata_page = self.cache.pin_read(&FilePageRef::new(
-            BTree::<Key>::METADATA_PAGE_ID,
+            BTree::METADATA_PAGE_ID,
             self.file_key.clone(),
         ))?;
 
@@ -146,7 +150,6 @@ impl<Key: BTreeKey> BTree<Key> {
         Ok(Self {
             cache,
             file_key,
-            _key_marker: PhantomData,
             structural_version_numbers: DashMap::new(),
         })
     }
@@ -166,14 +169,14 @@ impl<Key: BTreeKey> BTree<Key> {
     fn pin_leaf_for_write(
         &self,
         leaf_page_id: PageId,
-    ) -> Result<BTreeLeafNode<PinnedWritePage, Key>, BTreeError> {
+    ) -> Result<BTreeLeafNode<PinnedWritePage>, BTreeError> {
         let page = self.pin_write(leaf_page_id)?;
-        Ok(BTreeLeafNode::<PinnedWritePage, Key>::new(page)?)
+        Ok(BTreeLeafNode::<PinnedWritePage>::new(page)?)
     }
 
     /// Searches for a key in the B-tree and returns the corresponding record pointer (to heap
     /// file record) if the key was found.
-    pub fn search(&self, key: &Key) -> Result<Option<RecordPtr>, BTreeError> {
+    pub fn search(&self, key: &[u8]) -> Result<Option<RecordPtr>, BTreeError> {
         let mut current_page_id = self.read_root_page_id()?;
 
         loop {
@@ -183,11 +186,11 @@ impl<Key: BTreeKey> BTree<Key> {
 
             match node_type {
                 NodeType::Internal => {
-                    let node = BTreeInternalNode::<PinnedReadPage, Key>::new(page)?;
+                    let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
                     current_page_id = node.search(key)?.child_ptr;
                 }
                 NodeType::Leaf => {
-                    let node = BTreeLeafNode::<PinnedReadPage, Key>::new(page)?;
+                    let node = BTreeLeafNode::<PinnedReadPage>::new(page)?;
                     return match node.search(key)? {
                         LeafNodeSearchResult::Found { record_ptr } => Ok(Some(record_ptr)),
                         LeafNodeSearchResult::NotFoundLeaf { .. } => Ok(None),
@@ -213,14 +216,14 @@ impl<Key: BTreeKey> BTree<Key> {
     /// their child, that we descend into, has enough space to fit another key. That's because
     /// we know that the child can't become full and won't need to be split. If we reach the leaf
     /// and the node is still full we start the recursive split operation.
-    pub(crate) fn insert(&self, key: Key, record_pointer: RecordPtr) -> Result<(), BTreeError> {
-        let optimistic_result = self.insert_optimistic(&key, &record_pointer)?;
+    pub(crate) fn insert(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
+        let optimistic_result = self.insert_optimistic(key, &record_pointer)?;
         match optimistic_result {
             OptimisticInsertResult::InsertSucceeded => Ok(()),
             OptimisticInsertResult::StructuralChangeRetry => {
                 // Retry optimistically before going to pessimistic insert. This makes sense as
                 // splits of a node in a given path shouldn't occur too often.
-                match self.insert_optimistic(&key, &record_pointer)? {
+                match self.insert_optimistic(key, &record_pointer)? {
                     OptimisticInsertResult::InsertSucceeded => Ok(()),
                     _ => self.insert_pessimistic(key, record_pointer),
                 }
@@ -230,7 +233,7 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Traverses the tree to the leaf while recording page versions for optimistic concurrency checks.
-    fn traverse_with_versions(&self, key: &Key) -> Result<(PageId, Vec<PageVersion>), BTreeError> {
+    fn traverse_with_versions(&self, key: &[u8]) -> Result<(PageId, Vec<PageVersion>), BTreeError> {
         let mut current_page_id = self.read_root_page_id()?;
         let mut path_versions = Vec::new();
 
@@ -250,7 +253,7 @@ impl<Key: BTreeKey> BTree<Key> {
 
             match get_node_type(&page)? {
                 NodeType::Internal => {
-                    let node = BTreeInternalNode::<PinnedReadPage, Key>::new(page)?;
+                    let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
                     current_page_id = node.search(key)?.child_ptr;
                 }
                 NodeType::Leaf => {
@@ -274,7 +277,7 @@ impl<Key: BTreeKey> BTree<Key> {
     /// Performs an optimistic insert attempt at the leaf node.
     fn insert_optimistic(
         &self,
-        key: &Key,
+        key: &[u8],
         record_pointer: &RecordPtr,
     ) -> Result<OptimisticInsertResult, BTreeError> {
         // Traverse and collect version info.
@@ -288,7 +291,7 @@ impl<Key: BTreeKey> BTree<Key> {
             return Ok(OptimisticInsertResult::StructuralChangeRetry);
         }
 
-        match leaf_node.insert(key.clone(), *record_pointer)? {
+        match leaf_node.insert(key, *record_pointer)? {
             NodeInsertResult::Success => Ok(OptimisticInsertResult::InsertSucceeded),
             NodeInsertResult::PageFull => Ok(OptimisticInsertResult::FullNodeRetry),
             NodeInsertResult::KeyAlreadyExists => Err(BTreeError::DuplicateKey),
@@ -296,7 +299,7 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     ///  Traverses the tree while keeping write latches on nodes that may need to split.
-    fn traverse_pessimistic(&self, key: &Key) -> Result<PessimisticPath<Key>, BTreeError> {
+    fn traverse_pessimistic(&self, key: &[u8]) -> Result<PessimisticPath, BTreeError> {
         // Pin the metadata (in case root splits)
         let mut metadata_page = Some(self.pin_write(Self::METADATA_PAGE_ID)?);
         let mut current_page_id =
@@ -310,7 +313,7 @@ impl<Key: BTreeKey> BTree<Key> {
             let page = self.pin_write(current_page_id)?;
             match get_node_type(&page)? {
                 NodeType::Internal => {
-                    let node = BTreeInternalNode::<PinnedWritePage, Key>::new(page)?;
+                    let node = BTreeInternalNode::<PinnedWritePage>::new(page)?;
                     let old_page_id = current_page_id;
 
                     current_page_id = node.search(key)?.child_ptr;
@@ -335,12 +338,12 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 
     /// Performs a pessimistic insert, splitting nodes as necessary.
-    fn insert_pessimistic(&self, key: Key, record_pointer: RecordPtr) -> Result<(), BTreeError> {
-        let path = self.traverse_pessimistic(&key)?;
+    fn insert_pessimistic(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
+        let path = self.traverse_pessimistic(key)?;
 
         let mut leaf = self.pin_leaf_for_write(path.leaf_page_id)?;
 
-        match leaf.insert(key.clone(), record_pointer)? {
+        match leaf.insert(key, record_pointer)? {
             NodeInsertResult::Success => Ok(()),
             NodeInsertResult::PageFull => self.split_and_propagate(
                 path.latch_stack,
@@ -364,11 +367,11 @@ impl<Key: BTreeKey> BTree<Key> {
     fn allocate_and_init_leaf(
         &self,
         next_leaf_id: Option<PageId>,
-    ) -> Result<(PageId, BTreeLeafNode<PinnedWritePage, Key>), BTreeError> {
+    ) -> Result<(PageId, BTreeLeafNode<PinnedWritePage>), BTreeError> {
         let (new_page, new_leaf_id) = self.cache.allocate_page(&self.file_key)?;
         Ok((
             new_leaf_id,
-            BTreeLeafNode::<PinnedWritePage, Key>::initialize(new_page, next_leaf_id)?,
+            BTreeLeafNode::<PinnedWritePage>::initialize(new_page, next_leaf_id)?,
         ))
     }
 
@@ -376,20 +379,20 @@ impl<Key: BTreeKey> BTree<Key> {
     fn allocate_and_init_internal(
         &self,
         leftmost_child_id: PageId,
-    ) -> Result<(PageId, BTreeInternalNode<PinnedWritePage, Key>), BTreeError> {
+    ) -> Result<(PageId, BTreeInternalNode<PinnedWritePage>), BTreeError> {
         let (new_page, new_internal_id) = self.cache.allocate_page(&self.file_key)?;
         Ok((
             new_internal_id,
-            BTreeInternalNode::<PinnedWritePage, Key>::initialize(new_page, leftmost_child_id)?,
+            BTreeInternalNode::<PinnedWritePage>::initialize(new_page, leftmost_child_id)?,
         ))
     }
 
     /// Splits a leaf node and propagates the separator up the tree.
     fn split_and_propagate(
         &self,
-        internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage, Key>)>,
-        leaf_node: (PageId, BTreeLeafNode<PinnedWritePage, Key>),
-        key: Key,
+        internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        leaf_node: (PageId, BTreeLeafNode<PinnedWritePage>),
+        key: &[u8],
         record_pointer: RecordPtr,
         metadata_page: Option<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
@@ -407,10 +410,10 @@ impl<Key: BTreeKey> BTree<Key> {
     fn split_leaf(
         &self,
         leaf_page_id: PageId,
-        mut leaf_node: BTreeLeafNode<PinnedWritePage, Key>,
-        key: Key,
+        mut leaf_node: BTreeLeafNode<PinnedWritePage>,
+        key: &[u8],
         record_pointer: RecordPtr,
-    ) -> Result<(Key, PageId), BTreeError> {
+    ) -> Result<(Vec<u8>, PageId), BTreeError> {
         // Split keys of the leaf.
         let (records_to_move, separator_key) = leaf_node.split_keys()?;
 
@@ -426,9 +429,9 @@ impl<Key: BTreeKey> BTree<Key> {
         leaf_node.set_next_leaf_id(Some(new_leaf_id))?;
 
         // Insert the starting key into correct node.
-        if key < separator_key {
+        if key < separator_key.as_slice() {
             leaf_node.insert(key, record_pointer)?;
-        } else if key > separator_key {
+        } else if key > separator_key.as_slice() {
             new_leaf_node.insert(key, record_pointer)?;
         } else {
             return Err(BTreeError::DuplicateKey);
@@ -444,8 +447,8 @@ impl<Key: BTreeKey> BTree<Key> {
     /// creating a new root if necessary.
     fn propagate_separator_up(
         &self,
-        mut internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage, Key>)>,
-        mut current_separator_key: Key,
+        mut internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        mut current_separator_key: Vec<u8>,
         mut child_page_id: PageId,
         metadata_page: Option<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
@@ -464,7 +467,7 @@ impl<Key: BTreeKey> BTree<Key> {
 
         // Otherwise, walk ancestors from bottom to top.
         while let Some((parent_page_id, mut parent_node)) = internal_nodes.pop() {
-            match parent_node.insert(current_separator_key.clone(), child_page_id)? {
+            match parent_node.insert(current_separator_key.as_slice(), child_page_id)? {
                 NodeInsertResult::Success => return Ok(()),
                 NodeInsertResult::KeyAlreadyExists => return Err(BTreeError::DuplicateKey),
                 NodeInsertResult::PageFull => {
@@ -474,8 +477,9 @@ impl<Key: BTreeKey> BTree<Key> {
                     let (split_records, new_separator) = parent_node.split_keys()?;
 
                     // The first record's child pointer becomes the leftmost child of the new internal node.
-                    let (_, leftmost_child_bytes) = Key::deserialize(&split_records[0])?;
-                    let (leftmost_child_ptr, _) = PageId::deserialize(leftmost_child_bytes)?;
+                    let key_bytes_end = split_records[0].len() - size_of::<PageId>();
+                    let (leftmost_child_ptr, _) =
+                        PageId::deserialize(&split_records[0][key_bytes_end..])?;
 
                     // Allocate and initialize new internal page.
                     let (new_internal_id, mut new_internal_node) =
@@ -488,9 +492,10 @@ impl<Key: BTreeKey> BTree<Key> {
 
                     // Insert separator key into correct node.
                     if current_separator_key < new_separator {
-                        parent_node.insert(current_separator_key, child_page_id)?;
+                        parent_node.insert(current_separator_key.as_slice(), child_page_id)?;
                     } else if current_separator_key > new_separator {
-                        new_internal_node.insert(current_separator_key, child_page_id)?;
+                        new_internal_node
+                            .insert(current_separator_key.as_slice(), child_page_id)?;
                     } else {
                         return Err(BTreeError::DuplicateKey);
                     }
@@ -525,14 +530,14 @@ impl<Key: BTreeKey> BTree<Key> {
     fn create_new_root(
         &self,
         left_child_id: PageId,
-        separator_key: Key,
+        separator_key: Vec<u8>,
         right_child_id: PageId,
         mut metadata_page: PinnedWritePage,
     ) -> Result<(), BTreeError> {
         let (new_root_id, mut new_root) = self.allocate_and_init_internal(left_child_id)?;
 
         // Insert the separator key with the right child pointer
-        new_root.insert(separator_key, right_child_id)?;
+        new_root.insert(separator_key.as_slice(), right_child_id)?;
 
         // Update the metadata to point to the new root
         let metadata_bytes = &mut metadata_page.page_mut()[0..size_of::<BTreeMetadata>()];
@@ -549,6 +554,64 @@ impl<Key: BTreeKey> BTree<Key> {
     }
 }
 
+struct BTreeFactory {
+    file_key: FileKey,
+    cache: Arc<Cache>,
+}
+
+impl BTreeFactory {
+    pub fn new(file_key: FileKey, cache: Arc<Cache>) -> Self {
+        BTreeFactory { file_key, cache }
+    }
+
+    pub fn create_btree(self) -> Result<BTree, BTreeError> {
+        self.initialize_metadata_and_root_if_not_exist()?;
+
+        BTree::new(self.cache, self.file_key)
+    }
+
+    fn initialize_metadata_and_root_if_not_exist(&self) -> Result<(), BTreeError> {
+        let key = self.file_page_ref(BTree::METADATA_PAGE_ID);
+        match self.cache.pin_read(&key) {
+            Ok(page) => {
+                // Check that it is the correct metadata
+                BTreeMetadata::try_from(page.page())?;
+                Ok(())
+            }
+            Err(e) => {
+                if let CacheError::PagedFileError(PagedFileError::InvalidPageId(
+                    BTree::METADATA_PAGE_ID,
+                )) = e
+                {
+                    // This mean that metadata page was not allocated yet, so the file was just created
+                    let (mut metadata_page, metadata_page_id) =
+                        self.cache.allocate_page(key.file_key())?;
+
+                    if metadata_page_id != BTree::METADATA_PAGE_ID {
+                        return Ok(());
+                    }
+
+                    let (root_page, root_page_id) = self.cache.allocate_page(key.file_key())?;
+
+                    BTreeLeafNode::<PinnedWritePage>::initialize(root_page, None)?;
+
+                    let metadata = BTreeMetadata::new(root_page_id);
+
+                    metadata.save_to_page(&mut metadata_page);
+
+                    Ok(())
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
+    /// Creates a `FilePageRef` for `page_id` using b-tree file key.
+    fn file_page_ref(&self, page_id: PageId) -> FilePageRef {
+        FilePageRef::new(page_id, self.file_key.clone())
+    }
+}
 #[cfg(test)]
 mod test {
     use super::*;
@@ -564,11 +627,11 @@ mod test {
         fs::create_dir_all(&db_dir).unwrap();
 
         let files_manager = Arc::new(FilesManager::new(db_dir).unwrap());
-        let cache = Cache::new(200, files_manager.clone());
+        let cache = Cache::new(2000, files_manager.clone());
 
         // Use a unique file name for each test to avoid conflicts
         let file_key = FileKey::index(format!(
-            "test_heap_{}",
+            "test_btree_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -578,17 +641,12 @@ mod test {
         (cache, file_key, temp_dir)
     }
 
-    fn create_empty_btree<Key: BTreeKey>(
-        cache: Arc<Cache>,
-        file_key: FileKey,
-    ) -> Result<BTree<Key>, BTreeError> {
+    fn create_empty_btree(cache: Arc<Cache>, file_key: FileKey) -> Result<BTree, BTreeError> {
         let (mut metadata_page, metadata_page_id) = cache.allocate_page(&file_key)?;
-
-        assert_eq!(metadata_page_id, BTree::<Key>::METADATA_PAGE_ID);
+        assert_eq!(metadata_page_id, BTree::METADATA_PAGE_ID);
 
         let (root_page, root_id) = cache.allocate_page(&file_key)?;
-
-        BTreeLeafNode::<PinnedWritePage, Key>::initialize(root_page, None).unwrap();
+        BTreeLeafNode::<PinnedWritePage>::initialize(root_page, None)?;
 
         let metadata = BTreeMetadata::new(root_id);
         let metadata_bytes = bytemuck::bytes_of(&metadata);
@@ -599,149 +657,32 @@ mod test {
         BTree::new(cache, file_key)
     }
 
-    fn create_btree_with_data<Key: BTreeKey>(
+    fn create_btree_with_data(
         cache: Arc<Cache>,
         file_key: FileKey,
-        data: Vec<(Key, RecordPtr)>,
-    ) -> Result<BTree<Key>, BTreeError> {
+        data: Vec<(Vec<u8>, RecordPtr)>,
+    ) -> Result<BTree, BTreeError> {
         let btree = create_empty_btree(cache, file_key)?;
-
         for (key, record_ptr) in data {
-            btree.insert(key, record_ptr)?;
+            btree.insert(&key, record_ptr)?;
         }
-
         Ok(btree)
     }
 
-    #[test]
-    fn test_create_empty_btree() {
-        let (cache, file_key, _temp_dir) = setup_test_cache();
-
-        let btree = create_empty_btree::<i32>(cache, file_key);
-        assert!(btree.is_ok());
-    }
-
-    fn test_record_pointer(page_id: PageId, slot_id: u16) -> RecordPtr {
+    fn record_ptr(page_id: PageId, slot_id: u16) -> RecordPtr {
         RecordPtr::new(page_id, slot_id)
     }
-    #[test]
-    fn test_search_empty_btree() {
-        let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = create_empty_btree::<i32>(cache, file_key).unwrap();
 
-        let result = btree.search(&42);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), None);
+    fn key_i32(value: i32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        value.serialize(&mut buf);
+        buf
     }
 
-    #[test]
-    fn test_insert_single_key() {
-        let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = create_empty_btree::<i32>(cache, file_key).unwrap();
-
-        let record_ptr = test_record_pointer(10, 5);
-        let result = btree.insert(42, record_ptr);
-        assert!(result.is_ok());
-
-        let search_result = btree.search(&42).unwrap();
-        assert_eq!(search_result, Some(record_ptr));
-    }
-
-    #[test]
-    fn test_insert_multiple_keys() {
-        let (cache, file_key, _temp_dir) = setup_test_cache();
-
-        let data = vec![
-            (10, test_record_pointer(1, 0)),
-            (20, test_record_pointer(1, 1)),
-            (30, test_record_pointer(1, 2)),
-            (40, test_record_pointer(2, 0)),
-            (50, test_record_pointer(2, 1)),
-        ];
-
-        let btree = create_btree_with_data(cache, file_key, data.clone()).unwrap();
-
-        for (key, expected_ptr) in data {
-            let result = btree.search(&key).unwrap();
-            assert_eq!(result, Some(expected_ptr));
-        }
-    }
-
-    #[test]
-    fn test_insert_duplicate_key_unique_btree() {
-        let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = create_empty_btree::<i32>(cache, file_key).unwrap();
-
-        let record_ptr1 = test_record_pointer(10, 5);
-        let record_ptr2 = test_record_pointer(20, 10);
-
-        btree.insert(42, record_ptr1).unwrap();
-        let result = btree.insert(42, record_ptr2);
-
-        assert!(matches!(result, Err(BTreeError::DuplicateKey)));
-    }
-
-    #[test]
-    fn test_search_nonexistent_key() {
-        let (cache, file_key, _temp_dir) = setup_test_cache();
-
-        let data = vec![
-            (10, test_record_pointer(1, 0)),
-            (20, test_record_pointer(1, 1)),
-            (30, test_record_pointer(1, 2)),
-        ];
-
-        let btree = create_btree_with_data(cache, file_key, data).unwrap();
-
-        assert_eq!(btree.search(&5).unwrap(), None);
-        assert_eq!(btree.search(&15).unwrap(), None);
-        assert_eq!(btree.search(&100).unwrap(), None);
-    }
-
-    #[test]
-    fn test_insert_unordered_keys() {
-        let (cache, file_key, _temp_dir) = setup_test_cache();
-
-        let data = vec![
-            (50, test_record_pointer(5, 0)),
-            (30, test_record_pointer(3, 0)),
-            (70, test_record_pointer(7, 0)),
-            (20, test_record_pointer(2, 0)),
-            (40, test_record_pointer(4, 0)),
-            (60, test_record_pointer(6, 0)),
-            (80, test_record_pointer(8, 0)),
-        ];
-
-        let btree = create_btree_with_data(cache, file_key, data.clone()).unwrap();
-
-        for (key, expected_ptr) in data {
-            let result = btree.search(&key).unwrap();
-            assert_eq!(result, Some(expected_ptr));
-        }
-    }
-
-    #[test]
-    fn test_insert_enough_to_split_test() {
-        let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = create_empty_btree::<i32>(cache.clone(), file_key.clone()).unwrap();
-        let num_keys = 2000;
-
-        for i in 0..num_keys {
-            let key = i;
-
-            let result = btree.insert(
-                key,
-                test_record_pointer(key as PageId, (key % 65536) as u16),
-            );
-
-            assert!(result.is_ok(), "Failed to insert key {}: {:?}", key, result);
-        }
-
-        for i in 0..num_keys {
-            let result = btree.search(&i);
-            assert!(result.is_ok(), "Search failed for key {}: {:?}", i, result);
-            assert!(result.unwrap().is_some(), "Key {} not found", i);
-        }
+    fn key_string(value: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        value.to_string().serialize(&mut buf);
+        buf
     }
 
     fn random_string(len: usize) -> String {
@@ -754,78 +695,287 @@ mod test {
     }
 
     #[test]
-    fn test_split_trigger_with_large_string_keys() {
+    fn test_create_empty_btree() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = create_empty_btree::<String>(cache, file_key).unwrap();
+        let btree = create_empty_btree(cache, file_key);
+        assert!(btree.is_ok());
+    }
 
-        for i in 0..32 {
-            let key = format!("KEY_{}_{}", i, random_string(480));
-            let ptr = test_record_pointer(i as PageId, 0);
-            let result = btree.insert(key.clone(), ptr);
-            assert!(result.is_ok(), "Failed insert {}", i);
+    #[test]
+    fn test_search_empty_btree() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
 
-            let found = btree.search(&key).unwrap();
-            assert_eq!(found, Some(ptr));
+        assert_eq!(btree.search(&key_i32(42)).unwrap(), None);
+    }
+
+    #[test]
+    fn test_insert_and_search_single_key() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        let ptr = record_ptr(10, 5);
+        let key = key_i32(42);
+
+        btree.insert(&key, ptr).unwrap();
+        assert_eq!(btree.search(&key).unwrap(), Some(ptr));
+    }
+
+    #[test]
+    fn test_insert_multiple_ordered_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data = vec![
+            (key_i32(10), record_ptr(1, 0)),
+            (key_i32(20), record_ptr(1, 1)),
+            (key_i32(30), record_ptr(1, 2)),
+            (key_i32(40), record_ptr(2, 0)),
+            (key_i32(50), record_ptr(2, 1)),
+        ];
+
+        let btree = create_btree_with_data(cache, file_key, data.clone()).unwrap();
+
+        for (key, expected_ptr) in data {
+            assert_eq!(btree.search(&key).unwrap(), Some(expected_ptr));
         }
     }
 
     #[test]
-    fn test_concurrent_inserts_arc_btree() {
+    fn test_insert_unordered_keys() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = Arc::new(create_empty_btree::<i32>(cache, file_key).unwrap());
+
+        let data = vec![
+            (key_i32(50), record_ptr(5, 0)),
+            (key_i32(30), record_ptr(3, 0)),
+            (key_i32(70), record_ptr(7, 0)),
+            (key_i32(20), record_ptr(2, 0)),
+            (key_i32(40), record_ptr(4, 0)),
+            (key_i32(60), record_ptr(6, 0)),
+            (key_i32(80), record_ptr(8, 0)),
+        ];
+
+        let btree = create_btree_with_data(cache, file_key, data.clone()).unwrap();
+
+        for (key, expected_ptr) in data {
+            assert_eq!(btree.search(&key).unwrap(), Some(expected_ptr));
+        }
+    }
+
+    #[test]
+    fn test_insert_reverse_order() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        for i in (0..20).rev() {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        for i in 0..20 {
+            assert!(btree.search(&key_i32(i)).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_insert_duplicate_key_returns_error() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        let key = key_i32(42);
+        btree.insert(&key, record_ptr(10, 5)).unwrap();
+
+        let result = btree.insert(&key, record_ptr(20, 10));
+        assert!(matches!(result, Err(BTreeError::DuplicateKey)));
+    }
+
+    #[test]
+    fn test_search_nonexistent_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data = vec![
+            (key_i32(10), record_ptr(1, 0)),
+            (key_i32(20), record_ptr(1, 1)),
+            (key_i32(30), record_ptr(1, 2)),
+        ];
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        assert_eq!(btree.search(&key_i32(5)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(15)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(25)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(100)).unwrap(), None);
+    }
+
+    #[test]
+    fn test_search_boundary_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        let keys = [1, 5, 10, 15, 20];
+        for &k in &keys {
+            btree.insert(&key_i32(k), record_ptr(k as u32, 0)).unwrap();
+        }
+
+        for &k in &keys {
+            assert!(btree.search(&key_i32(k)).unwrap().is_some());
+        }
+
+        assert_eq!(btree.search(&key_i32(0)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(21)).unwrap(), None);
+    }
+
+    #[test]
+    fn test_insert_enough_to_trigger_splits() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+        let num_keys = 2000;
+
+        for i in 0..num_keys {
+            btree
+                .insert(&key_i32(i), record_ptr(i as u32, 0))
+                .unwrap_or_else(|_| panic!("Failed to insert key {}", i));
+        }
+
+        for i in 0..num_keys {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} not found after splits",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_random_order_with_splits() {
+        use rand::seq::SliceRandom;
+
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        let mut keys: Vec<i32> = (0..1000).collect();
+        keys.shuffle(&mut rand::rng());
+
+        for &key in &keys {
+            btree
+                .insert(&key_i32(key), record_ptr(key as u32, 0))
+                .unwrap();
+        }
+
+        for &key in &keys {
+            assert!(btree.search(&key_i32(key)).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_large_string_keys_trigger_splits() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        let mut keys = Vec::new();
+        for i in 0..32 {
+            let key = format!("KEY_{}_{}", i, random_string(480));
+            keys.push(key.clone());
+
+            btree
+                .insert(&key_string(&key), record_ptr(i, 0))
+                .unwrap_or_else(|_| panic!("Failed to insert large key {}", i));
+        }
+
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                btree.search(&key_string(key)).unwrap(),
+                Some(record_ptr(i as u32, 0))
+            );
+        }
+    }
+
+    #[test]
+    fn test_mixed_size_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        for i in 0..100 {
+            if i % 3 == 0 {
+                // Large key
+                let key = key_string(&format!("large_key_{}_{}", i, random_string(200)));
+                btree.insert(&key, record_ptr(i, 0)).unwrap();
+            } else {
+                // Small key
+                btree.insert(&key_i32(i as i32), record_ptr(i, 0)).unwrap();
+            }
+        }
+
+        // Verify we can find some of them
+        assert!(btree.search(&key_i32(1)).unwrap().is_some());
+        assert!(btree.search(&key_i32(2)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_sequential_insert_after_splits() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Insert more keys after splits
+        for i in 500..1000 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Verify everything
+        for i in 0..1000 {
+            assert!(btree.search(&key_i32(i)).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_concurrent_inserts() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
 
         let num_threads = 32;
         let keys_per_thread = 250;
-
-        let t = Instant::now();
+        let total_keys = num_threads * keys_per_thread;
 
         let handles: Vec<_> = (0..num_threads)
-            .map(|t| {
+            .map(|thread_id| {
                 let btree = btree.clone();
                 thread::spawn(move || {
                     for i in 0..keys_per_thread {
-                        let key = t * keys_per_thread + i;
+                        let key_val = thread_id * keys_per_thread + i;
                         btree
-                            .insert(key, test_record_pointer(key as u32, 0))
+                            .insert(&key_i32(key_val), record_ptr(key_val as u32, 0))
                             .unwrap();
                     }
                 })
             })
             .collect();
 
-        for h in handles {
-            h.join().unwrap();
+        for handle in handles {
+            handle.join().unwrap();
         }
 
-        let time = t.elapsed();
-
-        println!("{}", time.as_secs_f32());
-        let mut v = vec![];
-        for i in 0..num_threads * keys_per_thread {
-            let result = btree.search(&i).unwrap();
-            if result.is_none() {
-                v.push(i);
+        let mut missing = vec![];
+        for i in 0..total_keys {
+            if btree.search(&key_i32(i)).unwrap().is_none() {
+                missing.push(i);
             }
         }
-        for i in &v {
-            println!("{}", i);
-        }
-        assert_eq!(v.len(), 0);
+
+        assert!(missing.is_empty(), "Missing keys: {:?}", missing);
     }
 
     #[test]
-    fn test_concurrent_searches_during_inserts() {
-        use std::sync::Arc;
-        use std::thread;
-
+    fn test_concurrent_searches_and_inserts() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree = Arc::new(create_empty_btree::<i32>(cache, file_key).unwrap());
+        let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
 
         let writer = {
             let btree = btree.clone();
             thread::spawn(move || {
                 for i in 0..500 {
-                    btree.insert(i, test_record_pointer(i as u32, 0)).unwrap();
+                    btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
                 }
             })
         };
@@ -834,7 +984,8 @@ mod test {
             let btree = btree.clone();
             thread::spawn(move || {
                 for _ in 0..200 {
-                    let _ = btree.search(&(rand::random::<u16>() as i32 / 2)).unwrap();
+                    let key_val = rand::random::<u16>() as i32 / 2;
+                    let _ = btree.search(&key_i32(key_val)).unwrap();
                 }
             })
         };
@@ -843,15 +994,107 @@ mod test {
         reader.join().unwrap();
     }
 
+    #[test]
+    fn test_multiple_concurrent_readers() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
+
+        // Pre-populate with data
+        for i in 0..1000 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Spawn multiple reader threads
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let btree = btree.clone();
+                thread::spawn(move || {
+                    for i in 0..100 {
+                        let result = btree.search(&key_i32(i)).unwrap();
+                        assert!(result.is_some());
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_empty_key() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        let empty_key = vec![];
+        let ptr = record_ptr(1, 0);
+
+        btree.insert(&empty_key, ptr).unwrap();
+        assert_eq!(btree.search(&empty_key).unwrap(), Some(ptr));
+    }
+
+    #[test]
+    fn test_single_byte_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        for byte in 0u8..100 {
+            btree.insert(&[byte], record_ptr(byte as u32, 0)).unwrap();
+        }
+
+        for byte in 0u8..100 {
+            assert!(btree.search(&[byte]).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_identical_prefix_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        let keys = [
+            key_string("prefix_a"),
+            key_string("prefix_aa"),
+            key_string("prefix_aaa"),
+            key_string("prefix_b"),
+        ];
+
+        for (i, key) in keys.iter().enumerate() {
+            btree.insert(key, record_ptr(i as u32, 0)).unwrap();
+        }
+
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(btree.search(key).unwrap(), Some(record_ptr(i as u32, 0)));
+        }
+    }
+
+    #[test]
+    fn test_alternating_insert_search() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        for i in 0..100 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+
+            assert_eq!(
+                btree.search(&key_i32(i)).unwrap(),
+                Some(record_ptr(i as u32, 0))
+            );
+
+            if i > 0 {
+                assert!(btree.search(&key_i32(i - 1)).unwrap().is_some());
+            }
+        }
+    }
+
     #[ignore = "TODO: need to figure out better way to handle benchmark tests"]
     #[test]
     fn benchmark_concurrent_inserts_random() {
         use rand::{rng, seq::SliceRandom};
-        use std::sync::Arc;
-        use std::thread;
 
-        let num_threads = 16;
-        let keys_per_thread = 100;
+        let num_threads = 1;
+        let keys_per_thread = 1000;
         let total_keys = num_threads * keys_per_thread;
 
         println!("\n=== BTree Random Concurrent Insert Benchmark ===");
@@ -860,29 +1103,23 @@ mod test {
             num_threads, keys_per_thread, total_keys
         );
 
-        let mut keys: Vec<u32> = (0..total_keys as u32).collect();
-        keys.shuffle(&mut rng());
-        let keys = Arc::new(keys);
+        let mut key_values: Vec<i32> = (0..total_keys as i32).collect();
+        key_values.shuffle(&mut rng());
+        let key_values = Arc::new(key_values);
 
-        // Optimistic first before pessimistic
         let (cache, file_key, _temp_dir) = setup_test_cache();
-        let btree_opt = Arc::new(create_empty_btree::<i32>(cache, file_key).unwrap());
+        let btree_opt = Arc::new(create_empty_btree(cache, file_key).unwrap());
 
         let start = Instant::now();
         let handles: Vec<_> = (0..num_threads)
-            .map(|t| {
+            .map(|thread_id| {
                 let btree = btree_opt.clone();
-                let keys = keys.clone();
+                let keys = key_values.clone();
                 thread::spawn(move || {
-                    let start_idx = t * keys_per_thread;
+                    let start_idx = thread_id * keys_per_thread;
                     let end_idx = start_idx + keys_per_thread;
-                    for &key in &keys[start_idx..end_idx] {
-                        match btree.insert(key as i32, test_record_pointer(key, 0)) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("{}", e);
-                            }
-                        }
+                    for &key_val in &keys[start_idx..end_idx] {
+                        let _ = btree.insert(&key_i32(key_val), record_ptr(key_val as u32, 0));
                     }
                 })
             })
@@ -893,25 +1130,20 @@ mod test {
         }
         let optimistic_duration = start.elapsed();
 
-        // Only pessimistic
         let (cache2, file_key2, _temp_dir2) = setup_test_cache();
-        let btree_pessimistic = Arc::new(create_empty_btree::<i32>(cache2, file_key2).unwrap());
+        let btree_pessimistic = Arc::new(create_empty_btree(cache2, file_key2).unwrap());
 
         let start = Instant::now();
         let handles: Vec<_> = (0..num_threads)
-            .map(|t| {
+            .map(|thread_id| {
                 let btree = btree_pessimistic.clone();
-                let keys = keys.clone();
+                let keys = key_values.clone();
                 thread::spawn(move || {
-                    let start_idx = t * keys_per_thread;
+                    let start_idx = thread_id * keys_per_thread;
                     let end_idx = start_idx + keys_per_thread;
-                    for &key in &keys[start_idx..end_idx] {
-                        match btree.insert_pessimistic(key as i32, test_record_pointer(key, 0)) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("{}", e);
-                            }
-                        };
+                    for &key_val in &keys[start_idx..end_idx] {
+                        let _ = btree
+                            .insert_pessimistic(&key_i32(key_val), record_ptr(key_val as u32, 0));
                     }
                 })
             })

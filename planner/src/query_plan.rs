@@ -59,6 +59,9 @@ pub enum StatementPlanItem {
 
     // Operators (can be chained)
     Filter(Filter),
+    Sort(Sort),
+    Limit(Limit),
+    Skip(Skip),
 
     // Terminal operators (must always be root)
     Projection(Projection),
@@ -84,6 +87,26 @@ impl StatementPlanItem {
             data_source,
             predicate,
         })
+    }
+
+    pub(crate) fn sort(
+        data_source: StatementPlanItemId,
+        column: ResolvedNodeId,
+        order: SortOrder,
+    ) -> Self {
+        StatementPlanItem::Sort(Sort {
+            data_source,
+            column,
+            order,
+        })
+    }
+
+    pub(crate) fn limit(data_source: StatementPlanItemId, count: u32) -> Self {
+        StatementPlanItem::Limit(Limit { data_source, count })
+    }
+
+    pub(crate) fn skip(data_source: StatementPlanItemId, count: u32) -> Self {
+        StatementPlanItem::Skip(Skip { data_source, count })
     }
 
     pub(crate) fn projection(
@@ -140,6 +163,34 @@ pub struct IndexScan {
 pub struct Filter {
     pub data_source: StatementPlanItemId,
     pub predicate: ResolvedNodeId,
+}
+
+/// Sorts the `data_source` by `column` in specified `order`.
+#[derive(Debug)]
+pub struct Sort {
+    pub data_source: StatementPlanItemId,
+    pub column: ResolvedNodeId,
+    pub order: SortOrder,
+}
+
+#[derive(Debug)]
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+/// Limits the number of rows from `data_source` to `count`.
+#[derive(Debug)]
+pub struct Limit {
+    pub data_source: StatementPlanItemId,
+    pub count: u32,
+}
+
+/// Skips first `count` rows from `data_source`.
+#[derive(Debug)]
+pub struct Skip {
+    pub data_source: StatementPlanItemId,
+    pub count: u32,
 }
 
 /// Returns only `columns` from `data_source`.

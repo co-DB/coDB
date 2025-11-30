@@ -1,27 +1,17 @@
 mod consts;
+mod error_factory;
+mod expression_executor;
 mod iterators;
+pub mod response;
+mod statement_executor;
 
-use std::{collections::HashMap, iter, mem, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use dashmap::DashMap;
-use engine::{
-    data_types,
-    heap_file::{HeapFile, HeapFileError, HeapFileFactory},
-    record::{Field, Record},
-};
-use itertools::Itertools;
-use metadata::{
-    catalog::{Catalog, ColumnMetadata, ColumnMetadataError, TableMetadata},
-    types::Type,
-};
+use engine::heap_file::{HeapFile, HeapFileFactory};
+use metadata::catalog::Catalog;
 use parking_lot::RwLock;
-use planner::{
-    query_plan::{CreateTable, Projection, StatementPlan, StatementPlanItem, TableScan},
-    resolved_tree::{
-        ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
-        ResolvedTree,
-    },
-};
+use planner::{query_plan::StatementPlan, resolved_tree::ResolvedTree};
 use storage::{
     cache::Cache,
     files_manager::{FileKey, FilesManager, FilesManagerError},
@@ -30,7 +20,10 @@ use thiserror::Error;
 
 use crate::{
     consts::HEAP_FILE_BUCKET_SIZE,
+    error_factory::InternalExecutorError,
     iterators::{ParseErrorIter, QueryResultIter, StatementIter},
+    response::StatementResult,
+    statement_executor::StatementExecutor,
 };
 
 pub struct Executor {
@@ -44,63 +37,6 @@ pub struct Executor {
 pub enum ExecutorError {
     #[error("Cannot open files manager: {0}")]
     CannotOpenFilesManager(#[from] FilesManagerError),
-}
-
-/// Error for internal executor operations, shouldn't be exported outside of this module.
-#[derive(Error, Debug)]
-enum InternalExecutorError {
-    #[error("Table '{table_name}' does not exist.")]
-    TableDoesNotExist { table_name: String },
-    #[error("Cannot create heap file: {reason}")]
-    CannotCreateHeapFile { reason: String },
-    #[error("{0}")]
-    HeapFileError(#[from] HeapFileError),
-    #[error("Used invalid operation ({operation}) for data source")]
-    InvalidOperationInDataSource { operation: String },
-}
-
-#[derive(Debug)]
-pub struct ColumnData {
-    pub name: String,
-    pub ty: Type,
-}
-
-impl From<&ResolvedColumn> for ColumnData {
-    fn from(value: &ResolvedColumn) -> Self {
-        ColumnData {
-            name: value.name.clone(),
-            ty: value.ty,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum StatementType {
-    Insert,
-    Update,
-    Delete,
-    Create,
-    Alter,
-    Truncate,
-    Drop,
-}
-
-#[derive(Debug)]
-pub enum StatementResult {
-    OperationSuccessful {
-        rows_affected: usize,
-        ty: StatementType,
-    },
-    SelectSuccessful {
-        columns: Vec<ColumnData>,
-        rows: Vec<Record>,
-    },
-    ParseError {
-        error: String,
-    },
-    RuntimeError {
-        error: String,
-    },
 }
 
 impl Executor {
@@ -128,11 +64,6 @@ impl Executor {
     fn execute_statement(&self, statement: &StatementPlan, ast: &ResolvedTree) -> StatementResult {
         let se = StatementExecutor::new(self, statement, ast);
         se.execute()
-    }
-
-    /// Helper to create [`StatementResult::RuntimeError`] with provided message.
-    fn runtime_error(&self, msg: String) -> StatementResult {
-        StatementResult::RuntimeError { error: msg }
     }
 
     /// Gets heap file for given table and passes it to function `f`.
@@ -186,259 +117,15 @@ impl Executor {
     }
 }
 
-/// Executes a single statement from a query plan.
-///
-/// This struct encapsulates all the logic needed to execute one statement, including
-/// query operations (SELECT) and mutation operations (CREATE TABLE, INSERT, etc.).
-struct StatementExecutor<'e, 'q> {
-    executor: &'e Executor,
-    statement: &'q StatementPlan,
-    ast: &'q ResolvedTree,
-}
-
-/// Result of projection operation containing records and their column metadata.
-///
-/// The records vector contains transformed records with only the projected columns,
-/// while the columns vector describes the schema of those projected records.
-struct ProjectedRecords {
-    records: Vec<Record>,
-    columns: Vec<ColumnData>,
-}
-
-/// Column metadata used during projection operations.
-struct ProjectColumn<'c> {
-    rc: &'c ResolvedColumn,
-    /// Set to true if this is the last struct that references the [`ResolvedColumn`].
-    last: bool,
-}
-
-impl<'e, 'q> StatementExecutor<'e, 'q> {
-    fn new(executor: &'e Executor, statement: &'q StatementPlan, ast: &'q ResolvedTree) -> Self {
-        StatementExecutor {
-            executor,
-            statement,
-            ast,
-        }
-    }
-
-    /// Executes [`StatementExecutor::statement`] and returns its result.
-    fn execute(&self) -> StatementResult {
-        let root = self.statement.root();
-
-        match root.produces_result_set() {
-            true => self.execute_query(root),
-            false => self.execute_mutation(root),
-        }
-    }
-
-    /// Handler for all statements that only return data.
-    fn execute_query(&self, item: &StatementPlanItem) -> StatementResult {
-        match item {
-            StatementPlanItem::Projection(projection) => self.projection(projection),
-            _ => self.executor.runtime_error(format!(
-                "Invalid root operation ({:?}) for query statement",
-                item
-            )),
-        }
-    }
-
-    /// Handler for all statements that mutate data.
-    fn execute_mutation(&self, item: &StatementPlanItem) -> StatementResult {
-        match item {
-            StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
-            _ => self.executor.runtime_error(format!(
-                "Invalid root operation ({:?}) for mutation statement",
-                item
-            )),
-        }
-    }
-
-    /// Handler for all statements that are source of data.
-    fn execute_data_source(
-        &self,
-        data_source: &StatementPlanItem,
-    ) -> Result<Vec<Record>, InternalExecutorError> {
-        match data_source {
-            StatementPlanItem::TableScan(table_scan) => self.table_scan(table_scan),
-            _ => Err(InternalExecutorError::InvalidOperationInDataSource {
-                operation: format!("{:?}", data_source),
-            }),
-        }
-    }
-
-    /// Handler for [`TableScan`] statement.
-    fn table_scan(&self, table_scan: &TableScan) -> Result<Vec<Record>, InternalExecutorError> {
-        let records = self
-            .executor
-            .with_heap_file(&table_scan.table_name, |hf| hf.all_records())??;
-        Ok(records)
-    }
-
-    /// Handler for [`Projection`] statement.
-    fn projection(&self, projection: &Projection) -> StatementResult {
-        let data_source = self.statement.item(projection.data_source);
-        let records = match self.execute_data_source(data_source) {
-            Ok(records) => records,
-            Err(err) => {
-                return StatementResult::RuntimeError {
-                    error: err.to_string(),
-                };
-            }
-        };
-        match self.project_records(records, &projection.columns) {
-            Ok(projected_records) => StatementResult::SelectSuccessful {
-                columns: projected_records.columns,
-                rows: projected_records.records,
-            },
-            Err(err) => {
-                return StatementResult::RuntimeError {
-                    error: err.to_string(),
-                };
-            }
-        }
-    }
-
-    /// Transforms `records` so that they only contain specified `columns`.
-    fn project_records(
-        &self,
-        records: Vec<Record>,
-        columns: &[ResolvedNodeId],
-    ) -> Result<ProjectedRecords, InternalExecutorError> {
-        let project_columns: Vec<_> = self.map_expressions_to_project_columns(columns).collect();
-        let columns_data: Vec<_> = project_columns
-            .iter()
-            .map(|sc| ColumnData::from(sc.rc))
-            .collect();
-
-        let projected_records: Vec<_> = records
-            .into_iter()
-            .map(|record| {
-                let mut source_fields = record.fields;
-                let fields: Vec<_> = project_columns
-                    .iter()
-                    .map(|select_col| {
-                        let pos = select_col.rc.pos as usize;
-                        match select_col.last {
-                            true => mem::replace(&mut source_fields[pos], Field::Bool(false)),
-                            false => source_fields[pos].clone(),
-                        }
-                    })
-                    .collect();
-                Record::new(fields)
-            })
-            .collect();
-
-        Ok(ProjectedRecords {
-            records: projected_records,
-            columns: columns_data,
-        })
-    }
-
-    /// Handler for [`CreateTable`] table statement.
-    fn create_table(&self, create_table: &CreateTable) -> StatementResult {
-        let column_metadatas = match self.process_columns(create_table) {
-            Ok(cm) => cm,
-            Err(err) => {
-                return self
-                    .executor
-                    .runtime_error(format!("Failed to create column: {err}"));
-            }
-        };
-
-        let table_metadata = match TableMetadata::new(
-            &create_table.name,
-            &column_metadatas,
-            &create_table.primary_key_column.name,
-        ) {
-            Ok(tm) => tm,
-            Err(err) => {
-                return self
-                    .executor
-                    .runtime_error(format!("Failed to create table: {}", err));
-            }
-        };
-
-        let mut catalog = self.executor.catalog.write();
-
-        if let Err(err) = catalog.add_table(table_metadata) {
-            return self
-                .executor
-                .runtime_error(format!("Failed to create table: {}", err));
-        }
-
-        StatementResult::OperationSuccessful {
-            rows_affected: 0,
-            ty: StatementType::Create,
-        }
-    }
-
-    /// Creates iterator over all columns in [`CreateTable`] (including primary key column)
-    /// and sorts them by whether they are fixed-size (fixed-size columns are first).
-    fn sort_columns_by_fixed_size<'c>(
-        &self,
-        create_table: &'c CreateTable,
-    ) -> impl Iterator<Item = &'c ResolvedCreateColumnDescriptor> {
-        iter::once(&create_table.primary_key_column)
-            .chain(create_table.columns.iter())
-            .sorted_by(|a, b| {
-                let a_fixed = a.ty.is_fixed_size();
-                let b_fixed = b.ty.is_fixed_size();
-                b_fixed.cmp(&a_fixed)
-            })
-    }
-
-    /// Returns vector of [`ColumnMetadata`] that maps to columns in [`CreateTable`].
-    fn process_columns(
-        &self,
-        create_table: &CreateTable,
-    ) -> Result<Vec<ColumnMetadata>, ColumnMetadataError> {
-        let mut column_metadatas = Vec::with_capacity(create_table.columns.len());
-
-        let cols = self.sort_columns_by_fixed_size(create_table);
-
-        let mut pos = 0;
-        let mut last_fixed_pos = 0;
-        let mut base_offset = 0;
-
-        for col in cols {
-            let column_metadata =
-                ColumnMetadata::new(col.name.clone(), col.ty, pos, base_offset, last_fixed_pos)?;
-            column_metadatas.push(column_metadata);
-            pos += 1;
-            if let Some(offset) = data_types::type_size_on_disk(&col.ty) {
-                last_fixed_pos += 1;
-                base_offset += offset;
-            }
-        }
-        Ok(column_metadatas)
-    }
-
-    /// Creates iterator that maps `expressions` into [`ProjectColumn`]s.
-    /// It assumes that each expression points to [`ResolvedExpression::ColumnRef`].
-    fn map_expressions_to_project_columns(
-        &self,
-        expressions: &'q [ResolvedNodeId],
-    ) -> impl Iterator<Item = ProjectColumn<'q>> {
-        let mut last_occurrence = HashMap::new();
-        for (idx, &expr) in expressions.iter().enumerate() {
-            last_occurrence.insert(expr, idx);
-        }
-
-        expressions.iter().enumerate().map(move |(idx, &expr)| {
-            let last = last_occurrence.get(&expr) == Some(&idx);
-            match self.ast.node(expr) {
-                ResolvedExpression::ColumnRef(rc) => ProjectColumn { rc, last },
-                _ => unreachable!(),
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
+    use engine::record::{Field, Record};
+    use metadata::types::Type;
     use tempfile::TempDir;
+
+    use crate::response::{ColumnData, StatementType};
 
     use super::*;
 
@@ -459,7 +146,7 @@ mod tests {
     }
 
     // Helper to create a test executor
-    fn create_test_executor() -> (Executor, TempDir) {
+    pub(crate) fn create_test_executor() -> (Executor, TempDir) {
         let (catalog, temp_dir) = create_catalog();
         let db_path = temp_dir.path().join("test_db");
         let executor = Executor::new(db_path, catalog).unwrap();
@@ -467,7 +154,10 @@ mod tests {
     }
 
     // Helper to transform query to single statement
-    fn create_single_statement(query: &str, executor: &Executor) -> (StatementPlan, ResolvedTree) {
+    pub(crate) fn create_single_statement(
+        query: &str,
+        executor: &Executor,
+    ) -> (StatementPlan, ResolvedTree) {
         let query_plan = planner::process_query(query, executor.catalog.clone()).unwrap();
 
         (
@@ -540,48 +230,6 @@ mod tests {
         assert_eq!(columns[2].name(), "active");
         assert_eq!(columns[3].name(), "name");
         assert_eq!(columns[4].name(), "description");
-    }
-
-    #[test]
-    fn test_process_columns_calculates_correct_offsets() {
-        let (executor, _temp_dir) = create_test_executor();
-        let (plan, ast) = create_single_statement(
-            "CREATE TABLE test (name STRING, score FLOAT64, surname STRING, active BOOL, id INT32 PRIMARY_KEY);",
-            &executor,
-        );
-
-        let se = StatementExecutor::new(&executor, &plan, &ast);
-
-        let create_table = match plan.root() {
-            StatementPlanItem::CreateTable(ct) => ct,
-            _ => panic!("invalid item"),
-        };
-        let columns = se.process_columns(create_table).unwrap();
-
-        let id_col = columns.iter().find(|c| c.name() == "id").unwrap();
-        assert_eq!(id_col.base_offset(), 0);
-        assert_eq!(id_col.base_offset_pos(), 0);
-        assert_eq!(id_col.pos(), 0);
-
-        let score_col = columns.iter().find(|c| c.name() == "score").unwrap();
-        assert_eq!(score_col.base_offset(), 4);
-        assert_eq!(score_col.base_offset_pos(), 1);
-        assert_eq!(score_col.pos(), 1);
-
-        let active_col = columns.iter().find(|c| c.name() == "active").unwrap();
-        assert_eq!(active_col.base_offset(), 12);
-        assert_eq!(active_col.base_offset_pos(), 2);
-        assert_eq!(active_col.pos(), 2);
-
-        let name_col = columns.iter().find(|c| c.name() == "name").unwrap();
-        assert_eq!(name_col.base_offset(), 13);
-        assert_eq!(name_col.base_offset_pos(), 3);
-        assert_eq!(name_col.pos(), 3);
-
-        let surname_col = columns.iter().find(|c| c.name() == "surname").unwrap();
-        assert_eq!(surname_col.base_offset(), 13);
-        assert_eq!(surname_col.base_offset_pos(), 3);
-        assert_eq!(surname_col.pos(), 4);
     }
 
     #[test]
@@ -885,5 +533,321 @@ mod tests {
         assert_eq!(bob.fields.len(), 2);
         assert_eq!(bob.fields[0], Field::Int32(2));
         assert_eq!(bob.fields[1], Field::Int32(2));
+    }
+
+    #[test]
+    fn test_execute_select_with_where_clause_single_condition() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert test data
+        let records = vec![
+            Record::new(vec![
+                Field::Int32(1),
+                Field::Int32(25),
+                Field::String("Alice".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(2),
+                Field::Int32(30),
+                Field::String("Bob".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(3),
+                Field::Int32(25),
+                Field::String("Charlie".into()),
+            ]),
+        ];
+
+        executor
+            .with_heap_file("users", |hf| {
+                for record in records {
+                    hf.insert(record).unwrap();
+                }
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users WHERE age = 25;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 2);
+
+        assert!(rows.iter().all(|r| r.fields[2] == Field::Int32(25)));
+        assert!(
+            rows.iter()
+                .any(|r| matches!(&r.fields[1], Field::String(s) if s == "Alice"))
+        );
+        assert!(
+            rows.iter()
+                .any(|r| matches!(&r.fields[1], Field::String(s) if s == "Charlie"))
+        );
+    }
+
+    #[test]
+    fn test_execute_select_with_where_clause_comparison_operators() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        let records = vec![
+            Record::new(vec![
+                Field::Int32(1),
+                Field::Int32(100),
+                Field::String("Product A".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(2),
+                Field::Int32(200),
+                Field::String("Product B".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(3),
+                Field::Int32(150),
+                Field::String("Product C".into()),
+            ]),
+        ];
+
+        executor
+            .with_heap_file("products", |hf| {
+                for record in records {
+                    hf.insert(record).unwrap();
+                }
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, name FROM products WHERE price > 100;",
+            &executor,
+        );
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.fields[0] == Field::Int32(2)));
+        assert!(rows.iter().any(|r| r.fields[0] == Field::Int32(3)));
+    }
+
+    #[test]
+    fn test_execute_select_with_where_clause_no_matches() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        let record = Record::new(vec![
+            Field::Int32(1),
+            Field::Int32(25),
+            Field::String("Alice".into()),
+        ]);
+
+        executor
+            .with_heap_file("users", |hf| {
+                hf.insert(record).unwrap();
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM users WHERE age = 99;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_execute_select_with_where_clause_all_match() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+
+        executor.execute_statement(&create_plan, &create_ast);
+
+        let records = vec![
+            Record::new(vec![
+                Field::Int32(1),
+                Field::Int32(25),
+                Field::String("Alice".into()),
+            ]),
+            Record::new(vec![
+                Field::Int32(2),
+                Field::Int32(25),
+                Field::String("Bob".into()),
+            ]),
+        ];
+
+        executor
+            .with_heap_file("users", |hf| {
+                for record in records {
+                    hf.insert(record).unwrap();
+                }
+            })
+            .unwrap();
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM users WHERE TRUE;", &executor);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_execute_insert_single_row() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert a single row
+        let (insert_plan, insert_ast) = create_single_statement(
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+            &executor,
+        );
+        let insert_result = executor.execute_statement(&insert_plan, &insert_ast);
+        assert_operation_successful(insert_result, 1, StatementType::Insert);
+
+        // Verify the data was inserted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.fields[0], Field::Int32(1));
+        assert!(matches!(&row.fields[1], Field::String(s) if s == "Alice"));
+        assert_eq!(row.fields[2], Field::Int32(25));
+    }
+
+    #[test]
+    fn test_execute_insert_multiple_rows() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert multiple rows
+        let (insert1_plan, insert1_ast) = create_single_statement(
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+            &executor,
+        );
+        executor.execute_statement(&insert1_plan, &insert1_ast);
+
+        let (insert2_plan, insert2_ast) = create_single_statement(
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+            &executor,
+        );
+        executor.execute_statement(&insert2_plan, &insert2_ast);
+
+        let (insert3_plan, insert3_ast) = create_single_statement(
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+            &executor,
+        );
+        let insert_result = executor.execute_statement(&insert3_plan, &insert3_ast);
+        assert_operation_successful(insert_result, 1, StatementType::Insert);
+
+        // Verify all data was inserted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 3);
+
+        let alice = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(1))
+            .unwrap();
+        assert!(matches!(&alice.fields[1], Field::String(s) if s == "Alice"));
+        assert_eq!(alice.fields[2], Field::Int32(25));
+
+        let bob = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(2))
+            .unwrap();
+        assert!(matches!(&bob.fields[1], Field::String(s) if s == "Bob"));
+        assert_eq!(bob.fields[2], Field::Int32(30));
+
+        let charlie = rows
+            .iter()
+            .find(|r| r.fields[0] == Field::Int32(3))
+            .unwrap();
+        assert!(matches!(&charlie.fields[1], Field::String(s) if s == "Charlie"));
+        assert_eq!(charlie.fields[2], Field::Int32(35));
+    }
+
+    #[test]
+    fn test_execute_insert_with_different_column_order() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert with columns in different order
+        let (insert_plan, insert_ast) = create_single_statement(
+            "INSERT INTO users (age, name, id) VALUES (25, 'Alice', 1);",
+            &executor,
+        );
+        let insert_result = executor.execute_statement(&insert_plan, &insert_ast);
+        assert_operation_successful(insert_result, 1, StatementType::Insert);
+
+        // Verify the data was inserted correctly
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.fields[0], Field::Int32(1));
+        assert!(matches!(&row.fields[1], Field::String(s) if s == "Alice"));
+        assert_eq!(row.fields[2], Field::Int32(25));
     }
 }

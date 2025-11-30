@@ -9,7 +9,7 @@ use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
 
 /// Error for [`Ast`] related operations.
 #[derive(Error, Debug)]
-pub(crate) enum AstError {
+pub enum AstError {
     #[error("invalid node type(expected {expected}, got: {got})")]
     InvalidNodeType { expected: String, got: String },
 }
@@ -90,6 +90,21 @@ pub struct SelectStatement {
     pub columns: Option<Vec<NodeId>>,
     pub table_name: NodeId,
     pub where_clause: Option<NodeId>,
+    pub order_by: Option<OrderByDetails>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug)]
+pub struct OrderByDetails {
+    pub column: NodeId,
+    pub direction: OrderDirection,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OrderDirection {
+    Ascending,
+    Descending,
 }
 
 #[derive(Debug)]
