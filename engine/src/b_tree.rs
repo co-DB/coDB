@@ -1,8 +1,8 @@
 use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult, NodeDeleteResult,
-    NodeInsertResult, NodeType, get_node_type,
+    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, InternalNodeSearchResult,
+    LeafNodeSearchResult, NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
 use bytemuck::{Pod, Zeroable};
@@ -192,7 +192,7 @@ impl BTree {
             match node_type {
                 NodeType::Internal => {
                     let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
-                    current_page_id = node.search(key)?.child_ptr;
+                    current_page_id = node.search(key)?.child_ptr();
                 }
                 NodeType::Leaf => {
                     let node = BTreeLeafNode::<PinnedReadPage>::new(page)?;
@@ -261,7 +261,7 @@ impl BTree {
             match get_node_type(&page)? {
                 NodeType::Internal => {
                     let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
-                    current_page_id = node.search(key)?.child_ptr;
+                    current_page_id = node.search(key)?.child_ptr();
                 }
                 NodeType::Leaf => {
                     return Ok((current_page_id, path_versions));
@@ -327,7 +327,7 @@ impl BTree {
                     let node = BTreeInternalNode::<PinnedWritePage>::new(page)?;
                     let old_page_id = current_page_id;
 
-                    current_page_id = node.search(key)?.child_ptr;
+                    current_page_id = node.search(key)?.child_ptr();
 
                     // If child can fit another, we can safely drop ancestors and metadata.
                     if drop_lock_fn(&node)? {

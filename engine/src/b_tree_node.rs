@@ -129,9 +129,41 @@ pub(crate) enum LeafNodeSearchResult {
     NotFoundLeaf { insert_slot_id: SlotId },
 }
 
-pub(crate) struct InternalNodeSearchResult {
-    pub(crate) child_ptr: PageId,
-    pub(crate) insert_pos: Option<u16>,
+pub(crate) enum InternalNodeSearchResult {
+    /// Key found
+    FoundExact {
+        child_ptr: PageId,
+        /// The index of the child pointer that was followed.
+        /// Index 0 = leftmost_child_pointer (from header)
+        /// Index 1 = child pointer at slot 0
+        child_index: u16,
+    },
+
+    /// Key not found
+    /// If insertion is needed, insert at slot position = child_index
+    NotFoundInternal {
+        child_ptr: PageId,
+        /// The index of the child pointer that was followed.
+        /// Index 0 = leftmost_child_pointer (from header)
+        /// Index 1 = child pointer at slot 0
+        child_index: u16,
+    },
+}
+
+impl InternalNodeSearchResult {
+    pub(crate) fn child_ptr(&self) -> PageId {
+        match self {
+            InternalNodeSearchResult::FoundExact { child_ptr, .. } => *child_ptr,
+            InternalNodeSearchResult::NotFoundInternal { child_ptr, .. } => *child_ptr,
+        }
+    }
+
+    pub(crate) fn child_index(&self) -> u16 {
+        match self {
+            InternalNodeSearchResult::FoundExact { child_index, .. } => *child_index,
+            InternalNodeSearchResult::NotFoundInternal { child_index, .. } => *child_index,
+        }
+    }
 }
 
 /// Struct representing a B-Tree node. It is a wrapper on a slotted page, that uses its api for
@@ -261,14 +293,26 @@ where
         Ok(child_ptr)
     }
 
+    /// Gets the child pointer by its conceptual index.
+    /// Index 0 = leftmost_child_pointer (from header)
+    /// Index 1 = child pointer at slot 0
+    /// Index 2 = child pointer at slot 1, etc.
+    pub fn get_child_ptr_by_index(&self, child_index: u16) -> Result<PageId, BTreeNodeError> {
+        if child_index == 0 {
+            Ok(self.get_btree_header()?.leftmost_child_pointer)
+        } else {
+            self.get_child_ptr(child_index - 1)
+        }
+    }
+
     /// Search returns which child to follow.
     pub fn search(&self, target_key: &[u8]) -> Result<InternalNodeSearchResult, BTreeNodeError> {
         let num_slots = self.slotted_page.num_slots()?;
 
         if num_slots == 0 {
-            return Ok(InternalNodeSearchResult {
+            return Ok(InternalNodeSearchResult::NotFoundInternal {
                 child_ptr: self.get_btree_header()?.leftmost_child_pointer,
-                insert_pos: Some(0),
+                child_index: 0, // leftmost child
             });
         }
 
@@ -295,9 +339,9 @@ where
                 Ordering::Less => left = mid + 1,
                 Ordering::Equal => {
                     let child_ptr = self.get_child_ptr(mid)?;
-                    return Ok(InternalNodeSearchResult {
+                    return Ok(InternalNodeSearchResult::FoundExact {
                         child_ptr,
-                        insert_pos: None,
+                        child_index: mid + 1, // slot mid corresponds to child index mid+1
                     });
                 }
                 Ordering::Greater => {
@@ -310,15 +354,15 @@ where
         }
 
         let header = self.get_btree_header()?;
-        let (child_ptr, insert_pos) = if left == 0 {
-            (header.leftmost_child_pointer, 0)
+        let (child_ptr, child_index) = if left == 0 {
+            (header.leftmost_child_pointer, 0) // leftmost child is at index 0
         } else {
-            (self.get_child_ptr(left - 1)?, left)
+            (self.get_child_ptr(left - 1)?, left) // slot (left-1) corresponds to child index left
         };
 
-        Ok(InternalNodeSearchResult {
+        Ok(InternalNodeSearchResult::NotFoundInternal {
             child_ptr,
-            insert_pos: Some(insert_pos),
+            child_index,
         })
     }
 
@@ -351,9 +395,11 @@ where
         key: &[u8],
         new_child_id: PageId,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
-        let position = match self.search(key)?.insert_pos {
-            None => return Err(BTreeNodeError::InternalNodeDuplicateKey),
-            Some(pos) => pos,
+        let position = match self.search(key)? {
+            InternalNodeSearchResult::FoundExact { .. } => {
+                return Err(BTreeNodeError::InternalNodeDuplicateKey);
+            }
+            InternalNodeSearchResult::NotFoundInternal { child_index, .. } => child_index,
         };
         let mut buffer = Vec::new();
         buffer.extend_from_slice(key);
@@ -788,11 +834,19 @@ mod test {
         let key = serialize_i32_lexicographically(10);
         let res = node.search(key.as_slice()).unwrap();
 
-        assert_eq!(
-            res.child_ptr, 100,
-            "Empty internal node should return leftmost child"
-        );
-        assert_eq!(res.insert_pos, Some(0), "Insert position should be 0");
+        match res {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_index,
+            } => {
+                assert_eq!(
+                    child_ptr, 100,
+                    "Empty internal node should return leftmost child"
+                );
+                assert_eq!(child_index, 0, "Child index should be 0");
+            }
+            _ => panic!("Expected NotFoundInternal for empty node"),
+        }
     }
 
     #[test]
@@ -802,33 +856,80 @@ mod test {
 
         let node = make_internal_node(&keys, &children);
 
-        let res = node
+        // Test key < smallest key (should go to leftmost child)
+        match node
             .search(serialize_i32_lexicographically(5).as_slice())
-            .unwrap();
-        assert_eq!(res.child_ptr, 100, "Key 5 should route to leftmost child");
+            .unwrap()
+        {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_index,
+            } => {
+                assert_eq!(child_ptr, 100, "Key 5 should route to leftmost child");
+                assert_eq!(child_index, 0);
+            }
+            _ => panic!("Expected NotFoundInternal"),
+        }
 
-        let res = node
+        // Test exact match on key 10
+        match node
             .search(serialize_i32_lexicographically(10).as_slice())
-            .unwrap();
-        assert_eq!(
-            res.child_ptr, 200,
-            "Key 10 should route to its child pointer"
-        );
+            .unwrap()
+        {
+            InternalNodeSearchResult::FoundExact {
+                child_ptr,
+                child_index,
+            } => {
+                assert_eq!(child_ptr, 200, "Key 10 should route to its child pointer");
+                assert_eq!(child_index, 1);
+            }
+            _ => panic!("Expected FoundExact"),
+        }
 
-        let res = node
+        // Test key between 10 and 20
+        match node
             .search(serialize_i32_lexicographically(15).as_slice())
-            .unwrap();
-        assert_eq!(res.child_ptr, 200, "Key 15 should route to child after 10");
+            .unwrap()
+        {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_index,
+            } => {
+                assert_eq!(child_ptr, 200, "Key 15 should route to child after 10");
+                assert_eq!(child_index, 1);
+            }
+            _ => panic!("Expected NotFoundInternal"),
+        }
 
-        let res = node
+        // Test key between 20 and 30
+        match node
             .search(serialize_i32_lexicographically(25).as_slice())
-            .unwrap();
-        assert_eq!(res.child_ptr, 300, "Key 25 should route to child after 20");
+            .unwrap()
+        {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_index,
+            } => {
+                assert_eq!(child_ptr, 300, "Key 25 should route to child after 20");
+                assert_eq!(child_index, 2);
+            }
+            _ => panic!("Expected NotFoundInternal"),
+        }
 
-        let res = node
+        // Test key > largest key (should go to rightmost child)
+        match node
             .search(serialize_i32_lexicographically(35).as_slice())
-            .unwrap();
-        assert_eq!(res.child_ptr, 400, "Key 35 should route to rightmost child");
+            .unwrap()
+        {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_index,
+            } => {
+                assert_eq!(child_ptr, 400, "Key 35 should route to rightmost child");
+                assert_eq!(child_index, 3);
+            }
+            _ => panic!("Expected NotFoundInternal"),
+        }
     }
 
     #[test]
@@ -947,7 +1048,12 @@ mod test {
         assert!(matches!(result, NodeInsertResult::Success));
 
         let search_result = node.search(&key).unwrap();
-        assert_eq!(search_result.child_ptr, child_id);
+        match search_result {
+            InternalNodeSearchResult::FoundExact { child_ptr, .. } => {
+                assert_eq!(child_ptr, child_id);
+            }
+            _ => panic!("Expected FoundExact after insert"),
+        }
     }
 
     #[test]
@@ -966,7 +1072,12 @@ mod test {
         for (key_val, expected_child) in &keys_and_children {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
-            assert_eq!(search_result.child_ptr, *expected_child);
+            match search_result {
+                InternalNodeSearchResult::FoundExact { child_ptr, .. } => {
+                    assert_eq!(child_ptr, *expected_child);
+                }
+                _ => panic!("Expected FoundExact for key {}", key_val),
+            }
         }
     }
 
