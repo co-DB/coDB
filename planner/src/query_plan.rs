@@ -173,7 +173,7 @@ pub struct Sort {
     pub order: SortOrder,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum SortOrder {
     Ascending,
     Descending,

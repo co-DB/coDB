@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap, iter, mem};
+use std::{borrow::Cow, cmp::Ordering, collections::HashMap, iter, mem};
 
 use engine::{
     data_types,
@@ -9,7 +9,8 @@ use itertools::Itertools;
 use metadata::catalog::{ColumnMetadata, ColumnMetadataError, TableMetadata};
 use planner::{
     query_plan::{
-        CreateTable, Filter, Insert, Projection, StatementPlan, StatementPlanItem, TableScan,
+        CreateTable, Filter, Insert, Limit, Projection, Skip, Sort, SortOrder, StatementPlan,
+        StatementPlanItem, TableScan,
     },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
@@ -106,6 +107,9 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 Ok(records)
             }
             StatementPlanItem::Filter(filter) => self.filter(filter),
+            StatementPlanItem::Sort(sort) => self.sort(sort),
+            StatementPlanItem::Skip(skip) => self.skip(skip),
+            StatementPlanItem::Limit(limit) => self.limit(limit),
             _ => Err(InternalExecutorError::InvalidOperationInDataSource {
                 operation: format!("{:?}", data_source),
             }),
@@ -146,6 +150,58 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 }
             })
             .collect()
+    }
+
+    /// Handler for [`Sort`] statement.
+    fn sort(&self, sort: &Sort) -> Result<Vec<Record>, InternalExecutorError> {
+        let data_source = self.statement.item(sort.data_source);
+        let records = self.execute_data_source(data_source)?;
+        let column_pos = self.get_column_position(sort.column);
+        self.apply_sorting(records, column_pos, sort.order)
+    }
+
+    /// Sorts `records` by `column_pos`-th column in `order`.
+    /// If any comparison fails the error is returned.
+    fn apply_sorting(
+        &self,
+        mut records: Vec<Record>,
+        column_pos: usize,
+        order: SortOrder,
+    ) -> Result<Vec<Record>, InternalExecutorError> {
+        let mut e = None;
+        records.sort_by(|lhs, rhs| {
+            let lhs_column = &lhs.fields[column_pos];
+            let rhs_column = &rhs.fields[column_pos];
+            let cmp_res = match order {
+                SortOrder::Ascending => self.cmp_fields(lhs_column, rhs_column),
+                SortOrder::Descending => self.cmp_fields(rhs_column, lhs_column),
+            };
+            match cmp_res {
+                Ok(cmp) => cmp,
+                Err(err) => {
+                    e = Some(err);
+                    Ordering::Equal
+                }
+            }
+        });
+        match e {
+            Some(e) => Err(e),
+            None => Ok(records),
+        }
+    }
+
+    /// Handler for [`Skip`] statement.
+    fn skip(&self, skip: &Skip) -> Result<Vec<Record>, InternalExecutorError> {
+        let data_source = self.statement.item(skip.data_source);
+        let records = self.execute_data_source(data_source)?;
+        Ok(records.into_iter().skip(skip.count as _).collect())
+    }
+
+    /// Handler for [`Limit`] statement.
+    fn limit(&self, limit: &Limit) -> Result<Vec<Record>, InternalExecutorError> {
+        let data_source = self.statement.item(limit.data_source);
+        let records = self.execute_data_source(data_source)?;
+        Ok(records.into_iter().take(limit.count as _).collect())
     }
 
     /// Handler for [`Projection`] statement.
@@ -235,15 +291,9 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             .iter()
             .zip(values.iter())
             .sorted_by(|&(lhs_col, _), &(rhs_col, _)| {
-                let left_col = match self.ast.node(*lhs_col) {
-                    ResolvedExpression::ColumnRef(rc) => rc,
-                    _ => unreachable!(),
-                };
-                let right_col = match self.ast.node(*rhs_col) {
-                    ResolvedExpression::ColumnRef(rc) => rc,
-                    _ => unreachable!(),
-                };
-                left_col.pos.cmp(&right_col.pos)
+                let left_pos = self.get_column_position(*lhs_col);
+                let right_pos = self.get_column_position(*rhs_col);
+                left_pos.cmp(&right_pos)
             })
             .map(|(_, &expression)| {
                 let e = ExpressionExecutor::empty(self.ast);
@@ -345,6 +395,33 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 _ => unreachable!(),
             }
         })
+    }
+
+    /// Returns `column` position in table schema.
+    fn get_column_position(&self, column: ResolvedNodeId) -> usize {
+        match self.ast.node(column) {
+            ResolvedExpression::ColumnRef(cr) => cr.pos as usize,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Compares `lhs` with `rhs`, returns an error if types don't match or values cannot be compared.
+    fn cmp_fields(&self, lhs: &Field, rhs: &Field) -> Result<Ordering, InternalExecutorError> {
+        match (lhs, rhs) {
+            (Field::Int32(lhs), Field::Int32(rhs)) => Ok(lhs.cmp(rhs)),
+            (Field::Int64(lhs), Field::Int64(rhs)) => Ok(lhs.cmp(rhs)),
+            (Field::Float32(lhs), Field::Float32(rhs)) => lhs.partial_cmp(rhs).ok_or_else(|| {
+                error_factory::comparing_nan_values(lhs.to_string(), rhs.to_string())
+            }),
+            (Field::Float64(lhs), Field::Float64(rhs)) => lhs.partial_cmp(rhs).ok_or_else(|| {
+                error_factory::comparing_nan_values(lhs.to_string(), rhs.to_string())
+            }),
+            (Field::Bool(lhs), Field::Bool(rhs)) => Ok(lhs.cmp(rhs)),
+            (Field::String(lhs), Field::String(rhs)) => Ok(lhs.cmp(rhs)),
+            (Field::Date(lhs), Field::Date(rhs)) => Ok(lhs.cmp(rhs)),
+            (Field::DateTime(lhs), Field::DateTime(rhs)) => Ok(lhs.cmp(rhs)),
+            _ => Err(error_factory::incompatible_types(lhs, rhs)),
+        }
     }
 }
 

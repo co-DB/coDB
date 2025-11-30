@@ -166,6 +166,11 @@ mod tests {
         )
     }
 
+    // Helper to execute a single statement and unwrap the result
+    fn execute_single(executor: &Executor, query: &str) -> StatementResult {
+        executor.execute(query).next().unwrap()
+    }
+
     fn expect_select_successful(result: StatementResult) -> (Vec<ColumnData>, Vec<Record>) {
         match result {
             StatementResult::SelectSuccessful { columns, rows } => (columns, rows),
@@ -236,12 +241,10 @@ mod tests {
     fn test_execute_select_statement_empty_table() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
         );
-
-        executor.execute_statement(&create_plan, &create_ast);
 
         let (select_plan, select_ast) =
             create_single_statement("SELECT id, name, age FROM users;", &executor);
@@ -257,39 +260,23 @@ mod tests {
     fn test_execute_select_statement_all_columns() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
         );
 
-        let create_result = executor.execute_statement(&create_plan, &create_ast);
-        assert_operation_successful(create_result, 0, StatementType::Create);
-
-        // Insert records directly using heap file
-        let record1 = Record::new(vec![
-            Field::Int32(1),
-            Field::Int32(25),
-            Field::String("Alice".into()),
-        ]);
-
-        let record2 = Record::new(vec![
-            Field::Int32(2),
-            Field::Int32(30),
-            Field::String("Bob".into()),
-        ]);
-
-        let record3 = Record::new(vec![
-            Field::Int32(3),
-            Field::Int32(35),
-            Field::String("Charlie".into()),
-        ]);
-        executor
-            .with_heap_file("users", |hf| {
-                hf.insert(record1).unwrap();
-                hf.insert(record2).unwrap();
-                hf.insert(record3).unwrap();
-            })
-            .unwrap();
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
 
         let (select_plan, select_ast) =
             create_single_statement("SELECT id, name, age FROM users;", &executor);
@@ -337,30 +324,18 @@ mod tests {
     fn test_execute_select_statement_subset_of_columns() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
         );
-
-        executor.execute_statement(&create_plan, &create_ast);
-
-        // Insert records directly using heap file
-        let record1 = Record::new(vec![
-            Field::Int32(1),
-            Field::Int32(25),
-            Field::String("Alice".into()),
-        ]);
-        let record2 = Record::new(vec![
-            Field::Int32(2),
-            Field::Int32(30),
-            Field::String("Bob".into()),
-        ]);
-        executor
-            .with_heap_file("users", |hf| {
-                hf.insert(record1).unwrap();
-                hf.insert(record2).unwrap();
-            })
-            .unwrap();
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
 
         // Execute SELECT with only name and age
         let (select_plan, select_ast) =
@@ -397,40 +372,22 @@ mod tests {
     fn test_execute_select_statement_star_all_columns() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
         );
-
-        let create_result = executor.execute_statement(&create_plan, &create_ast);
-        assert_operation_successful(create_result, 0, StatementType::Create);
-
-        // Insert records directly using heap file
-        let record1 = Record::new(vec![
-            Field::Int32(1),
-            Field::Int32(25),
-            Field::String("Alice".into()),
-        ]);
-
-        let record2 = Record::new(vec![
-            Field::Int32(2),
-            Field::Int32(30),
-            Field::String("Bob".into()),
-        ]);
-
-        let record3 = Record::new(vec![
-            Field::Int32(3),
-            Field::Int32(35),
-            Field::String("Charlie".into()),
-        ]);
-
-        executor
-            .with_heap_file("users", |hf| {
-                hf.insert(record1).unwrap();
-                hf.insert(record2).unwrap();
-                hf.insert(record3).unwrap();
-            })
-            .unwrap();
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
 
         let (select_plan, select_ast) = create_single_statement("SELECT * FROM users;", &executor);
 
@@ -477,30 +434,18 @@ mod tests {
     fn test_execute_select_statement_duplicate_columns() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
         );
-
-        executor.execute_statement(&create_plan, &create_ast);
-
-        // Insert records directly using heap file
-        let record1 = Record::new(vec![
-            Field::Int32(1),
-            Field::Int32(25),
-            Field::String("Alice".into()),
-        ]);
-        let record2 = Record::new(vec![
-            Field::Int32(2),
-            Field::Int32(30),
-            Field::String("Bob".into()),
-        ]);
-        executor
-            .with_heap_file("users", |hf| {
-                hf.insert(record1).unwrap();
-                hf.insert(record2).unwrap();
-            })
-            .unwrap();
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
 
         // Execute SELECT with same column twice
         let (select_plan, select_ast) =
@@ -539,39 +484,22 @@ mod tests {
     fn test_execute_select_with_where_clause_single_condition() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
         );
-
-        executor.execute_statement(&create_plan, &create_ast);
-
-        // Insert test data
-        let records = vec![
-            Record::new(vec![
-                Field::Int32(1),
-                Field::Int32(25),
-                Field::String("Alice".into()),
-            ]),
-            Record::new(vec![
-                Field::Int32(2),
-                Field::Int32(30),
-                Field::String("Bob".into()),
-            ]),
-            Record::new(vec![
-                Field::Int32(3),
-                Field::Int32(25),
-                Field::String("Charlie".into()),
-            ]),
-        ];
-
-        executor
-            .with_heap_file("users", |hf| {
-                for record in records {
-                    hf.insert(record).unwrap();
-                }
-            })
-            .unwrap();
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 25);",
+        );
 
         let (select_plan, select_ast) =
             create_single_statement("SELECT id, name, age FROM users WHERE age = 25;", &executor);
@@ -598,38 +526,22 @@ mod tests {
     fn test_execute_select_with_where_clause_comparison_operators() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
         );
-
-        executor.execute_statement(&create_plan, &create_ast);
-
-        let records = vec![
-            Record::new(vec![
-                Field::Int32(1),
-                Field::Int32(100),
-                Field::String("Product A".into()),
-            ]),
-            Record::new(vec![
-                Field::Int32(2),
-                Field::Int32(200),
-                Field::String("Product B".into()),
-            ]),
-            Record::new(vec![
-                Field::Int32(3),
-                Field::Int32(150),
-                Field::String("Product C".into()),
-            ]),
-        ];
-
-        executor
-            .with_heap_file("products", |hf| {
-                for record in records {
-                    hf.insert(record).unwrap();
-                }
-            })
-            .unwrap();
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (1, 'Product A', 100);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (2, 'Product B', 200);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (3, 'Product C', 150);",
+        );
 
         let (select_plan, select_ast) = create_single_statement(
             "SELECT id, name FROM products WHERE price > 100;",
@@ -648,24 +560,14 @@ mod tests {
     fn test_execute_select_with_where_clause_no_matches() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
         );
-
-        executor.execute_statement(&create_plan, &create_ast);
-
-        let record = Record::new(vec![
-            Field::Int32(1),
-            Field::Int32(25),
-            Field::String("Alice".into()),
-        ]);
-
-        executor
-            .with_heap_file("users", |hf| {
-                hf.insert(record).unwrap();
-            })
-            .unwrap();
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
 
         let (select_plan, select_ast) =
             create_single_statement("SELECT id, name FROM users WHERE age = 99;", &executor);
@@ -682,33 +584,18 @@ mod tests {
     fn test_execute_select_with_where_clause_all_match() {
         let (executor, _temp_dir) = create_test_executor();
 
-        let (create_plan, create_ast) = create_single_statement(
-            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        execute_single(
             &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
         );
-
-        executor.execute_statement(&create_plan, &create_ast);
-
-        let records = vec![
-            Record::new(vec![
-                Field::Int32(1),
-                Field::Int32(25),
-                Field::String("Alice".into()),
-            ]),
-            Record::new(vec![
-                Field::Int32(2),
-                Field::Int32(25),
-                Field::String("Bob".into()),
-            ]),
-        ];
-
-        executor
-            .with_heap_file("users", |hf| {
-                for record in records {
-                    hf.insert(record).unwrap();
-                }
-            })
-            .unwrap();
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25);",
+        );
 
         let (select_plan, select_ast) =
             create_single_statement("SELECT id, name FROM users WHERE TRUE;", &executor);
@@ -719,6 +606,421 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
     }
+
+    #[test]
+    fn test_sorting_integers_ascending() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 30);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 20);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test ORDER BY value ASC;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::Int32(10));
+        assert_eq!(rows[1].fields[1], Field::Int32(20));
+        assert_eq!(rows[2].fields[1], Field::Int32(30));
+    }
+
+    #[test]
+    fn test_sorting_integers_descending() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 30);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 20);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test ORDER BY value DESC;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::Int32(30));
+        assert_eq!(rows[1].fields[1], Field::Int32(20));
+        assert_eq!(rows[2].fields[1], Field::Int32(10));
+    }
+
+    #[test]
+    fn test_sorting_strings_ascending() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO test (id, name) VALUES (1, 'zebra');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO test (id, name) VALUES (2, 'apple');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO test (id, name) VALUES (3, 'banana');",
+        );
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM test ORDER BY name ASC;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::String("apple".into()));
+        assert_eq!(rows[1].fields[1], Field::String("banana".into()));
+        assert_eq!(rows[2].fields[1], Field::String("zebra".into()));
+    }
+
+    #[test]
+    fn test_sorting_floats_implicit_ascending() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, score FLOAT64);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, score) VALUES (1, 3.75);");
+        execute_single(&executor, "INSERT INTO test (id, score) VALUES (2, 1.5);");
+        execute_single(&executor, "INSERT INTO test (id, score) VALUES (3, 2.25);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, score FROM test ORDER BY score;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::Float64(1.5));
+        assert_eq!(rows[1].fields[1], Field::Float64(2.25));
+        assert_eq!(rows[2].fields[1], Field::Float64(3.75));
+    }
+
+    #[test]
+    fn test_sorting_booleans() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, active BOOL);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, active) VALUES (1, TRUE);");
+        execute_single(
+            &executor,
+            "INSERT INTO test (id, active) VALUES (2, FALSE);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, active) VALUES (3, TRUE);");
+
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, active FROM test ORDER BY active ASC;",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].fields[1], Field::Bool(false));
+        assert_eq!(rows[1].fields[1], Field::Bool(true));
+        assert_eq!(rows[2].fields[1], Field::Bool(true));
+    }
+
+    #[test]
+    fn test_sorting_duplicate_values() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (4, 20);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test ORDER BY value ASC;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].fields[1], Field::Int32(10));
+        assert_eq!(rows[1].fields[1], Field::Int32(10));
+        assert_eq!(rows[2].fields[1], Field::Int32(20));
+        assert_eq!(rows[3].fields[1], Field::Int32(20));
+    }
+
+    #[test]
+    fn test_limit_fewer_rows_than_limit() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test LIMIT 5;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_limit_exact_number_of_rows() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test LIMIT 3;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_limit_more_rows_than_limit() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (4, 40);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (5, 50);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test LIMIT 3;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_limit_zero() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test LIMIT 0;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_offset_fewer_rows_than_offset() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test OFFSET 5;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_offset_exact_number_of_rows() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test OFFSET 3;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_offset_skip_some_rows() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (3, 30);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (4, 40);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (5, 50);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test OFFSET 2;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_offset_zero() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE test (id INT32 PRIMARY_KEY, value INT32);",
+        );
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (1, 10);");
+        execute_single(&executor, "INSERT INTO test (id, value) VALUES (2, 20);");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, value FROM test OFFSET 0;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_combined_where_order_limit_offset() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32, category STRING);",
+        );
+
+        // Insert test data
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (1, 'Laptop', 1200, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (2, 'Mouse', 25, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (3, 'Keyboard', 75, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (4, 'Monitor', 300, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (5, 'Desk', 200, 'Furniture');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (6, 'Chair', 150, 'Furniture');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (7, 'Headphones', 100, 'Electronics');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, category) VALUES (8, 'Webcam', 80, 'Electronics');",
+        );
+
+        // Query: Get Electronics products with price > 50, ordered by price DESC, skip first result, take 2
+        // Expected: After filtering (Mouse excluded), sorted DESC: Laptop(1200), Monitor(300), Headphones(100), Webcam(80), Keyboard(75)
+        // After OFFSET 1: Monitor(300), Headphones(100), Webcam(80), Keyboard(75),
+        // After LIMIT 2: Monitor(300), Headphones(100)
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, name, price FROM products WHERE category = 'Electronics' AND price > 50 ORDER BY price DESC OFFSET 1 LIMIT 2;",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[1].name, "name");
+        assert_eq!(columns[2].name, "price");
+
+        assert_eq!(rows.len(), 2);
+
+        // First row should be Monitor (300)
+        assert_eq!(rows[0].fields[0], Field::Int32(4));
+        assert_eq!(rows[0].fields[1], Field::String("Monitor".into()));
+        assert_eq!(rows[0].fields[2], Field::Int32(300));
+
+        // Second row should be Headphones (100)
+        assert_eq!(rows[1].fields[0], Field::Int32(7));
+        assert_eq!(rows[1].fields[1], Field::String("Headphones".into()));
+        assert_eq!(rows[1].fields[2], Field::Int32(100));
+
+        assert!(rows.iter().all(|r| {
+            if let Field::Int32(price) = r.fields[2] {
+                price > 50
+            } else {
+                false
+            }
+        }));
+    }
+
+    // TODO: add tests for sorting date and datetimes once they are handled
 
     #[test]
     fn test_execute_insert_single_row() {
