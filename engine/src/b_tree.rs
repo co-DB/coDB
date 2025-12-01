@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_node::{
@@ -100,14 +101,35 @@ impl PageVersion {
 /// Stores information about the path from root to leaf during a pessimistic insert, including
 /// ancestor nodes and metadata page.
 struct PessimisticPath {
-    latch_stack: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+    latch_stack: Vec<LatchHandle>,
     leaf_page_id: PageId,
     metadata_page: Option<PinnedWritePage>,
 }
 
+/// A helper struct for all the necessary data needed for performing operations on a node during
+/// tree restructuring operations (split,merge,redistribution).
+struct LatchHandle {
+    /// ID of the page containing the node.
+    page_id: PageId,
+    /// The actual node.
+    node: BTreeInternalNode<PinnedWritePage>,
+    /// Index of the child we descended into in the node. Used in delete to get the chosen node's
+    /// siblings.
+    child_pos: u16,
+}
+
+impl LatchHandle {
+    fn new(page_id: PageId, node: BTreeInternalNode<PinnedWritePage>, child_pos: u16) -> Self {
+        Self {
+            page_id,
+            node,
+            child_pos,
+        }
+    }
+}
 impl PessimisticPath {
     fn new(
-        latch_stack: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        latch_stack: Vec<LatchHandle>,
         leaf_page_id: PageId,
         metadata_page: Option<PinnedWritePage>,
     ) -> Self {
@@ -327,7 +349,10 @@ impl BTree {
                     let node = BTreeInternalNode::<PinnedWritePage>::new(page)?;
                     let old_page_id = current_page_id;
 
-                    current_page_id = node.search(key)?.child_ptr();
+                    let search_result = node.search(key)?;
+
+                    current_page_id = search_result.child_ptr();
+                    let child_index = search_result.child_index();
 
                     // If child can fit another, we can safely drop ancestors and metadata.
                     if drop_lock_fn(&node)? {
@@ -335,7 +360,8 @@ impl BTree {
                         latch_stack.clear();
                     }
 
-                    latch_stack.push((old_page_id, node));
+                    let latch_handle = LatchHandle::new(old_page_id, node, child_index);
+                    latch_stack.push(latch_handle);
                 }
                 NodeType::Leaf => {
                     return Ok(PessimisticPath {
@@ -401,7 +427,7 @@ impl BTree {
     /// Splits a leaf node and propagates the separator up the tree.
     fn split_and_propagate(
         &self,
-        internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        internal_nodes: Vec<LatchHandle>,
         leaf_node: (PageId, BTreeLeafNode<PinnedWritePage>),
         key: &[u8],
         record_pointer: RecordPtr,
@@ -458,7 +484,7 @@ impl BTree {
     /// creating a new root if necessary.
     fn propagate_separator_up(
         &self,
-        mut internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        mut internal_nodes: Vec<LatchHandle>,
         mut current_separator_key: Vec<u8>,
         mut child_page_id: PageId,
         metadata_page: Option<PinnedWritePage>,
@@ -477,7 +503,12 @@ impl BTree {
         }
 
         // Otherwise, walk ancestors from bottom to top.
-        while let Some((parent_page_id, mut parent_node)) = internal_nodes.pop() {
+        while let Some(handle) = internal_nodes.pop() {
+            let LatchHandle {
+                page_id: parent_page_id,
+                node: mut parent_node,
+                ..
+            } = handle;
             match parent_node.insert(current_separator_key.as_slice(), child_page_id)? {
                 NodeInsertResult::Success => return Ok(()),
                 NodeInsertResult::KeyAlreadyExists => return Err(BTreeError::DuplicateKey),
@@ -621,7 +652,7 @@ impl BTree {
 
     fn redistribute_or_merge(
         &self,
-        internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        internal_nodes: Vec<LatchHandle>,
         leaf_node: (PageId, BTreeLeafNode<PinnedWritePage>),
         key: &[u8],
         metadata_page: Option<PinnedWritePage>,
