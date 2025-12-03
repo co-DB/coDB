@@ -300,7 +300,7 @@ mod tests {
             .find(|r| *r.fields[0].value() == Value::Int32(1))
             .unwrap();
         assert_eq!(alice.fields.len(), 3);
-        assert!(matches!((&alice.fields[1]).into(), Value::String(s) if s == "Alice"));
+        assert!(matches!(&alice.fields[1].value(), Value::String(s) if s == "Alice"));
         assert!(matches!(alice.fields[2].value(), Value::Int32(25)));
 
         let bob = rows
@@ -308,7 +308,7 @@ mod tests {
             .find(|&r| *r.fields[0].value() == Value::Int32(2))
             .unwrap();
         assert_eq!(bob.fields.len(), 3);
-        assert!(matches!((&bob.fields[1]).into(), Value::String(s) if s == "Bob"));
+        assert!(matches!(&bob.fields[1].value(), Value::String(s) if s == "Bob"));
         assert!(matches!(bob.fields[2].value(), Value::Int32(30)));
 
         let charlie = rows
@@ -316,7 +316,7 @@ mod tests {
             .find(|r| *r.fields[0].value() == Value::Int32(3))
             .unwrap();
         assert_eq!(charlie.fields.len(), 3);
-        assert!(matches!((&charlie.fields[1]).into(), Value::String(s) if s == "Charlie"));
+        assert!(matches!(&charlie.fields[1].value(), Value::String(s) if s == "Charlie"));
         assert!(matches!(charlie.fields[2].value(), Value::Int32(35)));
     }
 

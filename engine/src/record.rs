@@ -122,12 +122,6 @@ impl From<Value> for Field {
     }
 }
 
-impl From<&Field> for Value {
-    fn from(value: &Field) -> Self {
-        value.0.clone()
-    }
-}
-
 impl From<Field> for Value {
     fn from(value: Field) -> Self {
         value.0

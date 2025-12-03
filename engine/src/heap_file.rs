@@ -1762,27 +1762,27 @@ mod tests {
     /// Helpers for asserting field type
     ///
     fn assert_string(expected: &str, actual: &Field) {
-        match actual.into() {
+        match actual.value() {
             Value::String(s) => {
-                assert_eq!(expected, s);
+                assert_eq!(expected, *s);
             }
             _ => panic!("expected String, got {:?}", actual),
         }
     }
 
     fn assert_i32(expected: i32, actual: &Field) {
-        match actual.into() {
+        match actual.value() {
             Value::Int32(i) => {
-                assert_eq!(expected, i);
+                assert_eq!(expected, *i);
             }
             _ => panic!("expected Int32, got {:?}", actual),
         }
     }
 
     fn assert_i64(expected: i64, actual: &Field) {
-        match actual.into() {
+        match actual.value() {
             Value::Int64(i) => {
-                assert_eq!(expected, i);
+                assert_eq!(expected, *i);
             }
             _ => panic!("expected Int64, got {:?}", actual),
         }
@@ -2994,8 +2994,8 @@ mod tests {
         // Verify all records are present (order may vary due to page allocation)
         let mut found_ids = all_records
             .iter()
-            .map(|r| match (&r.fields[0]).into() {
-                Value::Int32(id) => id,
+            .map(|r| match &r.fields[0].value() {
+                Value::Int32(id) => *id,
                 _ => panic!("Expected Int32"),
             })
             .collect::<Vec<_>>();
@@ -3046,7 +3046,7 @@ mod tests {
         // Find records by ID (order may vary)
         let record1 = all_records
             .iter()
-            .find(|r| match (&r.fields[0]).into() {
+            .find(|r| match &r.fields[0].value() {
                 Value::Int32(1) => true,
                 _ => false,
             })
@@ -3055,7 +3055,7 @@ mod tests {
 
         let record2 = all_records
             .iter()
-            .find(|r| match (&r.fields[0]).into() {
+            .find(|r| match &r.fields[0].value() {
                 Value::Int32(2) => true,
                 _ => false,
             })
@@ -3064,7 +3064,7 @@ mod tests {
 
         let record3 = all_records
             .iter()
-            .find(|r| match (&r.fields[0]).into() {
+            .find(|r| match &r.fields[0].value() {
                 Value::Int32(3) => true,
                 _ => false,
             })
@@ -3099,8 +3099,8 @@ mod tests {
         // Verify remaining IDs (0, 2, 4)
         let mut found_ids = all_records
             .iter()
-            .map(|r| match (&r.fields[0]).into() {
-                Value::Int32(id) => id,
+            .map(|r| match &r.fields[0].value() {
+                Value::Int32(id) => *id,
                 _ => panic!("Expected Int32"),
             })
             .collect::<Vec<_>>();
@@ -3112,8 +3112,8 @@ mod tests {
         for id in [0, 2, 4] {
             let record = all_records
                 .iter()
-                .find(|r| match (&r.fields[0]).into() {
-                    Value::Int32(rid) => rid == id,
+                .find(|r| match &r.fields[0].value() {
+                    Value::Int32(rid) => *rid == id,
                     _ => false,
                 })
                 .unwrap();
@@ -3155,8 +3155,8 @@ mod tests {
         for id in 0..3 {
             let record = all_records
                 .iter()
-                .find(|r| match (&r.fields[0]).into() {
-                    Value::Int32(rid) => rid == id,
+                .find(|r| match &r.fields[0].value() {
+                    Value::Int32(rid) => *rid == id,
                     _ => false,
                 })
                 .unwrap();
@@ -3195,8 +3195,8 @@ mod tests {
                 // Verify all IDs are present
                 let mut found_ids = all_records
                     .iter()
-                    .map(|r| match (&r.fields[0]).into() {
-                        Value::Int32(id) => id,
+                    .map(|r| match &r.fields[0].value() {
+                        Value::Int32(id) => *id,
                         _ => panic!("Expected Int32"),
                     })
                     .collect::<Vec<_>>();
@@ -4744,14 +4744,14 @@ mod tests {
                     assert_eq!(record.fields.len(), 3,);
 
                     // Try to match ABC pattern
-                    let is_abc_pattern = matches!((&record.fields[0]).into(), Value::String(s) if s == exp_f1_abc)
-                        && matches!((&record.fields[1]).into(), Value::String(s) if s == exp_f2_abc)
-                        && matches!((&record.fields[2]).into(), Value::String(s) if s == exp_f3_abc);
+                    let is_abc_pattern = matches!(&record.fields[0].value(), Value::String(s) if s == &exp_f1_abc)
+                        && matches!(&record.fields[1].value(), Value::String(s) if s == &exp_f2_abc)
+                        && matches!(&record.fields[2].value(), Value::String(s) if s == &exp_f3_abc);
 
                     // Try to match XYZ pattern
-                    let is_xyz_pattern = matches!((&record.fields[0]).into(), Value::String(s) if s == exp_f1_xyz)
-                        && matches!((&record.fields[1]).into(), Value::String(s) if s == exp_f2_xyz)
-                        && matches!((&record.fields[2]).into(), Value::String(s) if s == exp_f3_xyz);
+                    let is_xyz_pattern = matches!(&record.fields[0].value(), Value::String(s) if s == &exp_f1_xyz)
+                        && matches!(&record.fields[1].value(), Value::String(s) if s == &exp_f2_xyz)
+                        && matches!(&record.fields[2].value(), Value::String(s) if s == &exp_f3_xyz);
 
                     assert!(is_abc_pattern || is_xyz_pattern,);
 
@@ -4811,13 +4811,13 @@ mod tests {
         let final_record = heap_file.record(&record_ptr).unwrap();
         assert_eq!(final_record.fields.len(), 3);
 
-        let is_abc = matches!((&final_record.fields[0]).into(), Value::String(s) if s == expected_field1_abc)
-            && matches!((&final_record.fields[1]).into(), Value::String(s) if s == expected_field2_abc)
-            && matches!((&final_record.fields[2]).into(), Value::String(s) if s == expected_field3_abc);
+        let is_abc = matches!(&final_record.fields[0].value(), Value::String(s) if s == &expected_field1_abc)
+            && matches!(&final_record.fields[1].value(), Value::String(s) if s == &expected_field2_abc)
+            && matches!(&final_record.fields[2].value(), Value::String(s) if s == &expected_field3_abc);
 
-        let is_xyz = matches!((&final_record.fields[0]).into(), Value::String(s) if s == expected_field1_xyz)
-            && matches!((&final_record.fields[1]).into(), Value::String(s) if s == expected_field2_xyz)
-            && matches!((&final_record.fields[2]).into(), Value::String(s) if s == expected_field3_xyz);
+        let is_xyz = matches!(&final_record.fields[0].value(), Value::String(s) if s == &expected_field1_xyz)
+            && matches!(&final_record.fields[1].value(), Value::String(s) if s == &expected_field2_xyz)
+            && matches!(&final_record.fields[2].value(), Value::String(s) if s == &expected_field3_xyz);
 
         assert!(is_abc || is_xyz);
     }
@@ -5191,8 +5191,8 @@ mod tests {
                                 continue;
                             }
 
-                            match (&record.fields[0]).into() {
-                                Value::Int32(id) if id == *expected_id => {}
+                            match &record.fields[0].value() {
+                                Value::Int32(id) if *id == *expected_id => {}
                                 Value::Int32(id) => {
                                     println!(
                                         "[Verify chunk {}] Wrong ID at idx {}: expected {}, got {}",
@@ -5218,8 +5218,8 @@ mod tests {
                                 }
                             }
 
-                            match (&record.fields[1]).into() {
-                                Value::String(name) if &name == expected_name => {}
+                            match &record.fields[1].value() {
+                                Value::String(name) if name == expected_name => {}
                                 Value::String(name) => {
                                     println!(
                                         "[Verify chunk {}] Wrong name at idx {}: expected {}, got {}",
@@ -5294,7 +5294,7 @@ mod tests {
         // Verify no duplicate IDs
         let mut seen_ids = HashSet::new();
         for record in &all_records {
-            match (&record.fields[0]).into() {
+            match &record.fields[0].value() {
                 Value::Int32(id) => {
                     assert!(seen_ids.insert(id), "Found duplicate record ID: {}", id);
                 }
