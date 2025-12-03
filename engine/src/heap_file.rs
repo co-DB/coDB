@@ -424,7 +424,7 @@ impl FieldUpdateDescriptor {
         if column.ty() != value.ty() {
             return Err(HeapFileError::ColumnAndValueTypesDontMatch {
                 column_ty: column.ty().to_string(),
-                field_ty: value.ty().to_string(),
+                value_ty: value.ty().to_string(),
             });
         }
         Ok(FieldUpdateDescriptor { column, value })
@@ -816,8 +816,8 @@ pub enum HeapFileError {
     RecordSerializationError(#[from] RecordError),
     #[error("there was not enough space on page to perform request")]
     NotEnoughSpaceOnPage,
-    #[error("column type ({column_ty}) and field type ({field_ty}) do not match")]
-    ColumnAndValueTypesDontMatch { column_ty: String, field_ty: String },
+    #[error("column type ({column_ty}) and value type ({value_ty}) do not match")]
+    ColumnAndValueTypesDontMatch { column_ty: String, value_ty: String },
     #[error("{0}")]
     DBSerializationError(#[from] DbSerializationError),
 }

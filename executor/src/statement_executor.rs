@@ -243,7 +243,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                         let pos = select_col.rc.pos as usize;
                         match select_col.last {
                             true => {
-                                // We replace it with dummy field, in this case just Bool(false), but here could be anything - we won't use anymore
+                                // We replace it with dummy field, in this case just Bool(false), but here could be anything - we won't use it anymore
                                 mem::replace(&mut source_fields[pos], Value::Bool(false).into())
                             }
                             false => source_fields[pos].clone(),
