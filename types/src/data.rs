@@ -1,5 +1,10 @@
 use time::{Date, Duration, PrimitiveDateTime, Time};
 
+use crate::{
+    schema::Type,
+    serialization::{DbSerializable, DbSerializationError},
+};
+
 // 1970-01-01 - the date we measure our date against.
 const EPOCH_DATE: Date = match Date::from_ordinal_date(1970, 1) {
     Ok(date) => date,
@@ -144,6 +149,165 @@ impl From<DbDateTime> for PrimitiveDateTime {
             Time::from_hms_milli(hours as u8, minutes as u8, seconds as u8, millis as u16).unwrap();
 
         PrimitiveDateTime::new(base_date, base_time)
+    }
+}
+
+/// Represents a typed value that can be used in coSQL.
+#[derive(PartialEq, Debug, Clone)]
+pub enum Value {
+    Int32(i32),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
+    DateTime(DbDateTime),
+    Date(DbDate),
+    String(String),
+    Bool(bool),
+}
+
+impl Value {
+    pub fn ty(&self) -> Type {
+        match self {
+            Value::Int32(_) => Type::I32,
+            Value::Int64(_) => Type::I64,
+            Value::Float32(_) => Type::F32,
+            Value::Float64(_) => Type::F64,
+            Value::DateTime(_) => Type::DateTime,
+            Value::Date(_) => Type::Date,
+            Value::String(_) => Type::String,
+            Value::Bool(_) => Type::Bool,
+        }
+    }
+
+    /// Serializes this value into the provided buffer.
+    pub fn serialize(self, buffer: &mut Vec<u8>) {
+        match self {
+            Value::Int32(i) => i.serialize(buffer),
+            Value::Int64(i) => i.serialize(buffer),
+            Value::Float32(f) => f.serialize(buffer),
+            Value::Float64(f) => f.serialize(buffer),
+            Value::DateTime(d) => d.serialize(buffer),
+            Value::Date(d) => d.serialize(buffer),
+            Value::String(s) => s.serialize(buffer),
+            Value::Bool(b) => b.serialize(buffer),
+        }
+    }
+
+    /// Serializes this value at the beginning of the provided buffer.
+    ///
+    /// This function panics if buffer has not enough space to store the value.
+    pub fn serialize_into(self, buffer: &mut [u8]) {
+        match self {
+            Value::Int32(i) => i.serialize_into(buffer),
+            Value::Int64(i) => i.serialize_into(buffer),
+            Value::Float32(f) => f.serialize_into(buffer),
+            Value::Float64(f) => f.serialize_into(buffer),
+            Value::DateTime(d) => d.serialize_into(buffer),
+            Value::Date(d) => d.serialize_into(buffer),
+            Value::String(s) => s.serialize_into(buffer),
+            Value::Bool(b) => b.serialize_into(buffer),
+        }
+    }
+
+    /// Returns number of bytes that serialized value will take on disk.
+    pub fn size_serialized(&self) -> usize {
+        match self {
+            Value::Int32(i) => i.size_serialized(),
+            Value::Int64(i) => i.size_serialized(),
+            Value::Float32(f) => f.size_serialized(),
+            Value::Float64(f) => f.size_serialized(),
+            Value::DateTime(d) => d.size_serialized(),
+            Value::Date(d) => d.size_serialized(),
+            Value::String(s) => s.size_serialized(),
+            Value::Bool(b) => b.size_serialized(),
+        }
+    }
+
+    /// Deserializes a value from bytes using the provided type.
+    ///
+    /// Returns both the deserialized value and the remaining unconsumed bytes.
+    pub fn deserialize<'a>(
+        buffer: &'a [u8],
+        column_type: Type,
+    ) -> Result<(Self, &'a [u8]), DbSerializationError> {
+        match column_type {
+            Type::Bool => Self::deserialize_and_wrap(buffer, Value::Bool),
+            Type::I32 => Self::deserialize_and_wrap(buffer, Value::Int32),
+            Type::I64 => Self::deserialize_and_wrap(buffer, Value::Int64),
+            Type::F32 => Self::deserialize_and_wrap(buffer, Value::Float32),
+            Type::F64 => Self::deserialize_and_wrap(buffer, Value::Float64),
+            Type::Date => Self::deserialize_and_wrap(buffer, Value::Date),
+            Type::DateTime => Self::deserialize_and_wrap(buffer, Value::DateTime),
+            Type::String => Self::deserialize_and_wrap(buffer, Value::String),
+        }
+    }
+
+    /// Deserializes raw data type, wraps it into the corresponding value.
+    fn deserialize_and_wrap<'a, T, F>(
+        buffer: &'a [u8],
+        constructor: F,
+    ) -> Result<(Value, &'a [u8]), DbSerializationError>
+    where
+        T: DbSerializable,
+        F: FnOnce(T) -> Value,
+    {
+        T::deserialize(buffer).map(|(val, rest)| (constructor(val), rest))
+    }
+
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Value::Int32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::Int64(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Value::Float32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Float64(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            Value::String(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_date(&self) -> Option<&DbDate> {
+        match self {
+            Value::Date(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_datetime(&self) -> Option<&DbDateTime> {
+        match self {
+            Value::DateTime(v) => Some(v),
+            _ => None,
+        }
     }
 }
 

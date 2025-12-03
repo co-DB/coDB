@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cmp::Ordering, collections::HashMap, iter, mem};
+use std::{cmp::Ordering, collections::HashMap, iter, mem};
 
 use engine::{
     heap_file::{HeapFileError, RecordPtr},
@@ -16,6 +16,7 @@ use planner::{
         ResolvedTree,
     },
 };
+use types::data::Value;
 
 use crate::{
     Executor, InternalExecutorError, StatementResult, error_factory,
@@ -169,11 +170,11 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     ) -> Result<Vec<Record>, InternalExecutorError> {
         let mut e = None;
         records.sort_by(|lhs, rhs| {
-            let lhs_column = &lhs.fields[column_pos];
-            let rhs_column = &rhs.fields[column_pos];
+            let lhs_value = lhs.fields[column_pos].value();
+            let rhs_value = rhs.fields[column_pos].value();
             let cmp_res = match order {
-                SortOrder::Ascending => self.cmp_fields(lhs_column, rhs_column),
-                SortOrder::Descending => self.cmp_fields(rhs_column, lhs_column),
+                SortOrder::Ascending => self.cmp_fields(lhs_value, rhs_value),
+                SortOrder::Descending => self.cmp_fields(rhs_value, lhs_value),
             };
             match cmp_res {
                 Ok(cmp) => cmp,
@@ -241,7 +242,10 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                     .map(|select_col| {
                         let pos = select_col.rc.pos as usize;
                         match select_col.last {
-                            true => mem::replace(&mut source_fields[pos], Field::Bool(false)),
+                            true => {
+                                // We replace it with dummy field, in this case just Bool(false), but here could be anything - we won't use anymore
+                                mem::replace(&mut source_fields[pos], Value::Bool(false).into())
+                            }
                             false => source_fields[pos].clone(),
                         }
                     })
@@ -299,7 +303,10 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 e.execute_expression(expression)
             })
             .collect();
-        let fields = fields?.into_iter().map(Cow::into_owned).collect();
+        let fields = fields?
+            .into_iter()
+            .map(|value| Field::from(value.into_owned()))
+            .collect();
         let record = Record::new(fields);
         Ok(record)
     }
@@ -374,20 +381,20 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     }
 
     /// Compares `lhs` with `rhs`, returns an error if types don't match or values cannot be compared.
-    fn cmp_fields(&self, lhs: &Field, rhs: &Field) -> Result<Ordering, InternalExecutorError> {
+    fn cmp_fields(&self, lhs: &Value, rhs: &Value) -> Result<Ordering, InternalExecutorError> {
         match (lhs, rhs) {
-            (Field::Int32(lhs), Field::Int32(rhs)) => Ok(lhs.cmp(rhs)),
-            (Field::Int64(lhs), Field::Int64(rhs)) => Ok(lhs.cmp(rhs)),
-            (Field::Float32(lhs), Field::Float32(rhs)) => lhs.partial_cmp(rhs).ok_or_else(|| {
+            (Value::Int32(lhs), Value::Int32(rhs)) => Ok(lhs.cmp(rhs)),
+            (Value::Int64(lhs), Value::Int64(rhs)) => Ok(lhs.cmp(rhs)),
+            (Value::Float32(lhs), Value::Float32(rhs)) => lhs.partial_cmp(rhs).ok_or_else(|| {
                 error_factory::comparing_nan_values(lhs.to_string(), rhs.to_string())
             }),
-            (Field::Float64(lhs), Field::Float64(rhs)) => lhs.partial_cmp(rhs).ok_or_else(|| {
+            (Value::Float64(lhs), Value::Float64(rhs)) => lhs.partial_cmp(rhs).ok_or_else(|| {
                 error_factory::comparing_nan_values(lhs.to_string(), rhs.to_string())
             }),
-            (Field::Bool(lhs), Field::Bool(rhs)) => Ok(lhs.cmp(rhs)),
-            (Field::String(lhs), Field::String(rhs)) => Ok(lhs.cmp(rhs)),
-            (Field::Date(lhs), Field::Date(rhs)) => Ok(lhs.cmp(rhs)),
-            (Field::DateTime(lhs), Field::DateTime(rhs)) => Ok(lhs.cmp(rhs)),
+            (Value::Bool(lhs), Value::Bool(rhs)) => Ok(lhs.cmp(rhs)),
+            (Value::String(lhs), Value::String(rhs)) => Ok(lhs.cmp(rhs)),
+            (Value::Date(lhs), Value::Date(rhs)) => Ok(lhs.cmp(rhs)),
+            (Value::DateTime(lhs), Value::DateTime(rhs)) => Ok(lhs.cmp(rhs)),
             _ => Err(error_factory::incompatible_types(lhs, rhs)),
         }
     }

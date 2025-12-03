@@ -15,14 +15,17 @@ use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::{
-    record::{Field, Record, RecordError},
+    record::{Record, RecordError},
     slotted_page::{
         InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
         SlottedPageError, SlottedPageHeader, UpdateResult,
     },
 };
 
-use types::serialization::{DbSerializable, DbSerializationError};
+use types::{
+    data::Value,
+    serialization::{DbSerializable, DbSerializationError},
+};
 
 use storage::{
     cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedReadPage, PinnedWritePage},
@@ -407,24 +410,24 @@ impl<'d> RecordFragment<'d> {
 /// Struct used for describing update of single field.
 pub struct FieldUpdateDescriptor {
     column: ColumnMetadata,
-    field: Field,
+    value: Value,
 }
 
 impl FieldUpdateDescriptor {
     /// Creates new [`FieldUpdateDescriptor`].
     ///
-    /// Returns an error when `column` and `field` have different types.
+    /// Returns an error when `column` and `value` have different types.
     pub fn new(
         column: ColumnMetadata,
-        field: Field,
+        value: Value,
     ) -> Result<FieldUpdateDescriptor, HeapFileError> {
-        if column.ty() != field.ty() {
-            return Err(HeapFileError::ColumnAndFieldTypesDontMatch {
+        if column.ty() != value.ty() {
+            return Err(HeapFileError::ColumnAndValueTypesDontMatch {
                 column_ty: column.ty().to_string(),
-                field_ty: field.ty().to_string(),
+                field_ty: value.ty().to_string(),
             });
         }
-        Ok(FieldUpdateDescriptor { column, field })
+        Ok(FieldUpdateDescriptor { column, value })
     }
 }
 
@@ -814,7 +817,7 @@ pub enum HeapFileError {
     #[error("there was not enough space on page to perform request")]
     NotEnoughSpaceOnPage,
     #[error("column type ({column_ty}) and field type ({field_ty}) do not match")]
-    ColumnAndFieldTypesDontMatch { column_ty: String, field_ty: String },
+    ColumnAndValueTypesDontMatch { column_ty: String, field_ty: String },
     #[error("{0}")]
     DBSerializationError(#[from] DbSerializationError),
 }
@@ -997,9 +1000,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 // we just need to update bytes at that offset.
                 let offset = update.column.base_offset();
 
-                bytes_changed[offset..(offset + update.field.size_serialized())].fill(true);
+                bytes_changed[offset..(offset + update.value.size_serialized())].fill(true);
 
-                update.field.serialize_into(&mut data[offset..]);
+                update.value.serialize_into(&mut data[offset..]);
                 Ok(())
             }
             false => {
@@ -1020,15 +1023,15 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                     u16::deserialize(&data[offset..(offset + size_of::<u16>())])?;
                 let before_update_total_size = size_of::<u16>() + before_update_len as usize;
 
-                let mut serialized = Vec::with_capacity(update.field.size_serialized());
-                update.field.serialize(&mut serialized);
+                let mut serialized = Vec::with_capacity(update.value.size_serialized());
+                update.value.serialize(&mut serialized);
 
                 let bytes_changed_frag = vec![true; serialized.len()];
                 bytes_changed.splice(
                     offset..(offset + before_update_total_size),
                     bytes_changed_frag,
                 );
-                // When we update a string and its len changes we must update all fields that come after it
+                // When we update a string and its len changes we must update all values that come after it
                 if serialized.len() != before_update_total_size {
                     bytes_changed[(offset + serialized.len())..].fill(true);
                 }
@@ -1757,10 +1760,10 @@ mod tests {
     }
 
     /// Helpers for asserting field type
-
+    ///
     fn assert_string(expected: &str, actual: &Field) {
-        match actual {
-            Field::String(s) => {
+        match actual.into() {
+            Value::String(s) => {
                 assert_eq!(expected, s);
             }
             _ => panic!("expected String, got {:?}", actual),
@@ -1768,18 +1771,18 @@ mod tests {
     }
 
     fn assert_i32(expected: i32, actual: &Field) {
-        match actual {
-            Field::Int32(i) => {
-                assert_eq!(expected, *i);
+        match actual.into() {
+            Value::Int32(i) => {
+                assert_eq!(expected, i);
             }
             _ => panic!("expected Int32, got {:?}", actual),
         }
     }
 
     fn assert_i64(expected: i64, actual: &Field) {
-        match actual {
-            Field::Int64(i) => {
-                assert_eq!(expected, *i);
+        match actual.into() {
+            Value::Int64(i) => {
+                assert_eq!(expected, i);
             }
             _ => panic!("expected Int64, got {:?}", actual),
         }
@@ -1953,8 +1956,8 @@ mod tests {
 
     /// Helper to create a record with specific values
     fn create_custom_record_data(id: i32, name: &str) -> Vec<u8> {
-        let id_field = Field::Int32(id);
-        let name_field = Field::String(name.into());
+        let id_field = Value::Int32(id).into();
+        let name_field = Value::String(name.into()).into();
 
         let record = Record::new(vec![id_field, name_field]);
 
@@ -2575,7 +2578,10 @@ mod tests {
         drop(overflow_slotted);
 
         // Verify we can insert and read a record in the newly created file
-        let test_record = Record::new(vec![Field::Int32(42), Field::String("test".into())]);
+        let test_record = Record::new(vec![
+            Value::Int32(42).into(),
+            Value::String("test".into()).into(),
+        ]);
 
         let record_ptr = heap_file.insert(test_record).unwrap();
         assert_eq!(record_ptr.page_id, first_record_page);
@@ -2914,7 +2920,10 @@ mod tests {
         let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
         let heap_file = factory.create_heap_file().unwrap();
 
-        let record = Record::new(vec![Field::Int32(1), Field::String("test".into())]);
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("test".into()).into(),
+        ]);
         heap_file.insert(record).unwrap();
 
         let all_records = heap_file.all_records().unwrap();
@@ -2933,8 +2942,8 @@ mod tests {
 
         for i in 0..10 {
             let record = Record::new(vec![
-                Field::Int32(i),
-                Field::String(format!("record_{}", i)),
+                Value::Int32(i).into(),
+                Value::String(format!("record_{}", i)).into(),
             ]);
             heap_file.insert(record).unwrap();
         }
@@ -2964,14 +2973,17 @@ mod tests {
         let large_string = "x".repeat(large_string_size);
 
         // Insert first large record to fill first page
-        let record1 = Record::new(vec![Field::Int32(1), Field::String(large_string.clone())]);
+        let record1 = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String(large_string.clone()).into(),
+        ]);
         heap_file.insert(record1).unwrap();
 
         // Insert more records to trigger new page allocation
         for i in 2..=5 {
             let record = Record::new(vec![
-                Field::Int32(i),
-                Field::String(format!("record_{}", i)),
+                Value::Int32(i).into(),
+                Value::String(format!("record_{}", i)).into(),
             ]);
             heap_file.insert(record).unwrap();
         }
@@ -2982,8 +2994,8 @@ mod tests {
         // Verify all records are present (order may vary due to page allocation)
         let mut found_ids = all_records
             .iter()
-            .map(|r| match &r.fields[0] {
-                Field::Int32(id) => *id,
+            .map(|r| match (&r.fields[0]).into() {
+                Value::Int32(id) => id,
                 _ => panic!("Expected Int32"),
             })
             .collect::<Vec<_>>();
@@ -3006,17 +3018,26 @@ mod tests {
         let record_overhead = size_of::<u32>() + size_of::<u16>();
 
         // Insert small record
-        let small_record = Record::new(vec![Field::Int32(1), Field::String("small".into())]);
+        let small_record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("small".into()).into(),
+        ]);
         heap_file.insert(small_record).unwrap();
 
         // Insert large multi-fragment record
         let large_string_size = (2 * max_single_page_size) - record_overhead + 100;
         let large_string = "y".repeat(large_string_size);
-        let large_record = Record::new(vec![Field::Int32(2), Field::String(large_string.clone())]);
+        let large_record = Record::new(vec![
+            Value::Int32(2).into(),
+            Value::String(large_string.clone()).into(),
+        ]);
         heap_file.insert(large_record).unwrap();
 
         // Insert another small record
-        let small_record2 = Record::new(vec![Field::Int32(3), Field::String("small2".into())]);
+        let small_record2 = Record::new(vec![
+            Value::Int32(3).into(),
+            Value::String("small2".into()).into(),
+        ]);
         heap_file.insert(small_record2).unwrap();
 
         let all_records = heap_file.all_records().unwrap();
@@ -3025,8 +3046,8 @@ mod tests {
         // Find records by ID (order may vary)
         let record1 = all_records
             .iter()
-            .find(|r| match &r.fields[0] {
-                Field::Int32(1) => true,
+            .find(|r| match (&r.fields[0]).into() {
+                Value::Int32(1) => true,
                 _ => false,
             })
             .unwrap();
@@ -3034,8 +3055,8 @@ mod tests {
 
         let record2 = all_records
             .iter()
-            .find(|r| match &r.fields[0] {
-                Field::Int32(2) => true,
+            .find(|r| match (&r.fields[0]).into() {
+                Value::Int32(2) => true,
                 _ => false,
             })
             .unwrap();
@@ -3043,8 +3064,8 @@ mod tests {
 
         let record3 = all_records
             .iter()
-            .find(|r| match &r.fields[0] {
-                Field::Int32(3) => true,
+            .find(|r| match (&r.fields[0]).into() {
+                Value::Int32(3) => true,
                 _ => false,
             })
             .unwrap();
@@ -3062,8 +3083,8 @@ mod tests {
         let mut record_ptrs = vec![];
         for i in 0..5 {
             let record = Record::new(vec![
-                Field::Int32(i),
-                Field::String(format!("record_{}", i)),
+                Value::Int32(i).into(),
+                Value::String(format!("record_{}", i)).into(),
             ]);
             let ptr = heap_file.insert(record).unwrap();
             record_ptrs.push(ptr);
@@ -3078,8 +3099,8 @@ mod tests {
         // Verify remaining IDs (0, 2, 4)
         let mut found_ids = all_records
             .iter()
-            .map(|r| match &r.fields[0] {
-                Field::Int32(id) => *id,
+            .map(|r| match (&r.fields[0]).into() {
+                Value::Int32(id) => id,
                 _ => panic!("Expected Int32"),
             })
             .collect::<Vec<_>>();
@@ -3091,8 +3112,8 @@ mod tests {
         for id in [0, 2, 4] {
             let record = all_records
                 .iter()
-                .find(|r| match &r.fields[0] {
-                    Field::Int32(rid) => *rid == id,
+                .find(|r| match (&r.fields[0]).into() {
+                    Value::Int32(rid) => rid == id,
                     _ => false,
                 })
                 .unwrap();
@@ -3111,8 +3132,8 @@ mod tests {
         let mut record_ptrs = vec![];
         for i in 0..3 {
             let record = Record::new(vec![
-                Field::Int32(i),
-                Field::String(format!("original_{}", i)),
+                Value::Int32(i).into(),
+                Value::String(format!("original_{}", i)).into(),
             ]);
             let ptr = heap_file.insert(record).unwrap();
             record_ptrs.push(ptr);
@@ -3121,7 +3142,8 @@ mod tests {
         // Update record with ID 1
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String("updated_1".into())).unwrap();
+            FieldUpdateDescriptor::new(column_metadata, Value::String("updated_1".into()).into())
+                .unwrap();
         heap_file
             .update(&record_ptrs[1], vec![update_descriptor])
             .unwrap();
@@ -3133,8 +3155,8 @@ mod tests {
         for id in 0..3 {
             let record = all_records
                 .iter()
-                .find(|r| match &r.fields[0] {
-                    Field::Int32(rid) => *rid == id,
+                .find(|r| match (&r.fields[0]).into() {
+                    Value::Int32(rid) => rid == id,
                     _ => false,
                 })
                 .unwrap();
@@ -3157,8 +3179,8 @@ mod tests {
 
         for i in 0..20 {
             let record = Record::new(vec![
-                Field::Int32(i),
-                Field::String(format!("record_{}", i)),
+                Value::Int32(i).into(),
+                Value::String(format!("record_{}", i)).into(),
             ]);
             heap_file.insert(record).unwrap();
         }
@@ -3173,8 +3195,8 @@ mod tests {
                 // Verify all IDs are present
                 let mut found_ids = all_records
                     .iter()
-                    .map(|r| match &r.fields[0] {
-                        Field::Int32(id) => *id,
+                    .map(|r| match (&r.fields[0]).into() {
+                        Value::Int32(id) => id,
                         _ => panic!("Expected Int32"),
                     })
                     .collect::<Vec<_>>();
@@ -3554,8 +3576,8 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Insert a simple record
-        let id_field = Field::Int32(123);
-        let name_field = Field::String("test_user".into());
+        let id_field = Value::Int32(123).into();
+        let name_field = Value::String("test_user".into()).into();
         let record = Record::new(vec![id_field, name_field]);
 
         let record_ptr = heap_file.insert(record).unwrap();
@@ -3604,8 +3626,8 @@ mod tests {
         let large_string_size = max_record_size_on_single_page - record_overhead;
         let large_string = "x".repeat(large_string_size);
 
-        let id_field = Field::Int32(999);
-        let name_field = Field::String(large_string.clone());
+        let id_field = Value::Int32(999).into();
+        let name_field = Value::String(large_string.clone()).into();
         let record = Record::new(vec![id_field, name_field]);
 
         let record_ptr = heap_file.insert(record).unwrap();
@@ -3653,8 +3675,8 @@ mod tests {
         let large_string_size = max_single_page_size - record_overhead + 500;
         let large_string = "y".repeat(large_string_size);
 
-        let id_field = Field::Int32(777);
-        let name_field = Field::String(large_string.clone());
+        let id_field = Value::Int32(777).into();
+        let name_field = Value::String(large_string.clone()).into();
         let record = Record::new(vec![id_field, name_field]);
 
         let record_ptr = heap_file.insert(record).unwrap();
@@ -3728,8 +3750,8 @@ mod tests {
         let large_string_size = (3 * max_single_page_size) - record_overhead + 100;
         let large_string = "z".repeat(large_string_size);
 
-        let id_field = Field::Int32(555);
-        let name_field = Field::String(large_string.clone());
+        let id_field = Value::Int32(555).into();
+        let name_field = Value::String(large_string.clone()).into();
         let record = Record::new(vec![id_field, name_field]);
 
         let record_ptr = heap_file.insert(record).unwrap();
@@ -3789,7 +3811,10 @@ mod tests {
         let large_string_size = max_single_page_size - record_overhead;
         let large_string = "x".repeat(large_string_size);
 
-        let large_record = Record::new(vec![Field::Int32(1), Field::String(large_string.clone())]);
+        let large_record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String(large_string.clone()).into(),
+        ]);
 
         let first_record_ptr = heap_file.insert(large_record).unwrap();
         assert_eq!(first_record_ptr.page_id, first_record_page_id);
@@ -3797,8 +3822,8 @@ mod tests {
 
         // Insert a small record that won't fit in the remaining space
         let small_record = Record::new(vec![
-            Field::Int32(2),
-            Field::String("this_record_should_trigger_new_page".into()),
+            Value::Int32(2).into(),
+            Value::String("this_record_should_trigger_new_page".into()).into(),
         ]);
 
         let second_record_ptr = heap_file.insert(small_record).unwrap();
@@ -3846,13 +3871,13 @@ mod tests {
         let heap_file = Arc::new(factory.create_heap_file().unwrap());
 
         let record1 = Record::new(vec![
-            Field::Int32(100),
-            Field::String("thread_1_record".into()),
+            Value::Int32(100).into(),
+            Value::String("thread_1_record".into()).into(),
         ]);
 
         let record2 = Record::new(vec![
-            Field::Int32(200),
-            Field::String("thread_2_record".into()),
+            Value::Int32(200).into(),
+            Value::String("thread_2_record".into()).into(),
         ]);
 
         // Spawn two threads to insert records concurrently
@@ -3911,11 +3936,17 @@ mod tests {
         let large_string = "x".repeat(large_string_size);
 
         // Fill the first page completely
-        let large_record = Record::new(vec![Field::Int32(1), Field::String(large_string)]);
+        let large_record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String(large_string).into(),
+        ]);
         heap_file.insert(large_record).unwrap();
 
         // Insert small record to trigger new page allocation
-        let small_record = Record::new(vec![Field::Int32(2), Field::String("small".into())]);
+        let small_record = Record::new(vec![
+            Value::Int32(2).into(),
+            Value::String("small".into()).into(),
+        ]);
         heap_file.insert(small_record).unwrap();
 
         // Verify metadata is now dirty
@@ -3958,8 +3989,8 @@ mod tests {
 
         // Insert a simple record
         let original_record = Record::new(vec![
-            Field::Int32(100),
-            Field::String("original_name".into()),
+            Value::Int32(100).into(),
+            Value::String("original_name".into()).into(),
         ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
@@ -3967,7 +3998,7 @@ mod tests {
         // Update the Int32 field
         let column_metadata = heap_file.columns_metadata[0].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::Int32(200)).unwrap();
+            FieldUpdateDescriptor::new(column_metadata, Value::Int32(200)).unwrap();
 
         heap_file
             .update(&record_ptr, vec![update_descriptor])
@@ -4014,21 +4045,21 @@ mod tests {
         let large_string = "x".repeat(large_string_size);
 
         let original_record = Record::new(vec![
-            Field::Int32(100),
-            Field::Int32(25),
-            Field::Int64(1000),
-            Field::String(large_string.clone()),
+            Value::Int32(100).into(),
+            Value::Int32(25).into(),
+            Value::Int64(1000).into(),
+            Value::String(large_string.clone()).into(),
         ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
         // Update multiple fixed-size fields
         let update_id =
-            FieldUpdateDescriptor::new(columns_metadata[0].clone(), Field::Int32(200)).unwrap();
+            FieldUpdateDescriptor::new(columns_metadata[0].clone(), Value::Int32(200)).unwrap();
         let update_age =
-            FieldUpdateDescriptor::new(columns_metadata[1].clone(), Field::Int32(30)).unwrap();
+            FieldUpdateDescriptor::new(columns_metadata[1].clone(), Value::Int32(30)).unwrap();
         let update_score =
-            FieldUpdateDescriptor::new(columns_metadata[2].clone(), Field::Int64(2000)).unwrap();
+            FieldUpdateDescriptor::new(columns_metadata[2].clone(), Value::Int64(2000)).unwrap();
 
         heap_file
             .update(&record_ptr, vec![update_id, update_age, update_score])
@@ -4054,8 +4085,8 @@ mod tests {
 
         // Insert a simple record
         let original_record = Record::new(vec![
-            Field::Int32(100),
-            Field::String("original_name".into()),
+            Value::Int32(100).into(),
+            Value::String("original_name".into()).into(),
         ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
@@ -4063,7 +4094,7 @@ mod tests {
         // Update the String field with same length string
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String("0RIGIN4L_name".into()))
+            FieldUpdateDescriptor::new(column_metadata, Value::String("0RIGIN4L_name".into()))
                 .unwrap();
 
         heap_file
@@ -4088,8 +4119,8 @@ mod tests {
 
         // Insert a record with a longer string
         let original_record = Record::new(vec![
-            Field::Int32(100),
-            Field::String("original_long_name".into()),
+            Value::Int32(100).into(),
+            Value::String("original_long_name".into()).into(),
         ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
@@ -4097,7 +4128,7 @@ mod tests {
         // Update the String field with a shorter string
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String("short".into())).unwrap();
+            FieldUpdateDescriptor::new(column_metadata, Value::String("short".into())).unwrap();
 
         heap_file
             .update(&record_ptr, vec![update_descriptor])
@@ -4120,7 +4151,10 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Insert a record with a short string
-        let original_record = Record::new(vec![Field::Int32(100), Field::String("short".into())]);
+        let original_record = Record::new(vec![
+            Value::Int32(100).into(),
+            Value::String("short".into()).into(),
+        ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
@@ -4129,7 +4163,7 @@ mod tests {
             "this_is_a_much_longer_string_than_the_original_one_but_still_fits_in_single_page";
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String(longer_string.into()))
+            FieldUpdateDescriptor::new(column_metadata, Value::String(longer_string.into()).into())
                 .unwrap();
 
         heap_file
@@ -4153,7 +4187,10 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Insert a record with a short string
-        let original_record = Record::new(vec![Field::Int32(100), Field::String("short".into())]);
+        let original_record = Record::new(vec![
+            Value::Int32(100).into(),
+            Value::String("short".into()).into(),
+        ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
@@ -4173,7 +4210,7 @@ mod tests {
 
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String(very_large_string.clone()))
+            FieldUpdateDescriptor::new(column_metadata, Value::String(very_large_string.clone()))
                 .unwrap();
 
         heap_file
@@ -4232,8 +4269,10 @@ mod tests {
         let large_string_size = max_single_page_size - record_overhead + 500;
         let large_string = "x".repeat(large_string_size);
 
-        let original_record =
-            Record::new(vec![Field::Int32(100), Field::String(large_string.clone())]);
+        let original_record = Record::new(vec![
+            Value::Int32(100).into(),
+            Value::String(large_string.clone()).into(),
+        ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
@@ -4261,7 +4300,7 @@ mod tests {
         let small_string = "tiny";
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String(small_string.into()))
+            FieldUpdateDescriptor::new(column_metadata, Value::String(small_string.into()))
                 .unwrap();
 
         heap_file
@@ -4322,8 +4361,8 @@ mod tests {
         let initial_string = "x".repeat(initial_string_size);
 
         let original_record = Record::new(vec![
-            Field::Int32(100),
-            Field::String(initial_string.clone()),
+            Value::Int32(100).into(),
+            Value::String(initial_string.clone()).into(),
         ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
@@ -4334,7 +4373,7 @@ mod tests {
 
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String(updated_string.clone()))
+            FieldUpdateDescriptor::new(column_metadata, Value::String(updated_string.clone()))
                 .unwrap();
 
         heap_file
@@ -4393,8 +4432,8 @@ mod tests {
         let initial_string = "x".repeat(initial_string_size);
 
         let original_record = Record::new(vec![
-            Field::Int32(100),
-            Field::String(initial_string.clone()),
+            Value::Int32(100).into(),
+            Value::String(initial_string.clone()).into(),
         ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
@@ -4425,7 +4464,7 @@ mod tests {
 
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String(updated_string.clone()))
+            FieldUpdateDescriptor::new(column_metadata, Value::String(updated_string.clone()))
                 .unwrap();
 
         heap_file
@@ -4496,9 +4535,9 @@ mod tests {
 
         // Insert a record with three small strings
         let original_record = Record::new(vec![
-            Field::String("John".into()),
-            Field::String("Middle".into()),
-            Field::String("Doe".into()),
+            Value::String("John".into()).into(),
+            Value::String("Middle".into()).into(),
+            Value::String("Doe".into()).into(),
         ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
@@ -4512,7 +4551,7 @@ mod tests {
 
         let column_metadata = columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String(large_middle_name.clone()))
+            FieldUpdateDescriptor::new(column_metadata, Value::String(large_middle_name.clone()))
                 .unwrap();
 
         heap_file
@@ -4552,9 +4591,9 @@ mod tests {
 
         // Insert a record with small first/last names and large middle name
         let original_record = Record::new(vec![
-            Field::String("John".into()),
-            Field::String(large_middle_name.clone()),
-            Field::String("Doe".into()),
+            Value::String("John".into()).into(),
+            Value::String(large_middle_name.clone()).into(),
+            Value::String("Doe".into()).into(),
         ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
@@ -4564,7 +4603,7 @@ mod tests {
 
         let column_metadata = columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Field::String(small_middle_name.into()))
+            FieldUpdateDescriptor::new(column_metadata, Value::String(small_middle_name.into()))
                 .unwrap();
 
         heap_file
@@ -4609,7 +4648,7 @@ mod tests {
         let original_record = Record::new(
             original_strings
                 .iter()
-                .map(|s| Field::String(s.to_string()))
+                .map(|s| Value::String(s.to_string()).into())
                 .collect(),
         );
 
@@ -4623,7 +4662,7 @@ mod tests {
             .iter()
             .zip(updated_strings.iter())
             .map(|(col, s)| {
-                FieldUpdateDescriptor::new(col.clone(), Field::String(s.clone())).unwrap()
+                FieldUpdateDescriptor::new(col.clone(), Value::String(s.clone())).unwrap()
             })
             .collect();
 
@@ -4666,9 +4705,9 @@ mod tests {
         let initial_field3 = "C".repeat(field_size);
 
         let initial_record = Record::new(vec![
-            Field::String(initial_field1.clone()),
-            Field::String(initial_field2.clone()),
-            Field::String(initial_field3.clone()),
+            Value::String(initial_field1.clone()).into(),
+            Value::String(initial_field2.clone()).into(),
+            Value::String(initial_field3.clone()).into(),
         ]);
 
         let record_ptr = heap_file.insert(initial_record).unwrap();
@@ -4705,14 +4744,14 @@ mod tests {
                     assert_eq!(record.fields.len(), 3,);
 
                     // Try to match ABC pattern
-                    let is_abc_pattern = matches!(&record.fields[0], Field::String(s) if s == &exp_f1_abc)
-                        && matches!(&record.fields[1], Field::String(s) if s == &exp_f2_abc)
-                        && matches!(&record.fields[2], Field::String(s) if s == &exp_f3_abc);
+                    let is_abc_pattern = matches!((&record.fields[0]).into(), Value::String(s) if s == exp_f1_abc)
+                        && matches!((&record.fields[1]).into(), Value::String(s) if s == exp_f2_abc)
+                        && matches!((&record.fields[2]).into(), Value::String(s) if s == exp_f3_abc);
 
                     // Try to match XYZ pattern
-                    let is_xyz_pattern = matches!(&record.fields[0], Field::String(s) if s == &exp_f1_xyz)
-                        && matches!(&record.fields[1], Field::String(s) if s == &exp_f2_xyz)
-                        && matches!(&record.fields[2], Field::String(s) if s == &exp_f3_xyz);
+                    let is_xyz_pattern = matches!((&record.fields[0]).into(), Value::String(s) if s == exp_f1_xyz)
+                        && matches!((&record.fields[1]).into(), Value::String(s) if s == exp_f2_xyz)
+                        && matches!((&record.fields[2]).into(), Value::String(s) if s == exp_f3_xyz);
 
                     assert!(is_abc_pattern || is_xyz_pattern,);
 
@@ -4743,11 +4782,11 @@ mod tests {
                     let updated_field3 = char3.to_string().repeat(field_size);
 
                     let update_descriptors = vec![
-                        FieldUpdateDescriptor::new(cols[0].clone(), Field::String(updated_field1))
+                        FieldUpdateDescriptor::new(cols[0].clone(), Value::String(updated_field1))
                             .unwrap(),
-                        FieldUpdateDescriptor::new(cols[1].clone(), Field::String(updated_field2))
+                        FieldUpdateDescriptor::new(cols[1].clone(), Value::String(updated_field2))
                             .unwrap(),
-                        FieldUpdateDescriptor::new(cols[2].clone(), Field::String(updated_field3))
+                        FieldUpdateDescriptor::new(cols[2].clone(), Value::String(updated_field3))
                             .unwrap(),
                     ];
 
@@ -4772,13 +4811,13 @@ mod tests {
         let final_record = heap_file.record(&record_ptr).unwrap();
         assert_eq!(final_record.fields.len(), 3);
 
-        let is_abc = matches!(&final_record.fields[0], Field::String(s) if s == &expected_field1_abc)
-            && matches!(&final_record.fields[1], Field::String(s) if s == &expected_field2_abc)
-            && matches!(&final_record.fields[2], Field::String(s) if s == &expected_field3_abc);
+        let is_abc = matches!((&final_record.fields[0]).into(), Value::String(s) if s == expected_field1_abc)
+            && matches!((&final_record.fields[1]).into(), Value::String(s) if s == expected_field2_abc)
+            && matches!((&final_record.fields[2]).into(), Value::String(s) if s == expected_field3_abc);
 
-        let is_xyz = matches!(&final_record.fields[0], Field::String(s) if s == &expected_field1_xyz)
-            && matches!(&final_record.fields[1], Field::String(s) if s == &expected_field2_xyz)
-            && matches!(&final_record.fields[2], Field::String(s) if s == &expected_field3_xyz);
+        let is_xyz = matches!((&final_record.fields[0]).into(), Value::String(s) if s == expected_field1_xyz)
+            && matches!((&final_record.fields[1]).into(), Value::String(s) if s == expected_field2_xyz)
+            && matches!((&final_record.fields[2]).into(), Value::String(s) if s == expected_field3_xyz);
 
         assert!(is_abc || is_xyz);
     }
@@ -4795,8 +4834,10 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Insert a simple record
-        let original_record =
-            Record::new(vec![Field::Int32(100), Field::String("test_record".into())]);
+        let original_record = Record::new(vec![
+            Value::Int32(100).into(),
+            Value::String("test_record".into()).into(),
+        ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
@@ -4831,7 +4872,10 @@ mod tests {
         let large_string_size = (2 * max_single_page_size) - record_overhead + 100;
         let large_string = "x".repeat(large_string_size);
 
-        let original_record = Record::new(vec![Field::Int32(42), Field::String(large_string)]);
+        let original_record = Record::new(vec![
+            Value::Int32(42).into(),
+            Value::String(large_string).into(),
+        ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
@@ -4900,8 +4944,10 @@ mod tests {
         let large_string_size = (3 * max_single_page_size) - record_overhead + 100;
         let large_string = "x".repeat(large_string_size);
 
-        let original_record =
-            Record::new(vec![Field::Int32(42), Field::String(large_string.clone())]);
+        let original_record = Record::new(vec![
+            Value::Int32(42).into(),
+            Value::String(large_string.clone()).into(),
+        ]);
 
         let record_ptr = heap_file.insert(original_record).unwrap();
 
@@ -4993,8 +5039,10 @@ mod tests {
                     let record_id = (thread_id * records_per_thread + i) as i32;
                     let name = format!("thread_{}_record_{}", thread_id, i);
 
-                    let record =
-                        Record::new(vec![Field::Int32(record_id), Field::String(name.clone())]);
+                    let record = Record::new(vec![
+                        Value::Int32(record_id).into(),
+                        Value::String(name.clone()).into(),
+                    ]);
 
                     match heap_file_clone.insert(record) {
                         Ok(ptr) => {
@@ -5143,9 +5191,9 @@ mod tests {
                                 continue;
                             }
 
-                            match &record.fields[0] {
-                                Field::Int32(id) if *id == *expected_id => {}
-                                Field::Int32(id) => {
+                            match (&record.fields[0]).into() {
+                                Value::Int32(id) if id == *expected_id => {}
+                                Value::Int32(id) => {
                                     println!(
                                         "[Verify chunk {}] Wrong ID at idx {}: expected {}, got {}",
                                         chunk_idx, idx, expected_id, id
@@ -5170,9 +5218,9 @@ mod tests {
                                 }
                             }
 
-                            match &record.fields[1] {
-                                Field::String(name) if name == expected_name => {}
-                                Field::String(name) => {
+                            match (&record.fields[1]).into() {
+                                Value::String(name) if &name == expected_name => {}
+                                Value::String(name) => {
                                     println!(
                                         "[Verify chunk {}] Wrong name at idx {}: expected {}, got {}",
                                         chunk_idx, idx, expected_name, name
@@ -5246,9 +5294,9 @@ mod tests {
         // Verify no duplicate IDs
         let mut seen_ids = HashSet::new();
         for record in &all_records {
-            match &record.fields[0] {
-                Field::Int32(id) => {
-                    assert!(seen_ids.insert(*id), "Found duplicate record ID: {}", id);
+            match (&record.fields[0]).into() {
+                Value::Int32(id) => {
+                    assert!(seen_ids.insert(id), "Found duplicate record ID: {}", id);
                 }
                 _ => panic!("Expected Int32 field"),
             }

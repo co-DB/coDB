@@ -4,7 +4,7 @@ use protocol::text_protocol::{
     ColumnMetadata, ColumnType, Date, DateTime, Field, Record, StatementType,
 };
 use types::{
-    data::{DbDate, DbDateTime},
+    data::{DbDate, DbDateTime, Value},
     schema::Type,
 };
 
@@ -50,15 +50,15 @@ impl IntoTextProtocol<Record> for EngineRecord {
 
 impl IntoTextProtocol<Field> for EngineField {
     fn into_text_protocol(self) -> Field {
-        match self {
-            EngineField::Int32(i) => Field::Int32(i),
-            EngineField::Int64(i) => Field::Int64(i),
-            EngineField::Float32(f) => Field::Float32(f),
-            EngineField::Float64(f) => Field::Float64(f),
-            EngineField::DateTime(dt) => Field::DateTime(dt.into_text_protocol()),
-            EngineField::Date(d) => Field::Date(d.into_text_protocol()),
-            EngineField::String(s) => Field::String(s),
-            EngineField::Bool(b) => Field::Bool(b),
+        match self.into() {
+            Value::Int32(i) => Field::Int32(i),
+            Value::Int64(i) => Field::Int64(i),
+            Value::Float32(f) => Field::Float32(f),
+            Value::Float64(f) => Field::Float64(f),
+            Value::DateTime(dt) => Field::DateTime(dt.into_text_protocol()),
+            Value::Date(d) => Field::Date(d.into_text_protocol()),
+            Value::String(s) => Field::String(s),
+            Value::Bool(b) => Field::Bool(b),
         }
     }
 }

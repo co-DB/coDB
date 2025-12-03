@@ -1,8 +1,8 @@
 //! error_factory - provides helpers for creating errors across `executor` crate.
 
-use engine::{heap_file::HeapFileError, record::Field};
+use engine::heap_file::HeapFileError;
 use thiserror::Error;
-use types::schema::Type;
+use types::{data::Value, schema::Type};
 
 use crate::StatementResult;
 
@@ -38,14 +38,14 @@ pub(crate) fn runtime_error(msg: impl Into<String>) -> StatementResult {
     StatementResult::RuntimeError { error: msg.into() }
 }
 
-pub(crate) fn unexpected_type(expected: impl Into<String>, got: &Field) -> InternalExecutorError {
+pub(crate) fn unexpected_type(expected: impl Into<String>, got: &Value) -> InternalExecutorError {
     InternalExecutorError::UnexpectedType {
         expected: expected.into(),
         got: format!("{:?}", got),
     }
 }
 
-pub(crate) fn incompatible_types(lhs: &Field, rhs: &Field) -> InternalExecutorError {
+pub(crate) fn incompatible_types(lhs: &Value, rhs: &Value) -> InternalExecutorError {
     InternalExecutorError::IncompatibleTypes {
         lhs: format!("{:?}", lhs),
         rhs: format!("{:?}", rhs),
@@ -64,7 +64,7 @@ pub(crate) fn div_by_zero() -> InternalExecutorError {
     }
 }
 
-pub(crate) fn invalid_cast(child: &Field, new_type: &Type) -> InternalExecutorError {
+pub(crate) fn invalid_cast(child: &Value, new_type: &Type) -> InternalExecutorError {
     InternalExecutorError::InvalidCast {
         from: child.ty().to_string(),
         to: new_type.to_string(),

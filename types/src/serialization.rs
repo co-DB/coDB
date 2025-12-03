@@ -208,3 +208,196 @@ impl DbSerializableFixedSize for DbDateTime {
         size_of::<i32>() + size_of::<u32>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{f32, f64};
+
+    use crate::{data::Value, schema::Type};
+
+    use super::*;
+
+    #[test]
+    fn fails_when_buffer_smaller_than_expected() {
+        let buffer = [0x32, 0x33];
+        let result = Value::deserialize(&buffer, Type::I32);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DbSerializationError::UnexpectedEnd { .. })
+        ));
+    }
+
+    #[test]
+    fn fails_when_string_bytes_are_invalid_utf8() {
+        let buffer = [0x02, 0x00, 0xC2, 0x00];
+        let result = Value::deserialize(&buffer, Type::String);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DbSerializationError::FailedToDeserialize { .. })
+        ));
+    }
+
+    #[test]
+    fn fails_when_string_length_is_too_big() {
+        let buffer = [0x03, 0x00, 0x01, 0x01];
+        let result = Value::deserialize(&buffer, Type::String);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DbSerializationError::UnexpectedEnd { .. })
+        ));
+    }
+
+    #[test]
+    fn fails_when_deserializing_string_from_1_byte() {
+        let buffer = [0x01];
+        let result = Value::deserialize(&buffer, Type::String);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DbSerializationError::UnexpectedEnd { .. })
+        ));
+    }
+
+    #[test]
+    fn fails_for_invalid_bool() {
+        let buffer = [0x02];
+        let result = Value::deserialize(&buffer, Type::Bool);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DbSerializationError::FailedToDeserialize { .. })
+        ));
+    }
+
+    #[test]
+    fn serializing_fixed_length_types_works() {
+        let test_cases = [
+            (Value::Int32(0x12345678), vec![0x78, 0x56, 0x34, 0x12]),
+            (
+                Value::Int64(0x123456789ABCDEF0),
+                vec![0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12],
+            ),
+            (
+                Value::Float32(f32::consts::PI),
+                f32::consts::PI.to_le_bytes().to_vec(),
+            ),
+            (
+                Value::Float64(-f64::consts::E),
+                (-f64::consts::E).to_le_bytes().to_vec(),
+            ),
+            (Value::Bool(true), vec![0x01]),
+            (Value::Bool(false), vec![0x00]),
+            (
+                Value::Date(DbDate::new(19000)),
+                19000i32.to_le_bytes().to_vec(),
+            ),
+            (
+                Value::DateTime(DbDateTime::new(DbDate::new(1234), 451)),
+                [1234i32.to_le_bytes(), 451u32.to_le_bytes()].concat(),
+            ),
+        ];
+
+        for (field, expected_bytes) in test_cases {
+            let mut buffer = Vec::new();
+            field.serialize(&mut buffer);
+            assert_eq!(buffer, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn serializing_strings_works() {
+        let string = "field 1 where id = 1";
+        let field = Value::String(string.into());
+        let mut buffer = Vec::new();
+        field.serialize(&mut buffer);
+        let buffer_len: [u8; 2] = buffer[0..2].try_into().unwrap();
+        assert_eq!(u16::from_le_bytes(buffer_len), string.len() as u16);
+        let string_bytes = &buffer[2..];
+        assert_eq!(string_bytes, string.as_bytes());
+    }
+
+    #[test]
+    fn test_deserialize_known_bytes() {
+        let buffer: Vec<u8> = vec![
+            42, 0, 0, 0, // Int32(42)
+            1, // Bool(true)
+            2, 0, 72, 105, // String("Hi")
+            0, 0, 0, 0, 0, 0, 4, 64, // Float64(2.5)
+        ];
+
+        let mut rest = buffer.as_slice();
+        let test_cases = [
+            (Type::I32, Value::Int32(42)),
+            (Type::Bool, Value::Bool(true)),
+            (Type::String, Value::String("Hi".into())),
+            (Type::F64, Value::Float64(2.5)),
+        ];
+
+        for case in test_cases {
+            let (field, r) = Value::deserialize(rest, case.0).unwrap();
+            assert_eq!(field, case.1);
+            rest = r;
+        }
+
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn deserialize_empty_string() {
+        let buffer = [0x00, 0x00];
+        let (field, rest) = Value::deserialize(&buffer, Type::String).unwrap();
+        assert_eq!(field, Value::String("".into()));
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn serialize_into_fixed_length_types_works() {
+        let test_cases = [
+            (Value::Int32(0x12345678), vec![0x78, 0x56, 0x34, 0x12]),
+            (
+                Value::Int64(0x123456789ABCDEF0),
+                vec![0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12],
+            ),
+            (
+                Value::Float32(f32::consts::PI),
+                f32::consts::PI.to_le_bytes().to_vec(),
+            ),
+            (
+                Value::Float64(-f64::consts::E),
+                (-f64::consts::E).to_le_bytes().to_vec(),
+            ),
+            (Value::Bool(true), vec![0x01]),
+            (Value::Bool(false), vec![0x00]),
+            (
+                Value::Date(DbDate::new(19000)),
+                19000i32.to_le_bytes().to_vec(),
+            ),
+            (
+                Value::DateTime(DbDateTime::new(DbDate::new(1234), 451)),
+                [1234i32.to_le_bytes(), 451u32.to_le_bytes()].concat(),
+            ),
+        ];
+
+        for (field, expected_bytes) in test_cases {
+            let mut buffer = vec![0u8; expected_bytes.len()];
+            field.serialize_into(&mut buffer);
+            assert_eq!(buffer, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn serialize_into_strings_works() {
+        let string = "field 1 where id = 1";
+        let field = Value::String(string.into());
+        let mut buffer = vec![0u8; 2 + string.len()];
+        field.serialize_into(&mut buffer);
+
+        let buffer_len: [u8; 2] = buffer[0..2].try_into().unwrap();
+        assert_eq!(u16::from_le_bytes(buffer_len), string.len() as u16);
+        let string_bytes = &buffer[2..];
+        assert_eq!(string_bytes, string.as_bytes());
+    }
+}

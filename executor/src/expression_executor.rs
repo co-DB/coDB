@@ -10,7 +10,7 @@ use planner::{
     },
 };
 use types::{
-    data::{DbDate, DbDateTime},
+    data::{DbDate, DbDateTime, Value},
     schema::Type,
 };
 
@@ -88,7 +88,7 @@ where
     pub(crate) fn execute_expression(
         &self,
         expression: ResolvedNodeId,
-    ) -> Result<Cow<'r, Field>, InternalExecutorError> {
+    ) -> Result<Cow<'r, Value>, InternalExecutorError> {
         let node = self.ast.node(expression);
         match node {
             ResolvedExpression::ColumnRef(column) => self.execute_column_ref(column),
@@ -104,26 +104,26 @@ where
     fn execute_column_ref(
         &self,
         column: &'r ResolvedColumn,
-    ) -> Result<Cow<'r, Field>, InternalExecutorError> {
+    ) -> Result<Cow<'r, Value>, InternalExecutorError> {
         let table_name = self.table_name(column.table)?;
         self.context
             .get_field(table_name, column.pos)
-            .map(Cow::Borrowed)
+            .map(|field| Cow::Borrowed(field.value()))
             .ok_or(error_factory::cannot_load_column_from_context(&column.name))
     }
 
     fn execute_logical(
         &self,
         logical: &ResolvedLogicalExpression,
-    ) -> Result<Cow<'r, Field>, InternalExecutorError> {
+    ) -> Result<Cow<'r, Value>, InternalExecutorError> {
         let left_expr = self.execute_expression(logical.left)?;
         let left = left_expr
             .as_bool()
             .ok_or(error_factory::unexpected_type("bool", &left_expr))?;
 
         match logical.op {
-            LogicalOperator::And if !left => return Ok(Cow::Owned(Field::Bool(false))),
-            LogicalOperator::Or if left => return Ok(Cow::Owned(Field::Bool(true))),
+            LogicalOperator::And if !left => return Ok(Cow::Owned(Value::Bool(false))),
+            LogicalOperator::Or if left => return Ok(Cow::Owned(Value::Bool(true))),
             _ => {}
         }
 
@@ -136,13 +136,13 @@ where
             LogicalOperator::Or => left || right,
         };
 
-        Ok(Cow::Owned(Field::Bool(result)))
+        Ok(Cow::Owned(Value::Bool(result)))
     }
 
     fn execute_binary(
         &self,
         binary: &ResolvedBinaryExpression,
-    ) -> Result<Cow<'r, Field>, InternalExecutorError> {
+    ) -> Result<Cow<'r, Value>, InternalExecutorError> {
         let left = self.execute_expression(binary.left)?;
         let right = self.execute_expression(binary.right)?;
 
@@ -155,8 +155,8 @@ where
             BinaryOperator::Star => self.arithmetic_mul(lhs, rhs)?,
             BinaryOperator::Slash => self.arithmetic_div(lhs, rhs)?,
             BinaryOperator::Modulo => self.arithmetic_mod(lhs, rhs)?,
-            BinaryOperator::Equal => Field::Bool(lhs == rhs),
-            BinaryOperator::NotEqual => Field::Bool(lhs != rhs),
+            BinaryOperator::Equal => Value::Bool(lhs == rhs),
+            BinaryOperator::NotEqual => Value::Bool(lhs != rhs),
             BinaryOperator::Greater => self.compare_lt(rhs, lhs)?,
             BinaryOperator::GreaterEqual => self.compare_lte(rhs, lhs)?,
             BinaryOperator::Less => self.compare_lt(lhs, rhs)?,
@@ -169,7 +169,7 @@ where
     fn execute_unary(
         &self,
         unary: &ResolvedUnaryExpression,
-    ) -> Result<Cow<'r, Field>, InternalExecutorError> {
+    ) -> Result<Cow<'r, Value>, InternalExecutorError> {
         let expr = self.execute_expression(unary.expression)?;
         let value = expr.as_ref();
         let result = match unary.op {
@@ -180,181 +180,181 @@ where
         Ok(Cow::Owned(result))
     }
 
-    fn execute_cast(&self, cast: &ResolvedCast) -> Result<Cow<'r, Field>, InternalExecutorError> {
+    fn execute_cast(&self, cast: &ResolvedCast) -> Result<Cow<'r, Value>, InternalExecutorError> {
         let child = self.execute_expression(cast.child)?;
         let child = child.as_ref();
-        let field = match (child, cast.new_ty) {
-            (Field::Int32(previous), Type::I64) => Field::Int64(*previous as i64),
-            (Field::Float32(previous), Type::F64) => Field::Float64(*previous as f64),
+        let value = match (child, cast.new_ty) {
+            (Value::Int32(previous), Type::I64) => Value::Int64(*previous as i64),
+            (Value::Float32(previous), Type::F64) => Value::Float64(*previous as f64),
             _ => return Err(error_factory::invalid_cast(child, &cast.new_ty)),
         };
-        Ok(Cow::Owned(field))
+        Ok(Cow::Owned(value))
     }
 
     fn execute_literal(
         &self,
         literal: &ResolvedLiteral,
-    ) -> Result<Cow<'r, Field>, InternalExecutorError> {
+    ) -> Result<Cow<'r, Value>, InternalExecutorError> {
         let field = match literal {
-            ResolvedLiteral::String(s) => Field::String(s.clone()),
-            ResolvedLiteral::Float32(f32) => Field::Float32(*f32),
-            ResolvedLiteral::Float64(f64) => Field::Float64(*f64),
-            ResolvedLiteral::Int32(i32) => Field::Int32(*i32),
-            ResolvedLiteral::Int64(i64) => Field::Int64(*i64),
-            ResolvedLiteral::Bool(b) => Field::Bool(*b),
-            ResolvedLiteral::Date(date) => Field::Date(DbDate::from(*date)),
+            ResolvedLiteral::String(s) => Value::String(s.clone()),
+            ResolvedLiteral::Float32(f32) => Value::Float32(*f32),
+            ResolvedLiteral::Float64(f64) => Value::Float64(*f64),
+            ResolvedLiteral::Int32(i32) => Value::Int32(*i32),
+            ResolvedLiteral::Int64(i64) => Value::Int64(*i64),
+            ResolvedLiteral::Bool(b) => Value::Bool(*b),
+            ResolvedLiteral::Date(date) => Value::Date(DbDate::from(*date)),
             ResolvedLiteral::DateTime(primitive_date_time) => {
-                Field::DateTime(DbDateTime::from(*primitive_date_time))
+                Value::DateTime(DbDateTime::from(*primitive_date_time))
             }
         };
         Ok(Cow::Owned(field))
     }
 
     /// Computes `lhs + rhs`.
-    fn arithmetic_add(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
-        let field = match (lhs, rhs) {
-            (Field::Int32(lhs), Field::Int32(rhs)) => Field::Int32(lhs + rhs),
-            (Field::Int64(lhs), Field::Int64(rhs)) => Field::Int64(lhs + rhs),
-            (Field::Float32(lhs), Field::Float32(rhs)) => Field::Float32(lhs + rhs),
-            (Field::Float64(lhs), Field::Float64(rhs)) => Field::Float64(lhs + rhs),
-            (Field::String(lhs), Field::String(rhs)) => Field::String(format!("{lhs}{rhs}")),
+    fn arithmetic_add(&self, lhs: &Value, rhs: &Value) -> Result<Value, InternalExecutorError> {
+        let value = match (lhs, rhs) {
+            (Value::Int32(lhs), Value::Int32(rhs)) => Value::Int32(lhs + rhs),
+            (Value::Int64(lhs), Value::Int64(rhs)) => Value::Int64(lhs + rhs),
+            (Value::Float32(lhs), Value::Float32(rhs)) => Value::Float32(lhs + rhs),
+            (Value::Float64(lhs), Value::Float64(rhs)) => Value::Float64(lhs + rhs),
+            (Value::String(lhs), Value::String(rhs)) => Value::String(format!("{lhs}{rhs}")),
             _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
-        Ok(field)
+        Ok(value)
     }
 
     /// Computes `lhs - rhs`.
-    fn arithmetic_sub(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
-        let field = match (lhs, rhs) {
-            (Field::Int32(lhs), Field::Int32(rhs)) => Field::Int32(lhs - rhs),
-            (Field::Int64(lhs), Field::Int64(rhs)) => Field::Int64(lhs - rhs),
-            (Field::Float32(lhs), Field::Float32(rhs)) => Field::Float32(lhs - rhs),
-            (Field::Float64(lhs), Field::Float64(rhs)) => Field::Float64(lhs - rhs),
+    fn arithmetic_sub(&self, lhs: &Value, rhs: &Value) -> Result<Value, InternalExecutorError> {
+        let value = match (lhs, rhs) {
+            (Value::Int32(lhs), Value::Int32(rhs)) => Value::Int32(lhs - rhs),
+            (Value::Int64(lhs), Value::Int64(rhs)) => Value::Int64(lhs - rhs),
+            (Value::Float32(lhs), Value::Float32(rhs)) => Value::Float32(lhs - rhs),
+            (Value::Float64(lhs), Value::Float64(rhs)) => Value::Float64(lhs - rhs),
             _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
-        Ok(field)
+        Ok(value)
     }
 
     /// Computes `lhs * rhs`.
-    fn arithmetic_mul(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
-        let field = match (lhs, rhs) {
-            (Field::Int32(lhs), Field::Int32(rhs)) => Field::Int32(lhs * rhs),
-            (Field::Int64(lhs), Field::Int64(rhs)) => Field::Int64(lhs * rhs),
-            (Field::Float32(lhs), Field::Float32(rhs)) => Field::Float32(lhs * rhs),
-            (Field::Float64(lhs), Field::Float64(rhs)) => Field::Float64(lhs * rhs),
+    fn arithmetic_mul(&self, lhs: &Value, rhs: &Value) -> Result<Value, InternalExecutorError> {
+        let value = match (lhs, rhs) {
+            (Value::Int32(lhs), Value::Int32(rhs)) => Value::Int32(lhs * rhs),
+            (Value::Int64(lhs), Value::Int64(rhs)) => Value::Int64(lhs * rhs),
+            (Value::Float32(lhs), Value::Float32(rhs)) => Value::Float32(lhs * rhs),
+            (Value::Float64(lhs), Value::Float64(rhs)) => Value::Float64(lhs * rhs),
             _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
-        Ok(field)
+        Ok(value)
     }
 
     /// Computes `lhs / rhs`.
-    fn arithmetic_div(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
-        let field = match (lhs, rhs) {
-            (Field::Int32(lhs), Field::Int32(rhs)) => {
+    fn arithmetic_div(&self, lhs: &Value, rhs: &Value) -> Result<Value, InternalExecutorError> {
+        let value = match (lhs, rhs) {
+            (Value::Int32(lhs), Value::Int32(rhs)) => {
                 if *rhs == 0 {
                     return Err(error_factory::div_by_zero());
                 }
-                Field::Int32(lhs / rhs)
+                Value::Int32(lhs / rhs)
             }
-            (Field::Int64(lhs), Field::Int64(rhs)) => {
+            (Value::Int64(lhs), Value::Int64(rhs)) => {
                 if *rhs == 0 {
                     return Err(error_factory::div_by_zero());
                 }
-                Field::Int64(lhs / rhs)
+                Value::Int64(lhs / rhs)
             }
-            (Field::Float32(lhs), Field::Float32(rhs)) => {
+            (Value::Float32(lhs), Value::Float32(rhs)) => {
                 if *rhs == 0.0 {
                     return Err(error_factory::div_by_zero());
                 }
-                Field::Float32(lhs / rhs)
+                Value::Float32(lhs / rhs)
             }
-            (Field::Float64(lhs), Field::Float64(rhs)) => {
+            (Value::Float64(lhs), Value::Float64(rhs)) => {
                 if *rhs == 0.0 {
                     return Err(error_factory::div_by_zero());
                 }
-                Field::Float64(lhs / rhs)
+                Value::Float64(lhs / rhs)
             }
             _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
-        Ok(field)
+        Ok(value)
     }
 
     /// Computes `lhs % rhs`.
-    fn arithmetic_mod(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
-        let field = match (lhs, rhs) {
-            (Field::Int32(lhs), Field::Int32(rhs)) => {
+    fn arithmetic_mod(&self, lhs: &Value, rhs: &Value) -> Result<Value, InternalExecutorError> {
+        let value = match (lhs, rhs) {
+            (Value::Int32(lhs), Value::Int32(rhs)) => {
                 if *rhs == 0 {
                     return Err(error_factory::mod_by_zero());
                 }
-                Field::Int32(lhs % rhs)
+                Value::Int32(lhs % rhs)
             }
-            (Field::Int64(lhs), Field::Int64(rhs)) => {
+            (Value::Int64(lhs), Value::Int64(rhs)) => {
                 if *rhs == 0 {
                     return Err(error_factory::mod_by_zero());
                 }
-                Field::Int64(lhs % rhs)
+                Value::Int64(lhs % rhs)
             }
             _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
-        Ok(field)
+        Ok(value)
     }
 
     /// Computes `lhs < rhs`.
-    fn compare_lt(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
+    fn compare_lt(&self, lhs: &Value, rhs: &Value) -> Result<Value, InternalExecutorError> {
         let result = match (lhs, rhs) {
-            (Field::Int32(lhs), Field::Int32(rhs)) => lhs < rhs,
-            (Field::Int64(lhs), Field::Int64(rhs)) => lhs < rhs,
-            (Field::Float32(lhs), Field::Float32(rhs)) => lhs < rhs,
-            (Field::Float64(lhs), Field::Float64(rhs)) => lhs < rhs,
-            (Field::String(lhs), Field::String(rhs)) => lhs < rhs,
-            (Field::Date(lhs), Field::Date(rhs)) => lhs < rhs,
-            (Field::DateTime(lhs), Field::DateTime(rhs)) => lhs < rhs,
+            (Value::Int32(lhs), Value::Int32(rhs)) => lhs < rhs,
+            (Value::Int64(lhs), Value::Int64(rhs)) => lhs < rhs,
+            (Value::Float32(lhs), Value::Float32(rhs)) => lhs < rhs,
+            (Value::Float64(lhs), Value::Float64(rhs)) => lhs < rhs,
+            (Value::String(lhs), Value::String(rhs)) => lhs < rhs,
+            (Value::Date(lhs), Value::Date(rhs)) => lhs < rhs,
+            (Value::DateTime(lhs), Value::DateTime(rhs)) => lhs < rhs,
             _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
-        Ok(Field::Bool(result))
+        Ok(Value::Bool(result))
     }
 
     /// Computes `lhs <= rhs`.
-    fn compare_lte(&self, lhs: &Field, rhs: &Field) -> Result<Field, InternalExecutorError> {
+    fn compare_lte(&self, lhs: &Value, rhs: &Value) -> Result<Value, InternalExecutorError> {
         let result = match (lhs, rhs) {
-            (Field::Int32(lhs), Field::Int32(rhs)) => lhs <= rhs,
-            (Field::Int64(lhs), Field::Int64(rhs)) => lhs <= rhs,
-            (Field::Float32(lhs), Field::Float32(rhs)) => lhs <= rhs,
-            (Field::Float64(lhs), Field::Float64(rhs)) => lhs <= rhs,
-            (Field::String(lhs), Field::String(rhs)) => lhs <= rhs,
-            (Field::Date(lhs), Field::Date(rhs)) => lhs <= rhs,
-            (Field::DateTime(lhs), Field::DateTime(rhs)) => lhs <= rhs,
+            (Value::Int32(lhs), Value::Int32(rhs)) => lhs <= rhs,
+            (Value::Int64(lhs), Value::Int64(rhs)) => lhs <= rhs,
+            (Value::Float32(lhs), Value::Float32(rhs)) => lhs <= rhs,
+            (Value::Float64(lhs), Value::Float64(rhs)) => lhs <= rhs,
+            (Value::String(lhs), Value::String(rhs)) => lhs <= rhs,
+            (Value::Date(lhs), Value::Date(rhs)) => lhs <= rhs,
+            (Value::DateTime(lhs), Value::DateTime(rhs)) => lhs <= rhs,
             _ => return Err(error_factory::incompatible_types(lhs, rhs)),
         };
-        Ok(Field::Bool(result))
+        Ok(Value::Bool(result))
     }
 
     /// Computes `!value`.
-    fn logical_negate(&self, value: &Field) -> Result<Field, InternalExecutorError> {
+    fn logical_negate(&self, value: &Value) -> Result<Value, InternalExecutorError> {
         let value = value
             .as_bool()
             .ok_or(error_factory::unexpected_type("bool", value))?;
-        Ok(Field::Bool(!value))
+        Ok(Value::Bool(!value))
     }
 
     /// Computes `+value`.
-    fn identity(&self, value: &Field) -> Result<Field, InternalExecutorError> {
+    fn identity(&self, value: &Value) -> Result<Value, InternalExecutorError> {
         match value {
-            Field::Int32(value) => Ok(Field::Int32(*value)),
-            Field::Int64(value) => Ok(Field::Int64(*value)),
-            Field::Float32(value) => Ok(Field::Float32(*value)),
-            Field::Float64(value) => Ok(Field::Float64(*value)),
+            Value::Int32(value) => Ok(Value::Int32(*value)),
+            Value::Int64(value) => Ok(Value::Int64(*value)),
+            Value::Float32(value) => Ok(Value::Float32(*value)),
+            Value::Float64(value) => Ok(Value::Float64(*value)),
             _ => Err(error_factory::unexpected_type("any numeric type", value)),
         }
     }
 
     /// Computes `-value`.
-    fn negate(&self, value: &Field) -> Result<Field, InternalExecutorError> {
+    fn negate(&self, value: &Value) -> Result<Value, InternalExecutorError> {
         match value {
-            Field::Int32(value) => Ok(Field::Int32(-value)),
-            Field::Int64(value) => Ok(Field::Int64(-value)),
-            Field::Float32(value) => Ok(Field::Float32(-value)),
-            Field::Float64(value) => Ok(Field::Float64(-value)),
+            Value::Int32(value) => Ok(Value::Int32(-value)),
+            Value::Int64(value) => Ok(Value::Int64(-value)),
+            Value::Float32(value) => Ok(Value::Float32(-value)),
+            Value::Float64(value) => Ok(Value::Float64(-value)),
             _ => Err(error_factory::unexpected_type("any numeric type", value)),
         }
     }
@@ -405,11 +405,11 @@ mod tests {
 
     fn create_test_record() -> Record {
         Record::new(vec![
-            Field::Int32(1),
-            Field::Int32(25),
-            Field::Float64(100.5),
-            Field::Bool(true),
-            Field::String("Alice".into()),
+            Value::Int32(1).into(),
+            Value::Int32(25).into(),
+            Value::Float64(100.5).into(),
+            Value::Bool(true).into(),
+            Value::String("Alice".into()).into(),
         ])
     }
 
@@ -421,7 +421,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -431,7 +431,7 @@ mod tests {
         let executor = ExpressionExecutor::empty(&tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -441,7 +441,7 @@ mod tests {
         let executor = ExpressionExecutor::empty(&tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
         let executor = ExpressionExecutor::empty(&tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -462,7 +462,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -473,7 +473,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -516,7 +516,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(false));
+        assert_eq!(result.as_ref(), &Value::Bool(false));
     }
 
     #[test]
@@ -538,7 +538,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -549,7 +549,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -560,7 +560,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -572,7 +572,7 @@ mod tests {
         let result = executor.execute_expression(expr_id).unwrap();
 
         // Should be true due to short-circuit (first condition is true)
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -584,7 +584,7 @@ mod tests {
         let result = executor.execute_expression(expr_id).unwrap();
 
         // Should be false due to short-circuit (first condition is false)
-        assert_eq!(result.as_ref(), &Field::Bool(false));
+        assert_eq!(result.as_ref(), &Value::Bool(false));
     }
 
     #[test]
@@ -595,7 +595,7 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 
     #[test]
@@ -606,6 +606,6 @@ mod tests {
         let executor = ExpressionExecutor::with_single_record(&record, &tree);
         let result = executor.execute_expression(expr_id).unwrap();
 
-        assert_eq!(result.as_ref(), &Field::Bool(true));
+        assert_eq!(result.as_ref(), &Value::Bool(true));
     }
 }

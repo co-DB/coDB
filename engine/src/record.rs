@@ -1,10 +1,6 @@
 ﻿use metadata::catalog::ColumnMetadata;
 use thiserror::Error;
-use types::{
-    data::{DbDate, DbDateTime},
-    schema::Type,
-    serialization::{DbSerializable, DbSerializationError},
-};
+use types::{data::Value, schema::Type, serialization::DbSerializationError};
 
 /// Error for record related operations
 #[derive(Error, Debug)]
@@ -25,16 +21,16 @@ impl RecordError {
     /// Returns a mapped serialization error that now includes the name of the field being (de)serialized.
     fn map_serialization_error(
         db_serialization_error: DbSerializationError,
-        field_name: &str,
+        field_name: impl Into<String>,
     ) -> Self {
         match db_serialization_error {
             DbSerializationError::UnexpectedEnd { expected, actual } => Self::UnexpectedEnd {
-                field_name: field_name.to_string(),
+                field_name: field_name.into(),
                 expected,
                 actual,
             },
             DbSerializationError::FailedToDeserialize => Self::FailedToDeserialize {
-                field_name: field_name.to_string(),
+                field_name: field_name.into(),
             },
         }
     }
@@ -89,173 +85,59 @@ impl Record {
 }
 
 /// Represents a typed database field value.
-///
-/// Each variant corresponds to a supported database column type.
 #[derive(PartialEq, Debug, Clone)]
-pub enum Field {
-    Int32(i32),
-    Int64(i64),
-    Float32(f32),
-    Float64(f64),
-    DateTime(DbDateTime),
-    Date(DbDate),
-    String(String),
-    Bool(bool),
-}
+pub struct Field(Value);
 
 impl Field {
     pub fn ty(&self) -> Type {
-        match self {
-            Field::Int32(_) => Type::I32,
-            Field::Int64(_) => Type::I64,
-            Field::Float32(_) => Type::F32,
-            Field::Float64(_) => Type::F64,
-            Field::DateTime(_) => Type::DateTime,
-            Field::Date(_) => Type::Date,
-            Field::String(_) => Type::String,
-            Field::Bool(_) => Type::Bool,
-        }
+        self.0.ty()
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.0
     }
 
     /// Serializes this field into the provided buffer.
     pub(crate) fn serialize(self, buffer: &mut Vec<u8>) {
-        match self {
-            Field::Int32(i) => i.serialize(buffer),
-            Field::Int64(i) => i.serialize(buffer),
-            Field::Float32(f) => f.serialize(buffer),
-            Field::Float64(f) => f.serialize(buffer),
-            Field::DateTime(d) => d.serialize(buffer),
-            Field::Date(d) => d.serialize(buffer),
-            Field::String(s) => s.serialize(buffer),
-            Field::Bool(b) => b.serialize(buffer),
-        }
+        self.0.serialize(buffer);
     }
 
-    /// Serializes this field at the beginning of the provided buffer.
-    ///
-    /// This function panics if buffer has not enough space to store the field.
-    pub(crate) fn serialize_into(self, buffer: &mut [u8]) {
-        match self {
-            Field::Int32(i) => i.serialize_into(buffer),
-            Field::Int64(i) => i.serialize_into(buffer),
-            Field::Float32(f) => f.serialize_into(buffer),
-            Field::Float64(f) => f.serialize_into(buffer),
-            Field::DateTime(d) => d.serialize_into(buffer),
-            Field::Date(d) => d.serialize_into(buffer),
-            Field::String(s) => s.serialize_into(buffer),
-            Field::Bool(b) => b.serialize_into(buffer),
-        }
-    }
-
-    /// Returns number of bytes that serialized field will take on disk.
-    pub(crate) fn size_serialized(&self) -> usize {
-        match self {
-            Field::Int32(i) => i.size_serialized(),
-            Field::Int64(i) => i.size_serialized(),
-            Field::Float32(f) => f.size_serialized(),
-            Field::Float64(f) => f.size_serialized(),
-            Field::DateTime(d) => d.size_serialized(),
-            Field::Date(d) => d.size_serialized(),
-            Field::String(s) => s.size_serialized(),
-            Field::Bool(b) => b.size_serialized(),
-        }
-    }
-
-    /// Deserializes raw data type, wraps it into the corresponding field and maps the error to the
-    /// field error type (adding the name of the field we are deserializing)
-    fn deserialize_and_wrap<'a, T, F>(
-        buffer: &'a [u8],
-        constructor: F,
-        name: &str,
-    ) -> Result<(Field, &'a [u8]), RecordError>
-    where
-        T: DbSerializable,
-        F: FnOnce(T) -> Field,
-    {
-        T::deserialize(buffer)
-            .map(|(val, rest)| (constructor(val), rest))
-            .map_err(|err| RecordError::map_serialization_error(err, name))
-    }
-
-    /// Deserializes a field from bytes using the provided column metadata.
+    /// Deserializes a field from bytes using the provided type.
     ///
     /// Returns both the deserialized field and the remaining unconsumed bytes.
-    fn deserialize<'a>(
+    pub(crate) fn deserialize<'a>(
         buffer: &'a [u8],
         column_type: Type,
-        name: &str,
+        column_name: impl Into<String>,
     ) -> Result<(Self, &'a [u8]), RecordError> {
-        match column_type {
-            Type::Bool => Self::deserialize_and_wrap(buffer, Field::Bool, name),
-            Type::I32 => Self::deserialize_and_wrap(buffer, Field::Int32, name),
-            Type::I64 => Self::deserialize_and_wrap(buffer, Field::Int64, name),
-            Type::F32 => Self::deserialize_and_wrap(buffer, Field::Float32, name),
-            Type::F64 => Self::deserialize_and_wrap(buffer, Field::Float64, name),
-            Type::Date => Self::deserialize_and_wrap(buffer, Field::Date, name),
-            Type::DateTime => Self::deserialize_and_wrap(buffer, Field::DateTime, name),
-            Type::String => Self::deserialize_and_wrap(buffer, Field::String, name),
-        }
+        let (value, rest) = Value::deserialize(buffer, column_type)
+            .map_err(|err| RecordError::map_serialization_error(err, column_name))?;
+        Ok((value.into(), rest))
     }
+}
 
-    pub fn as_i32(&self) -> Option<i32> {
-        match self {
-            Field::Int32(v) => Some(*v),
-            _ => None,
-        }
+impl From<Value> for Field {
+    fn from(value: Value) -> Self {
+        Field(value)
     }
+}
 
-    pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            Field::Int64(v) => Some(*v),
-            _ => None,
-        }
+impl From<&Field> for Value {
+    fn from(value: &Field) -> Self {
+        value.0.clone()
     }
+}
 
-    pub fn as_f32(&self) -> Option<f32> {
-        match self {
-            Field::Float32(v) => Some(*v),
-            _ => None,
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Field::Float64(v) => Some(*v),
-            _ => None,
-        }
-    }
-
-    pub fn as_string(&self) -> Option<&str> {
-        match self {
-            Field::String(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            Field::Bool(v) => Some(*v),
-            _ => None,
-        }
-    }
-
-    pub fn as_date(&self) -> Option<&DbDate> {
-        match self {
-            Field::Date(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    pub fn as_datetime(&self) -> Option<&DbDateTime> {
-        match self {
-            Field::DateTime(v) => Some(v),
-            _ => None,
-        }
+impl From<Field> for Value {
+    fn from(value: Field) -> Self {
+        value.0
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use types::data::{DbDate, DbDateTime};
+
     use super::*;
 
     // Helper function to create ColumnMetadata for testing
@@ -264,141 +146,14 @@ mod tests {
     }
 
     #[test]
-    fn fails_when_buffer_smaller_than_expected() {
-        let buffer = [0x32, 0x33];
-        let result = Field::deserialize(&buffer, Type::I32, "name");
-        assert!(result.is_err());
-        assert!(matches!(result, Err(RecordError::UnexpectedEnd { .. })));
-    }
-
-    #[test]
-    fn fails_when_string_bytes_are_invalid_utf8() {
-        let buffer = [0x02, 0x00, 0xC2, 0x00];
-        let result = Field::deserialize(&buffer, Type::String, "name");
-        assert!(result.is_err());
-        assert!(matches!(
-            result,
-            Err(RecordError::FailedToDeserialize { .. })
-        ));
-    }
-
-    #[test]
-    fn fails_when_string_length_is_too_big() {
-        let buffer = [0x03, 0x00, 0x01, 0x01];
-        let result = Field::deserialize(&buffer, Type::String, "name");
-        assert!(result.is_err());
-        assert!(matches!(result, Err(RecordError::UnexpectedEnd { .. })));
-    }
-
-    #[test]
-    fn fails_when_deserializing_string_from_1_byte() {
-        let buffer = [0x01];
-        let result = Field::deserialize(&buffer, Type::String, "name");
-        assert!(result.is_err());
-        assert!(matches!(result, Err(RecordError::UnexpectedEnd { .. })));
-    }
-
-    #[test]
-    fn fails_for_invalid_bool() {
-        let buffer = [0x02];
-        let result = Field::deserialize(&buffer, Type::Bool, "name");
-        assert!(result.is_err());
-        assert!(matches!(
-            result,
-            Err(RecordError::FailedToDeserialize { .. })
-        ));
-    }
-
-    #[test]
-    fn serializing_fixed_length_types_works() {
-        let test_cases = [
-            (Field::Int32(0x12345678), vec![0x78, 0x56, 0x34, 0x12]),
-            (
-                Field::Int64(0x123456789ABCDEF0),
-                vec![0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12],
-            ),
-            (
-                Field::Float32(std::f32::consts::PI),
-                std::f32::consts::PI.to_le_bytes().to_vec(),
-            ),
-            (
-                Field::Float64(-std::f64::consts::E),
-                (-std::f64::consts::E).to_le_bytes().to_vec(),
-            ),
-            (Field::Bool(true), vec![0x01]),
-            (Field::Bool(false), vec![0x00]),
-            (
-                Field::Date(DbDate::new(19000)),
-                19000i32.to_le_bytes().to_vec(),
-            ),
-            (
-                Field::DateTime(DbDateTime::new(DbDate::new(1234), 451)),
-                [1234i32.to_le_bytes(), 451u32.to_le_bytes()].concat(),
-            ),
-        ];
-
-        for (field, expected_bytes) in test_cases {
-            let mut buffer = Vec::new();
-            field.serialize(&mut buffer);
-            assert_eq!(buffer, expected_bytes);
-        }
-    }
-
-    #[test]
-    fn serializing_strings_works() {
-        let string = "field 1 where id = 1";
-        let field = Field::String(string.into());
-        let mut buffer = Vec::new();
-        field.serialize(&mut buffer);
-        let buffer_len: [u8; 2] = buffer[0..2].try_into().unwrap();
-        assert_eq!(u16::from_le_bytes(buffer_len), string.len() as u16);
-        let string_bytes = &buffer[2..];
-        assert_eq!(string_bytes, string.as_bytes());
-    }
-
-    #[test]
-    fn test_deserialize_known_bytes() {
-        let buffer: Vec<u8> = vec![
-            42, 0, 0, 0, // Int32(42)
-            1, // Bool(true)
-            2, 0, 72, 105, // String("Hi")
-            0, 0, 0, 0, 0, 0, 4, 64, // Float64(2.5)
-        ];
-
-        let mut rest = buffer.as_slice();
-        let test_cases = [
-            (Type::I32, "age", Field::Int32(42)),
-            (Type::Bool, "flag", Field::Bool(true)),
-            (Type::String, "greeting", Field::String("Hi".into())),
-            (Type::F64, "pi", Field::Float64(2.5)),
-        ];
-
-        for case in test_cases {
-            let (field, r) = Field::deserialize(rest, case.0, case.1).unwrap();
-            assert_eq!(field, case.2);
-            rest = r;
-        }
-
-        assert!(rest.is_empty());
-    }
-
-    #[test]
-    fn deserialize_empty_string() {
-        let buffer = [0x00, 0x00];
-        let (field, rest) = Field::deserialize(&buffer, Type::String, "empty").unwrap();
-        assert_eq!(field, Field::String("".into()));
-        assert!(rest.is_empty());
-    }
-
-    #[test]
     fn test_roundtrip_serialization_then_deserialization() {
         let fields = vec![
-            Field::Int32(-42),
-            Field::Int64(-10000000),
-            Field::Date(DbDate::new(2500)),
-            Field::DateTime(DbDateTime::new(DbDate::new(-12456), 1244)),
-            Field::Bool(true),
-            Field::String("true".into()),
+            Field(Value::Int32(-42)),
+            Field(Value::Int64(-10000000)),
+            Field(Value::Date(DbDate::new(2500))),
+            Field(Value::DateTime(DbDateTime::new(DbDate::new(-12456), 1244))),
+            Field(Value::Bool(true)),
+            Field(Value::String("true".into())),
         ];
 
         let column_metadata = vec![
@@ -419,53 +174,5 @@ mod tests {
         assert!(deserialized_record.is_ok());
         let deserialized_record = deserialized_record.unwrap();
         assert_eq!(deserialized_record.fields, cloned_fields);
-    }
-
-    #[test]
-    fn serialize_into_fixed_length_types_works() {
-        let test_cases = [
-            (Field::Int32(0x12345678), vec![0x78, 0x56, 0x34, 0x12]),
-            (
-                Field::Int64(0x123456789ABCDEF0),
-                vec![0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12],
-            ),
-            (
-                Field::Float32(std::f32::consts::PI),
-                std::f32::consts::PI.to_le_bytes().to_vec(),
-            ),
-            (
-                Field::Float64(-std::f64::consts::E),
-                (-std::f64::consts::E).to_le_bytes().to_vec(),
-            ),
-            (Field::Bool(true), vec![0x01]),
-            (Field::Bool(false), vec![0x00]),
-            (
-                Field::Date(DbDate::new(19000)),
-                19000i32.to_le_bytes().to_vec(),
-            ),
-            (
-                Field::DateTime(DbDateTime::new(DbDate::new(1234), 451)),
-                [1234i32.to_le_bytes(), 451u32.to_le_bytes()].concat(),
-            ),
-        ];
-
-        for (field, expected_bytes) in test_cases {
-            let mut buffer = vec![0u8; expected_bytes.len()];
-            field.serialize_into(&mut buffer);
-            assert_eq!(buffer, expected_bytes);
-        }
-    }
-
-    #[test]
-    fn serialize_into_strings_works() {
-        let string = "field 1 where id = 1";
-        let field = Field::String(string.into());
-        let mut buffer = vec![0u8; 2 + string.len()];
-        field.serialize_into(&mut buffer);
-
-        let buffer_len: [u8; 2] = buffer[0..2].try_into().unwrap();
-        assert_eq!(u16::from_le_bytes(buffer_len), string.len() as u16);
-        let string_bytes = &buffer[2..];
-        assert_eq!(string_bytes, string.as_bytes());
     }
 }
