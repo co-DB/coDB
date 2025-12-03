@@ -9,10 +9,10 @@ use std::{
 
 use crate::consts::METADATA_FILE_NAME;
 use crate::metadata_file_helper::MetadataFileHelper;
-use crate::types::Type;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use types::schema::{self, Type};
 
 /// [`Catalog`] is an in-memory structure that holds information about a database's tables.
 /// It maps to the underlying file `{PATH_TO_CODB}/{DATABASE_NAME}/{METADATA_FILE_NAME}`.
@@ -121,37 +121,39 @@ impl Catalog {
         Ok(())
     }
 
+    // TODO: refactor this
     /// Adds column to the table.
     /// It works by delegating this to [`TableMetadata::add_column`].
     ///
     /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
     /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
-    pub fn add_column(
-        &mut self,
-        table_name: impl AsRef<str>,
-        column_metadata: ColumnMetadata,
-    ) -> Result<(), CatalogError> {
-        let table = self.table_mut(table_name.as_ref())?;
-        table.add_column(column_metadata)?;
-        self.sync_to_disk()?;
-        Ok(())
-    }
+    // pub fn add_column(
+    //     &mut self,
+    //     table_name: impl AsRef<str>,
+    //     column_metadata: ColumnMetadata,
+    // ) -> Result<(), CatalogError> {
+    //     let table: &mut TableMetadata = self.table_mut(table_name.as_ref())?;
+    //     table.add_column(column_metadata)?;
+    //     self.sync_to_disk()?;
+    //     Ok(())
+    // }
 
+    // TODO: refactor this
     /// Removes column to the table.
     /// It works by delegating this to [`TableMetadata::remove_column`].
     ///
     /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
     /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
-    pub fn remove_column(
-        &mut self,
-        table_name: impl AsRef<str>,
-        column_name: impl AsRef<str>,
-    ) -> Result<(), CatalogError> {
-        let table = self.table_mut(table_name.as_ref())?;
-        table.remove_column(column_name.as_ref())?;
-        self.sync_to_disk()?;
-        Ok(())
-    }
+    // pub fn remove_column(
+    //     &mut self,
+    //     table_name: impl AsRef<str>,
+    //     column_name: impl AsRef<str>,
+    // ) -> Result<(), CatalogError> {
+    //     let table = self.table_mut(table_name.as_ref())?;
+    //     table.remove_column(column_name.as_ref())?;
+    //     self.sync_to_disk()?;
+    //     Ok(())
+    // }
 
     /// Syncs in-memory [`Catalog`] instance with underlying file.
     /// Can fail if io error occurs.
@@ -201,18 +203,18 @@ pub enum TableMetadataError {
 impl TableMetadata {
     /// Creates new [`TableMetadata`].
     /// Can fail if the columns slice contains more than one column with the same name, or if `primary_key_column_name` is not in `columns`.
-    pub fn new(
+    ///
+    /// Only for internal usage, other modules should use [`TableMetadataFactory`].
+    fn new(
         name: impl Into<String>,
-        columns: &[ColumnMetadata],
+        columns: Vec<ColumnMetadata>,
         primary_key_column_name: impl Into<String>,
     ) -> Result<Self, TableMetadataError> {
-        let mut table_columns = Vec::with_capacity(columns.len());
         let mut table_columns_by_name = HashMap::with_capacity(columns.len());
         for (idx, column) in columns.iter().enumerate() {
             if table_columns_by_name.contains_key(&column.name) {
                 return Err(TableMetadataError::DuplicatedColumn(column.name.clone()));
             }
-            table_columns.push(column.clone());
             table_columns_by_name.insert(column.name.clone(), idx);
         }
 
@@ -225,7 +227,7 @@ impl TableMetadata {
 
         Ok(TableMetadata {
             name: name.into(),
-            columns: table_columns,
+            columns,
             columns_by_name: table_columns_by_name,
             primary_key_column_name,
         })
@@ -245,49 +247,148 @@ impl TableMetadata {
         self.columns.iter().cloned()
     }
 
+    // TODO: refactor this
     /// Adds new column to the table.
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with same name already exists.
-    fn add_column(&mut self, column: ColumnMetadata) -> Result<(), TableMetadataError> {
-        let already_exists = self.columns_by_name.contains_key(&column.name);
-        match already_exists {
-            true => Err(TableMetadataError::ColumnAlreadyExists(column.name)),
-            false => {
-                self.columns_by_name
-                    .insert(column.name.clone(), self.columns.len());
-                self.columns.push(column);
-                Ok(())
-            }
-        }
-    }
+    // fn add_column(&mut self, column: ColumnMetadata) -> Result<(), TableMetadataError> {
+    //     let already_exists = self.columns_by_name.contains_key(&column.name);
+    //     match already_exists {
+    //         true => Err(TableMetadataError::ColumnAlreadyExists(column.name)),
+    //         false => {
+    //             self.columns_by_name
+    //                 .insert(column.name.clone(), self.columns.len());
+    //             self.columns.push(column);
+    //             Ok(())
+    //         }
+    //     }
+    // }
 
+    // TODO: refactor this
     /// Removes column from the table.
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with provided name does not exist or the column is primary key.
-    fn remove_column(&mut self, column_name: &str) -> Result<(), TableMetadataError> {
-        if column_name == self.primary_key_column_name() {
-            return Err(TableMetadataError::InvalidColumnUsed(column_name.into()));
-        }
-        let idx = self.columns_by_name.remove(column_name);
-        match idx {
-            Some(idx) => {
-                self.columns.swap_remove(idx);
-                // Removed last element - no need to update any index
-                if idx == self.columns.len() {
-                    return Ok(());
-                }
-                // Update index of the element that was moved
-                let swapped_name = &self.columns[idx].name;
-                self.columns_by_name.insert(swapped_name.clone(), idx);
-                Ok(())
-            }
-            None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
-        }
-    }
+    // fn remove_column(&mut self, column_name: &str) -> Result<(), TableMetadataError> {
+    //     if column_name == self.primary_key_column_name() {
+    //         return Err(TableMetadataError::InvalidColumnUsed(column_name.into()));
+    //     }
+    //     let idx = self.columns_by_name.remove(column_name);
+    //     match idx {
+    //         Some(idx) => {
+    //             self.columns.swap_remove(idx);
+    //             // Removed last element - no need to update any index
+    //             if idx == self.columns.len() {
+    //                 return Ok(());
+    //             }
+    //             // Update index of the element that was moved
+    //             let swapped_name = &self.columns[idx].name;
+    //             self.columns_by_name.insert(swapped_name.clone(), idx);
+    //             Ok(())
+    //         }
+    //         None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
+    //     }
+    // }
 
     /// Returns name of the table's primary key column
     pub fn primary_key_column_name(&self) -> &str {
         &self.primary_key_column_name
+    }
+}
+
+pub struct NewColumnDto {
+    pub name: String,
+    pub ty: Type,
+}
+
+/// Structure for creating new [`TableMetadata`].
+pub struct TableMetadataFactory {
+    column_dtos: Vec<NewColumnDto>,
+    name: String,
+    primary_key_column_name: String,
+    columns: Vec<ColumnMetadata>,
+    columns_by_name: HashMap<String, usize>,
+}
+
+impl TableMetadataFactory {
+    pub fn new(
+        name: impl Into<String>,
+        column_dtos: Vec<NewColumnDto>,
+        primary_key_column_name: impl Into<String>,
+    ) -> Self {
+        TableMetadataFactory {
+            columns: Vec::with_capacity(column_dtos.len()),
+            columns_by_name: HashMap::with_capacity(column_dtos.len()),
+            column_dtos,
+            name: name.into(),
+            primary_key_column_name: primary_key_column_name.into(),
+        }
+    }
+
+    pub fn create_table_metadata(mut self) -> Result<TableMetadata, TableMetadataError> {
+        self.create_columns()?;
+        self.create_columns_by_name()?;
+        self.primary_key_exists()?;
+        let tm = TableMetadata {
+            columns: self.columns,
+            columns_by_name: self.columns_by_name,
+            name: self.name,
+            primary_key_column_name: self.primary_key_column_name,
+        };
+        Ok(tm)
+    }
+
+    /// Creates [`TableMetadataFactory::columns_by_name`] based on [`TableMetadataFactory::columns`]
+    fn create_columns_by_name(&mut self) -> Result<(), TableMetadataError> {
+        for (idx, column) in self.columns.iter().enumerate() {
+            if self.columns_by_name.contains_key(&column.name) {
+                return Err(TableMetadataError::DuplicatedColumn(column.name.clone()));
+            }
+            self.columns_by_name.insert(column.name.clone(), idx);
+        }
+        Ok(())
+    }
+
+    /// Checks if [`TableMetadataFactory::primary_key_column_name`] exists in [`TableMetadataFactory::columns`]
+    fn primary_key_exists(&self) -> Result<(), TableMetadataError> {
+        if !self
+            .columns_by_name
+            .contains_key(&self.primary_key_column_name)
+        {
+            return Err(TableMetadataError::UnknownPrimaryKeyColumn(
+                self.primary_key_column_name.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Creates [`TableMetadataFactory::columns`] based on [`TableMetadataFactory::column_dtos`]
+    fn create_columns(&mut self) -> Result<(), TableMetadataError> {
+        self.sort_column_dtos_by_fixed_size();
+
+        let mut pos = 0;
+        let mut last_fixed_pos = 0;
+        let mut base_offset = 0;
+
+        for col in &self.column_dtos {
+            let column_metadata =
+                ColumnMetadata::new(col.name.clone(), col.ty, pos, base_offset, last_fixed_pos)?;
+            self.columns.push(column_metadata);
+            pos += 1;
+            if let Some(offset) = schema::type_size_on_disk(&col.ty) {
+                last_fixed_pos += 1;
+                base_offset += offset;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sorts columns by whether they are fixed-size (fixed-size columns are first).
+    fn sort_column_dtos_by_fixed_size<'c>(&mut self) {
+        self.column_dtos.sort_unstable_by(|a, b| {
+            let a_fixed = a.ty.is_fixed_size();
+            let b_fixed = b.ty.is_fixed_size();
+            b_fixed.cmp(&a_fixed)
+        })
     }
 }
 
@@ -434,7 +535,7 @@ impl TryFrom<TableJson> for TableMetadata {
             .into_iter()
             .map(ColumnMetadata::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let tm = TableMetadata::new(value.name, &columns, value.primary_key_column_name)?;
+        let tm = TableMetadata::new(value.name, columns, value.primary_key_column_name)?;
         Ok(tm)
     }
 }
@@ -650,7 +751,7 @@ mod tests {
     }
 
     // Helper to create a dummy table
-    fn dummy_table(name: &str, columns: &[ColumnMetadata], pk: &str) -> TableMetadata {
+    fn dummy_table(name: &str, columns: Vec<ColumnMetadata>, pk: &str) -> TableMetadata {
         TableMetadata::new(name, columns, pk).unwrap()
     }
 
@@ -660,7 +761,7 @@ mod tests {
             dummy_column("id", Type::I32, 0),
             dummy_column("name", Type::String, 1),
         ];
-        dummy_table("users", &columns, "id")
+        dummy_table("users", columns, "id")
     }
 
     // Helper to check if table is as expected
@@ -1205,55 +1306,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn catalog_add_column_persists_to_disk() {
-        // given catalog with table `users`
-        let mut fixture = CatalogTestFixture::with_table(users_table());
-
-        // when adding a new column
-        let new_col = dummy_column("email", Type::String, 2);
-        let result = fixture.catalog_mut().add_column("users", new_col.clone());
-
-        // then column is added
-        assert!(result.is_ok());
-        assert!(
-            fixture
-                .catalog()
-                .table("users")
-                .unwrap()
-                .column("email")
-                .is_ok()
-        );
-
-        // and persisted to disk
-        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
-            assert_eq!(tables[0].columns.len(), 3);
-            assert!(tables[0].columns.iter().any(|c| c.name == "email"));
-        });
-    }
-
-    #[test]
-    fn catalog_remove_column_persists_to_disk() {
-        // given catalog with table `users` that has 2 columns
-        let mut fixture = CatalogTestFixture::with_table(users_table());
-
-        // when removing column "name"
-        let result = fixture.catalog_mut().remove_column("users", "name");
-
-        // then column is removed
-        assert!(result.is_ok());
-        let table = fixture.catalog().table("users").unwrap();
-        assert!(table.column("name").is_err());
-        assert!(table.column("id").is_ok());
-
-        // and persisted to disk
-        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
-            assert_eq!(tables[0].columns.len(), 1);
-            assert_eq!(tables[0].columns[0].name, "id");
-            assert!(!tables[0].columns.iter().any(|c| c.name == "name"));
-        });
-    }
-
     // Helper to check if error variant is as expected
     fn assert_table_metadata_error_variant(
         actual: &TableMetadataError,
@@ -1274,7 +1326,7 @@ mod tests {
             dummy_column("id", Type::String, 1),
         ];
         // when creating new [`TableMetadata`]
-        let result = TableMetadata::new("users", &columns, "id");
+        let result = TableMetadata::new("users", columns, "id");
         // error is returned
         assert!(result.is_err());
         assert_table_metadata_error_variant(
@@ -1291,7 +1343,7 @@ mod tests {
             dummy_column("name", Type::String, 1),
         ];
         // when creating [`TableMetadata`] with unknown primary key column name
-        let result = TableMetadata::new("users", &columns, "not_a_column");
+        let result = TableMetadata::new("users", columns, "not_a_column");
         // error is returned
         assert!(result.is_err());
         assert_table_metadata_error_variant(
@@ -1308,7 +1360,7 @@ mod tests {
             dummy_column("name", Type::String, 1),
         ];
         // when creating new [`TableMetadata`]
-        let result = TableMetadata::new("users", &columns, "id");
+        let result = TableMetadata::new("users", columns, "id");
         // [`TableMetadata`] is returned
         assert!(result.is_ok());
         let table = result.unwrap();
@@ -1326,7 +1378,7 @@ mod tests {
             dummy_column("id", Type::I32, 0),
             dummy_column("name", Type::String, 1),
         ];
-        let table = TableMetadata::new("users", &columns, "id").unwrap();
+        let table = TableMetadata::new("users", columns.clone(), "id").unwrap();
 
         // when getting column "name"
         let result = table.column("name");
@@ -1353,112 +1405,225 @@ mod tests {
     }
 
     #[test]
-    fn table_metadata_add_column_adds_new_column() {
-        // given table with one column "id"
-        let id_col = dummy_column("id", Type::I32, 0);
-        let columns = vec![id_col.clone()];
-        let mut table = TableMetadata::new("users", &columns, "id").unwrap();
-
-        // when adding a new column "name"
-        let new_col = dummy_column("name", Type::String, 1);
-        let result = table.add_column(new_col.clone());
-
-        // then column "name" is present
-        assert!(result.is_ok());
-        let col = table.column("name").unwrap();
-        assert_column(&new_col, &col);
-        // and column "id" still exists
-        let col = table.column("id").unwrap();
-        assert_column(&id_col, &col)
-    }
-
-    #[test]
-    fn table_metadata_add_column_returns_error_when_column_exists() {
-        // given table with column "id"
-        let columns = vec![dummy_column("id", Type::I32, 0)];
-        let mut table = TableMetadata::new("users", &columns, "id").unwrap();
-
-        // when adding column with same name
-        let duplicate_col = dummy_column("id", Type::I32, 1);
-        let result = table.add_column(duplicate_col);
-
-        // then error is returned
-        assert!(result.is_err());
-        assert_table_metadata_error_variant(
-            &result.unwrap_err(),
-            &TableMetadataError::ColumnAlreadyExists(String::new()),
-        );
-    }
-
-    #[test]
-    fn table_metadata_remove_column_removes_last_column() {
-        // given table with two columns
-        let mut table = users_table();
-
-        // when removing last column ("name")
-        let result = table.remove_column("name");
-
-        // then only "id" remains
-        assert!(result.is_ok());
-        assert!(table.column("name").is_err());
-        assert!(table.column("id").is_ok());
-        assert_eq!(table.columns.len(), 1);
-    }
-
-    #[test]
-    fn table_metadata_remove_column_removes_middle_column() {
-        // given table with three columns
+    fn test_table_metadata_factory_calculates_correct_offsets() {
         let columns = vec![
-            dummy_column("id", Type::I32, 0),
-            dummy_column("middle", Type::String, 1),
-            dummy_column("last", Type::Bool, 2),
+            NewColumnDto {
+                name: "id".to_string(),
+                ty: Type::I32,
+            },
+            NewColumnDto {
+                name: "name".to_string(),
+                ty: Type::String,
+            },
+            NewColumnDto {
+                name: "score".to_string(),
+                ty: Type::F64,
+            },
+            NewColumnDto {
+                name: "surname".to_string(),
+                ty: Type::String,
+            },
+            NewColumnDto {
+                name: "active".to_string(),
+                ty: Type::Bool,
+            },
         ];
-        let mut table = TableMetadata::new("users", &columns, "id").unwrap();
 
-        // when removing the "middle" column
-        let result = table.remove_column("middle");
+        let factory = TableMetadataFactory::new("test", columns, "id");
+        let table = factory.create_table_metadata().unwrap();
 
-        // then "middle" is gone, "id" and "last" remain
-        assert!(result.is_ok());
-        assert!(table.column("middle").is_err());
-        assert!(table.column("id").is_ok());
-        assert!(table.column("last").is_ok());
-        assert_eq!(table.columns.len(), 2);
+        let id_col = table.column("id").unwrap();
+        assert_eq!(id_col.base_offset(), 0);
+        assert_eq!(id_col.base_offset_pos(), 0);
+        assert_eq!(id_col.pos(), 0);
 
-        // and "last" is still accessible and correct
-        let last_col = table.column("last").unwrap();
-        assert_eq!(last_col.name, "last");
+        let score_col = table.column("score").unwrap();
+        assert_eq!(score_col.base_offset(), 4);
+        assert_eq!(score_col.base_offset_pos(), 1);
+        assert_eq!(score_col.pos(), 1);
+
+        let active_col = table.column("active").unwrap();
+        assert_eq!(active_col.base_offset(), 12);
+        assert_eq!(active_col.base_offset_pos(), 2);
+        assert_eq!(active_col.pos(), 2);
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.base_offset(), 13);
+        assert_eq!(name_col.base_offset_pos(), 3);
+        assert_eq!(name_col.pos(), 3);
+
+        let surname_col = table.column("surname").unwrap();
+        assert_eq!(surname_col.base_offset(), 13);
+        assert_eq!(surname_col.base_offset_pos(), 3);
+        assert_eq!(surname_col.pos(), 4);
     }
 
     #[test]
-    fn table_metadata_remove_column_returns_error_when_removing_primary_key() {
-        // given table with primary key "id"
-        let mut table = users_table();
+    fn test_table_metadata_factory_all_fixed_size_types() {
+        let columns = vec![
+            NewColumnDto {
+                name: "id".to_string(),
+                ty: Type::I32,
+            },
+            NewColumnDto {
+                name: "value".to_string(),
+                ty: Type::I64,
+            },
+            NewColumnDto {
+                name: "ratio".to_string(),
+                ty: Type::F64,
+            },
+            NewColumnDto {
+                name: "active".to_string(),
+                ty: Type::Bool,
+            },
+        ];
 
-        // when trying to remove primary key column
-        let result = table.remove_column("id");
+        let factory = TableMetadataFactory::new("test", columns, "id");
+        let table = factory.create_table_metadata().unwrap();
 
-        // then error is returned
-        assert!(result.is_err());
-        assert_table_metadata_error_variant(
-            &result.unwrap_err(),
-            &TableMetadataError::InvalidColumnUsed(String::new()),
-        );
+        let id_col = table.column("id").unwrap();
+        assert_eq!(id_col.base_offset(), 0);
+        assert_eq!(id_col.ty(), Type::I32);
+
+        let value_col = table.column("value").unwrap();
+        assert_eq!(value_col.base_offset(), 4);
+        assert_eq!(value_col.ty(), Type::I64);
+
+        let ratio_col = table.column("ratio").unwrap();
+        assert_eq!(ratio_col.base_offset(), 12);
+        assert_eq!(ratio_col.ty(), Type::F64);
+
+        let active_col = table.column("active").unwrap();
+        assert_eq!(active_col.base_offset(), 20);
+        assert_eq!(active_col.ty(), Type::Bool);
     }
 
     #[test]
-    fn table_metadata_remove_column_returns_error_when_column_not_found() {
-        // given table with two columns
-        let mut table = users_table();
+    fn test_table_metadata_factory_primary_key_column() {
+        let columns = vec![
+            NewColumnDto {
+                name: "id".to_string(),
+                ty: Type::I32,
+            },
+            NewColumnDto {
+                name: "name".to_string(),
+                ty: Type::String,
+            },
+        ];
 
-        // when trying to remove non-existing column
-        let result = table.remove_column("not_found");
+        let factory = TableMetadataFactory::new("test", columns, "id");
+        let table = factory.create_table_metadata().unwrap();
 
-        // then error is returned
+        assert_eq!(table.primary_key_column_name(), "id");
+    }
+
+    #[test]
+    fn test_table_metadata_factory_duplicate_column_name() {
+        let columns = vec![
+            NewColumnDto {
+                name: "id".to_string(),
+                ty: Type::I32,
+            },
+            NewColumnDto {
+                name: "name".to_string(),
+                ty: Type::String,
+            },
+            NewColumnDto {
+                name: "name".to_string(),
+                ty: Type::I32,
+            },
+        ];
+
+        let factory = TableMetadataFactory::new("test", columns, "id");
+        let result = factory.create_table_metadata();
+
         assert!(result.is_err());
-        assert_table_metadata_error_variant(
-            &result.unwrap_err(),
-            &TableMetadataError::ColumnNotFound(String::new()),
-        );
+        assert!(matches!(
+            result.unwrap_err(),
+            TableMetadataError::DuplicatedColumn(_)
+        ));
+    }
+
+    #[test]
+    fn test_table_metadata_factory_unknown_primary_key() {
+        let columns = vec![
+            NewColumnDto {
+                name: "id".to_string(),
+                ty: Type::I32,
+            },
+            NewColumnDto {
+                name: "name".to_string(),
+                ty: Type::String,
+            },
+        ];
+
+        let factory = TableMetadataFactory::new("test", columns, "unknown_column");
+        let result = factory.create_table_metadata();
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TableMetadataError::UnknownPrimaryKeyColumn(_)
+        ));
+    }
+
+    #[test]
+    fn test_table_metadata_factory_single_column() {
+        let columns = vec![NewColumnDto {
+            name: "id".to_string(),
+            ty: Type::I32,
+        }];
+
+        let factory = TableMetadataFactory::new("test", columns, "id");
+        let table = factory.create_table_metadata().unwrap();
+
+        let id_col = table.column("id").unwrap();
+        assert_eq!(id_col.base_offset(), 0);
+        assert_eq!(id_col.pos(), 0);
+        assert_eq!(table.columns().count(), 1);
+    }
+
+    #[test]
+    fn test_table_metadata_factory_multiple_variable_size_columns() {
+        let columns = vec![
+            NewColumnDto {
+                name: "id".to_string(),
+                ty: Type::I32,
+            },
+            NewColumnDto {
+                name: "first_name".to_string(),
+                ty: Type::String,
+            },
+            NewColumnDto {
+                name: "last_name".to_string(),
+                ty: Type::String,
+            },
+            NewColumnDto {
+                name: "email".to_string(),
+                ty: Type::String,
+            },
+        ];
+
+        let factory = TableMetadataFactory::new("users", columns, "id");
+        let table = factory.create_table_metadata().unwrap();
+
+        let id_col = table.column("id").unwrap();
+        assert_eq!(id_col.base_offset(), 0);
+        assert_eq!(id_col.pos(), 0);
+
+        // All variable-size columns should share the same base_offset
+        let first_name = table.column("first_name").unwrap();
+        let last_name = table.column("last_name").unwrap();
+        let email = table.column("email").unwrap();
+
+        assert_eq!(first_name.base_offset(), 4);
+        assert_eq!(last_name.base_offset(), 4);
+        assert_eq!(email.base_offset(), 4);
+
+        // But different positions
+        assert_eq!(first_name.pos(), 1);
+        assert_eq!(last_name.pos(), 2);
+        assert_eq!(email.pos(), 3);
     }
 }

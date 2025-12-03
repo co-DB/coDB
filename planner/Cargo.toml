@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 metadata = { path = "../metadata" }
+types = { path = "../types" }
 
 thiserror.workspace = true
 parking_lot.workspace = true

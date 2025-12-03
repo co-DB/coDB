@@ -1,7 +1,10 @@
-﻿use crate::data_types::{DbDate, DbDateTime, DbSerializable, DbSerializationError};
-
-use metadata::{catalog::ColumnMetadata, types::Type};
+﻿use metadata::catalog::ColumnMetadata;
 use thiserror::Error;
+use types::{
+    data::{DbDate, DbDateTime},
+    schema::Type,
+    serialization::{DbSerializable, DbSerializationError},
+};
 
 /// Error for record related operations
 #[derive(Error, Debug)]

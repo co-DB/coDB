@@ -1,7 +1,7 @@
 use std::fmt::{self, Display};
 
-use metadata::types::Type;
 use time::{Date, PrimitiveDateTime};
+use types::schema::Type;
 
 use crate::{
     ast::OrderDirection,

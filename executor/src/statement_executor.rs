@@ -1,12 +1,11 @@
 use std::{borrow::Cow, cmp::Ordering, collections::HashMap, iter, mem};
 
 use engine::{
-    data_types,
     heap_file::{HeapFileError, RecordPtr},
     record::{Field, Record},
 };
 use itertools::Itertools;
-use metadata::catalog::{ColumnMetadata, ColumnMetadataError, TableMetadata};
+use metadata::catalog::{NewColumnDto, TableMetadataFactory};
 use planner::{
     query_plan::{
         CreateTable, Filter, Insert, Limit, Projection, Skip, Sort, SortOrder, StatementPlan,
@@ -307,18 +306,16 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
     /// Handler for [`CreateTable`] table statement.
     fn create_table(&self, create_table: &CreateTable) -> StatementResult {
-        let column_metadatas = match self.process_columns(create_table) {
-            Ok(cm) => cm,
-            Err(err) => {
-                return error_factory::runtime_error(format!("Failed to create column: {err}"));
-            }
-        };
+        let new_column_dtos = self.map_to_new_columns_dto(
+            iter::once(&create_table.primary_key_column).chain(create_table.columns.iter()),
+        );
 
-        let table_metadata = match TableMetadata::new(
+        let tm_factory = TableMetadataFactory::new(
             &create_table.name,
-            &column_metadatas,
+            new_column_dtos,
             &create_table.primary_key_column.name,
-        ) {
+        );
+        let table_metadata = match tm_factory.create_table_metadata() {
             Ok(tm) => tm,
             Err(err) => {
                 return error_factory::runtime_error(format!("Failed to create table: {}", err));
@@ -336,45 +333,16 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         }
     }
 
-    /// Creates iterator over all columns in [`CreateTable`] (including primary key column)
-    /// and sorts them by whether they are fixed-size (fixed-size columns are first).
-    fn sort_columns_by_fixed_size<'c>(
+    fn map_to_new_columns_dto(
         &self,
-        create_table: &'c CreateTable,
-    ) -> impl Iterator<Item = &'c ResolvedCreateColumnDescriptor> {
-        iter::once(&create_table.primary_key_column)
-            .chain(create_table.columns.iter())
-            .sorted_by(|a, b| {
-                let a_fixed = a.ty.is_fixed_size();
-                let b_fixed = b.ty.is_fixed_size();
-                b_fixed.cmp(&a_fixed)
+        columns: impl Iterator<Item = &'q ResolvedCreateColumnDescriptor>,
+    ) -> Vec<NewColumnDto> {
+        columns
+            .map(|c| NewColumnDto {
+                name: c.name.clone(),
+                ty: c.ty,
             })
-    }
-
-    /// Returns vector of [`ColumnMetadata`] that maps to columns in [`CreateTable`].
-    fn process_columns(
-        &self,
-        create_table: &CreateTable,
-    ) -> Result<Vec<ColumnMetadata>, ColumnMetadataError> {
-        let mut column_metadatas = Vec::with_capacity(create_table.columns.len());
-
-        let cols = self.sort_columns_by_fixed_size(create_table);
-
-        let mut pos = 0;
-        let mut last_fixed_pos = 0;
-        let mut base_offset = 0;
-
-        for col in cols {
-            let column_metadata =
-                ColumnMetadata::new(col.name.clone(), col.ty, pos, base_offset, last_fixed_pos)?;
-            column_metadatas.push(column_metadata);
-            pos += 1;
-            if let Some(offset) = data_types::type_size_on_disk(&col.ty) {
-                last_fixed_pos += 1;
-                base_offset += offset;
-            }
-        }
-        Ok(column_metadatas)
+            .collect()
     }
 
     /// Creates iterator that maps `expressions` into [`ProjectColumn`]s.
@@ -422,54 +390,5 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             (Field::DateTime(lhs), Field::DateTime(rhs)) => Ok(lhs.cmp(rhs)),
             _ => Err(error_factory::incompatible_types(lhs, rhs)),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::tests::{create_single_statement, create_test_executor};
-
-    use super::*;
-
-    #[test]
-    fn test_process_columns_calculates_correct_offsets() {
-        let (executor, _temp_dir) = create_test_executor();
-        let (plan, ast) = create_single_statement(
-            "CREATE TABLE test (name STRING, score FLOAT64, surname STRING, active BOOL, id INT32 PRIMARY_KEY);",
-            &executor,
-        );
-
-        let se = StatementExecutor::new(&executor, &plan, &ast);
-
-        let create_table = match plan.root() {
-            StatementPlanItem::CreateTable(ct) => ct,
-            _ => panic!("invalid item"),
-        };
-        let columns = se.process_columns(create_table).unwrap();
-
-        let id_col = columns.iter().find(|c| c.name() == "id").unwrap();
-        assert_eq!(id_col.base_offset(), 0);
-        assert_eq!(id_col.base_offset_pos(), 0);
-        assert_eq!(id_col.pos(), 0);
-
-        let score_col = columns.iter().find(|c| c.name() == "score").unwrap();
-        assert_eq!(score_col.base_offset(), 4);
-        assert_eq!(score_col.base_offset_pos(), 1);
-        assert_eq!(score_col.pos(), 1);
-
-        let active_col = columns.iter().find(|c| c.name() == "active").unwrap();
-        assert_eq!(active_col.base_offset(), 12);
-        assert_eq!(active_col.base_offset_pos(), 2);
-        assert_eq!(active_col.pos(), 2);
-
-        let name_col = columns.iter().find(|c| c.name() == "name").unwrap();
-        assert_eq!(name_col.base_offset(), 13);
-        assert_eq!(name_col.base_offset_pos(), 3);
-        assert_eq!(name_col.pos(), 3);
-
-        let surname_col = columns.iter().find(|c| c.name() == "surname").unwrap();
-        assert_eq!(surname_col.base_offset(), 13);
-        assert_eq!(surname_col.base_offset_pos(), 3);
-        assert_eq!(surname_col.pos(), 4);
     }
 }

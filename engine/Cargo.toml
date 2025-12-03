@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 metadata = { path = "../metadata" }
 storage = { path = "../storage" }
+types = { path = "../types" }
 
 thiserror.workspace = true
 log.workspace = true

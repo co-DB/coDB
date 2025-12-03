@@ -1,9 +1,11 @@
-﻿use engine::data_types::{DbDate, DbDateTime};
-use engine::record::{Field as EngineField, Record as EngineRecord};
+﻿use engine::record::{Field as EngineField, Record as EngineRecord};
 use executor::response::{ColumnData, StatementType as ExecutorStatementType};
-use metadata::types::Type;
 use protocol::text_protocol::{
     ColumnMetadata, ColumnType, Date, DateTime, Field, Record, StatementType,
+};
+use types::{
+    data::{DbDate, DbDateTime},
+    schema::Type,
 };
 
 pub(crate) trait IntoTextProtocol<T> {

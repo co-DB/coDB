@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["client", "engine", "executor", "metadata", "planner", "protocol", "server", "storage"]
+members = ["client", "engine", "executor", "metadata", "planner", "protocol", "server", "storage", "types"]
 
 [workspace.package]
 rust-version = "1.90.0"

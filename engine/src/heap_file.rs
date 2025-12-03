@@ -15,13 +15,14 @@ use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::{
-    data_types::{DbSerializable, DbSerializationError},
     record::{Field, Record, RecordError},
     slotted_page::{
         InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
         SlottedPageError, SlottedPageHeader, UpdateResult,
     },
 };
+
+use types::serialization::{DbSerializable, DbSerializationError};
 
 use storage::{
     cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedReadPage, PinnedWritePage},
@@ -1712,8 +1713,8 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use metadata::types::Type;
     use tempfile::tempdir;
+    use types::schema::Type;
 
     use crate::{
         record::Field,

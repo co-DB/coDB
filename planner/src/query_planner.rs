@@ -137,7 +137,7 @@ impl QueryPlanner {
 
 #[cfg(test)]
 mod tests {
-    use metadata::types::Type;
+    use types::schema::Type;
 
     use crate::{
         ast::OrderDirection,

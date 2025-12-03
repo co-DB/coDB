@@ -296,6 +296,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "types",
 ]
 
 [[package]]
@@ -350,6 +351,7 @@ dependencies = [
  "storage",
  "tempfile",
  "thiserror",
+ "types",
 ]
 
 [[package]]
@@ -531,6 +533,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "types",
 ]
 
 [[package]]
@@ -606,6 +609,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "types",
 ]
 
 [[package]]
@@ -831,6 +835,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "types",
 ]
 
 [[package]]
@@ -967,6 +972,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
 ]
 
 [[package]]

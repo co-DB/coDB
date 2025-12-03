@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-use metadata::types::Type;
 use thiserror::Error;
+use types::schema::Type;
 
 use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
 

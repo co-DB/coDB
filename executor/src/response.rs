@@ -1,6 +1,6 @@
 use engine::record::Record;
-use metadata::types::Type;
 use planner::resolved_tree::ResolvedColumn;
+use types::schema::Type;
 
 use crate::error_factory::InternalExecutorError;
 

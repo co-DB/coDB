@@ -122,8 +122,8 @@ mod tests {
     use std::fs;
 
     use engine::record::{Field, Record};
-    use metadata::types::Type;
     use tempfile::TempDir;
+    use types::schema::Type;
 
     use crate::response::{ColumnData, StatementType};
 

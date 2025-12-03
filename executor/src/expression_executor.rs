@@ -1,10 +1,6 @@
 use std::{borrow::Cow, collections::HashMap};
 
-use engine::{
-    data_types::{DbDate, DbDateTime},
-    record::{Field, Record},
-};
-use metadata::types::Type;
+use engine::record::{Field, Record};
 use planner::{
     operators::{BinaryOperator, LogicalOperator, UnaryOperator},
     resolved_tree::{
@@ -12,6 +8,10 @@ use planner::{
         ResolvedLiteral, ResolvedLogicalExpression, ResolvedNodeId, ResolvedTree,
         ResolvedUnaryExpression,
     },
+};
+use types::{
+    data::{DbDate, DbDateTime},
+    schema::Type,
 };
 
 use crate::{InternalExecutorError, error_factory};
