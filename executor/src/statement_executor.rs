@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, iter, mem};
+use std::{cmp::Ordering, collections::HashMap, iter, mem, ops::Deref};
 
 use engine::{
     heap_file::{HeapFileError, RecordPtr},
@@ -170,8 +170,8 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     ) -> Result<Vec<Record>, InternalExecutorError> {
         let mut e = None;
         records.sort_by(|lhs, rhs| {
-            let lhs_value = lhs.fields[column_pos].value();
-            let rhs_value = rhs.fields[column_pos].value();
+            let lhs_value = lhs.fields[column_pos].deref();
+            let rhs_value = rhs.fields[column_pos].deref();
             let cmp_res = match order {
                 SortOrder::Ascending => self.cmp_fields(lhs_value, rhs_value),
                 SortOrder::Descending => self.cmp_fields(rhs_value, lhs_value),

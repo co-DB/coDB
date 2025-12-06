@@ -1,4 +1,6 @@
-﻿use metadata::catalog::ColumnMetadata;
+﻿use std::ops::Deref;
+
+use metadata::catalog::ColumnMetadata;
 use thiserror::Error;
 use types::{data::Value, schema::Type, serialization::DbSerializationError};
 
@@ -89,14 +91,6 @@ impl Record {
 pub struct Field(Value);
 
 impl Field {
-    pub fn ty(&self) -> Type {
-        self.0.ty()
-    }
-
-    pub fn value(&self) -> &Value {
-        &self.0
-    }
-
     /// Serializes this field into the provided buffer.
     pub(crate) fn serialize(self, buffer: &mut Vec<u8>) {
         self.0.serialize(buffer);
@@ -113,6 +107,14 @@ impl Field {
         let (value, rest) = Value::deserialize(buffer, column_type)
             .map_err(|err| RecordError::map_serialization_error(err, column_name))?;
         Ok((value.into(), rest))
+    }
+}
+
+impl Deref for Field {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 

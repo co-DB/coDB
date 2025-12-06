@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, ops::Deref};
 
 use engine::record::{Field, Record};
 use planner::{
@@ -108,7 +108,7 @@ where
         let table_name = self.table_name(column.table)?;
         self.context
             .get_field(table_name, column.pos)
-            .map(|field| Cow::Borrowed(field.value()))
+            .map(|field| Cow::Borrowed(field.deref()))
             .ok_or(error_factory::cannot_load_column_from_context(&column.name))
     }
 

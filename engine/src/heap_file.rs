@@ -1711,6 +1711,7 @@ mod tests {
     use std::{
         collections::HashSet,
         fs,
+        ops::Deref,
         sync::atomic::AtomicUsize,
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1762,7 +1763,7 @@ mod tests {
     /// Helpers for asserting field type
     ///
     fn assert_string(expected: &str, actual: &Field) {
-        match actual.value() {
+        match actual.deref() {
             Value::String(s) => {
                 assert_eq!(expected, *s);
             }
@@ -1771,7 +1772,7 @@ mod tests {
     }
 
     fn assert_i32(expected: i32, actual: &Field) {
-        match actual.value() {
+        match actual.deref() {
             Value::Int32(i) => {
                 assert_eq!(expected, *i);
             }
@@ -1780,7 +1781,7 @@ mod tests {
     }
 
     fn assert_i64(expected: i64, actual: &Field) {
-        match actual.value() {
+        match actual.deref() {
             Value::Int64(i) => {
                 assert_eq!(expected, *i);
             }
@@ -2994,7 +2995,7 @@ mod tests {
         // Verify all records are present (order may vary due to page allocation)
         let mut found_ids = all_records
             .iter()
-            .map(|r| match &r.fields[0].value() {
+            .map(|r| match &r.fields[0].deref() {
                 Value::Int32(id) => *id,
                 _ => panic!("Expected Int32"),
             })
@@ -3046,7 +3047,7 @@ mod tests {
         // Find records by ID (order may vary)
         let record1 = all_records
             .iter()
-            .find(|r| match &r.fields[0].value() {
+            .find(|r| match &r.fields[0].deref() {
                 Value::Int32(1) => true,
                 _ => false,
             })
@@ -3055,7 +3056,7 @@ mod tests {
 
         let record2 = all_records
             .iter()
-            .find(|r| match &r.fields[0].value() {
+            .find(|r| match &r.fields[0].deref() {
                 Value::Int32(2) => true,
                 _ => false,
             })
@@ -3064,7 +3065,7 @@ mod tests {
 
         let record3 = all_records
             .iter()
-            .find(|r| match &r.fields[0].value() {
+            .find(|r| match &r.fields[0].deref() {
                 Value::Int32(3) => true,
                 _ => false,
             })
@@ -3099,7 +3100,7 @@ mod tests {
         // Verify remaining IDs (0, 2, 4)
         let mut found_ids = all_records
             .iter()
-            .map(|r| match &r.fields[0].value() {
+            .map(|r| match &r.fields[0].deref() {
                 Value::Int32(id) => *id,
                 _ => panic!("Expected Int32"),
             })
@@ -3112,7 +3113,7 @@ mod tests {
         for id in [0, 2, 4] {
             let record = all_records
                 .iter()
-                .find(|r| match &r.fields[0].value() {
+                .find(|r| match &r.fields[0].deref() {
                     Value::Int32(rid) => *rid == id,
                     _ => false,
                 })
@@ -3155,7 +3156,7 @@ mod tests {
         for id in 0..3 {
             let record = all_records
                 .iter()
-                .find(|r| match &r.fields[0].value() {
+                .find(|r| match &r.fields[0].deref() {
                     Value::Int32(rid) => *rid == id,
                     _ => false,
                 })
@@ -3195,7 +3196,7 @@ mod tests {
                 // Verify all IDs are present
                 let mut found_ids = all_records
                     .iter()
-                    .map(|r| match &r.fields[0].value() {
+                    .map(|r| match &r.fields[0].deref() {
                         Value::Int32(id) => *id,
                         _ => panic!("Expected Int32"),
                     })
@@ -4744,14 +4745,14 @@ mod tests {
                     assert_eq!(record.fields.len(), 3,);
 
                     // Try to match ABC pattern
-                    let is_abc_pattern = matches!(&record.fields[0].value(), Value::String(s) if s == &exp_f1_abc)
-                        && matches!(&record.fields[1].value(), Value::String(s) if s == &exp_f2_abc)
-                        && matches!(&record.fields[2].value(), Value::String(s) if s == &exp_f3_abc);
+                    let is_abc_pattern = matches!(&record.fields[0].deref(), Value::String(s) if s == &exp_f1_abc)
+                        && matches!(&record.fields[1].deref(), Value::String(s) if s == &exp_f2_abc)
+                        && matches!(&record.fields[2].deref(), Value::String(s) if s == &exp_f3_abc);
 
                     // Try to match XYZ pattern
-                    let is_xyz_pattern = matches!(&record.fields[0].value(), Value::String(s) if s == &exp_f1_xyz)
-                        && matches!(&record.fields[1].value(), Value::String(s) if s == &exp_f2_xyz)
-                        && matches!(&record.fields[2].value(), Value::String(s) if s == &exp_f3_xyz);
+                    let is_xyz_pattern = matches!(&record.fields[0].deref(), Value::String(s) if s == &exp_f1_xyz)
+                        && matches!(&record.fields[1].deref(), Value::String(s) if s == &exp_f2_xyz)
+                        && matches!(&record.fields[2].deref(), Value::String(s) if s == &exp_f3_xyz);
 
                     assert!(is_abc_pattern || is_xyz_pattern,);
 
@@ -4811,13 +4812,13 @@ mod tests {
         let final_record = heap_file.record(&record_ptr).unwrap();
         assert_eq!(final_record.fields.len(), 3);
 
-        let is_abc = matches!(&final_record.fields[0].value(), Value::String(s) if s == &expected_field1_abc)
-            && matches!(&final_record.fields[1].value(), Value::String(s) if s == &expected_field2_abc)
-            && matches!(&final_record.fields[2].value(), Value::String(s) if s == &expected_field3_abc);
+        let is_abc = matches!(&final_record.fields[0].deref(), Value::String(s) if s == &expected_field1_abc)
+            && matches!(&final_record.fields[1].deref(), Value::String(s) if s == &expected_field2_abc)
+            && matches!(&final_record.fields[2].deref(), Value::String(s) if s == &expected_field3_abc);
 
-        let is_xyz = matches!(&final_record.fields[0].value(), Value::String(s) if s == &expected_field1_xyz)
-            && matches!(&final_record.fields[1].value(), Value::String(s) if s == &expected_field2_xyz)
-            && matches!(&final_record.fields[2].value(), Value::String(s) if s == &expected_field3_xyz);
+        let is_xyz = matches!(&final_record.fields[0].deref(), Value::String(s) if s == &expected_field1_xyz)
+            && matches!(&final_record.fields[1].deref(), Value::String(s) if s == &expected_field2_xyz)
+            && matches!(&final_record.fields[2].deref(), Value::String(s) if s == &expected_field3_xyz);
 
         assert!(is_abc || is_xyz);
     }
@@ -5191,7 +5192,7 @@ mod tests {
                                 continue;
                             }
 
-                            match &record.fields[0].value() {
+                            match &record.fields[0].deref() {
                                 Value::Int32(id) if *id == *expected_id => {}
                                 Value::Int32(id) => {
                                     println!(
@@ -5218,7 +5219,7 @@ mod tests {
                                 }
                             }
 
-                            match &record.fields[1].value() {
+                            match &record.fields[1].deref() {
                                 Value::String(name) if name == expected_name => {}
                                 Value::String(name) => {
                                     println!(
@@ -5294,7 +5295,7 @@ mod tests {
         // Verify no duplicate IDs
         let mut seen_ids = HashSet::new();
         for record in &all_records {
-            match &record.fields[0].value() {
+            match &record.fields[0].deref() {
                 Value::Int32(id) => {
                     assert!(seen_ids.insert(id), "Found duplicate record ID: {}", id);
                 }
