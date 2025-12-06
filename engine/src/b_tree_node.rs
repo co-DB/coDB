@@ -1,5 +1,4 @@
-﻿use crate::data_types::{DbSerializable, DbSerializationError};
-use crate::heap_file::RecordPtr;
+﻿use crate::heap_file::RecordPtr;
 use crate::slotted_page::{
     InsertResult, PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
     SlottedPageHeader, get_base_header,
@@ -9,6 +8,7 @@ use std::cmp::Ordering;
 use storage::cache::{PageRead, PageWrite};
 use storage::paged_file::PageId;
 use thiserror::Error;
+use types::serialization::{DbSerializable, DbSerializationError};
 
 #[derive(Error, Debug)]
 pub(crate) enum BTreeNodeError {

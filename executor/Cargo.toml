@@ -9,6 +9,7 @@ engine = { path = "../engine" }
 storage = { path = "../storage" }
 metadata = { path = "../metadata" }
 planner = { path = "../planner" }
+types = { path = "../types" }
 
 dashmap.workspace = true
 parking_lot.workspace = true

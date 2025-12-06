@@ -120,10 +120,11 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::ops::Deref;
 
-    use engine::record::{Field, Record};
-    use metadata::types::Type;
+    use engine::record::Record;
     use tempfile::TempDir;
+    use types::{data::Value, schema::Type};
 
     use crate::response::{ColumnData, StatementType};
 
@@ -297,27 +298,27 @@ mod tests {
 
         let alice = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(1))
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
             .unwrap();
         assert_eq!(alice.fields.len(), 3);
-        assert!(matches!(&alice.fields[1], Field::String(s) if s == "Alice"));
-        assert!(matches!(alice.fields[2], Field::Int32(25)));
+        assert!(matches!(&alice.fields[1].deref(), Value::String(s) if s == "Alice"));
+        assert!(matches!(alice.fields[2].deref(), Value::Int32(25)));
 
         let bob = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(2))
+            .find(|&r| *r.fields[0].deref() == Value::Int32(2))
             .unwrap();
         assert_eq!(bob.fields.len(), 3);
-        assert!(matches!(&bob.fields[1], Field::String(s) if s == "Bob"));
-        assert!(matches!(bob.fields[2], Field::Int32(30)));
+        assert!(matches!(&bob.fields[1].deref(), Value::String(s) if s == "Bob"));
+        assert!(matches!(bob.fields[2].deref(), Value::Int32(30)));
 
         let charlie = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(3))
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
             .unwrap();
         assert_eq!(charlie.fields.len(), 3);
-        assert!(matches!(&charlie.fields[1], Field::String(s) if s == "Charlie"));
-        assert!(matches!(charlie.fields[2], Field::Int32(35)));
+        assert!(matches!(&charlie.fields[1].deref(), Value::String(s) if s == "Charlie"));
+        assert!(matches!(charlie.fields[2].deref(), Value::Int32(35)));
     }
 
     #[test]
@@ -355,17 +356,17 @@ mod tests {
 
         let alice = rows
             .iter()
-            .find(|r| r.fields[1] == Field::Int32(25))
+            .find(|r| *r.fields[1].deref() == Value::Int32(25))
             .unwrap();
         assert_eq!(alice.fields.len(), 2);
-        assert!(matches!(&alice.fields[0], Field::String(s) if s == "Alice"));
+        assert!(matches!(&alice.fields[0].deref(), Value::String(s) if s == "Alice"));
 
         let bob = rows
             .iter()
-            .find(|r| r.fields[1] == Field::Int32(30))
+            .find(|r| *r.fields[1].deref() == Value::Int32(30))
             .unwrap();
         assert_eq!(bob.fields.len(), 2);
-        assert!(matches!(&bob.fields[0], Field::String(s) if s == "Bob"));
+        assert!(matches!(&bob.fields[0].deref(), Value::String(s) if s == "Bob"));
     }
 
     #[test]
@@ -407,27 +408,27 @@ mod tests {
 
         let alice = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(1))
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
             .unwrap();
         assert_eq!(alice.fields.len(), 3);
-        assert!(matches!(alice.fields[1], Field::Int32(25)));
-        assert!(matches!(&alice.fields[2], Field::String(s) if s == "Alice"));
+        assert!(matches!(alice.fields[1].deref(), Value::Int32(25)));
+        assert!(matches!(&alice.fields[2].deref(), Value::String(s) if s == "Alice"));
 
         let bob = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(2))
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
             .unwrap();
         assert_eq!(bob.fields.len(), 3);
-        assert!(matches!(bob.fields[1], Field::Int32(30)));
-        assert!(matches!(&bob.fields[2], Field::String(s) if s == "Bob"));
+        assert!(matches!(bob.fields[1].deref(), Value::Int32(30)));
+        assert!(matches!(&bob.fields[2].deref(), Value::String(s) if s == "Bob"));
 
         let charlie = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(3))
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
             .unwrap();
         assert_eq!(charlie.fields.len(), 3);
-        assert!(matches!(charlie.fields[1], Field::Int32(35)));
-        assert!(matches!(&charlie.fields[2], Field::String(s) if s == "Charlie"));
+        assert!(matches!(charlie.fields[1].deref(), Value::Int32(35)));
+        assert!(matches!(&charlie.fields[2].deref(), Value::String(s) if s == "Charlie"));
     }
 
     #[test]
@@ -465,19 +466,19 @@ mod tests {
 
         let alice = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(1))
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
             .unwrap();
         assert_eq!(alice.fields.len(), 2);
-        assert_eq!(alice.fields[0], Field::Int32(1));
-        assert_eq!(alice.fields[1], Field::Int32(1));
+        assert_eq!(*alice.fields[0].deref(), Value::Int32(1));
+        assert_eq!(*alice.fields[1].deref(), Value::Int32(1));
 
         let bob = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(2))
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
             .unwrap();
         assert_eq!(bob.fields.len(), 2);
-        assert_eq!(bob.fields[0], Field::Int32(2));
-        assert_eq!(bob.fields[1], Field::Int32(2));
+        assert_eq!(*bob.fields[0].deref(), Value::Int32(2));
+        assert_eq!(*bob.fields[1].deref(), Value::Int32(2));
     }
 
     #[test]
@@ -511,14 +512,17 @@ mod tests {
         assert_eq!(columns.len(), 3);
         assert_eq!(rows.len(), 2);
 
-        assert!(rows.iter().all(|r| r.fields[2] == Field::Int32(25)));
         assert!(
             rows.iter()
-                .any(|r| matches!(&r.fields[1], Field::String(s) if s == "Alice"))
+                .all(|r| *r.fields[2].deref() == Value::Int32(25))
         );
         assert!(
             rows.iter()
-                .any(|r| matches!(&r.fields[1], Field::String(s) if s == "Charlie"))
+                .any(|r| matches!(&r.fields[1].deref(), Value::String(s) if s == "Alice"))
+        );
+        assert!(
+            rows.iter()
+                .any(|r| matches!(&r.fields[1].deref(), Value::String(s) if s == "Charlie"))
         );
     }
 
@@ -552,8 +556,8 @@ mod tests {
         let (_, rows) = expect_select_successful(result);
 
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|r| r.fields[0] == Field::Int32(2)));
-        assert!(rows.iter().any(|r| r.fields[0] == Field::Int32(3)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(3)));
     }
 
     #[test]
@@ -627,9 +631,9 @@ mod tests {
 
         assert_eq!(columns.len(), 2);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].fields[1], Field::Int32(10));
-        assert_eq!(rows[1].fields[1], Field::Int32(20));
-        assert_eq!(rows[2].fields[1], Field::Int32(30));
+        assert_eq!(*rows[0].fields[1].deref(), Value::Int32(10));
+        assert_eq!(*rows[1].fields[1].deref(), Value::Int32(20));
+        assert_eq!(*rows[2].fields[1].deref(), Value::Int32(30));
     }
 
     #[test]
@@ -652,9 +656,9 @@ mod tests {
 
         assert_eq!(columns.len(), 2);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].fields[1], Field::Int32(30));
-        assert_eq!(rows[1].fields[1], Field::Int32(20));
-        assert_eq!(rows[2].fields[1], Field::Int32(10));
+        assert_eq!(*rows[0].fields[1].deref(), Value::Int32(30));
+        assert_eq!(*rows[1].fields[1].deref(), Value::Int32(20));
+        assert_eq!(*rows[2].fields[1].deref(), Value::Int32(10));
     }
 
     #[test]
@@ -685,9 +689,9 @@ mod tests {
         let (_, rows) = expect_select_successful(result);
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].fields[1], Field::String("apple".into()));
-        assert_eq!(rows[1].fields[1], Field::String("banana".into()));
-        assert_eq!(rows[2].fields[1], Field::String("zebra".into()));
+        assert_eq!(*rows[0].fields[1].deref(), Value::String("apple".into()));
+        assert_eq!(*rows[1].fields[1].deref(), Value::String("banana".into()));
+        assert_eq!(*rows[2].fields[1].deref(), Value::String("zebra".into()));
     }
 
     #[test]
@@ -709,9 +713,9 @@ mod tests {
         let (_, rows) = expect_select_successful(result);
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].fields[1], Field::Float64(1.5));
-        assert_eq!(rows[1].fields[1], Field::Float64(2.25));
-        assert_eq!(rows[2].fields[1], Field::Float64(3.75));
+        assert_eq!(*rows[0].fields[1].deref(), Value::Float64(1.5));
+        assert_eq!(*rows[1].fields[1].deref(), Value::Float64(2.25));
+        assert_eq!(*rows[2].fields[1].deref(), Value::Float64(3.75));
     }
 
     #[test]
@@ -738,9 +742,9 @@ mod tests {
         let (_, rows) = expect_select_successful(result);
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].fields[1], Field::Bool(false));
-        assert_eq!(rows[1].fields[1], Field::Bool(true));
-        assert_eq!(rows[2].fields[1], Field::Bool(true));
+        assert_eq!(*rows[0].fields[1].deref(), Value::Bool(false));
+        assert_eq!(*rows[1].fields[1].deref(), Value::Bool(true));
+        assert_eq!(*rows[2].fields[1].deref(), Value::Bool(true));
     }
 
     #[test]
@@ -763,10 +767,10 @@ mod tests {
         let (_, rows) = expect_select_successful(result);
 
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].fields[1], Field::Int32(10));
-        assert_eq!(rows[1].fields[1], Field::Int32(10));
-        assert_eq!(rows[2].fields[1], Field::Int32(20));
-        assert_eq!(rows[3].fields[1], Field::Int32(20));
+        assert_eq!(*rows[0].fields[1].deref(), Value::Int32(10));
+        assert_eq!(*rows[1].fields[1].deref(), Value::Int32(10));
+        assert_eq!(*rows[2].fields[1].deref(), Value::Int32(20));
+        assert_eq!(*rows[3].fields[1].deref(), Value::Int32(20));
     }
 
     #[test]
@@ -1002,17 +1006,20 @@ mod tests {
         assert_eq!(rows.len(), 2);
 
         // First row should be Monitor (300)
-        assert_eq!(rows[0].fields[0], Field::Int32(4));
-        assert_eq!(rows[0].fields[1], Field::String("Monitor".into()));
-        assert_eq!(rows[0].fields[2], Field::Int32(300));
+        assert_eq!(*rows[0].fields[0].deref(), Value::Int32(4));
+        assert_eq!(*rows[0].fields[1].deref(), Value::String("Monitor".into()));
+        assert_eq!(*rows[0].fields[2].deref(), Value::Int32(300));
 
         // Second row should be Headphones (100)
-        assert_eq!(rows[1].fields[0], Field::Int32(7));
-        assert_eq!(rows[1].fields[1], Field::String("Headphones".into()));
-        assert_eq!(rows[1].fields[2], Field::Int32(100));
+        assert_eq!(*rows[1].fields[0].deref(), Value::Int32(7));
+        assert_eq!(
+            *rows[1].fields[1].deref(),
+            Value::String("Headphones".into())
+        );
+        assert_eq!(*rows[1].fields[2].deref(), Value::Int32(100));
 
         assert!(rows.iter().all(|r| {
-            if let Field::Int32(price) = r.fields[2] {
+            if let Value::Int32(price) = *r.fields[2].deref() {
                 price > 50
             } else {
                 false
@@ -1052,9 +1059,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
 
         let row = &rows[0];
-        assert_eq!(row.fields[0], Field::Int32(1));
-        assert!(matches!(&row.fields[1], Field::String(s) if s == "Alice"));
-        assert_eq!(row.fields[2], Field::Int32(25));
+        assert_eq!(*row.fields[0].deref(), Value::Int32(1));
+        assert!(matches!(&row.fields[1].deref(), Value::String(s) if s == "Alice"));
+        assert_eq!(*row.fields[2].deref(), Value::Int32(25));
     }
 
     #[test]
@@ -1100,24 +1107,24 @@ mod tests {
 
         let alice = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(1))
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
             .unwrap();
-        assert!(matches!(&alice.fields[1], Field::String(s) if s == "Alice"));
-        assert_eq!(alice.fields[2], Field::Int32(25));
+        assert!(matches!(&alice.fields[1].deref(), Value::String(s) if s == "Alice"));
+        assert_eq!(*alice.fields[2].deref(), Value::Int32(25));
 
         let bob = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(2))
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
             .unwrap();
-        assert!(matches!(&bob.fields[1], Field::String(s) if s == "Bob"));
-        assert_eq!(bob.fields[2], Field::Int32(30));
+        assert!(matches!(&bob.fields[1].deref(), Value::String(s) if s == "Bob"));
+        assert_eq!(*bob.fields[2].deref(), Value::Int32(30));
 
         let charlie = rows
             .iter()
-            .find(|r| r.fields[0] == Field::Int32(3))
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
             .unwrap();
-        assert!(matches!(&charlie.fields[1], Field::String(s) if s == "Charlie"));
-        assert_eq!(charlie.fields[2], Field::Int32(35));
+        assert!(matches!(&charlie.fields[1].deref(), Value::String(s) if s == "Charlie"));
+        assert_eq!(*charlie.fields[2].deref(), Value::Int32(35));
     }
 
     #[test]
@@ -1148,8 +1155,8 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.fields[0], Field::Int32(1));
-        assert!(matches!(&row.fields[1], Field::String(s) if s == "Alice"));
-        assert_eq!(row.fields[2], Field::Int32(25));
+        assert_eq!(*row.fields[0].deref(), Value::Int32(1));
+        assert!(matches!(&row.fields[1].deref(), Value::String(s) if s == "Alice"));
+        assert_eq!(*row.fields[2].deref(), Value::Int32(25));
     }
 }

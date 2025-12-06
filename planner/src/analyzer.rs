@@ -4,12 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use metadata::{
-    catalog::{Catalog, CatalogError, ColumnMetadata, TableMetadata, TableMetadataError},
-    types::Type,
-};
+use metadata::catalog::{Catalog, CatalogError, ColumnMetadata, TableMetadata, TableMetadataError};
 use parking_lot::RwLock;
 use thiserror::Error;
+use types::schema::Type;
 
 use crate::{
     ast::{
@@ -1182,11 +1180,11 @@ mod tests {
     };
     use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
     use metadata::catalog::Catalog;
-    use metadata::types::Type;
     use parking_lot::RwLock;
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use types::schema::Type;
 
     const METADATA_FILE_NAME: &str = "metadata.coDB";
 

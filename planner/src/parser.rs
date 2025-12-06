@@ -3,9 +3,9 @@ use crate::operators::{BinaryOperator, LogicalOperator, UnaryOperator};
 use super::ast::*;
 use super::lexer::Lexer;
 use super::tokens::{Token, TokenType};
-use metadata::types::Type;
 use std::mem;
 use thiserror::Error;
+use types::schema::Type;
 
 type PrefixFn = fn(&mut Parser) -> Result<NodeId, ParserError>;
 

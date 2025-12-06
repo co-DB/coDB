@@ -2,6 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::data::{DbDate, DbDateTime};
+use crate::serialization::DbSerializableFixedSize;
+
 /// Represents all possible types that value in coSQL can get.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Type {
@@ -47,6 +50,19 @@ impl fmt::Display for Type {
             Type::Date => write!(f, "Date"),
             Type::DateTime => write!(f, "DateTime"),
         }
+    }
+}
+
+pub fn type_size_on_disk(ty: &Type) -> Option<usize> {
+    match ty {
+        Type::String => None,
+        Type::F32 => Some(f32::fixed_size_serialized()),
+        Type::F64 => Some(f64::fixed_size_serialized()),
+        Type::I32 => Some(i32::fixed_size_serialized()),
+        Type::I64 => Some(i64::fixed_size_serialized()),
+        Type::Bool => Some(bool::fixed_size_serialized()),
+        Type::Date => Some(DbDate::fixed_size_serialized()),
+        Type::DateTime => Some(DbDateTime::fixed_size_serialized()),
     }
 }
 

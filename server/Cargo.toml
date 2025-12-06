@@ -9,7 +9,7 @@ executor = { path = "../executor" }
 metadata = { path = "../metadata" }
 engine = { path = "../engine" }
 protocol = { path = "../protocol" }
-
+types = { path = "../types" }
 
 tokio.workspace = true
 thiserror.workspace = true

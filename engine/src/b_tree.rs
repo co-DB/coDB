@@ -4,7 +4,6 @@ use crate::b_tree_node::{
     BTreeInternalNode, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult, NodeInsertResult,
     NodeType, get_node_type,
 };
-use crate::data_types::{DbSerializable, DbSerializationError};
 use crate::heap_file::RecordPtr;
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
@@ -13,6 +12,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use storage::cache::{Cache, CacheError, FilePageRef, PageWrite, PinnedReadPage, PinnedWritePage};
 use storage::files_manager::FileKey;
 use thiserror::Error;
+use types::serialization::{DbSerializable, DbSerializationError};
 
 #[derive(Debug, Error)]
 pub(crate) enum BTreeError {

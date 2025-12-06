@@ -1,6 +1,6 @@
 use core::fmt;
 
-use metadata::types::Type;
+use types::schema::Type;
 
 #[derive(Debug, Clone, Copy)]
 pub enum BinaryOperator {
