@@ -128,15 +128,15 @@ impl Catalog {
     pub fn add_column(
         &mut self,
         table_name: impl AsRef<str>,
-        columnd_dto: NewColumnDto,
+        column_dto: NewColumnDto,
     ) -> Result<NewColumnAdded, CatalogError> {
         let table: &mut TableMetadata = self.table_mut(table_name.as_ref())?;
-        let new_column = table.add_column(columnd_dto)?;
+        let new_column = table.add_column(column_dto)?;
         self.sync_to_disk()?;
         Ok(new_column)
     }
 
-    /// Removes column to the table.
+    /// Removes column from the table.
     /// It works by delegating this to [`TableMetadata::remove_column`].
     ///
     /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
@@ -344,7 +344,7 @@ impl TableMetadata {
                 Some(size) => {
                     // This is the first variable size column in the table
                     (
-                        self.columns[prev_pos].base_offset + size,
+                        self.columns[prev_pos].base_offset() + size,
                         prev_pos as u16 + 1,
                     )
                 }
@@ -407,7 +407,7 @@ impl TableMetadata {
 
                 if self.columns.len() != idx {
                     // It was not the last column, we need to fix metadata of other columns that come after the deleted one
-                    self.recalculate_columns_metadata_from(idx - 1);
+                    self.recalculate_columns_metadata_from(idx);
                 }
 
                 Ok(ColumnRemoved {
@@ -1861,6 +1861,49 @@ mod tests {
         assert_eq!(email_col.pos(), 3);
         assert_eq!(email_col.base_offset(), 12);
         assert_eq!(email_col.base_offset_pos(), 2);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_first_non_primary_key_column() {
+        // given table where first column is NOT primary key
+        let columns = vec![
+            dummy_column("age", Type::I32, 0),
+            dummy_column("id", Type::I32, 1),
+            dummy_column("score", Type::F64, 2),
+            ColumnMetadata::new("name".to_string(), Type::String, 3, 16, 3).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing first column (which is not primary key)
+        let result = table.remove_column("age");
+
+        // then column is removed and all subsequent columns recalculated
+        assert!(result.is_ok());
+        let removed = result.unwrap();
+        assert_eq!(removed.pos, 0);
+        assert_eq!(removed.ty, Type::I32);
+
+        // id shifts to position 0
+        let id_col = table.column("id").unwrap();
+        assert_eq!(id_col.pos(), 0);
+        assert_eq!(id_col.base_offset(), 0);
+        assert_eq!(id_col.base_offset_pos(), 0);
+
+        // score shifts down
+        let score_col = table.column("score").unwrap();
+        assert_eq!(score_col.pos(), 1);
+        assert_eq!(score_col.base_offset(), 4);
+        assert_eq!(score_col.base_offset_pos(), 1);
+
+        // name shifts down
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 2);
+        assert_eq!(name_col.base_offset(), 12);
+        assert_eq!(name_col.base_offset_pos(), 2);
+
+        // column no longer exists
+        assert!(table.column("age").is_err());
+        assert_eq!(table.columns.len(), 3);
     }
 
     #[test]
