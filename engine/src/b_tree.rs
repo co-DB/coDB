@@ -2,7 +2,7 @@ use std::pin::Pin;
 use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, InternalNodeSearchResult,
+    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, InternalNodeSearchResult,
     LeafNodeSearchResult, NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
@@ -114,13 +114,17 @@ struct LatchHandle {
     page_id: PageId,
     /// The actual node.
     node: BTreeInternalNode<PinnedWritePage>,
-    /// Index of the child we descended into in the node. Used in delete to get the chosen node's
+    /// Position of the child we descended into in the node. Used in delete to get the chosen node's
     /// siblings.
-    child_pos: u16,
+    child_pos: ChildPosition,
 }
 
 impl LatchHandle {
-    fn new(page_id: PageId, node: BTreeInternalNode<PinnedWritePage>, child_pos: u16) -> Self {
+    fn new(
+        page_id: PageId,
+        node: BTreeInternalNode<PinnedWritePage>,
+        child_pos: ChildPosition,
+    ) -> Self {
         Self {
             page_id,
             node,
@@ -150,7 +154,7 @@ struct NodeLatch {
 struct MergeContext {
     parent_id: PageId,
     parent_node: BTreeInternalNode<PinnedWritePage>,
-    child_pos: u16,
+    child_pos: ChildPosition,
     internal_nodes: Vec<LatchHandle>,
     metadata_page: Option<PinnedWritePage>,
 }
@@ -208,6 +212,14 @@ impl BTree {
     ) -> Result<BTreeLeafNode<PinnedWritePage>, BTreeError> {
         let page = self.pin_write(leaf_page_id)?;
         Ok(BTreeLeafNode::<PinnedWritePage>::new(page)?)
+    }
+
+    fn pin_internal_for_write(
+        &self,
+        internal_page_id: PageId,
+    ) -> Result<BTreeInternalNode<PinnedWritePage>, BTreeError> {
+        let page = self.pin_write(internal_page_id)?;
+        Ok(BTreeInternalNode::<PinnedWritePage>::new(page)?)
     }
 
     /// Searches for a key in the B-tree and returns the corresponding record pointer (to heap
@@ -361,7 +373,7 @@ impl BTree {
                     let search_result = node.search(key)?;
 
                     current_page_id = search_result.child_ptr();
-                    let child_index = search_result.child_index();
+                    let child_pos = search_result.child_pos();
 
                     // If child can fit another, we can safely drop ancestors and metadata.
                     if drop_lock_fn(&node)? {
@@ -369,7 +381,7 @@ impl BTree {
                         latch_stack.clear();
                     }
 
-                    let latch_handle = LatchHandle::new(old_page_id, node, child_index);
+                    let latch_handle = LatchHandle::new(old_page_id, node, child_pos);
                     latch_stack.push(latch_handle);
                 }
                 NodeType::Leaf => {
@@ -681,6 +693,9 @@ impl BTree {
             child_pos,
         } = parent;
 
+        // I think here?
+        self.update_structural_version(parent_id);
+
         if let Some(right_sibling_id) = node.next_leaf_id()? {
             let mut right_sibling = self.pin_leaf_for_write(right_sibling_id)?;
 
@@ -691,12 +706,15 @@ impl BTree {
 
                 // Update separator in parent - new separator is the new first key of right sibling.
                 let new_separator_key = right_sibling.get_first_key()?;
-                parent_node.update_separator_at_slot(child_pos, &new_separator_key)?;
+                let slot_id = child_pos
+                    .slot_id()
+                    .expect("child_pos must be AfterSlot to have a right sibling");
+                parent_node.update_separator_at_slot(slot_id, &new_separator_key)?;
 
                 return Ok(());
             }
 
-            if child_pos == 0 {
+            if child_pos == ChildPosition::Leftmost {
                 let ctx = MergeContext {
                     parent_id,
                     parent_node,
@@ -709,7 +727,10 @@ impl BTree {
             }
         }
 
-        let left_node_id = parent_node.get_child_ptr_by_index(child_pos - 1)?;
+        let preceding_child_pos = parent_node
+            .get_preceding_child_pos(child_pos)?
+            .expect("We know child pos is not Leftmost, so this will always return a position");
+        let left_node_id = parent_node.get_child_ptr_at(preceding_child_pos)?;
         let mut left_sibling = self.pin_leaf_for_write(left_node_id)?;
 
         if left_sibling.can_redistribute_key()? {
@@ -718,7 +739,10 @@ impl BTree {
 
             // The redistributed key becomes the new separator (it's now the first key of current node).
             let new_separator_key = Self::extract_key_from_leaf_record(&redistributed_record);
-            parent_node.update_separator_at_slot(child_pos - 1, &new_separator_key)?;
+            let slot_id = preceding_child_pos
+                .slot_id()
+                .expect("preceding_child_pos must be AfterSlot");
+            parent_node.update_separator_at_slot(slot_id, &new_separator_key)?;
 
             node.insert_record(redistributed_record.as_slice())?;
             return Ok(());
@@ -751,7 +775,14 @@ impl BTree {
 
         node.set_next_leaf_id(sibling_node.next_leaf_id()?)?;
 
-        ctx.parent_node.delete_at(ctx.child_pos + 1)?;
+        let next_child_pos = ctx
+            .parent_node
+            .get_next_child_pos(ctx.child_pos)?
+            .expect("We wouldn't have gone into this function if right sibling didn't exist");
+        let slot_id = next_child_pos
+            .slot_id()
+            .expect("next_child_pos must be AfterSlot");
+        ctx.parent_node.delete_at(slot_id)?;
 
         self.free_page(sibling_id)?;
 
@@ -776,7 +807,11 @@ impl BTree {
 
         sibling_node.set_next_leaf_id(node.next_leaf_id()?)?;
 
-        ctx.parent_node.delete_at(ctx.child_pos)?;
+        let slot_id = ctx
+            .child_pos
+            .slot_id()
+            .expect("child_pos must be AfterSlot for merge_with_left_sibling");
+        ctx.parent_node.delete_at(slot_id)?;
 
         // Free the current page
         self.free_page(node_id)?;
@@ -790,9 +825,11 @@ impl BTree {
     }
 
     fn free_page(&self, page_id: PageId) -> Result<(), BTreeError> {
+        self.structural_version_numbers.remove(&page_id);
         let page_ref = self.page_ref(page_id);
         Ok(self.cache.free_page(&page_ref)?)
     }
+
     fn handle_internal_underflow(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
         let parent = match ctx.internal_nodes.pop() {
             None => {
@@ -811,15 +848,44 @@ impl BTree {
             child_pos,
         } = parent;
 
+        // Check if we have a right sibling to be made
+
+        if let Some(right_sibling_pos) = parent_node.get_next_child_pos(child_pos)? {
+            let right_sibling =
+                self.pin_internal_for_write(parent_node.get_child_ptr_at(right_sibling_pos)?)?;
+        }
         Ok(())
     }
 
+    fn merge_with_right_sibling_internal(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
+        Ok(())
+    }
+
+    fn merge_with_left_sibling_internal(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
+        Ok(())
+    }
     fn handle_root_underflow(
         &self,
         root_node: BTreeInternalNode<PinnedWritePage>,
         root_id: PageId,
-        metadata_page: PinnedWritePage,
+        mut metadata_page: PinnedWritePage,
     ) -> Result<(), BTreeError> {
+        // If root has more than one child we can keep it with the underflow.
+        if root_node.num_children()? == 1 {
+            let child_id = root_node.get_child_ptr_at(ChildPosition::Leftmost)?;
+
+            let metadata_bytes = &mut metadata_page.page_mut()[0..size_of::<BTreeMetadata>()];
+            let metadata =
+                bytemuck::try_from_bytes_mut::<BTreeMetadata>(metadata_bytes).map_err(|e| {
+                    BTreeError::CorruptMetadata {
+                        reason: e.to_string(),
+                    }
+                })?;
+
+            metadata.root_page_id = child_id;
+            self.free_page(root_id)?;
+        }
+
         Ok(())
     }
 

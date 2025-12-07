@@ -1,7 +1,7 @@
 ﻿use crate::heap_file::RecordPtr;
 use crate::slotted_page::{
-    InsertResult, PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
-    SlottedPageHeader, get_base_header,
+    InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
+    SlottedPageError, SlottedPageHeader, get_base_header,
 };
 use bytemuck::{Pod, Zeroable};
 use std::cmp::Ordering;
@@ -41,6 +41,25 @@ pub(crate) enum NodeDeleteResult {
     Success,
     SuccessUnderflow,
     KeyDoesNotExist,
+}
+
+/// Represents a child pointer position in an internal B-tree node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildPosition {
+    /// The leftmost child pointer, stored in the node header.
+    Leftmost,
+    /// A child pointer stored in a slot.
+    AfterSlot(SlotId),
+}
+
+impl ChildPosition {
+    /// Returns the slot ID if this is an AfterSlot position, None for Leftmost.
+    pub fn slot_id(&self) -> Option<SlotId> {
+        match self {
+            ChildPosition::Leftmost => None,
+            ChildPosition::AfterSlot(slot_id) => Some(*slot_id),
+        }
+    }
 }
 
 /// Type aliases for making things a little more readable
@@ -126,23 +145,18 @@ pub(crate) enum LeafNodeSearchResult {
 }
 
 pub(crate) enum InternalNodeSearchResult {
-    /// Key found
+    /// Key found exactly
     FoundExact {
         child_ptr: PageId,
-        /// The index of the child pointer that was followed.
-        /// Index 0 = leftmost_child_pointer (from header)
-        /// Index 1 = child pointer at slot 0
-        child_index: u16,
+        /// The position of the child pointer that was followed.
+        child_pos: ChildPosition,
     },
 
-    /// Key not found
-    /// If insertion is needed, insert at slot position = child_index
+    /// Key not found, followed a child pointer during search
     NotFoundInternal {
         child_ptr: PageId,
-        /// The index of the child pointer that was followed.
-        /// Index 0 = leftmost_child_pointer (from header)
-        /// Index 1 = child pointer at slot 0
-        child_index: u16,
+        /// The position of the child pointer that was followed.
+        child_pos: ChildPosition,
     },
 }
 
@@ -154,10 +168,10 @@ impl InternalNodeSearchResult {
         }
     }
 
-    pub(crate) fn child_index(&self) -> u16 {
+    pub(crate) fn child_pos(&self) -> ChildPosition {
         match self {
-            InternalNodeSearchResult::FoundExact { child_index, .. } => *child_index,
-            InternalNodeSearchResult::NotFoundInternal { child_index, .. } => *child_index,
+            InternalNodeSearchResult::FoundExact { child_pos, .. } => *child_pos,
+            InternalNodeSearchResult::NotFoundInternal { child_pos, .. } => *child_pos,
         }
     }
 }
@@ -310,16 +324,51 @@ where
         Ok(child_ptr)
     }
 
-    /// Gets the child pointer by its conceptual index.
-    /// Index 0 = leftmost_child_pointer (from header)
-    /// Index 1 = child pointer at slot 0
-    /// Index 2 = child pointer at slot 1, etc.
-    pub fn get_child_ptr_by_index(&self, child_index: u16) -> Result<PageId, BTreeNodeError> {
-        if child_index == 0 {
-            Ok(self.get_btree_header()?.leftmost_child_pointer)
-        } else {
-            self.get_child_ptr(child_index - 1)
+    /// Gets the child pointer at the given position.
+    pub fn get_child_ptr_at(&self, pos: ChildPosition) -> Result<PageId, BTreeNodeError> {
+        match pos {
+            ChildPosition::Leftmost => Ok(self.get_btree_header()?.leftmost_child_pointer),
+            ChildPosition::AfterSlot(slot_id) => self.get_child_ptr(slot_id),
         }
+    }
+
+    /// Returns the child position immediately preceding the given position,
+    /// skipping any deleted slots.
+    pub(crate) fn get_preceding_child_pos(
+        &self,
+        pos: ChildPosition,
+    ) -> Result<Option<ChildPosition>, BTreeNodeError> {
+        match pos {
+            ChildPosition::Leftmost => Ok(None),
+            ChildPosition::AfterSlot(slot_id) => {
+                // Find the first non-deleted slot before this one
+                let preceding_slot = (0..slot_id)
+                    .rev()
+                    .find(|&s| !self.slotted_page.is_slot_deleted(s).unwrap_or(true));
+
+                match preceding_slot {
+                    Some(s) => Ok(Some(ChildPosition::AfterSlot(s))),
+                    None => Ok(Some(ChildPosition::Leftmost)),
+                }
+            }
+        }
+    }
+
+    /// Returns the child position immediately following the given position,
+    /// skipping any deleted slots.
+    pub fn get_next_child_pos(
+        &self,
+        pos: ChildPosition,
+    ) -> Result<Option<ChildPosition>, BTreeNodeError> {
+        let start_slot = match pos {
+            ChildPosition::Leftmost => 0,
+            ChildPosition::AfterSlot(slot_id) => slot_id + 1,
+        };
+
+        let next_slot = (start_slot..self.slotted_page.num_slots()?)
+            .find(|&s| !self.slotted_page.is_slot_deleted(s).unwrap_or(true));
+
+        Ok(next_slot.map(ChildPosition::AfterSlot))
     }
 
     /// Search returns which child to follow.
@@ -329,7 +378,7 @@ where
         if num_slots == 0 {
             return Ok(InternalNodeSearchResult::NotFoundInternal {
                 child_ptr: self.get_btree_header()?.leftmost_child_pointer,
-                child_index: 0, // leftmost child
+                child_pos: ChildPosition::Leftmost,
             });
         }
 
@@ -358,7 +407,7 @@ where
                     let child_ptr = self.get_child_ptr(mid)?;
                     return Ok(InternalNodeSearchResult::FoundExact {
                         child_ptr,
-                        child_index: mid + 1, // slot mid corresponds to child index mid+1
+                        child_pos: ChildPosition::AfterSlot(mid),
                     });
                 }
                 Ordering::Greater => {
@@ -371,15 +420,18 @@ where
         }
 
         let header = self.get_btree_header()?;
-        let (child_ptr, child_index) = if left == 0 {
-            (header.leftmost_child_pointer, 0) // leftmost child is at index 0
+        let (child_ptr, child_pos) = if left == 0 {
+            (header.leftmost_child_pointer, ChildPosition::Leftmost)
         } else {
-            (self.get_child_ptr(left - 1)?, left) // slot (left-1) corresponds to child index left
+            (
+                self.get_child_ptr(left - 1)?,
+                ChildPosition::AfterSlot(left - 1),
+            )
         };
 
         Ok(InternalNodeSearchResult::NotFoundInternal {
             child_ptr,
-            child_index,
+            child_pos,
         })
     }
 
@@ -420,7 +472,15 @@ where
             InternalNodeSearchResult::FoundExact { .. } => {
                 return Err(BTreeNodeError::InternalNodeDuplicateKey);
             }
-            InternalNodeSearchResult::NotFoundInternal { child_index, .. } => child_index,
+            InternalNodeSearchResult::NotFoundInternal { child_pos, .. } => {
+                // Convert child position to slot index for insertion.
+                // When inserting after Leftmost, we insert at slot 0.
+                // When inserting after slot N, we insert at slot N+1.
+                match child_pos {
+                    ChildPosition::Leftmost => 0,
+                    ChildPosition::AfterSlot(slot_id) => slot_id + 1,
+                }
+            }
         };
         let mut buffer = Vec::new();
         buffer.extend_from_slice(key);
@@ -919,13 +979,13 @@ mod test {
         match res {
             InternalNodeSearchResult::NotFoundInternal {
                 child_ptr,
-                child_index,
+                child_pos,
             } => {
                 assert_eq!(
                     child_ptr, 100,
                     "Empty internal node should return leftmost child"
                 );
-                assert_eq!(child_index, 0, "Child index should be 0");
+                assert_eq!(child_pos, ChildPosition::Leftmost);
             }
             _ => panic!("Expected NotFoundInternal for empty node"),
         }
@@ -945,10 +1005,10 @@ mod test {
         {
             InternalNodeSearchResult::NotFoundInternal {
                 child_ptr,
-                child_index,
+                child_pos,
             } => {
                 assert_eq!(child_ptr, 100, "Key 5 should route to leftmost child");
-                assert_eq!(child_index, 0);
+                assert_eq!(child_pos, ChildPosition::Leftmost);
             }
             _ => panic!("Expected NotFoundInternal"),
         }
@@ -960,10 +1020,10 @@ mod test {
         {
             InternalNodeSearchResult::FoundExact {
                 child_ptr,
-                child_index,
+                child_pos,
             } => {
                 assert_eq!(child_ptr, 200, "Key 10 should route to its child pointer");
-                assert_eq!(child_index, 1);
+                assert_eq!(child_pos, ChildPosition::AfterSlot(0));
             }
             _ => panic!("Expected FoundExact"),
         }
@@ -975,10 +1035,10 @@ mod test {
         {
             InternalNodeSearchResult::NotFoundInternal {
                 child_ptr,
-                child_index,
+                child_pos,
             } => {
                 assert_eq!(child_ptr, 200, "Key 15 should route to child after 10");
-                assert_eq!(child_index, 1);
+                assert_eq!(child_pos, ChildPosition::AfterSlot(0));
             }
             _ => panic!("Expected NotFoundInternal"),
         }
@@ -990,10 +1050,10 @@ mod test {
         {
             InternalNodeSearchResult::NotFoundInternal {
                 child_ptr,
-                child_index,
+                child_pos,
             } => {
                 assert_eq!(child_ptr, 300, "Key 25 should route to child after 20");
-                assert_eq!(child_index, 2);
+                assert_eq!(child_pos, ChildPosition::AfterSlot(1));
             }
             _ => panic!("Expected NotFoundInternal"),
         }
@@ -1005,10 +1065,10 @@ mod test {
         {
             InternalNodeSearchResult::NotFoundInternal {
                 child_ptr,
-                child_index,
+                child_pos,
             } => {
                 assert_eq!(child_ptr, 400, "Key 35 should route to rightmost child");
-                assert_eq!(child_index, 3);
+                assert_eq!(child_pos, ChildPosition::AfterSlot(2));
             }
             _ => panic!("Expected NotFoundInternal"),
         }
@@ -1534,4 +1594,6 @@ mod test {
         let result = node.delete(&key).unwrap();
         assert!(matches!(result, NodeDeleteResult::KeyDoesNotExist));
     }
+
+    // TODO: Add tests for get_preceding and get_next index.
 }
