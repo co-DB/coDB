@@ -48,7 +48,6 @@ pub enum CatalogError {
     TableError(#[from] TableMetadataError),
 }
 
-// TODO: Add updating columns
 impl Catalog {
     /// Creates new instance of [`Catalog`] for database `database_name`.
     /// Can fail if database does not exist or io error occurs.
