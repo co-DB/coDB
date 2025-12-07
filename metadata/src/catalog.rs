@@ -264,21 +264,18 @@ impl TableMetadata {
         column_dto: NewColumnDto,
     ) -> Result<NewColumnAdded, TableMetadataError> {
         let already_exists = self.columns_by_name.contains_key(&column_dto.name);
-        match already_exists {
-            true => Err(TableMetadataError::ColumnAlreadyExists(column_dto.name)),
-            false => {
-                let pos = match column_dto.ty.is_fixed_size() {
-                    true => self.add_fixed_size_column(column_dto.name.clone(), column_dto.ty)?,
-                    false => {
-                        self.add_variable_size_column(column_dto.name.clone(), column_dto.ty)?
-                    }
-                };
-                self.columns_by_name.insert(column_dto.name, pos);
-                Ok(NewColumnAdded {
-                    pos: pos as _,
-                    ty: column_dto.ty,
-                })
-            }
+        if already_exists {
+            Err(TableMetadataError::ColumnAlreadyExists(column_dto.name))
+        } else {
+            let pos = match column_dto.ty.is_fixed_size() {
+                true => self.add_fixed_size_column(column_dto.name.clone(), column_dto.ty)?,
+                false => self.add_variable_size_column(column_dto.name.clone(), column_dto.ty)?,
+            };
+            self.columns_by_name.insert(column_dto.name, pos);
+            Ok(NewColumnAdded {
+                pos: pos as _,
+                ty: column_dto.ty,
+            })
         }
     }
 
