@@ -137,22 +137,21 @@ impl Catalog {
         Ok(new_column)
     }
 
-    // TODO: refactor this
     /// Removes column to the table.
     /// It works by delegating this to [`TableMetadata::remove_column`].
     ///
     /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
     /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
-    // pub fn remove_column(
-    //     &mut self,
-    //     table_name: impl AsRef<str>,
-    //     column_name: impl AsRef<str>,
-    // ) -> Result<(), CatalogError> {
-    //     let table = self.table_mut(table_name.as_ref())?;
-    //     table.remove_column(column_name.as_ref())?;
-    //     self.sync_to_disk()?;
-    //     Ok(())
-    // }
+    pub fn remove_column(
+        &mut self,
+        table_name: impl AsRef<str>,
+        column_name: impl AsRef<str>,
+    ) -> Result<ColumnRemoved, CatalogError> {
+        let table = self.table_mut(table_name.as_ref())?;
+        let cr = table.remove_column(column_name.as_ref())?;
+        self.sync_to_disk()?;
+        Ok(cr)
+    }
 
     /// Syncs in-memory [`Catalog`] instance with underlying file.
     /// Can fail if io error occurs.
@@ -201,6 +200,12 @@ pub enum TableMetadataError {
 
 #[derive(Debug)]
 pub struct NewColumnAdded {
+    pub pos: u16,
+    pub ty: Type,
+}
+
+#[derive(Debug)]
+pub struct ColumnRemoved {
     pub pos: u16,
     pub ty: Type,
 }
@@ -389,30 +394,31 @@ impl TableMetadata {
         }
     }
 
-    // TODO: refactor this
     /// Removes column from the table.
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with provided name does not exist or the column is primary key.
-    // fn remove_column(&mut self, column_name: &str) -> Result<(), TableMetadataError> {
-    //     if column_name == self.primary_key_column_name() {
-    //         return Err(TableMetadataError::InvalidColumnUsed(column_name.into()));
-    //     }
-    //     let idx = self.columns_by_name.remove(column_name);
-    //     match idx {
-    //         Some(idx) => {
-    //             self.columns.swap_remove(idx);
-    //             // Removed last element - no need to update any index
-    //             if idx == self.columns.len() {
-    //                 return Ok(());
-    //             }
-    //             // Update index of the element that was moved
-    //             let swapped_name = &self.columns[idx].name;
-    //             self.columns_by_name.insert(swapped_name.clone(), idx);
-    //             Ok(())
-    //         }
-    //         None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
-    //     }
-    // }
+    fn remove_column(&mut self, column_name: &str) -> Result<ColumnRemoved, TableMetadataError> {
+        if column_name == self.primary_key_column_name() {
+            return Err(TableMetadataError::InvalidColumnUsed(column_name.into()));
+        }
+        let idx = self.columns_by_name.remove(column_name);
+        match idx {
+            Some(idx) => {
+                let cm = self.columns.remove(idx);
+
+                if self.columns.len() != idx {
+                    // It was not the last column, we need to fix metadata of other columns that come after the deleted one
+                    self.recalculate_columns_metadata_from(idx - 1);
+                }
+
+                Ok(ColumnRemoved {
+                    pos: cm.pos(),
+                    ty: cm.ty(),
+                })
+            }
+            None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
+        }
+    }
 
     /// Returns name of the table's primary key column
     pub fn primary_key_column_name(&self) -> &str {
@@ -1691,6 +1697,171 @@ mod tests {
         assert_eq!(name_col.pos(), 2);
         assert_eq!(name_col.base_offset(), 8);
         assert_eq!(name_col.base_offset_pos(), 2);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_fixed_size_column_from_end() {
+        // given table with multiple fixed-size columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+            dummy_column("score", Type::F64, 2),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing last fixed-size column
+        let result = table.remove_column("score");
+
+        // then column is removed
+        assert!(result.is_ok());
+        let removed = result.unwrap();
+        assert_eq!(removed.pos, 2);
+        assert_eq!(removed.ty, Type::F64);
+
+        // and column no longer exists
+        assert!(table.column("score").is_err());
+        assert_eq!(table.columns.len(), 2);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_fixed_size_column_from_middle() {
+        // given table with fixed and variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+            ColumnMetadata::new("name".to_string(), Type::String, 2, 8, 2).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing fixed-size column from middle
+        let result = table.remove_column("age");
+
+        // then column is removed and metadata recalculated
+        assert!(result.is_ok());
+
+        let id_col = table.column("id").unwrap();
+        assert_eq!(id_col.pos(), 0);
+        assert_eq!(id_col.base_offset(), 0);
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 1);
+        assert_eq!(name_col.base_offset(), 4);
+        assert_eq!(name_col.base_offset_pos(), 1);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_variable_size_column_from_end() {
+        // given table with fixed and variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            ColumnMetadata::new("name".to_string(), Type::String, 1, 4, 1).unwrap(),
+            ColumnMetadata::new("email".to_string(), Type::String, 2, 4, 1).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing last variable-size column
+        let result = table.remove_column("email");
+
+        // then column is removed
+        assert!(result.is_ok());
+        let removed = result.unwrap();
+        assert_eq!(removed.pos, 2);
+        assert_eq!(removed.ty, Type::String);
+
+        // and column no longer exists
+        assert!(table.column("email").is_err());
+        assert_eq!(table.columns.len(), 2);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_variable_size_column_from_middle() {
+        // given table with multiple variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            ColumnMetadata::new("name".to_string(), Type::String, 1, 4, 1).unwrap(),
+            ColumnMetadata::new("email".to_string(), Type::String, 2, 4, 1).unwrap(),
+            ColumnMetadata::new("address".to_string(), Type::String, 3, 4, 1).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing variable-size column from middle
+        let result = table.remove_column("email");
+
+        // then column is removed and metadata recalculated
+        assert!(result.is_ok());
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 1);
+
+        let address_col = table.column("address").unwrap();
+        assert_eq!(address_col.pos(), 2);
+        assert_eq!(address_col.base_offset(), 4);
+        assert_eq!(address_col.base_offset_pos(), 1);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_returns_error_for_primary_key() {
+        // given table with primary key "id"
+        let mut table = users_table();
+
+        // when trying to remove primary key column
+        let result = table.remove_column("id");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::InvalidColumnUsed(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_remove_column_returns_error_for_nonexistent_column() {
+        // given table with columns
+        let mut table = users_table();
+
+        // when trying to remove non-existent column
+        let result = table.remove_column("missing");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::ColumnNotFound(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_remove_column_recalculates_all_subsequent_columns() {
+        // given table with mixed fixed and variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+            dummy_column("score", Type::F64, 2),
+            ColumnMetadata::new("name".to_string(), Type::String, 3, 16, 3).unwrap(),
+            ColumnMetadata::new("email".to_string(), Type::String, 4, 16, 3).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing fixed-size column from middle
+        let result = table.remove_column("age");
+
+        // then all subsequent columns are recalculated
+        assert!(result.is_ok());
+
+        let score_col = table.column("score").unwrap();
+        assert_eq!(score_col.pos(), 1);
+        assert_eq!(score_col.base_offset(), 4);
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 2);
+        assert_eq!(name_col.base_offset(), 12);
+        assert_eq!(name_col.base_offset_pos(), 2);
+
+        let email_col = table.column("email").unwrap();
+        assert_eq!(email_col.pos(), 3);
+        assert_eq!(email_col.base_offset(), 12);
+        assert_eq!(email_col.base_offset_pos(), 2);
     }
 
     #[test]
