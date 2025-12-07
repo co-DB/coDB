@@ -52,7 +52,6 @@ pub(crate) type BTreeInternalNode<Page> = BTreeNode<Page, BTreeInternalHeader>;
 #[derive(Pod, Zeroable, Copy, Clone)]
 pub(crate) struct BTreeInternalHeader {
     base_header: SlottedPageBaseHeader,
-    padding: u16,
     /// Stores the page id of the child node with keys lesser than the smallest one in
     /// this node. We store this here, because a btree node with n keys needs n+1 child
     /// pointers and storing the first pointer here is easier than storing it in a
@@ -77,7 +76,6 @@ impl Default for BTreeInternalHeader {
                 size_of::<BTreeInternalHeader>() as u16,
                 PageType::BTreeInternal,
             ),
-            padding: 0,
             leftmost_child_pointer: Self::NO_LEFTMOST_CHILD_POINTER,
         }
     }
@@ -88,7 +86,6 @@ impl Default for BTreeInternalHeader {
 #[derive(Pod, Zeroable, Copy, Clone)]
 pub(crate) struct BTreeLeafHeader {
     base_header: SlottedPageBaseHeader,
-    padding: u16,
     /// Pointer to the right sibling leaf node (for range queries)
     next_leaf_pointer: PageId,
 }
@@ -110,7 +107,6 @@ impl Default for BTreeLeafHeader {
                 size_of::<BTreeLeafHeader>() as u16,
                 PageType::BTreeLeaf,
             ),
-            padding: 0,
             next_leaf_pointer: Self::NO_NEXT_LEAF,
         }
     }
@@ -233,6 +229,18 @@ where
 
         Ok(None)
     }
+
+    pub(crate) fn get_all_records(&self) -> Result<Vec<&[u8]>, BTreeNodeError> {
+        Ok(self.slotted_page.read_all_records()?.collect())
+    }
+
+    pub(crate) fn is_underflow(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY)
+    }
+
+    pub(crate) fn num_keys(&self) -> Result<u16, BTreeNodeError> {
+        Ok(self.slotted_page.num_used_slots()?)
+    }
 }
 
 impl<Page, Header> BTreeNode<Page, Header>
@@ -271,12 +279,21 @@ where
             InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
         }
     }
+
+    pub(crate) fn delete_at(&mut self, slot_id: SlotId) -> Result<(), BTreeNodeError> {
+        Ok(self.slotted_page.delete(slot_id)?)
+    }
 }
 
 impl<Page> BTreeNode<Page, BTreeInternalHeader>
 where
     Page: PageRead,
 {
+    /// Returns the number of children in this internal node (num_keys + 1).
+    pub fn num_children(&self) -> Result<u16, BTreeNodeError> {
+        Ok(self.num_keys()? + 1)
+    }
+
     /// Gets the key stored in the given slot.
     fn get_key(&self, slot_id: SlotId) -> Result<&[u8], BTreeNodeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
@@ -369,6 +386,11 @@ where
     pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
         Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY)
     }
+
+    /// Check if this internal node can spare a key for redistribution to a sibling.
+    pub(crate) fn can_redistribute_key(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
+    }
 }
 
 impl<Page> BTreeNode<Page, BTreeInternalHeader>
@@ -381,7 +403,6 @@ where
                 size_of::<BTreeInternalHeader>() as u16,
                 PageType::BTreeInternal,
             ),
-            padding: 0,
             leftmost_child_pointer,
         };
 
@@ -585,7 +606,6 @@ where
                 size_of::<BTreeLeafHeader>() as u16,
                 PageType::BTreeLeaf,
             ),
-            padding: 0,
             next_leaf_pointer: next_leaf.unwrap_or(BTreeLeafHeader::NO_NEXT_LEAF),
         };
         let slotted_page = SlottedPage::initialize_with_header(page, header)?;

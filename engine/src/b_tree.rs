@@ -147,6 +147,14 @@ struct NodeLatch {
     node: BTreeInternalNode<PinnedWritePage>,
 }
 
+struct MergeContext {
+    parent_id: PageId,
+    parent_node: BTreeInternalNode<PinnedWritePage>,
+    child_pos: u16,
+    internal_nodes: Vec<LatchHandle>,
+    metadata_page: Option<PinnedWritePage>,
+}
+
 /// Structure responsible for managing on-disk index files.
 ///
 /// Each [`BTree`] instance corresponds to a single physical file on disk.
@@ -644,7 +652,6 @@ impl BTree {
             NodeDeleteResult::SuccessUnderflow => self.redistribute_or_merge(
                 path.latch_stack,
                 (path.leaf_page_id, leaf),
-                key,
                 path.metadata_page,
             ),
             NodeDeleteResult::KeyDoesNotExist => Err(BTreeError::DuplicateKey),
@@ -655,12 +662,11 @@ impl BTree {
         &self,
         mut internal_nodes: Vec<LatchHandle>,
         leaf_node: (PageId, BTreeLeafNode<PinnedWritePage>),
-        _key: &[u8],
-        _metadata_page: Option<PinnedWritePage>,
+        metadata_page: Option<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
-        let (_, mut node) = leaf_node;
+        let (node_id, mut node) = leaf_node;
 
-        // We need the parent for separator updates
+        // We need the parent for separator updates.
         let parent = match internal_nodes.pop() {
             Some(p) => p,
             None => {
@@ -670,7 +676,7 @@ impl BTree {
         };
 
         let LatchHandle {
-            page_id: _parent_id,
+            page_id: parent_id,
             node: mut parent_node,
             child_pos,
         } = parent;
@@ -683,27 +689,34 @@ impl BTree {
                 let redistributed_record = right_sibling.remove_first_key()?;
                 node.insert_record(redistributed_record.as_slice())?;
 
-                // Update separator in parent - new separator is the new first key of right sibling
+                // Update separator in parent - new separator is the new first key of right sibling.
                 let new_separator_key = right_sibling.get_first_key()?;
                 parent_node.update_separator_at_slot(child_pos, &new_separator_key)?;
 
                 return Ok(());
             }
-        }
 
-        if child_pos == 0 {
-            // No left sibling, so we need to merge
-            return self.merge();
+            if child_pos == 0 {
+                let ctx = MergeContext {
+                    parent_id,
+                    parent_node,
+                    child_pos,
+                    internal_nodes,
+                    metadata_page,
+                };
+                // No left sibling, so we need to merge.
+                return self.merge_with_right_sibling(node, right_sibling_id, right_sibling, ctx);
+            }
         }
 
         let left_node_id = parent_node.get_child_ptr_by_index(child_pos - 1)?;
         let mut left_sibling = self.pin_leaf_for_write(left_node_id)?;
 
         if left_sibling.can_redistribute_key()? {
-            // Move last key from left sibling to current node
+            // Move last key from left sibling to current node.
             let redistributed_record = left_sibling.remove_last_key()?;
 
-            // The redistributed key becomes the new separator (it's now the first key of current node)
+            // The redistributed key becomes the new separator (it's now the first key of current node).
             let new_separator_key = Self::extract_key_from_leaf_record(&redistributed_record);
             parent_node.update_separator_at_slot(child_pos - 1, &new_separator_key)?;
 
@@ -711,7 +724,103 @@ impl BTree {
             return Ok(());
         }
 
-        self.merge()
+        // Can't redistribute keys from neither node meaning we must merge (left node is more
+        // convenient here)
+        let ctx = MergeContext {
+            parent_id,
+            parent_node,
+            child_pos,
+            internal_nodes,
+            metadata_page,
+        };
+        self.merge_with_left_sibling(node, node_id, left_sibling, ctx)
+    }
+
+    fn merge_with_right_sibling(
+        &self,
+        mut node: BTreeLeafNode<PinnedWritePage>,
+        sibling_id: PageId,
+        sibling_node: BTreeLeafNode<PinnedWritePage>,
+        mut ctx: MergeContext,
+    ) -> Result<(), BTreeError> {
+        // Move all keys from right sibling to node
+        let keys_to_move = sibling_node.get_all_records()?;
+        for key in keys_to_move {
+            node.insert_record(key)?;
+        }
+
+        node.set_next_leaf_id(sibling_node.next_leaf_id()?)?;
+
+        ctx.parent_node.delete_at(ctx.child_pos + 1)?;
+
+        self.free_page(sibling_id)?;
+
+        if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
+            self.handle_internal_underflow(ctx)?;
+        }
+
+        Ok(())
+    }
+
+    fn merge_with_left_sibling(
+        &self,
+        node: BTreeLeafNode<PinnedWritePage>,
+        node_id: PageId,
+        mut sibling_node: BTreeLeafNode<PinnedWritePage>,
+        mut ctx: MergeContext,
+    ) -> Result<(), BTreeError> {
+        let keys_to_move = node.get_all_records()?;
+        for key in keys_to_move {
+            sibling_node.insert_record(&key)?;
+        }
+
+        sibling_node.set_next_leaf_id(node.next_leaf_id()?)?;
+
+        ctx.parent_node.delete_at(ctx.child_pos)?;
+
+        // Free the current page
+        self.free_page(node_id)?;
+
+        // Check if parent underflows
+        if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
+            self.handle_internal_underflow(ctx)?;
+        }
+
+        Ok(())
+    }
+
+    fn free_page(&self, page_id: PageId) -> Result<(), BTreeError> {
+        let page_ref = self.page_ref(page_id);
+        Ok(self.cache.free_page(&page_ref)?)
+    }
+    fn handle_internal_underflow(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
+        let parent = match ctx.internal_nodes.pop() {
+            None => {
+                return self.handle_root_underflow(
+                    ctx.parent_node,
+                    ctx.parent_id,
+                    ctx.metadata_page.unwrap(),
+                );
+            }
+            Some(handle) => handle,
+        };
+
+        let LatchHandle {
+            page_id: parent_id,
+            node: mut parent_node,
+            child_pos,
+        } = parent;
+
+        Ok(())
+    }
+
+    fn handle_root_underflow(
+        &self,
+        root_node: BTreeInternalNode<PinnedWritePage>,
+        root_id: PageId,
+        metadata_page: PinnedWritePage,
+    ) -> Result<(), BTreeError> {
+        Ok(())
     }
 
     /// Extracts the key portion from a leaf record (key + RecordPtr).
