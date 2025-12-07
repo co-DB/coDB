@@ -492,6 +492,35 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             Some((i as SlotId, &self.page.data()[record_start..record_end]))
         }))
     }
+
+    /// Reads records from the end until it finds and returns a used one.
+    pub fn read_last_non_deleted_record(&self) -> Result<(SlotId, &[u8]), SlottedPageError> {
+        let slots = self.get_slots()?;
+        let last = slots
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, slot)| !slot.is_deleted());
+
+        match last {
+            None => Err(SlottedPageError::UninitializedPage),
+            Some((id, _)) => Ok((id as SlotId, self.read_record(id as SlotId)?)),
+        }
+    }
+
+    /// Reads records until it finds and returns a used one.
+    pub fn read_first_non_deleted_record(&self) -> Result<(SlotId, &[u8]), SlottedPageError> {
+        let slots = self.get_slots()?;
+        let first = slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| !slot.is_deleted());
+
+        match first {
+            None => Err(SlottedPageError::UninitializedPage),
+            Some((id, _)) => Ok((id as SlotId, self.read_record(id as SlotId)?)),
+        }
+    }
 }
 
 impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {

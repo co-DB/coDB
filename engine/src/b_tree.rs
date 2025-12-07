@@ -6,6 +6,7 @@ use crate::b_tree_node::{
     LeafNodeSearchResult, NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
+use crate::slotted_page::SlotId;
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -652,11 +653,75 @@ impl BTree {
 
     fn redistribute_or_merge(
         &self,
-        internal_nodes: Vec<LatchHandle>,
+        mut internal_nodes: Vec<LatchHandle>,
         leaf_node: (PageId, BTreeLeafNode<PinnedWritePage>),
-        key: &[u8],
-        metadata_page: Option<PinnedWritePage>,
+        _key: &[u8],
+        _metadata_page: Option<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
+        let (_, mut node) = leaf_node;
+
+        // We need the parent for separator updates
+        let parent = match internal_nodes.pop() {
+            Some(p) => p,
+            None => {
+                // No parent means this is the root, so we can have an underflow here.
+                return Ok(());
+            }
+        };
+
+        let LatchHandle {
+            page_id: _parent_id,
+            node: mut parent_node,
+            child_pos,
+        } = parent;
+
+        if let Some(right_sibling_id) = node.next_leaf_id()? {
+            let mut right_sibling = self.pin_leaf_for_write(right_sibling_id)?;
+
+            if right_sibling.can_redistribute_key()? {
+                // Move first key from right sibling to current node
+                let redistributed_record = right_sibling.remove_first_key()?;
+                node.insert_record(redistributed_record.as_slice())?;
+
+                // Update separator in parent - new separator is the new first key of right sibling
+                let new_separator_key = right_sibling.get_first_key()?;
+                parent_node.update_separator_at_slot(child_pos, &new_separator_key)?;
+
+                return Ok(());
+            }
+        }
+
+        if child_pos == 0 {
+            // No left sibling, so we need to merge
+            return self.merge();
+        }
+
+        let left_node_id = parent_node.get_child_ptr_by_index(child_pos - 1)?;
+        let mut left_sibling = self.pin_leaf_for_write(left_node_id)?;
+
+        if left_sibling.can_redistribute_key()? {
+            // Move last key from left sibling to current node
+            let redistributed_record = left_sibling.remove_last_key()?;
+
+            // The redistributed key becomes the new separator (it's now the first key of current node)
+            let new_separator_key = Self::extract_key_from_leaf_record(&redistributed_record);
+            parent_node.update_separator_at_slot(child_pos - 1, &new_separator_key)?;
+
+            node.insert_record(redistributed_record.as_slice())?;
+            return Ok(());
+        }
+
+        self.merge()
+    }
+
+    /// Extracts the key portion from a leaf record (key + RecordPtr).
+    fn extract_key_from_leaf_record(record: &[u8]) -> Vec<u8> {
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = record.len() - serialized_record_ptr_size;
+        record[..key_bytes_end].to_vec()
+    }
+
+    fn merge(&self) -> Result<(), BTreeError> {
         Ok(())
     }
 }

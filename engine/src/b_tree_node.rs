@@ -414,6 +414,27 @@ where
         Ok(())
     }
 
+    /// Updates the separator key at the given slot index while preserving the child pointer.
+    /// This is used during redistribution to update the separator between siblings.
+    pub fn update_separator_at_slot(
+        &mut self,
+        slot_id: SlotId,
+        new_key: &[u8],
+    ) -> Result<(), BTreeNodeError> {
+        let child_ptr = self.get_child_ptr(slot_id)?;
+
+        self.slotted_page.delete(slot_id)?;
+
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(new_key);
+        child_ptr.serialize(&mut buffer);
+
+        let result = self.slotted_page.insert_at(&buffer, slot_id)?;
+        self.handle_insert_result(result, &buffer, slot_id)?;
+
+        Ok(())
+    }
+
     pub fn split_keys(&mut self) -> Result<(Vec<Vec<u8>>, Vec<u8>), BTreeNodeError> {
         let valid_records = self
             .slotted_page
@@ -540,6 +561,18 @@ where
             val => Ok(Some(val)),
         }
     }
+
+    pub(crate) fn can_redistribute_key(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
+    }
+
+    /// Returns the first (smallest) key in this leaf node without removing it.
+    pub fn get_first_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (_, record) = self.slotted_page.read_first_non_deleted_record()?;
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = record.len() - serialized_record_ptr_size;
+        Ok(record[..key_bytes_end].to_vec())
+    }
 }
 
 impl<Page> BTreeNode<Page, BTreeLeafHeader>
@@ -565,7 +598,6 @@ where
         record_pointer: RecordPtr,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let position = match self.search(key)? {
-            // TODO (For indexes): handle duplicated keys
             LeafNodeSearchResult::Found { .. } => return Ok(NodeInsertResult::KeyAlreadyExists),
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => insert_slot_id,
         };
@@ -651,6 +683,36 @@ where
         let separator_key = first_record[..key_bytes_end].to_vec();
 
         Ok((copied_split_records, separator_key))
+    }
+
+    pub(crate) fn remove_last_key(&mut self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (id, record) = self.slotted_page.read_last_non_deleted_record()?;
+        let record = record.to_vec();
+        self.slotted_page.delete(id)?;
+        Ok(record)
+    }
+
+    pub(crate) fn remove_first_key(&mut self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (id, record) = self.slotted_page.read_first_non_deleted_record()?;
+        let record = record.to_vec();
+        self.slotted_page.delete(id)?;
+        Ok(record)
+    }
+
+    /// Inserts a record that is not separated into key and record pointer.
+    pub(crate) fn insert_record(
+        &mut self,
+        record: &[u8],
+    ) -> Result<NodeInsertResult, BTreeNodeError> {
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = record.len() - serialized_record_ptr_size;
+        let (key, _) = record.split_at(key_bytes_end);
+        let position = match self.search(key)? {
+            LeafNodeSearchResult::Found { .. } => return Ok(NodeInsertResult::KeyAlreadyExists),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => insert_slot_id,
+        };
+        self.slotted_page.insert_at(record, position)?;
+        Ok(NodeInsertResult::Success)
     }
 }
 #[cfg(test)]
