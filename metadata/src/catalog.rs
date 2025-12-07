@@ -48,7 +48,6 @@ pub enum CatalogError {
     TableError(#[from] TableMetadataError),
 }
 
-// TODO: Add updating columns
 impl Catalog {
     /// Creates new instance of [`Catalog`] for database `database_name`.
     /// Can fail if database does not exist or io error occurs.
@@ -121,39 +120,37 @@ impl Catalog {
         Ok(())
     }
 
-    // TODO: refactor this
     /// Adds column to the table.
     /// It works by delegating this to [`TableMetadata::add_column`].
     ///
     /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
     /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
-    // pub fn add_column(
-    //     &mut self,
-    //     table_name: impl AsRef<str>,
-    //     column_metadata: ColumnMetadata,
-    // ) -> Result<(), CatalogError> {
-    //     let table: &mut TableMetadata = self.table_mut(table_name.as_ref())?;
-    //     table.add_column(column_metadata)?;
-    //     self.sync_to_disk()?;
-    //     Ok(())
-    // }
+    pub fn add_column(
+        &mut self,
+        table_name: impl AsRef<str>,
+        column_dto: NewColumnDto,
+    ) -> Result<NewColumnAdded, CatalogError> {
+        let table: &mut TableMetadata = self.table_mut(table_name.as_ref())?;
+        let new_column = table.add_column(column_dto)?;
+        self.sync_to_disk()?;
+        Ok(new_column)
+    }
 
-    // TODO: refactor this
-    /// Removes column to the table.
+    /// Removes column from the table.
     /// It works by delegating this to [`TableMetadata::remove_column`].
     ///
     /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
     /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
-    // pub fn remove_column(
-    //     &mut self,
-    //     table_name: impl AsRef<str>,
-    //     column_name: impl AsRef<str>,
-    // ) -> Result<(), CatalogError> {
-    //     let table = self.table_mut(table_name.as_ref())?;
-    //     table.remove_column(column_name.as_ref())?;
-    //     self.sync_to_disk()?;
-    //     Ok(())
-    // }
+    pub fn remove_column(
+        &mut self,
+        table_name: impl AsRef<str>,
+        column_name: impl AsRef<str>,
+    ) -> Result<ColumnRemoved, CatalogError> {
+        let table = self.table_mut(table_name.as_ref())?;
+        let cr = table.remove_column(column_name.as_ref())?;
+        self.sync_to_disk()?;
+        Ok(cr)
+    }
 
     /// Syncs in-memory [`Catalog`] instance with underlying file.
     /// Can fail if io error occurs.
@@ -198,6 +195,18 @@ pub enum TableMetadataError {
     /// While creating new [`TableMetadata`] column returned error
     #[error("column returned error: {0}")]
     ColumnError(#[from] ColumnMetadataError),
+}
+
+#[derive(Debug)]
+pub struct NewColumnAdded {
+    pub pos: u16,
+    pub ty: Type,
+}
+
+#[derive(Debug)]
+pub struct ColumnRemoved {
+    pub pos: u16,
+    pub ty: Type,
 }
 
 impl TableMetadata {
@@ -247,47 +256,165 @@ impl TableMetadata {
         self.columns.iter().cloned()
     }
 
-    // TODO: refactor this
     /// Adds new column to the table.
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with same name already exists.
-    // fn add_column(&mut self, column: ColumnMetadata) -> Result<(), TableMetadataError> {
-    //     let already_exists = self.columns_by_name.contains_key(&column.name);
-    //     match already_exists {
-    //         true => Err(TableMetadataError::ColumnAlreadyExists(column.name)),
-    //         false => {
-    //             self.columns_by_name
-    //                 .insert(column.name.clone(), self.columns.len());
-    //             self.columns.push(column);
-    //             Ok(())
-    //         }
-    //     }
-    // }
+    fn add_column(
+        &mut self,
+        column_dto: NewColumnDto,
+    ) -> Result<NewColumnAdded, TableMetadataError> {
+        let already_exists = self.columns_by_name.contains_key(&column_dto.name);
+        if already_exists {
+            Err(TableMetadataError::ColumnAlreadyExists(column_dto.name))
+        } else {
+            let pos = match column_dto.ty.is_fixed_size() {
+                true => self.add_fixed_size_column(column_dto.name.clone(), column_dto.ty)?,
+                false => self.add_variable_size_column(column_dto.name.clone(), column_dto.ty)?,
+            };
+            self.columns_by_name.insert(column_dto.name, pos);
+            Ok(NewColumnAdded {
+                pos: pos as _,
+                ty: column_dto.ty,
+            })
+        }
+    }
 
-    // TODO: refactor this
+    /// Adds fixed size column to list of columns. It works by adding column as the last fixed size column
+    /// and updating metadata of every variable column.
+    /// Returns index of added element in the list of columns.
+    fn add_fixed_size_column(
+        &mut self,
+        name: impl Into<String>,
+        ty: Type,
+    ) -> Result<usize, TableMetadataError> {
+        let last_fixed_size_pos = self
+            .columns
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, col)| col.ty.is_fixed_size())
+            .map(|(idx, _)| idx)
+            .expect("at least one fixed-size column is always in a table");
+
+        let last_fixed_size = &self.columns[last_fixed_size_pos];
+        let last_fixed_size_on_disk = schema::type_size_on_disk(&last_fixed_size.ty)
+            .expect("fixed size column must have size");
+        let base_offset = self.columns[last_fixed_size_pos].base_offset() + last_fixed_size_on_disk;
+        let cm = ColumnMetadata::new(
+            name.into(),
+            ty,
+            last_fixed_size_pos as u16 + 1,
+            base_offset,
+            last_fixed_size.base_offset_pos() + 1,
+        )?;
+
+        let only_fixed_size_columns = last_fixed_size_pos == self.columns.len() - 1;
+        match only_fixed_size_columns {
+            true => {
+                // We just append to the end - no need to fix any column
+                self.columns.push(cm);
+                let pos = self.columns.len() - 1;
+                Ok(pos)
+            }
+            false => {
+                let pos = last_fixed_size_pos + 1;
+                self.columns.insert(pos, cm);
+                self.recalculate_columns_metadata_from(pos + 1);
+                Ok(pos)
+            }
+        }
+    }
+
+    /// Adds variable size column to list of columns by simply appending it to the end.
+    /// Returns index of added element in the list of columns.
+    fn add_variable_size_column(
+        &mut self,
+        name: impl Into<String>,
+        ty: Type,
+    ) -> Result<usize, TableMetadataError> {
+        // We know columns.len() > 0, as we cannot have table with no columns.
+        // Thus, every `columns[prev_pos]` should not panic.
+        let pos = self.columns.len();
+        let prev_pos = pos - 1;
+        let (base_offset, base_offset_pos) =
+            match schema::type_size_on_disk(&self.columns[prev_pos].ty) {
+                Some(size) => {
+                    // This is the first variable size column in the table
+                    (
+                        self.columns[prev_pos].base_offset() + size,
+                        prev_pos as u16 + 1,
+                    )
+                }
+                None => {
+                    // Previous column is also variable size, so we can copy base offset
+                    (
+                        self.columns[prev_pos].base_offset(),
+                        self.columns[prev_pos].base_offset_pos(),
+                    )
+                }
+            };
+        let cm = ColumnMetadata::new(name.into(), ty, pos as _, base_offset, base_offset_pos)?;
+        self.columns.push(cm);
+        Ok(pos)
+    }
+
+    /// Iterates over [`TableMetadata::columns`] starting at `from` and recalculates metadata of each column
+    /// Basically it's doing the same thing as in [`TableMetadataFactory::create_columns`], but only on the subset of columns.
+    fn recalculate_columns_metadata_from(&mut self, from: usize) {
+        let (mut pos, mut last_fixed_pos, mut base_offset) = match from > 0 {
+            true => {
+                let pos = from as u16;
+                let prev = &self.columns[from - 1];
+                let (last_fixed_pos, base_offset) = match schema::type_size_on_disk(&prev.ty) {
+                    Some(size) => (from as u16, prev.base_offset() + size as usize),
+                    None => (prev.base_offset_pos(), prev.base_offset()),
+                };
+                (pos, last_fixed_pos, base_offset)
+            }
+            false => (0, 0, 0),
+        };
+
+        for cm in self.columns[from..].iter_mut() {
+            cm.pos = pos;
+            cm.base_offset = base_offset;
+            cm.base_offset_pos = last_fixed_pos;
+
+            self.columns_by_name.insert(cm.name.clone(), cm.pos as _);
+
+            pos += 1;
+
+            if let Some(size) = schema::type_size_on_disk(&cm.ty) {
+                last_fixed_pos += 1;
+                base_offset += size;
+            }
+        }
+    }
+
     /// Removes column from the table.
     /// IMPORTANT NOTE: this function is not responsible for handling proper data migration after change of table layout. The only purpose of this function is to update underlying metadata file.
     /// Can fail if column with provided name does not exist or the column is primary key.
-    // fn remove_column(&mut self, column_name: &str) -> Result<(), TableMetadataError> {
-    //     if column_name == self.primary_key_column_name() {
-    //         return Err(TableMetadataError::InvalidColumnUsed(column_name.into()));
-    //     }
-    //     let idx = self.columns_by_name.remove(column_name);
-    //     match idx {
-    //         Some(idx) => {
-    //             self.columns.swap_remove(idx);
-    //             // Removed last element - no need to update any index
-    //             if idx == self.columns.len() {
-    //                 return Ok(());
-    //             }
-    //             // Update index of the element that was moved
-    //             let swapped_name = &self.columns[idx].name;
-    //             self.columns_by_name.insert(swapped_name.clone(), idx);
-    //             Ok(())
-    //         }
-    //         None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
-    //     }
-    // }
+    fn remove_column(&mut self, column_name: &str) -> Result<ColumnRemoved, TableMetadataError> {
+        if column_name == self.primary_key_column_name() {
+            return Err(TableMetadataError::InvalidColumnUsed(column_name.into()));
+        }
+        let idx = self.columns_by_name.remove(column_name);
+        match idx {
+            Some(idx) => {
+                let cm = self.columns.remove(idx);
+
+                if self.columns.len() != idx {
+                    // It was not the last column, we need to fix metadata of other columns that come after the deleted one
+                    self.recalculate_columns_metadata_from(idx);
+                }
+
+                Ok(ColumnRemoved {
+                    pos: cm.pos(),
+                    ty: cm.ty(),
+                })
+            }
+            None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
+        }
+    }
 
     /// Returns name of the table's primary key column
     pub fn primary_key_column_name(&self) -> &str {
@@ -409,7 +536,7 @@ pub struct ColumnMetadata {
     /// | int32 | int32 | Bool |
     /// `base_offset` of the columns are: 0, 4, 8
     ///
-    /// However, when having variable-size columns:
+    /// However, when we have variable-size columns:
     /// | int32 | string | string|
     /// `base_offset` of the columns are: 0, 4, 4
     base_offset: usize,
@@ -1402,6 +1529,378 @@ mod tests {
             &result.unwrap_err(),
             &TableMetadataError::ColumnNotFound(String::new()),
         );
+    }
+
+    #[test]
+    fn table_metadata_add_column_adds_fixed_size_column_to_end_when_no_variable_columns() {
+        // given table with only fixed-size columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when adding new fixed-size column
+        let result = table.add_column(NewColumnDto {
+            name: "score".to_string(),
+            ty: Type::F64,
+        });
+
+        // then column is added at the end
+        assert!(result.is_ok());
+        let added = result.unwrap();
+        assert_eq!(added.pos, 2);
+        assert_eq!(added.ty, Type::F64);
+
+        let score_col = table.column("score").unwrap();
+        assert_eq!(score_col.pos(), 2);
+        assert_eq!(score_col.base_offset(), 8);
+        assert_eq!(score_col.base_offset_pos(), 2);
+    }
+
+    #[test]
+    fn table_metadata_add_column_adds_fixed_size_column_before_variable_columns() {
+        // given table with fixed and variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            ColumnMetadata::new("name".to_string(), Type::String, 1, 4, 1).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when adding new fixed-size column
+        let result = table.add_column(NewColumnDto {
+            name: "age".to_string(),
+            ty: Type::I32,
+        });
+
+        // then column is inserted before variable columns
+        assert!(result.is_ok());
+        let added = result.unwrap();
+        assert_eq!(added.pos, 1);
+        assert_eq!(added.ty, Type::I32);
+
+        let age_col = table.column("age").unwrap();
+        assert_eq!(age_col.pos(), 1);
+        assert_eq!(age_col.base_offset(), 4);
+        assert_eq!(age_col.base_offset_pos(), 1);
+
+        // variable column should be shifted
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 2);
+        assert_eq!(name_col.base_offset(), 8);
+        assert_eq!(name_col.base_offset_pos(), 2);
+    }
+
+    #[test]
+    fn table_metadata_add_column_adds_variable_size_column_to_end() {
+        // given table with fixed and variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            ColumnMetadata::new("name".to_string(), Type::String, 1, 4, 1).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when adding new variable-size column
+        let result = table.add_column(NewColumnDto {
+            name: "email".to_string(),
+            ty: Type::String,
+        });
+
+        // then column is added at the end
+        assert!(result.is_ok());
+        let added = result.unwrap();
+        assert_eq!(added.pos, 2);
+        assert_eq!(added.ty, Type::String);
+
+        let email_col = table.column("email").unwrap();
+        assert_eq!(email_col.pos(), 2);
+        assert_eq!(email_col.base_offset(), 4);
+        assert_eq!(email_col.base_offset_pos(), 1);
+    }
+
+    #[test]
+    fn table_metadata_add_column_recalculates_multiple_variable_columns() {
+        // given table with fixed and multiple variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            ColumnMetadata::new("name".to_string(), Type::String, 1, 4, 1).unwrap(),
+            ColumnMetadata::new("email".to_string(), Type::String, 2, 4, 1).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when adding new fixed-size column
+        let result = table.add_column(NewColumnDto {
+            name: "age".to_string(),
+            ty: Type::I32,
+        });
+
+        // then all variable columns are recalculated
+        assert!(result.is_ok());
+
+        let age_col = table.column("age").unwrap();
+        assert_eq!(age_col.pos(), 1);
+        assert_eq!(age_col.base_offset(), 4);
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 2);
+        assert_eq!(name_col.base_offset(), 8);
+        assert_eq!(name_col.base_offset_pos(), 2);
+
+        let email_col = table.column("email").unwrap();
+        assert_eq!(email_col.pos(), 3);
+        assert_eq!(email_col.base_offset(), 8);
+        assert_eq!(email_col.base_offset_pos(), 2);
+    }
+
+    #[test]
+    fn table_metadata_add_column_returns_error_on_duplicate_name() {
+        // given table with column "id"
+        let mut table = users_table();
+
+        // when adding column with duplicate name
+        let result = table.add_column(NewColumnDto {
+            name: "id".to_string(),
+            ty: Type::I32,
+        });
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::ColumnAlreadyExists(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_add_column_first_variable_after_fixed() {
+        // given table with only fixed-size columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when adding first variable-size column
+        let result = table.add_column(NewColumnDto {
+            name: "name".to_string(),
+            ty: Type::String,
+        });
+
+        // then column is added with correct base_offset_pos
+        assert!(result.is_ok());
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 2);
+        assert_eq!(name_col.base_offset(), 8);
+        assert_eq!(name_col.base_offset_pos(), 2);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_fixed_size_column_from_end() {
+        // given table with multiple fixed-size columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+            dummy_column("score", Type::F64, 2),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing last fixed-size column
+        let result = table.remove_column("score");
+
+        // then column is removed
+        assert!(result.is_ok());
+        let removed = result.unwrap();
+        assert_eq!(removed.pos, 2);
+        assert_eq!(removed.ty, Type::F64);
+
+        // and column no longer exists
+        assert!(table.column("score").is_err());
+        assert_eq!(table.columns.len(), 2);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_fixed_size_column_from_middle() {
+        // given table with fixed and variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+            ColumnMetadata::new("name".to_string(), Type::String, 2, 8, 2).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing fixed-size column from middle
+        let result = table.remove_column("age");
+
+        // then column is removed and metadata recalculated
+        assert!(result.is_ok());
+
+        let id_col = table.column("id").unwrap();
+        assert_eq!(id_col.pos(), 0);
+        assert_eq!(id_col.base_offset(), 0);
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 1);
+        assert_eq!(name_col.base_offset(), 4);
+        assert_eq!(name_col.base_offset_pos(), 1);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_variable_size_column_from_end() {
+        // given table with fixed and variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            ColumnMetadata::new("name".to_string(), Type::String, 1, 4, 1).unwrap(),
+            ColumnMetadata::new("email".to_string(), Type::String, 2, 4, 1).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing last variable-size column
+        let result = table.remove_column("email");
+
+        // then column is removed
+        assert!(result.is_ok());
+        let removed = result.unwrap();
+        assert_eq!(removed.pos, 2);
+        assert_eq!(removed.ty, Type::String);
+
+        // and column no longer exists
+        assert!(table.column("email").is_err());
+        assert_eq!(table.columns.len(), 2);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_variable_size_column_from_middle() {
+        // given table with multiple variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            ColumnMetadata::new("name".to_string(), Type::String, 1, 4, 1).unwrap(),
+            ColumnMetadata::new("email".to_string(), Type::String, 2, 4, 1).unwrap(),
+            ColumnMetadata::new("address".to_string(), Type::String, 3, 4, 1).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing variable-size column from middle
+        let result = table.remove_column("email");
+
+        // then column is removed and metadata recalculated
+        assert!(result.is_ok());
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 1);
+
+        let address_col = table.column("address").unwrap();
+        assert_eq!(address_col.pos(), 2);
+        assert_eq!(address_col.base_offset(), 4);
+        assert_eq!(address_col.base_offset_pos(), 1);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_returns_error_for_primary_key() {
+        // given table with primary key "id"
+        let mut table = users_table();
+
+        // when trying to remove primary key column
+        let result = table.remove_column("id");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::InvalidColumnUsed(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_remove_column_returns_error_for_nonexistent_column() {
+        // given table with columns
+        let mut table = users_table();
+
+        // when trying to remove non-existent column
+        let result = table.remove_column("missing");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::ColumnNotFound(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_remove_column_recalculates_all_subsequent_columns() {
+        // given table with mixed fixed and variable columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+            dummy_column("score", Type::F64, 2),
+            ColumnMetadata::new("name".to_string(), Type::String, 3, 16, 3).unwrap(),
+            ColumnMetadata::new("email".to_string(), Type::String, 4, 16, 3).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing fixed-size column from middle
+        let result = table.remove_column("age");
+
+        // then all subsequent columns are recalculated
+        assert!(result.is_ok());
+
+        let score_col = table.column("score").unwrap();
+        assert_eq!(score_col.pos(), 1);
+        assert_eq!(score_col.base_offset(), 4);
+
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 2);
+        assert_eq!(name_col.base_offset(), 12);
+        assert_eq!(name_col.base_offset_pos(), 2);
+
+        let email_col = table.column("email").unwrap();
+        assert_eq!(email_col.pos(), 3);
+        assert_eq!(email_col.base_offset(), 12);
+        assert_eq!(email_col.base_offset_pos(), 2);
+    }
+
+    #[test]
+    fn table_metadata_remove_column_removes_first_non_primary_key_column() {
+        // given table where first column is NOT primary key
+        let columns = vec![
+            dummy_column("age", Type::I32, 0),
+            dummy_column("id", Type::I32, 1),
+            dummy_column("score", Type::F64, 2),
+            ColumnMetadata::new("name".to_string(), Type::String, 3, 16, 3).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when removing first column (which is not primary key)
+        let result = table.remove_column("age");
+
+        // then column is removed and all subsequent columns recalculated
+        assert!(result.is_ok());
+        let removed = result.unwrap();
+        assert_eq!(removed.pos, 0);
+        assert_eq!(removed.ty, Type::I32);
+
+        // id shifts to position 0
+        let id_col = table.column("id").unwrap();
+        assert_eq!(id_col.pos(), 0);
+        assert_eq!(id_col.base_offset(), 0);
+        assert_eq!(id_col.base_offset_pos(), 0);
+
+        // score shifts down
+        let score_col = table.column("score").unwrap();
+        assert_eq!(score_col.pos(), 1);
+        assert_eq!(score_col.base_offset(), 4);
+        assert_eq!(score_col.base_offset_pos(), 1);
+
+        // name shifts down
+        let name_col = table.column("name").unwrap();
+        assert_eq!(name_col.pos(), 2);
+        assert_eq!(name_col.base_offset(), 12);
+        assert_eq!(name_col.base_offset_pos(), 2);
+
+        // column no longer exists
+        assert!(table.column("age").is_err());
+        assert_eq!(table.columns.len(), 3);
     }
 
     #[test]
