@@ -1,7 +1,7 @@
 ﻿use crate::heap_file::RecordPtr;
 use crate::slotted_page::{
-    InsertResult, PageType, ReprC, Slot, SlotId, SlottedPage, SlottedPageBaseHeader,
-    SlottedPageError, SlottedPageHeader, get_base_header,
+    InsertResult, PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
+    SlottedPageHeader, get_base_header,
 };
 use bytemuck::{Pod, Zeroable};
 use std::cmp::Ordering;
@@ -309,7 +309,7 @@ where
     }
 
     /// Gets the key stored in the given slot.
-    fn get_key(&self, slot_id: SlotId) -> Result<&[u8], BTreeNodeError> {
+    pub(crate) fn get_key(&self, slot_id: SlotId) -> Result<&[u8], BTreeNodeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
         let key_bytes_end = record_bytes.len() - size_of::<PageId>();
         let key_bytes = &record_bytes[..key_bytes_end];
@@ -443,6 +443,29 @@ where
     pub(crate) fn can_redistribute_key(&self) -> Result<bool, BTreeNodeError> {
         Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
     }
+
+    /// Returns the first (smallest) key in this internal node without removing it.
+    pub(crate) fn get_first_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (_, record) = self.slotted_page.read_first_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        Ok(record[..key_bytes_end].to_vec())
+    }
+
+    /// Returns the last (largest) key in this internal node without removing it.
+    pub(crate) fn get_last_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (_, record) = self.slotted_page.read_last_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        Ok(record[..key_bytes_end].to_vec())
+    }
+
+    /// Returns the last (largest) key and its child pointer without removing.
+    pub(crate) fn get_last_key_and_child(&self) -> Result<(Vec<u8>, PageId), BTreeNodeError> {
+        let (_, record) = self.slotted_page.read_last_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        let key = record[..key_bytes_end].to_vec();
+        let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
+        Ok((key, child_ptr))
+    }
 }
 
 impl<Page> BTreeNode<Page, BTreeInternalHeader>
@@ -561,6 +584,56 @@ where
         let separator_key = first_record[..key_bytes_end].to_vec();
 
         Ok((copied_split_records, separator_key))
+    }
+
+    /// Removes the first key from this node.
+    /// Returns the (key, old_leftmost_child).
+    /// Updates the leftmost child pointer to be the child pointer from the removed slot.
+    pub(crate) fn remove_first_key(&mut self) -> Result<(Vec<u8>, PageId), BTreeNodeError> {
+        let (slot_id, record) = self.slotted_page.read_first_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        let key = record[..key_bytes_end].to_vec();
+        let (new_leftmost, _) = PageId::deserialize(&record[key_bytes_end..])?;
+
+        let old_leftmost = self.get_btree_header()?.leftmost_child_pointer;
+
+        self.slotted_page.delete(slot_id)?;
+        self.get_btree_header_mut()?.leftmost_child_pointer = new_leftmost;
+
+        Ok((key, old_leftmost))
+    }
+
+    /// Removes the last key from this node.
+    /// Returns the (key, child_ptr) of the removed entry.
+    pub(crate) fn remove_last_key(&mut self) -> Result<(Vec<u8>, PageId), BTreeNodeError> {
+        let (slot_id, record) = self.slotted_page.read_last_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        let key = record[..key_bytes_end].to_vec();
+        let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
+
+        self.slotted_page.delete(slot_id)?;
+
+        Ok((key, child_ptr))
+    }
+
+    /// Inserts a key at the beginning of this node with a new leftmost child.
+    /// The old leftmost child becomes the child pointer for the new key.
+    pub(crate) fn insert_first_with_new_leftmost(
+        &mut self,
+        key: &[u8],
+        new_leftmost: PageId,
+    ) -> Result<NodeInsertResult, BTreeNodeError> {
+        let old_leftmost = self.get_btree_header()?.leftmost_child_pointer;
+        self.get_btree_header_mut()?.leftmost_child_pointer = new_leftmost;
+
+        // Insert the key with old_leftmost as its child pointer
+        // Since this key should be smaller than all existing keys, it goes at position 0
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(key);
+        old_leftmost.serialize(&mut buffer);
+
+        let insert_result = self.slotted_page.insert_at(&buffer, 0)?;
+        self.handle_insert_result(insert_result, &buffer, 0)
     }
 }
 impl<Page> BTreeNode<Page, BTreeLeafHeader>

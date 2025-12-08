@@ -1,9 +1,8 @@
-use std::pin::Pin;
 use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, InternalNodeSearchResult,
-    LeafNodeSearchResult, NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
+    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, LeafNodeSearchResult,
+    NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
 use crate::slotted_page::SlotId;
@@ -616,6 +615,12 @@ impl BTree {
         Ok(())
     }
 
+    /// Deletes a key from the B-Tree. Works similarly to insert in that it first tries an optimistic
+    /// approach, which uses read latches and only upgrades to write latch for the leaf node the key
+    /// is found in. If that fails (due to structural change of the path or the possibility of underflow
+    /// of one of the ancestors) we go to pessimistic strategy, which keeps write latches on all
+    /// nodes in the path until we are sure that they won't need to be merged/redistributed into.
+    /// For a little more info read [`insert`] docs.
     pub fn delete(&self, key: &[u8]) -> Result<(), BTreeError> {
         let optimistic_result = self.delete_optimistic(key)?;
         match optimistic_result {
@@ -632,6 +637,8 @@ impl BTree {
         }
     }
 
+    /// Tries to optimistically delete a key, failing if a need to redistribute keys or merge or
+    /// a structural change occurs.
     fn delete_optimistic(&self, key: &[u8]) -> Result<OptimisticOperationResult, BTreeError> {
         // Traverse and collect version info.
         let (leaf_page_id, path_versions) = self.traverse_with_versions(key)?;
@@ -653,6 +660,8 @@ impl BTree {
         }
     }
 
+    /// Deletes the key, while keeping write latches on ancestor nodes, which may structurally change
+    /// (possibly even root). Merges and redistributes as needed.
     fn delete_pessimistic(&self, key: &[u8]) -> Result<(), BTreeError> {
         let path =
             self.traverse_pessimistic(key, |node| Ok(node.will_not_underflow_after_delete()?))?;
@@ -670,6 +679,9 @@ impl BTree {
         }
     }
 
+    /// A function for fixing a leaf node that has an underflow (less than [`BTreeNode:UNDERFLOW_BOUNDARY`]
+    /// fraction of space filled). First tries to move a key from one of the siblings (right, then left)
+    /// and if that fails merges with one of the sibling (left one, unless it doesn't exist).
     fn redistribute_or_merge(
         &self,
         mut internal_nodes: Vec<LatchHandle>,
@@ -693,14 +705,14 @@ impl BTree {
             child_pos,
         } = parent;
 
-        // I think here?
-        self.update_structural_version(parent_id);
+        self.update_structural_version(node_id);
 
+        // First, try moving a key from right sibling.
         if let Some(right_sibling_id) = node.next_leaf_id()? {
             let mut right_sibling = self.pin_leaf_for_write(right_sibling_id)?;
 
             if right_sibling.can_redistribute_key()? {
-                // Move first key from right sibling to current node
+                // Move first key from right sibling to current node.
                 let redistributed_record = right_sibling.remove_first_key()?;
                 node.insert_record(redistributed_record.as_slice())?;
 
@@ -714,6 +726,7 @@ impl BTree {
                 return Ok(());
             }
 
+            // No left sibling, so we need to merge.
             if child_pos == ChildPosition::Leftmost {
                 let ctx = MergeContext {
                     parent_id,
@@ -722,14 +735,15 @@ impl BTree {
                     internal_nodes,
                     metadata_page,
                 };
-                // No left sibling, so we need to merge.
                 return self.merge_with_right_sibling(node, right_sibling_id, right_sibling, ctx);
             }
         }
 
+        // Now do the same with left sibling.
         let preceding_child_pos = parent_node
             .get_preceding_child_pos(child_pos)?
             .expect("We know child pos is not Leftmost, so this will always return a position");
+
         let left_node_id = parent_node.get_child_ptr_at(preceding_child_pos)?;
         let mut left_sibling = self.pin_leaf_for_write(left_node_id)?;
 
@@ -749,7 +763,7 @@ impl BTree {
         }
 
         // Can't redistribute keys from neither node meaning we must merge (left node is more
-        // convenient here)
+        // convenient here).
         let ctx = MergeContext {
             parent_id,
             parent_node,
@@ -760,6 +774,8 @@ impl BTree {
         self.merge_with_left_sibling(node, node_id, left_sibling, ctx)
     }
 
+    /// Merges with right sibling, moving all keys to the current node and freeing the sibling
+    /// page.
     fn merge_with_right_sibling(
         &self,
         mut node: BTreeLeafNode<PinnedWritePage>,
@@ -767,7 +783,7 @@ impl BTree {
         sibling_node: BTreeLeafNode<PinnedWritePage>,
         mut ctx: MergeContext,
     ) -> Result<(), BTreeError> {
-        // Move all keys from right sibling to node
+        // Move all keys from right sibling to node.
         let keys_to_move = sibling_node.get_all_records()?;
         for key in keys_to_move {
             node.insert_record(key)?;
@@ -779,9 +795,11 @@ impl BTree {
             .parent_node
             .get_next_child_pos(ctx.child_pos)?
             .expect("We wouldn't have gone into this function if right sibling didn't exist");
+
         let slot_id = next_child_pos
             .slot_id()
             .expect("next_child_pos must be AfterSlot");
+
         ctx.parent_node.delete_at(slot_id)?;
 
         self.free_page(sibling_id)?;
@@ -793,6 +811,8 @@ impl BTree {
         Ok(())
     }
 
+    /// Merges with left sibling, moving all keys to the current node and freeing the sibling
+    /// page.
     fn merge_with_left_sibling(
         &self,
         node: BTreeLeafNode<PinnedWritePage>,
@@ -800,6 +820,7 @@ impl BTree {
         mut sibling_node: BTreeLeafNode<PinnedWritePage>,
         mut ctx: MergeContext,
     ) -> Result<(), BTreeError> {
+        // Move all keys from left sibling to node.
         let keys_to_move = node.get_all_records()?;
         for key in keys_to_move {
             sibling_node.insert_record(&key)?;
@@ -813,10 +834,8 @@ impl BTree {
             .expect("child_pos must be AfterSlot for merge_with_left_sibling");
         ctx.parent_node.delete_at(slot_id)?;
 
-        // Free the current page
         self.free_page(node_id)?;
 
-        // Check if parent underflows
         if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
             self.handle_internal_underflow(ctx)?;
         }
@@ -824,18 +843,26 @@ impl BTree {
         Ok(())
     }
 
+    /// Frees the page at disk level and removes it from structural version numbers map.
     fn free_page(&self, page_id: PageId) -> Result<(), BTreeError> {
         self.structural_version_numbers.remove(&page_id);
         let page_ref = self.page_ref(page_id);
         Ok(self.cache.free_page(&page_ref)?)
     }
 
+    /// Takes care of restructuring an internal node if it has an underflow. Works similarly to
+    /// [`redistribute_or_merge`] just for internal nodes.
     fn handle_internal_underflow(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
-        let parent = match ctx.internal_nodes.pop() {
+        // The node that has an underflow (it was the parent when handling the leaf).
+        let underflow_id = ctx.parent_id;
+        let mut underflow_node = ctx.parent_node;
+
+        let parent_handle = match ctx.internal_nodes.pop() {
+            // underflow_node is the root.
             None => {
                 return self.handle_root_underflow(
-                    ctx.parent_node,
-                    ctx.parent_id,
+                    underflow_node,
+                    underflow_id,
                     ctx.metadata_page.unwrap(),
                 );
             }
@@ -845,25 +872,228 @@ impl BTree {
         let LatchHandle {
             page_id: parent_id,
             node: mut parent_node,
-            child_pos,
-        } = parent;
+            child_pos: underflow_child_pos,
+        } = parent_handle;
 
-        // Check if we have a right sibling to be made
+        self.update_structural_version(parent_id);
 
-        if let Some(right_sibling_pos) = parent_node.get_next_child_pos(child_pos)? {
-            let right_sibling =
-                self.pin_internal_for_write(parent_node.get_child_ptr_at(right_sibling_pos)?)?;
+        // First try to redistribute from right sibling.
+        if let Some(right_sibling_pos) = parent_node.get_next_child_pos(underflow_child_pos)? {
+            let right_sibling_id = parent_node.get_child_ptr_at(right_sibling_pos)?;
+            let mut right_sibling = self.pin_internal_for_write(right_sibling_id)?;
+
+            if right_sibling.can_redistribute_key()? {
+                let separator_slot = right_sibling_pos
+                    .slot_id()
+                    .expect("right_sibling_pos must be AfterSlot");
+                return self.redistribute_from_right_internal(
+                    &mut underflow_node,
+                    &mut right_sibling,
+                    &mut parent_node,
+                    separator_slot,
+                );
+            }
+
+            // No left sibling, must merge with right
+            if matches!(underflow_child_pos, ChildPosition::Leftmost) {
+                let separator_slot = right_sibling_pos
+                    .slot_id()
+                    .expect("right_sibling_pos must be AfterSlot");
+                let new_ctx = MergeContext {
+                    parent_id,
+                    parent_node,
+                    child_pos: underflow_child_pos,
+                    internal_nodes: ctx.internal_nodes,
+                    metadata_page: ctx.metadata_page,
+                };
+                return self.merge_internal_with_right_sibling(
+                    underflow_node,
+                    right_sibling,
+                    right_sibling_id,
+                    separator_slot,
+                    new_ctx,
+                );
+            }
         }
+
+        let preceding_child_pos = parent_node
+            .get_preceding_child_pos(underflow_child_pos)?
+            .expect("underflow_child_pos is not Leftmost, so there must be a preceding position");
+        let left_sibling_id = parent_node.get_child_ptr_at(preceding_child_pos)?;
+        let mut left_sibling = self.pin_internal_for_write(left_sibling_id)?;
+
+        let separator_slot = underflow_child_pos
+            .slot_id()
+            .expect("underflow_child_pos must be AfterSlot when we have a left sibling");
+
+        if left_sibling.can_redistribute_key()? {
+            return self.redistribute_from_left_internal(
+                &mut underflow_node,
+                &mut left_sibling,
+                &mut parent_node,
+                separator_slot,
+            );
+        }
+
+        let new_ctx = MergeContext {
+            parent_id,
+            parent_node,
+            child_pos: underflow_child_pos,
+            internal_nodes: ctx.internal_nodes,
+            metadata_page: ctx.metadata_page,
+        };
+        self.merge_internal_with_left_sibling(underflow_node, underflow_id, left_sibling, new_ctx)
+    }
+
+    /// Redistributes a key from the right sibling to the underflowing node.
+    ///
+    /// The separator in the parent comes down to the underflowing node,
+    /// and the first key of the right sibling becomes the new separator.
+    fn redistribute_from_right_internal(
+        &self,
+        underflow_node: &mut BTreeInternalNode<PinnedWritePage>,
+        right_sibling: &mut BTreeInternalNode<PinnedWritePage>,
+        parent_node: &mut BTreeInternalNode<PinnedWritePage>,
+        separator_slot: SlotId,
+    ) -> Result<(), BTreeError> {
+        // Get current separator from parent
+        let separator_key = parent_node.get_key(separator_slot)?.to_vec();
+
+        // Get first key and old leftmost from right sibling
+        // This removes the first key and updates right's leftmost to be the child ptr from that slot
+        let (new_separator_key, old_right_leftmost) = right_sibling.remove_first_key()?;
+
+        // Insert separator into underflow_node with old_right_leftmost as child
+        underflow_node.insert(separator_key.as_slice(), old_right_leftmost)?;
+
+        // Update parent's separator to be the new separator key
+        parent_node.update_separator_at_slot(separator_slot, &new_separator_key)?;
+
         Ok(())
     }
 
-    fn merge_with_right_sibling_internal(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
+    /// Redistributes a key from the left sibling to the underflowing node.
+    ///
+    /// The separator in the parent comes down to the underflowing node,
+    /// and the last key of the left sibling becomes the new separator.
+    fn redistribute_from_left_internal(
+        &self,
+        underflow_node: &mut BTreeInternalNode<PinnedWritePage>,
+        left_sibling: &mut BTreeInternalNode<PinnedWritePage>,
+        parent_node: &mut BTreeInternalNode<PinnedWritePage>,
+        separator_slot: SlotId,
+    ) -> Result<(), BTreeError> {
+        // Get current separator from parent
+        let separator_key = parent_node.get_key(separator_slot)?.to_vec();
+
+        // Get last key and its child from left sibling
+        let (new_separator_key, left_last_child) = left_sibling.remove_last_key()?;
+
+        // Insert separator at the beginning of underflow_node with left_last_child as new leftmost
+        underflow_node.insert_first_with_new_leftmost(&separator_key, left_last_child)?;
+
+        // Update parent's separator to be the new separator key
+        parent_node.update_separator_at_slot(separator_slot, &new_separator_key)?;
+
         Ok(())
     }
 
-    fn merge_with_left_sibling_internal(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
+    /// Merges the underflowing node with its right sibling.
+    ///
+    /// The separator from parent comes down, all keys from right sibling move to underflow_node,
+    /// and the right sibling is freed.
+    fn merge_internal_with_right_sibling(
+        &self,
+        mut underflow_node: BTreeInternalNode<PinnedWritePage>,
+        right_sibling: BTreeInternalNode<PinnedWritePage>,
+        right_sibling_id: PageId,
+        separator_slot: SlotId,
+        mut ctx: MergeContext,
+    ) -> Result<(), BTreeError> {
+        let separator_key = ctx.parent_node.get_key(separator_slot)?.to_vec();
+
+        let right_leftmost = right_sibling.get_child_ptr_at(ChildPosition::Leftmost)?;
+
+        underflow_node.insert(&separator_key, right_leftmost)?;
+
+        let right_records = right_sibling.get_all_records()?;
+        for record in right_records {
+            let key_bytes_end = record.len() - size_of::<PageId>();
+            let key = &record[..key_bytes_end];
+            let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
+            underflow_node.insert(key, child_ptr)?;
+        }
+
+        ctx.parent_node.delete_at(separator_slot)?;
+
+        self.free_page(right_sibling_id)?;
+
+        if ctx.parent_node.is_underflow()? {
+            let new_ctx = MergeContext {
+                parent_id: ctx.parent_id,
+                parent_node: ctx.parent_node,
+                child_pos: ctx.child_pos,
+                internal_nodes: ctx.internal_nodes,
+                metadata_page: ctx.metadata_page,
+            };
+            return self.handle_internal_underflow(new_ctx);
+        }
+
         Ok(())
     }
+
+    /// Merges the underflowing node with its left sibling.
+    ///
+    /// The separator from parent comes down, all keys from underflow_node move to left sibling,
+    /// and the underflow_node is freed.
+    fn merge_internal_with_left_sibling(
+        &self,
+        underflow_node: BTreeInternalNode<PinnedWritePage>,
+        underflow_id: PageId,
+        mut left_sibling: BTreeInternalNode<PinnedWritePage>,
+        mut ctx: MergeContext,
+    ) -> Result<(), BTreeError> {
+        let separator_slot = ctx
+            .child_pos
+            .slot_id()
+            .expect("child_pos must be AfterSlot for merge_with_left_sibling");
+
+        let separator_key = ctx.parent_node.get_key(separator_slot)?.to_vec();
+
+        let underflow_leftmost = underflow_node.get_child_ptr_at(ChildPosition::Leftmost)?;
+
+        left_sibling.insert(&separator_key, underflow_leftmost)?;
+
+        let underflow_records = underflow_node.get_all_records()?;
+        for record in underflow_records {
+            let key_bytes_end = record.len() - size_of::<PageId>();
+            let key = &record[..key_bytes_end];
+            let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
+            left_sibling.insert(key, child_ptr)?;
+        }
+
+        // Delete separator from parent
+        ctx.parent_node.delete_at(separator_slot)?;
+
+        // Free underflow_node page
+        self.free_page(underflow_id)?;
+
+        // Check if parent underflows
+        if ctx.parent_node.is_underflow()? {
+            let new_ctx = MergeContext {
+                parent_id: ctx.parent_id,
+                parent_node: ctx.parent_node,
+                child_pos: ctx.child_pos,
+                internal_nodes: ctx.internal_nodes,
+                metadata_page: ctx.metadata_page,
+            };
+            return self.handle_internal_underflow(new_ctx);
+        }
+
+        Ok(())
+    }
+
+    /// Handles the underflow of root. If it has one child, it becomes the root.
     fn handle_root_underflow(
         &self,
         root_node: BTreeInternalNode<PinnedWritePage>,
@@ -894,10 +1124,6 @@ impl BTree {
         let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
         let key_bytes_end = record.len() - serialized_record_ptr_size;
         record[..key_bytes_end].to_vec()
-    }
-
-    fn merge(&self) -> Result<(), BTreeError> {
-        Ok(())
     }
 }
 
