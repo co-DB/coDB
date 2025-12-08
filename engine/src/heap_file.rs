@@ -1,6 +1,7 @@
 use std::{
     array,
     marker::PhantomData,
+    mem,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -945,6 +946,47 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         }
     }
 
+    /// Migrates all records to add a new column at the specified position with a default value.
+    pub fn add_column_migration(
+        &mut self,
+        position: u16,
+        new_column_min_offset: usize,
+        default_value: Value,
+        new_column_metadata: Vec<ColumnMetadata>,
+    ) -> Result<(), HeapFileError> {
+        let old_columns = mem::replace(&mut self.columns_metadata, new_column_metadata);
+
+        // Iterate through all record pages - we don't need to use PageLockChain
+        // as this whole function has exclusive access to the whole heap file struct.
+        let mut page_id = *self.metadata.first_record_page.lock();
+        while page_id != RecordPageHeader::NO_NEXT_PAGE {
+            let page = self.read_record_page(page_id)?;
+            let next_page_id = page.next_page()?;
+
+            let slots: Vec<_> = page.not_deleted_slot_ids()?.collect();
+            // We drop page here, because in each call to `add_column_to_record`
+            // we need a write-lock to this page.
+            // If we didn't do it we would end up with a deadlock.
+            drop(page);
+
+            // Update each record on the page
+            for slot_id in slots {
+                let ptr = RecordPtr::new(page_id, slot_id);
+                self.add_column_to_record(
+                    &ptr,
+                    position,
+                    new_column_min_offset,
+                    default_value.clone(),
+                    &old_columns,
+                )?;
+            }
+
+            page_id = next_page_id;
+        }
+
+        Ok(())
+    }
+
     /// Reads [`Record`] located at `ptr` and returns its bare bytes.
     fn record_bytes(&self, ptr: &RecordPtr) -> Result<Vec<u8>, HeapFileError> {
         let mut page_chain =
@@ -1592,6 +1634,33 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         page_id: PageId,
     ) -> Result<(), HeapFileError> {
         self.update_page_with_fsm(page, slot, data, page_id, &self.overflow_pages_fsm)
+    }
+
+    /// Adds a column to a single record at `ptr` and writes updated value to the disk
+    fn add_column_to_record(
+        &self,
+        ptr: &RecordPtr,
+        position: u16,
+        new_column_min_offset: usize,
+        default_value: Value,
+        old_columns: &[ColumnMetadata],
+    ) -> Result<(), HeapFileError> {
+        // Read the record with the old schema
+        let record_bytes = self.record_bytes(ptr)?;
+        let record = Record::deserialize(old_columns, &record_bytes)?;
+
+        let mut fields = record.fields;
+        fields.insert(position as _, default_value.into());
+
+        // Serialize with the new schema
+        let new_record = Record::new(fields);
+        let new_bytes = new_record.serialize();
+
+        let mut bytes_changed = vec![false; new_bytes.len()];
+        bytes_changed[new_column_min_offset..].fill(true);
+        self.update_record_bytes(ptr, &new_bytes, &bytes_changed)?;
+
+        Ok(())
     }
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
@@ -4996,6 +5065,279 @@ mod tests {
             result.unwrap_err(),
             HeapFileError::SlottedPageError(_)
         ));
+    }
+
+    #[test]
+    fn heap_file_add_column_to_empty_table() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Add a new column to empty table
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(25), new_columns.clone())
+            .unwrap();
+
+        // Verify metadata was updated
+        assert_eq!(heap_file.columns_metadata.len(), 3);
+        assert_eq!(heap_file.columns_metadata[2].name(), "age");
+    }
+
+    #[test]
+    fn heap_file_add_column_single_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Add new column with default value
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let new_column_offset = size_of::<i32>();
+        heap_file
+            .add_column_migration(2, new_column_offset, Value::Int32(25), new_columns.clone())
+            .unwrap();
+
+        // Read back and verify
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+        assert_i32(25, &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_add_column_multiple_records() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert multiple records
+        let mut ptrs = vec![];
+        for i in 0..5 {
+            let record = Record::new(vec![
+                Value::Int32(i).into(),
+                Value::String(format!("user_{}", i)).into(),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            ptrs.push(ptr);
+        }
+
+        // Add new column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(30), new_columns)
+            .unwrap();
+
+        // Verify all records were updated
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let record = heap_file.record(ptr).unwrap();
+            assert_eq!(record.fields.len(), 3);
+            assert_i32(i as i32, &record.fields[0]);
+            assert_string(&format!("user_{}", i), &record.fields[1]);
+            assert_i32(30, &record.fields[2]);
+        }
+    }
+
+    #[test]
+    fn heap_file_add_column_at_beginning() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Add new column at the beginning
+        let new_columns = vec![
+            ColumnMetadata::new("prefix".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("id".into(), Type::I32, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 2, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(0, 0, Value::String("Mr.".into()), new_columns)
+            .unwrap();
+
+        // Read and verify order
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_string("Mr.", &updated_record.fields[0]);
+        assert_i32(1, &updated_record.fields[1]);
+        assert_string("Alice", &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_add_column_multi_fragment_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Create a large record that spans multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead + 500;
+        let large_string = "x".repeat(large_string_size);
+
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String(large_string.clone()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Add new column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(25), new_columns)
+            .unwrap();
+
+        // Verify the large record still works
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string(&large_string, &updated_record.fields[1]);
+        assert_i32(25, &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_add_column_across_multiple_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert records across multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead;
+
+        let mut ptrs = vec![];
+
+        // Insert 3 large records to span multiple pages
+        for i in 0..3 {
+            let large_string = format!("{}", i).repeat(large_string_size);
+            let record = Record::new(vec![
+                Value::Int32(i).into(),
+                Value::String(large_string).into(),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            ptrs.push(ptr);
+        }
+
+        // Add new column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("status".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(1), new_columns)
+            .unwrap();
+
+        // Verify all records across all pages were updated
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let record = heap_file.record(ptr).unwrap();
+            assert_eq!(record.fields.len(), 3);
+            assert_i32(i as i32, &record.fields[0]);
+            assert_i32(1, &record.fields[2]);
+        }
+    }
+
+    #[test]
+    fn heap_file_add_multiple_columns_sequentially() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Add first column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(25), new_columns)
+            .unwrap();
+
+        // Add second column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+            ColumnMetadata::new("city".into(), Type::String, 3, 2 * size_of::<i32>(), 3).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(
+                3,
+                2 * size_of::<i32>(),
+                Value::String("NYC".into()),
+                new_columns,
+            )
+            .unwrap();
+
+        // Verify both columns were added
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 4);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+        assert_i32(25, &updated_record.fields[2]);
+        assert_string("NYC", &updated_record.fields[3]);
     }
 
     #[ignore = "TODO: need to figure out better way to handle benchmark tests"]

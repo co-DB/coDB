@@ -200,6 +200,7 @@ pub enum TableMetadataError {
 #[derive(Debug)]
 pub struct NewColumnAdded {
     pub pos: u16,
+    pub base_offset: usize,
     pub ty: Type,
 }
 
@@ -272,8 +273,10 @@ impl TableMetadata {
                 false => self.add_variable_size_column(column_dto.name.clone(), column_dto.ty)?,
             };
             self.columns_by_name.insert(column_dto.name, pos);
+            let base_offset = self.columns[pos].base_offset();
             Ok(NewColumnAdded {
                 pos: pos as _,
+                base_offset,
                 ty: column_dto.ty,
             })
         }
@@ -1551,6 +1554,7 @@ mod tests {
         let added = result.unwrap();
         assert_eq!(added.pos, 2);
         assert_eq!(added.ty, Type::F64);
+        assert_eq!(added.base_offset, 8);
 
         let score_col = table.column("score").unwrap();
         assert_eq!(score_col.pos(), 2);
@@ -1578,6 +1582,7 @@ mod tests {
         let added = result.unwrap();
         assert_eq!(added.pos, 1);
         assert_eq!(added.ty, Type::I32);
+        assert_eq!(added.base_offset, 4);
 
         let age_col = table.column("age").unwrap();
         assert_eq!(age_col.pos(), 1);
@@ -1611,6 +1616,7 @@ mod tests {
         let added = result.unwrap();
         assert_eq!(added.pos, 2);
         assert_eq!(added.ty, Type::String);
+        assert_eq!(added.base_offset, 4);
 
         let email_col = table.column("email").unwrap();
         assert_eq!(email_col.pos(), 2);
