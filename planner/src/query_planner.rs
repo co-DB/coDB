@@ -2,8 +2,9 @@ use crate::{
     ast::OrderDirection,
     query_plan::{QueryPlan, SortOrder, StatementPlan, StatementPlanItem},
     resolved_tree::{
-        ResolvedCreateStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedNodeId,
-        ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
+        ResolvedAlterAddColumnStatement, ResolvedCreateStatement, ResolvedExpression,
+        ResolvedInsertStatement, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
+        ResolvedTable, ResolvedTree,
     },
 };
 
@@ -44,7 +45,9 @@ impl QueryPlanner {
             ResolvedStatement::Update(update) => todo!(),
             ResolvedStatement::Delete(delete) => todo!(),
             ResolvedStatement::Create(create) => self.plan_create_statement(create),
-            ResolvedStatement::AlterAddColumn(alter_add_column) => todo!(),
+            ResolvedStatement::AlterAddColumn(alter_add_column) => {
+                self.plan_alter_add_column_statement(alter_add_column)
+            }
             ResolvedStatement::AlterRenameColumn(alter_rename_column) => todo!(),
             ResolvedStatement::AlterRenameTable(alter_rename_table) => todo!(),
             ResolvedStatement::AlterDropColumn(alter_drop_column) => todo!(),
@@ -117,6 +120,24 @@ impl QueryPlanner {
         plan
     }
 
+    fn plan_alter_add_column_statement(
+        &self,
+        alter_add_column: &ResolvedAlterAddColumnStatement,
+    ) -> StatementPlan {
+        let mut plan = StatementPlan::new();
+
+        let table = self.get_resolved_table(alter_add_column.table);
+        let (name, ty) = (&alter_add_column.column_name, alter_add_column.column_type);
+
+        plan.add_item(StatementPlanItem::add_column(
+            table.name.clone(),
+            name.clone(),
+            ty,
+        ));
+
+        plan
+    }
+
     /// Helper to transform generic node into [`ResolvedTable`].
     fn get_resolved_table(&self, id: ResolvedNodeId) -> &ResolvedTable {
         let table_expr = self.tree.node(id);
@@ -143,8 +164,8 @@ mod tests {
         ast::OrderDirection,
         operators::BinaryOperator,
         query_plan::{
-            CreateTable, Filter, Insert, Limit, Projection, QueryPlan, Skip, Sort, SortOrder,
-            StatementPlanItem, TableScan,
+            AddColumn, CreateTable, Filter, Insert, Limit, Projection, QueryPlan, Skip, Sort,
+            SortOrder, StatementPlanItem, TableScan,
         },
         query_planner::QueryPlanner,
         resolved_tree::{
@@ -207,6 +228,13 @@ mod tests {
         match item {
             StatementPlanItem::CreateTable(create_table) => create_table,
             _ => panic!("expected: create table, got: {:?}", item),
+        }
+    }
+
+    fn assert_add_column_item(item: &StatementPlanItem) -> &AddColumn {
+        match item {
+            StatementPlanItem::AddColumn(add_column) => add_column,
+            _ => panic!("expected: add column, got: {:?}", item),
         }
     }
 
@@ -600,5 +628,46 @@ mod tests {
             create_table.columns[1].addon,
             ResolvedCreateColumnAddon::None
         );
+    }
+
+    #[test]
+    fn query_planner_alter_add_column_statement() {
+        use crate::resolved_tree::ResolvedAlterAddColumnStatement;
+
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "users".into(),
+            primary_key_name: "id".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let alter_add_column = ResolvedAlterAddColumnStatement {
+            table: table_id,
+            column_name: "email".into(),
+            column_type: Type::String,
+        };
+
+        tree.add_statement(ResolvedStatement::AlterAddColumn(alter_add_column));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        // Assert we only got one plan
+        assert_eq!(plan.plans.len(), 1);
+        let alter_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains only one item (AddColumn)
+        assert_eq!(alter_plan.items.len(), 1);
+
+        // Assert add column is correct
+        let add_column_item = alter_plan.root();
+        let add_column = assert_add_column_item(add_column_item);
+
+        assert_eq!(add_column.table_name, "users");
+        assert_eq!(add_column.column_name, "email");
+        assert_eq!(add_column.column_ty, Type::String);
     }
 }
