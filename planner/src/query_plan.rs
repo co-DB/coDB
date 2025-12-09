@@ -227,7 +227,7 @@ pub struct Insert {
     pub values: Vec<ResolvedNodeId>,
 }
 
-/// Creates a new table
+/// Creates a new table.
 #[derive(Debug)]
 pub struct CreateTable {
     pub name: String,
@@ -235,7 +235,7 @@ pub struct CreateTable {
     pub columns: Vec<ResolvedCreateColumnDescriptor>,
 }
 
-/// Adds a new column
+/// Adds a new column.
 #[derive(Debug)]
 pub struct AddColumn {
     pub table_name: String,
@@ -243,7 +243,7 @@ pub struct AddColumn {
     pub column_ty: Type,
 }
 
-/// Removes a column
+/// Removes a column.
 #[derive(Debug)]
 pub struct RemoveColumn {
     pub table_name: String,

@@ -777,7 +777,7 @@ impl Parser {
     /// Parses ADD variant of the ALTER statement.
     ///
     /// Syntax:
-    /// `<add_alter_action> -> ADD <column> <type>`
+    /// `<add_alter_action> -> ADD COLUMN <column> <type>`
     fn parse_alter_add(&mut self) -> Result<AlterAction, ParserError> {
         self.expect_token(TokenType::Add)?;
         self.expect_token(TokenType::Column)?;

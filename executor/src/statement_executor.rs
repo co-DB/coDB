@@ -373,16 +373,16 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         };
 
         let revert_changes_in_catalog = || {
-            if let Err(_) = self
+            if let Err(e) = self
                 .executor
                 .catalog
                 .write()
                 .remove_column(&add_column.table_name, &add_column.column_name)
             {
                 // Failed to revert changes - DB state is invalid (TODO: maybe we can do something better here)
-                return Some(error_factory::runtime_error(
-                    "added column to catalog, but didn't migrate records in heap file - DB content is out of sync",
-                ));
+                return Some(error_factory::runtime_error(format!(
+                    "added column to catalog, but didn't migrate records in heap file - DB content is out of sync (failed to revert column addition: {e})"
+                )));
             }
             None
         };
@@ -459,16 +459,16 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 ty: column_removed.ty,
             };
 
-            if let Err(_) = self
+            if let Err(e) = self
                 .executor
                 .catalog
                 .write()
                 .add_column(&remove_column.table_name, column_request)
             {
                 // Failed to revert changes - DB state is invalid (TODO: maybe we can do something better here)
-                return Some(error_factory::runtime_error(
-                    "removed column from catalog, but didn't migrate records in heap file - DB content is out of sync",
-                ));
+                return Some(error_factory::runtime_error(format!(
+                    "removed column from catalog, but didn't migrate records in heap file - DB content is out of sync (failed to revert column removal: {e})",
+                )));
             }
             None
         };
