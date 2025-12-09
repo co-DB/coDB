@@ -128,10 +128,10 @@ impl Catalog {
     pub fn add_column(
         &mut self,
         table_name: impl AsRef<str>,
-        column_dto: NewColumnDto,
+        column_request: NewColumnRequest,
     ) -> Result<NewColumnAdded, CatalogError> {
         let table: &mut TableMetadata = self.table_mut(table_name.as_ref())?;
-        let new_column = table.add_column(column_dto)?;
+        let new_column = table.add_column(column_request)?;
         self.sync_to_disk()?;
         Ok(new_column)
     }
@@ -262,22 +262,26 @@ impl TableMetadata {
     /// Can fail if column with same name already exists.
     fn add_column(
         &mut self,
-        column_dto: NewColumnDto,
+        column_request: NewColumnRequest,
     ) -> Result<NewColumnAdded, TableMetadataError> {
-        let already_exists = self.columns_by_name.contains_key(&column_dto.name);
+        let already_exists = self.columns_by_name.contains_key(&column_request.name);
         if already_exists {
-            Err(TableMetadataError::ColumnAlreadyExists(column_dto.name))
+            Err(TableMetadataError::ColumnAlreadyExists(column_request.name))
         } else {
-            let pos = match column_dto.ty.is_fixed_size() {
-                true => self.add_fixed_size_column(column_dto.name.clone(), column_dto.ty)?,
-                false => self.add_variable_size_column(column_dto.name.clone(), column_dto.ty)?,
+            let pos = match column_request.ty.is_fixed_size() {
+                true => {
+                    self.add_fixed_size_column(column_request.name.clone(), column_request.ty)?
+                }
+                false => {
+                    self.add_variable_size_column(column_request.name.clone(), column_request.ty)?
+                }
             };
-            self.columns_by_name.insert(column_dto.name, pos);
+            self.columns_by_name.insert(column_request.name, pos);
             let base_offset = self.columns[pos].base_offset();
             Ok(NewColumnAdded {
                 pos: pos as _,
                 base_offset,
-                ty: column_dto.ty,
+                ty: column_request.ty,
             })
         }
     }
@@ -425,14 +429,14 @@ impl TableMetadata {
     }
 }
 
-pub struct NewColumnDto {
+pub struct NewColumnRequest {
     pub name: String,
     pub ty: Type,
 }
 
 /// Structure for creating new [`TableMetadata`].
 pub struct TableMetadataFactory {
-    column_dtos: Vec<NewColumnDto>,
+    column_requests: Vec<NewColumnRequest>,
     name: String,
     primary_key_column_name: String,
     columns: Vec<ColumnMetadata>,
@@ -442,13 +446,13 @@ pub struct TableMetadataFactory {
 impl TableMetadataFactory {
     pub fn new(
         name: impl Into<String>,
-        column_dtos: Vec<NewColumnDto>,
+        column_requests: Vec<NewColumnRequest>,
         primary_key_column_name: impl Into<String>,
     ) -> Self {
         TableMetadataFactory {
-            columns: Vec::with_capacity(column_dtos.len()),
-            columns_by_name: HashMap::with_capacity(column_dtos.len()),
-            column_dtos,
+            columns: Vec::with_capacity(column_requests.len()),
+            columns_by_name: HashMap::with_capacity(column_requests.len()),
+            column_requests,
             name: name.into(),
             primary_key_column_name: primary_key_column_name.into(),
         }
@@ -491,15 +495,15 @@ impl TableMetadataFactory {
         Ok(())
     }
 
-    /// Creates [`TableMetadataFactory::columns`] based on [`TableMetadataFactory::column_dtos`]
+    /// Creates [`TableMetadataFactory::columns`] based on [`TableMetadataFactory::column_requests`]
     fn create_columns(&mut self) -> Result<(), TableMetadataError> {
-        self.sort_column_dtos_by_fixed_size();
+        self.sort_column_requests_by_fixed_size();
 
         let mut pos = 0;
         let mut last_fixed_pos = 0;
         let mut base_offset = 0;
 
-        for col in &self.column_dtos {
+        for col in &self.column_requests {
             let column_metadata =
                 ColumnMetadata::new(col.name.clone(), col.ty, pos, base_offset, last_fixed_pos)?;
             self.columns.push(column_metadata);
@@ -513,8 +517,8 @@ impl TableMetadataFactory {
     }
 
     /// Sorts columns by whether they are fixed-size (fixed-size columns are first).
-    fn sort_column_dtos_by_fixed_size<'c>(&mut self) {
-        self.column_dtos.sort_unstable_by(|a, b| {
+    fn sort_column_requests_by_fixed_size<'c>(&mut self) {
+        self.column_requests.sort_unstable_by(|a, b| {
             let a_fixed = a.ty.is_fixed_size();
             let b_fixed = b.ty.is_fixed_size();
             b_fixed.cmp(&a_fixed)
@@ -1544,7 +1548,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding new fixed-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "score".to_string(),
             ty: Type::F64,
         });
@@ -1572,7 +1576,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding new fixed-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "age".to_string(),
             ty: Type::I32,
         });
@@ -1606,7 +1610,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding new variable-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "email".to_string(),
             ty: Type::String,
         });
@@ -1635,7 +1639,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding new fixed-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "age".to_string(),
             ty: Type::I32,
         });
@@ -1664,7 +1668,7 @@ mod tests {
         let mut table = users_table();
 
         // when adding column with duplicate name
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "id".to_string(),
             ty: Type::I32,
         });
@@ -1687,7 +1691,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding first variable-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "name".to_string(),
             ty: Type::String,
         });
@@ -1912,23 +1916,23 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_calculates_correct_offsets() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "score".to_string(),
                 ty: Type::F64,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "surname".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "active".to_string(),
                 ty: Type::Bool,
             },
@@ -1966,19 +1970,19 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_all_fixed_size_types() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "value".to_string(),
                 ty: Type::I64,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "ratio".to_string(),
                 ty: Type::F64,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "active".to_string(),
                 ty: Type::Bool,
             },
@@ -2007,11 +2011,11 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_primary_key_column() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::String,
             },
@@ -2026,15 +2030,15 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_duplicate_column_name() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::I32,
             },
@@ -2053,11 +2057,11 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_unknown_primary_key() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::String,
             },
@@ -2075,7 +2079,7 @@ mod tests {
 
     #[test]
     fn test_table_metadata_factory_single_column() {
-        let columns = vec![NewColumnDto {
+        let columns = vec![NewColumnRequest {
             name: "id".to_string(),
             ty: Type::I32,
         }];
@@ -2092,19 +2096,19 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_multiple_variable_size_columns() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "first_name".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "last_name".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "email".to_string(),
                 ty: Type::String,
             },

@@ -88,6 +88,23 @@ impl Executor {
         Ok(f(hf.value()))
     }
 
+    /// Same as [`Executor::with_heap_file`], but with mutable reference to [`HeapFile`].
+    fn with_heap_file_mut<R>(
+        &self,
+        table_name: impl Into<String> + Clone + AsRef<str>,
+        f: impl FnOnce(&mut HeapFile<HEAP_FILE_BUCKET_SIZE>) -> R,
+    ) -> Result<R, InternalExecutorError> {
+        self.heap_files
+            .entry(table_name.clone().into())
+            .or_try_insert_with(|| self.open_heap_file(table_name.clone()))?;
+        let mut hf = self.heap_files.get_mut(table_name.as_ref()).ok_or(
+            InternalExecutorError::TableDoesNotExist {
+                table_name: table_name.clone().into(),
+            },
+        )?;
+        Ok(f(hf.value_mut()))
+    }
+
     /// Creates new heap file for given table.
     ///
     /// As in [`Executor::with_heap_file`] if table was removed just before we started processing
@@ -1158,5 +1175,147 @@ mod tests {
         assert_eq!(*row.fields[0].deref(), Value::Int32(1));
         assert!(matches!(&row.fields[1].deref(), Value::String(s) if s == "Alice"));
         assert_eq!(*row.fields[2].deref(), Value::Int32(25));
+    }
+
+    #[test]
+    fn test_add_column_to_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+
+        // Add column to empty table
+        let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN age INT32;");
+        assert_operation_successful(result, 1, StatementType::Alter);
+
+        // Verify column was added by selecting from table
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[2].name, "age");
+        assert_eq!(columns[2].ty, Type::I32);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_add_column_with_existing_records() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+        execute_single(&executor, "INSERT INTO users (id, name) VALUES (2, 'Bob');");
+
+        // Add column
+        let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN age INT32;");
+        assert_operation_successful(result, 1, StatementType::Alter);
+
+        // Verify records have default value
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        for row in &rows {
+            assert_eq!(row.fields.len(), 3);
+            assert_eq!(*row.fields[2].deref(), Value::default_for_ty(&Type::I32));
+        }
+    }
+
+    #[test]
+    fn test_add_multiple_columns_sequentially() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+
+        // Add first column
+        let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN age INT32;");
+        assert_operation_successful(result, 1, StatementType::Alter);
+
+        // Add second column
+        let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN city STRING;");
+        assert_operation_successful(result, 1, StatementType::Alter);
+
+        // Verify both columns exist
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age, city FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[2].name, "age");
+        assert_eq!(columns[3].name, "city");
+
+        let row = &rows[0];
+        assert_eq!(*row.fields[0].deref(), Value::Int32(1));
+        assert_eq!(*row.fields[1].deref(), Value::String("Alice".into()));
+        assert_eq!(*row.fields[2].deref(), Value::default_for_ty(&Type::I32));
+        assert_eq!(*row.fields[3].deref(), Value::default_for_ty(&Type::String));
+    }
+
+    #[test]
+    fn test_add_column_can_insert_new_records() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+
+        // Add column
+        execute_single(&executor, "ALTER TABLE users ADD COLUMN age INT32;");
+
+        // Insert new record with the new column
+        let result = execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        // Verify both records
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[2].deref(), Value::default_for_ty(&Type::I32));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*bob.fields[2].deref(), Value::Int32(30));
     }
 }

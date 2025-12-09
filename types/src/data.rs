@@ -58,6 +58,14 @@ impl From<DbDate> for Date {
     }
 }
 
+impl Default for DbDate {
+    fn default() -> Self {
+        Self {
+            days_since_epoch: 0,
+        }
+    }
+}
+
 /// Wrapper struct for internal representation of the DateTime type (days since epoch + seconds since
 /// midnight). Uses the [`DbDate`] struct for representing the day part for easy access to y/m/d methods.
 ///
@@ -152,6 +160,15 @@ impl From<DbDateTime> for PrimitiveDateTime {
     }
 }
 
+impl Default for DbDateTime {
+    fn default() -> Self {
+        Self {
+            date: DbDate::default(),
+            milliseconds_since_midnight: 0,
+        }
+    }
+}
+
 /// Represents a typed value that can be used in coSQL.
 #[derive(PartialEq, Debug, Clone)]
 pub enum Value {
@@ -176,6 +193,19 @@ impl Value {
             Value::Date(_) => Type::Date,
             Value::String(_) => Type::String,
             Value::Bool(_) => Type::Bool,
+        }
+    }
+
+    pub fn default_for_ty(ty: &Type) -> Self {
+        match ty {
+            Type::String => Value::String(String::default()),
+            Type::F32 => Value::Float32(f32::default()),
+            Type::F64 => Value::Float64(f64::default()),
+            Type::I32 => Value::Int32(i32::default()),
+            Type::I64 => Value::Int64(i64::default()),
+            Type::Bool => Value::Bool(bool::default()),
+            Type::Date => Value::Date(DbDate::default()),
+            Type::DateTime => Value::DateTime(DbDateTime::default()),
         }
     }
 

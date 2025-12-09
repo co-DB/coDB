@@ -5,11 +5,11 @@ use engine::{
     record::{Field, Record},
 };
 use itertools::Itertools;
-use metadata::catalog::{NewColumnDto, TableMetadataFactory};
+use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
 use planner::{
     query_plan::{
-        CreateTable, Filter, Insert, Limit, Projection, Skip, Sort, SortOrder, StatementPlan,
-        StatementPlanItem, TableScan,
+        AddColumn, CreateTable, Filter, Insert, Limit, Projection, Skip, Sort, SortOrder,
+        StatementPlan, StatementPlanItem, TableScan,
     },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
@@ -89,6 +89,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         match item {
             StatementPlanItem::Insert(insert) => self.insert(insert),
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
+            StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
             _ => error_factory::runtime_error(format!(
                 "Invalid root operation ({:?}) for mutation statement",
                 item
@@ -311,15 +312,15 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         Ok(record)
     }
 
-    /// Handler for [`CreateTable`] table statement.
+    /// Handler for [`CreateTable`] statement.
     fn create_table(&self, create_table: &CreateTable) -> StatementResult {
-        let new_column_dtos = self.map_to_new_columns_dto(
+        let new_columns = self.map_to_new_columns_request(
             iter::once(&create_table.primary_key_column).chain(create_table.columns.iter()),
         );
 
         let tm_factory = TableMetadataFactory::new(
             &create_table.name,
-            new_column_dtos,
+            new_columns,
             &create_table.primary_key_column.name,
         );
         let table_metadata = match tm_factory.create_table_metadata() {
@@ -340,16 +341,102 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         }
     }
 
-    fn map_to_new_columns_dto(
+    fn map_to_new_columns_request(
         &self,
         columns: impl Iterator<Item = &'q ResolvedCreateColumnDescriptor>,
-    ) -> Vec<NewColumnDto> {
+    ) -> Vec<NewColumnRequest> {
         columns
-            .map(|c| NewColumnDto {
+            .map(|c| NewColumnRequest {
                 name: c.name.clone(),
                 ty: c.ty,
             })
             .collect()
+    }
+
+    /// Handler for [`AddColumn`] statement.
+    fn add_column(&self, add_column: &AddColumn) -> StatementResult {
+        let column_request = NewColumnRequest {
+            name: add_column.column_name.clone(),
+            ty: add_column.column_ty,
+        };
+
+        // Update column in catalog first
+        let column_added = match self
+            .executor
+            .catalog
+            .write()
+            .add_column(&add_column.table_name, column_request)
+        {
+            Ok(ca) => ca,
+            Err(e) => return error_factory::runtime_error(format!("failed to add column: {e}")),
+        };
+
+        let revert_changes_in_catalog = || {
+            if let Err(_) = self
+                .executor
+                .catalog
+                .write()
+                .remove_column(&add_column.table_name, &add_column.column_name)
+            {
+                // Failed to revert changes - DB state is invalid (TODO: maybe we can do something better here)
+                return Some(error_factory::runtime_error(
+                    "added column to catalog, but didn't migrate records in heap file - DB content is out of sync",
+                ));
+            }
+            None
+        };
+
+        // Load new columns list
+        let table = match self.executor.catalog.read().table(&add_column.table_name) {
+            Ok(t) => t,
+            Err(e) => {
+                // Try to revert changes made in catalog
+                if let Some(revert_err) = revert_changes_in_catalog() {
+                    return revert_err;
+                }
+                return error_factory::runtime_error(format!("failed to read table: {e}"));
+            }
+        };
+        let new_columns: Vec<_> = table.columns().collect();
+
+        // Try to migrate records in heap file
+        if let Err(e) = self.add_new_field_to_records(
+            &add_column.table_name,
+            column_added.pos,
+            column_added.base_offset,
+            Value::default_for_ty(&column_added.ty),
+            new_columns,
+        ) {
+            // Try to revert changes made in catalog
+            if let Some(revert_err) = revert_changes_in_catalog() {
+                return revert_err;
+            }
+
+            return error_factory::runtime_error(format!(
+                "couldn't migrate records in heap file: {e}"
+            ));
+        };
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 1,
+            ty: StatementType::Alter,
+        }
+    }
+
+    /// Adds new field to each record in heap file
+    fn add_new_field_to_records(
+        &self,
+        table_name: impl AsRef<str>,
+        position: u16,
+        new_column_min_offset: usize,
+        default_value: Value,
+        new_columns: Vec<ColumnMetadata>,
+    ) -> Result<(), InternalExecutorError> {
+        self.executor
+            .with_heap_file_mut(table_name.as_ref(), |hf| {
+                hf.add_column_migration(position, new_column_min_offset, default_value, new_columns)
+            })??;
+        Ok(())
     }
 
     /// Creates iterator that maps `expressions` into [`ProjectColumn`]s.
