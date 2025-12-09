@@ -624,20 +624,19 @@ impl BTree {
     /// nodes in the path until we are sure that they won't need to be merged/redistributed into.
     /// For a little more info read [`insert`] docs.
     pub fn delete(&self, key: &[u8]) -> Result<(), BTreeError> {
-        // let optimistic_result = self.delete_optimistic(key)?;
-        // match optimistic_result {
-        //     OptimisticOperationResult::Success => Ok(()),
-        //     OptimisticOperationResult::StructuralChangeRetry => {
-        //         // Retry optimistically before going to pessimistic delete. This makes sense as
-        //         // merges of a node in a given path shouldn't occur too often.
-        //         match self.delete_optimistic(key)? {
-        //             OptimisticOperationResult::Success => Ok(()),
-        //             _ => self.delete_pessimistic(key),
-        //         }
-        //     }
-        //     OptimisticOperationResult::FullNodeRetry => self.delete_pessimistic(key),
-        // }
-        self.delete_pessimistic(key)
+        let optimistic_result = self.delete_optimistic(key)?;
+        match optimistic_result {
+            OptimisticOperationResult::Success => Ok(()),
+            OptimisticOperationResult::StructuralChangeRetry => {
+                // Retry optimistically before going to pessimistic delete. This makes sense as
+                // merges of a node in a given path shouldn't occur too often.
+                match self.delete_optimistic(key)? {
+                    OptimisticOperationResult::Success => Ok(()),
+                    _ => self.delete_pessimistic(key),
+                }
+            }
+            OptimisticOperationResult::FullNodeRetry => self.delete_pessimistic(key),
+        }
     }
 
     /// Tries to optimistically delete a key, failing if a need to redistribute keys or merge or
