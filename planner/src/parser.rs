@@ -780,7 +780,11 @@ impl Parser {
     /// `<add_alter_action> -> ADD <column> <type>`
     fn parse_alter_add(&mut self) -> Result<AlterAction, ParserError> {
         self.expect_token(TokenType::Add)?;
-        let column_name = self.parse_column_name()?;
+        self.expect_token(TokenType::Column)?;
+        // Here we don't use `Self::parse_column_name` because in add column statement
+        // column does not exist yet.
+        let column_ident = self.expect_ident()?;
+        let column_name = self.add_identifier_node(column_ident);
         let column_type = self.parse_type()?;
         Ok(AlterAction::Add(AddAlterAction {
             column_name,
@@ -1382,7 +1386,7 @@ mod tests {
 
     #[test]
     fn parses_alter_add_correctly() {
-        let parser = Parser::new("ALTER TABLE users ADD age INT32;");
+        let parser = Parser::new("ALTER TABLE users ADD COLUMN age INT32;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
