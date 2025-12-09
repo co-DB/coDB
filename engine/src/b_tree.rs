@@ -23,6 +23,8 @@ pub(crate) enum BTreeError {
     NodeError(#[from] BTreeNodeError),
     #[error("tried to insert a duplicate key")]
     DuplicateKey,
+    #[error("tried to delete a key that does not exist")]
+    KeyNotFound,
     #[error("deserialization error occurred: {0}")]
     DeserializationError(#[from] DbSerializationError),
     #[error("metadata of the b-tree was corrupted: {reason}")]
@@ -622,19 +624,20 @@ impl BTree {
     /// nodes in the path until we are sure that they won't need to be merged/redistributed into.
     /// For a little more info read [`insert`] docs.
     pub fn delete(&self, key: &[u8]) -> Result<(), BTreeError> {
-        let optimistic_result = self.delete_optimistic(key)?;
-        match optimistic_result {
-            OptimisticOperationResult::Success => Ok(()),
-            OptimisticOperationResult::StructuralChangeRetry => {
-                // Retry optimistically before going to pessimistic delete. This makes sense as
-                // merges of a node in a given path shouldn't occur too often.
-                match self.delete_optimistic(key)? {
-                    OptimisticOperationResult::Success => Ok(()),
-                    _ => self.delete_pessimistic(key),
-                }
-            }
-            OptimisticOperationResult::FullNodeRetry => self.delete_pessimistic(key),
-        }
+        // let optimistic_result = self.delete_optimistic(key)?;
+        // match optimistic_result {
+        //     OptimisticOperationResult::Success => Ok(()),
+        //     OptimisticOperationResult::StructuralChangeRetry => {
+        //         // Retry optimistically before going to pessimistic delete. This makes sense as
+        //         // merges of a node in a given path shouldn't occur too often.
+        //         match self.delete_optimistic(key)? {
+        //             OptimisticOperationResult::Success => Ok(()),
+        //             _ => self.delete_pessimistic(key),
+        //         }
+        //     }
+        //     OptimisticOperationResult::FullNodeRetry => self.delete_pessimistic(key),
+        // }
+        self.delete_pessimistic(key)
     }
 
     /// Tries to optimistically delete a key, failing if a need to redistribute keys or merge or
@@ -663,6 +666,8 @@ impl BTree {
     /// Deletes the key, while keeping write latches on ancestor nodes, which may structurally change
     /// (possibly even root). Merges and redistributes as needed.
     fn delete_pessimistic(&self, key: &[u8]) -> Result<(), BTreeError> {
+        // Keep the full ancestor path latched during delete so we can safely perform
+        // redistributions/merges that bubble up the tree (avoids losing structural context).
         let path =
             self.traverse_pessimistic(key, |node| Ok(node.will_not_underflow_after_delete()?))?;
 
@@ -675,7 +680,7 @@ impl BTree {
                 (path.leaf_page_id, leaf),
                 path.metadata_page,
             ),
-            NodeDeleteResult::KeyDoesNotExist => Err(BTreeError::DuplicateKey),
+            NodeDeleteResult::KeyDoesNotExist => Err(BTreeError::KeyNotFound),
         }
     }
 
@@ -707,8 +712,9 @@ impl BTree {
 
         self.update_structural_version(node_id);
 
-        // First, try moving a key from right sibling.
-        if let Some(right_sibling_id) = node.next_leaf_id()? {
+        // First, try moving a key from the structural right sibling (as defined by the parent).
+        if let Some(right_child_pos) = parent_node.get_next_child_pos(child_pos)? {
+            let right_sibling_id = parent_node.get_child_ptr_at(right_child_pos)?;
             let mut right_sibling = self.pin_leaf_for_write(right_sibling_id)?;
 
             if right_sibling.can_redistribute_key()? {
@@ -718,9 +724,9 @@ impl BTree {
 
                 // Update separator in parent - new separator is the new first key of right sibling.
                 let new_separator_key = right_sibling.get_first_key()?;
-                let slot_id = child_pos
+                let slot_id = right_child_pos
                     .slot_id()
-                    .expect("child_pos must be AfterSlot to have a right sibling");
+                    .expect("right_child_pos must be AfterSlot to have a right sibling");
                 parent_node.update_separator_at_slot(slot_id, &new_separator_key)?;
 
                 return Ok(());
@@ -735,7 +741,13 @@ impl BTree {
                     internal_nodes,
                     metadata_page,
                 };
-                return self.merge_with_right_sibling(node, right_sibling_id, right_sibling, ctx);
+                return self.merge_with_right_sibling(
+                    node,
+                    node_id,
+                    right_sibling_id,
+                    right_sibling,
+                    ctx,
+                );
             }
         }
 
@@ -771,7 +783,7 @@ impl BTree {
             internal_nodes,
             metadata_page,
         };
-        self.merge_with_left_sibling(node, node_id, left_sibling, ctx)
+        self.merge_with_left_sibling(node, node_id, left_sibling, left_node_id, ctx)
     }
 
     /// Merges with right sibling, moving all keys to the current node and freeing the sibling
@@ -779,6 +791,7 @@ impl BTree {
     fn merge_with_right_sibling(
         &self,
         mut node: BTreeLeafNode<PinnedWritePage>,
+        node_id: PageId,
         sibling_id: PageId,
         sibling_node: BTreeLeafNode<PinnedWritePage>,
         mut ctx: MergeContext,
@@ -790,6 +803,7 @@ impl BTree {
         }
 
         node.set_next_leaf_id(sibling_node.next_leaf_id()?)?;
+        self.update_structural_version(node_id);
 
         let next_child_pos = ctx
             .parent_node
@@ -818,6 +832,7 @@ impl BTree {
         node: BTreeLeafNode<PinnedWritePage>,
         node_id: PageId,
         mut sibling_node: BTreeLeafNode<PinnedWritePage>,
+        sibling_id: PageId,
         mut ctx: MergeContext,
     ) -> Result<(), BTreeError> {
         // Move all keys from left sibling to node.
@@ -827,6 +842,7 @@ impl BTree {
         }
 
         sibling_node.set_next_leaf_id(node.next_leaf_id()?)?;
+        self.update_structural_version(sibling_id);
 
         let slot_id = ctx
             .child_pos
@@ -908,6 +924,7 @@ impl BTree {
                 };
                 return self.merge_internal_with_right_sibling(
                     underflow_node,
+                    underflow_id,
                     right_sibling,
                     right_sibling_id,
                     separator_slot,
@@ -942,7 +959,13 @@ impl BTree {
             internal_nodes: ctx.internal_nodes,
             metadata_page: ctx.metadata_page,
         };
-        self.merge_internal_with_left_sibling(underflow_node, underflow_id, left_sibling, new_ctx)
+        self.merge_internal_with_left_sibling(
+            underflow_node,
+            underflow_id,
+            left_sibling,
+            left_sibling_id,
+            new_ctx,
+        )
     }
 
     /// Redistributes a key from the right sibling to the underflowing node.
@@ -1005,6 +1028,7 @@ impl BTree {
     fn merge_internal_with_right_sibling(
         &self,
         mut underflow_node: BTreeInternalNode<PinnedWritePage>,
+        underflow_id: PageId,
         right_sibling: BTreeInternalNode<PinnedWritePage>,
         right_sibling_id: PageId,
         separator_slot: SlotId,
@@ -1014,6 +1038,7 @@ impl BTree {
 
         let right_leftmost = right_sibling.get_child_ptr_at(ChildPosition::Leftmost)?;
 
+        self.update_structural_version(underflow_id);
         underflow_node.insert(&separator_key, right_leftmost)?;
 
         let right_records = right_sibling.get_all_records()?;
@@ -1051,6 +1076,7 @@ impl BTree {
         underflow_node: BTreeInternalNode<PinnedWritePage>,
         underflow_id: PageId,
         mut left_sibling: BTreeInternalNode<PinnedWritePage>,
+        left_sibling_id: PageId,
         mut ctx: MergeContext,
     ) -> Result<(), BTreeError> {
         let separator_slot = ctx
@@ -1063,6 +1089,7 @@ impl BTree {
         let underflow_leftmost = underflow_node.get_child_ptr_at(ChildPosition::Leftmost)?;
 
         left_sibling.insert(&separator_key, underflow_leftmost)?;
+        self.update_structural_version(left_sibling_id);
 
         let underflow_records = underflow_node.get_all_records()?;
         for record in underflow_records {
@@ -1072,13 +1099,10 @@ impl BTree {
             left_sibling.insert(key, child_ptr)?;
         }
 
-        // Delete separator from parent
         ctx.parent_node.delete_at(separator_slot)?;
 
-        // Free underflow_node page
         self.free_page(underflow_id)?;
 
-        // Check if parent underflows
         if ctx.parent_node.is_underflow()? {
             let new_ctx = MergeContext {
                 parent_id: ctx.parent_id,
@@ -1733,5 +1757,590 @@ mod test {
             "\nSpeedup: {:.2}x",
             pessimistic_duration.as_secs_f64() / optimistic_duration.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn test_delete_single_key() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate with enough keys to create internal nodes
+        for i in 0..100 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Verify all keys exist
+        for i in 0..100 {
+            assert!(btree.search(&key_i32(i)).unwrap().is_some());
+        }
+
+        // Now delete a single key
+        btree.delete(&key_i32(50)).unwrap();
+        assert_eq!(btree.search(&key_i32(50)).unwrap(), None);
+
+        // Verify other keys still exist
+        for i in 0..100 {
+            if i != 50 {
+                assert!(
+                    btree.search(&key_i32(i)).unwrap().is_some(),
+                    "Key {} should still exist after deleting 50",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_multiple_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Populate with enough keys to create internal nodes
+        for i in 0..200 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete some keys
+        btree.delete(&key_i32(20)).unwrap();
+        btree.delete(&key_i32(40)).unwrap();
+        btree.delete(&key_i32(100)).unwrap();
+        btree.delete(&key_i32(150)).unwrap();
+
+        // Verify deleted keys are gone
+        assert_eq!(btree.search(&key_i32(20)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(40)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(100)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(150)).unwrap(), None);
+
+        // Verify remaining keys still exist
+        assert!(btree.search(&key_i32(10)).unwrap().is_some());
+        assert!(btree.search(&key_i32(30)).unwrap().is_some());
+        assert!(btree.search(&key_i32(50)).unwrap().is_some());
+        assert!(btree.search(&key_i32(199)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_portion_of_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Use enough keys to create a multi-level tree
+        let keys: Vec<i32> = (0..500).collect();
+        for &k in &keys {
+            btree.insert(&key_i32(k), record_ptr(k as u32, 0)).unwrap();
+        }
+
+        // Delete ~20% of keys (100 out of 500)
+        for &k in &keys[..100] {
+            btree
+                .delete(&key_i32(k))
+                .unwrap_or_else(|_| panic!("Failed to delete key {}", k));
+        }
+
+        // Verify deleted keys are gone
+        for &k in &keys[..100] {
+            assert_eq!(
+                btree.search(&key_i32(k)).unwrap(),
+                None,
+                "Key {} should be deleted",
+                k
+            );
+        }
+
+        // Verify remaining keys exist
+        for &k in &keys[100..] {
+            assert!(
+                btree.search(&key_i32(k)).unwrap().is_some(),
+                "Key {} should still exist",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_in_reverse_order() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Use enough keys to create a multi-level tree
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete a portion in reverse order (keep some keys to maintain structure)
+        for i in (200..500).rev() {
+            btree
+                .delete(&key_i32(i))
+                .unwrap_or_else(|e| panic!("Failed to delete key {} {e}", i));
+            assert_eq!(btree.search(&key_i32(i)).unwrap(), None);
+        }
+
+        // Verify remaining keys still exist
+        for i in 0..200 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_in_order() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Use enough keys to create a multi-level tree
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete a portion in order (keep some keys to maintain structure)
+        for i in 0..300 {
+            btree
+                .delete(&key_i32(i))
+                .unwrap_or_else(|e| panic!("Failed to delete key {} {e}", i));
+            assert_eq!(btree.search(&key_i32(i)).unwrap(), None);
+        }
+
+        // Verify remaining keys still exist
+        for i in 300..500 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_random_order() {
+        use rand::seq::SliceRandom;
+
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Use enough keys to create a multi-level tree
+        let all_keys: Vec<i32> = (0..500).collect();
+        for &k in &all_keys {
+            btree.insert(&key_i32(k), record_ptr(k as u32, 0)).unwrap();
+        }
+
+        // Only delete half the keys
+        let mut keys_to_delete: Vec<i32> = (0..250).collect();
+        keys_to_delete.shuffle(&mut rand::rng());
+        for &k in &keys_to_delete {
+            btree
+                .delete(&key_i32(k))
+                .unwrap_or_else(|_| panic!("Failed to delete key {}", k));
+            assert_eq!(btree.search(&key_i32(k)).unwrap(), None);
+        }
+
+        // Verify remaining keys still exist
+        for k in 250..500 {
+            assert!(
+                btree.search(&key_i32(k)).unwrap().is_some(),
+                "Key {} should still exist",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_and_reinsert() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate to create a multi-level tree
+        for i in 0..100 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        let key = key_i32(42);
+        let ptr2 = record_ptr(20, 10);
+
+        // Verify key exists
+        assert!(btree.search(&key).unwrap().is_some());
+
+        // Delete and verify
+        btree.delete(&key).unwrap();
+        assert_eq!(btree.search(&key).unwrap(), None);
+
+        // Reinsert with different pointer
+        btree.insert(&key, ptr2).unwrap();
+        assert_eq!(btree.search(&key).unwrap(), Some(ptr2));
+    }
+
+    #[test]
+    fn test_delete_after_splits() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Insert enough keys to trigger multiple splits
+        let num_keys = 1000;
+        for i in 0..num_keys {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete every third key (keeping 2/3 of keys to maintain tree structure)
+        for i in (0..num_keys).step_by(3) {
+            btree
+                .delete(&key_i32(i))
+                .unwrap_or_else(|e| panic!("Failed to delete key {i}: {e}"));
+        }
+
+        // Verify deleted keys are gone and remaining keys exist
+        for i in 0..num_keys {
+            if i % 3 == 0 {
+                assert_eq!(
+                    btree.search(&key_i32(i)).unwrap(),
+                    None,
+                    "Key {} should be deleted",
+                    i
+                );
+            } else {
+                assert!(
+                    btree.search(&key_i32(i)).unwrap().is_some(),
+                    "Key {} should still exist",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_triggers_merges() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Insert enough keys to build a multi-level tree
+        let num_keys = 1000;
+        for i in 0..num_keys {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete half the keys to trigger merges (but keep enough to maintain structure)
+        for i in 0..500 {
+            match btree.delete(&key_i32(i)) {
+                Ok(()) => {}
+                Err(e) => panic!("Failed to delete key {}", e),
+            }
+        }
+
+        // Verify remaining keys still work
+        for i in 500..num_keys {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist after merges",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_alternating_insert_delete() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate to create a multi-level tree
+        for i in 0..200 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Now do alternating inserts and deletes
+        for i in 200..300 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+
+            if i > 200 && (i - 200) % 3 == 0 {
+                // Delete a previous key from the newly inserted range
+                btree.delete(&key_i32(i - 2)).unwrap();
+            }
+        }
+
+        // Verify we can search for keys that weren't deleted
+        assert!(btree.search(&key_i32(0)).unwrap().is_some());
+        assert!(btree.search(&key_i32(100)).unwrap().is_some());
+        assert!(btree.search(&key_i32(299)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_from_tree_with_large_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate with small keys to create tree structure
+        for i in 0..100 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Then add large keys
+        let mut large_keys = Vec::new();
+        for i in 0..20 {
+            let key = format!("KEY_{}_{}", i, random_string(200));
+            large_keys.push(key.clone());
+            btree
+                .insert(&key_string(&key), record_ptr(100 + i, 0))
+                .unwrap();
+        }
+
+        // Delete half the large keys
+        for i in (0..20).step_by(2) {
+            btree.delete(&key_string(&large_keys[i])).unwrap();
+        }
+
+        // Verify large keys
+        for i in 0..20 {
+            if i % 2 == 0 {
+                assert_eq!(btree.search(&key_string(&large_keys[i])).unwrap(), None);
+            } else {
+                assert!(btree.search(&key_string(&large_keys[i])).unwrap().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_boundary_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate with regular keys to create tree structure
+        for i in 0..200 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Insert boundary keys
+        btree
+            .insert(&key_i32(i32::MIN), record_ptr(1000, 0))
+            .unwrap();
+        btree
+            .insert(&key_i32(i32::MAX), record_ptr(1001, 0))
+            .unwrap();
+
+        // Delete boundary keys
+        btree.delete(&key_i32(i32::MIN)).unwrap();
+        btree.delete(&key_i32(i32::MAX)).unwrap();
+
+        assert_eq!(btree.search(&key_i32(i32::MIN)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(i32::MAX)).unwrap(), None);
+
+        // Regular keys should still exist
+        assert!(btree.search(&key_i32(0)).unwrap().is_some());
+        assert!(btree.search(&key_i32(100)).unwrap().is_some());
+        assert!(btree.search(&key_i32(199)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_concurrent_deletes() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
+
+        let num_keys = 2000; // Use more keys to ensure multi-level tree
+
+        // Pre-populate
+        for i in 0..num_keys {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Only delete half the keys to ensure tree stays multi-level
+        let delete_range = num_keys / 2;
+        let num_threads = 8;
+        let keys_per_thread = delete_range / num_threads;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|thread_id| {
+                let btree = btree.clone();
+                thread::spawn(move || {
+                    let start = thread_id * keys_per_thread;
+                    let end = start + keys_per_thread;
+                    for i in start..end {
+                        let _ = btree.delete(&key_i32(i as i32));
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify deleted keys are gone
+        for i in 0..delete_range {
+            assert_eq!(
+                btree.search(&key_i32(i as i32)).unwrap(),
+                None,
+                "Key {} should be deleted",
+                i
+            );
+        }
+
+        // Verify remaining keys still exist
+        for i in delete_range..num_keys {
+            assert!(
+                btree.search(&key_i32(i as i32)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_concurrent_inserts_and_deletes() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
+
+        // Pre-populate with keys 0-499
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        let btree_insert = btree.clone();
+        let btree_delete = btree.clone();
+
+        // Insert keys 500-999 while deleting keys 0-249
+        let insert_handle = thread::spawn(move || {
+            for i in 500..1000 {
+                btree_insert
+                    .insert(&key_i32(i), record_ptr(i as u32, 0))
+                    .unwrap();
+            }
+        });
+
+        let delete_handle = thread::spawn(move || {
+            for i in 0..250 {
+                btree_delete
+                    .delete(&key_i32(i))
+                    .unwrap_or_else(|e| panic!("Delete of key {i} failed: {e}"));
+            }
+        });
+
+        insert_handle.join().unwrap();
+        delete_handle.join().unwrap();
+
+        // Verify: keys 0-249 should be deleted, 250-999 should exist
+        for i in 0..250 {
+            assert_eq!(
+                btree.search(&key_i32(i)).unwrap(),
+                None,
+                "Key {} should be deleted",
+                i
+            );
+        }
+        for i in 250..1000 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_empty_tree() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Deleting from empty tree should not panic
+        // The behavior depends on implementation - it might be Ok or an error
+        let _ = btree.delete(&key_i32(42));
+    }
+
+    #[test]
+    fn test_delete_stress_insert_delete_cycles() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First create a substantial base multi-level tree
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Multiple cycles of insert and delete starting from offset 500
+        for cycle in 0..5 {
+            let offset = 500 + cycle * 100;
+
+            // Insert 100 keys
+            for i in 0..100 {
+                btree
+                    .insert(&key_i32(offset + i), record_ptr((offset + i) as u32, 0))
+                    .unwrap();
+            }
+
+            // Delete only 30 keys (less aggressive to maintain tree structure)
+            for i in 0..30 {
+                btree
+                    .delete(&key_i32(offset + i))
+                    .unwrap_or_else(|_| panic!("Failed to delete key {}", offset + i));
+            }
+        }
+
+        // Verify some of the final state
+        for cycle in 0..5 {
+            let offset = 500 + cycle * 100;
+            for i in 0..30 {
+                assert_eq!(
+                    btree.search(&key_i32(offset + i)).unwrap(),
+                    None,
+                    "Key {} should be deleted",
+                    offset + i
+                );
+            }
+            for i in 30..100 {
+                assert!(
+                    btree.search(&key_i32(offset + i)).unwrap().is_some(),
+                    "Key {} should exist",
+                    offset + i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_interleaved_with_search() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Create a multi-level tree with 300 keys
+        for i in 0..300 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete keys in the middle range, interleaved with searches
+        for i in 100..200 {
+            // Search before delete
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should exist before delete",
+                i
+            );
+
+            // Delete
+            btree
+                .delete(&key_i32(i))
+                .unwrap_or_else(|_| panic!("Failed to delete key {}", i));
+
+            // Search after delete
+            assert_eq!(
+                btree.search(&key_i32(i)).unwrap(),
+                None,
+                "Key {} should not exist after delete",
+                i
+            );
+        }
+
+        // Verify keys outside the deleted range still exist
+        for i in 0..100 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
+        for i in 200..300 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
     }
 }

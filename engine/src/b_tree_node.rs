@@ -249,7 +249,7 @@ where
     }
 
     pub(crate) fn is_underflow(&self) -> Result<bool, BTreeNodeError> {
-        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY)
+        Ok(self.slotted_page.fraction_filled()? < Self::UNDERFLOW_BOUNDARY)
     }
 
     pub(crate) fn num_keys(&self) -> Result<u16, BTreeNodeError> {
@@ -436,7 +436,7 @@ where
     }
 
     pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
-        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY)
+        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
     }
 
     /// Check if this internal node can spare a key for redistribution to a sibling.
