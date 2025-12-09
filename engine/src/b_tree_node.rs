@@ -727,6 +727,10 @@ where
         let key_bytes_end = record.len() - serialized_record_ptr_size;
         Ok(record[..key_bytes_end].to_vec())
     }
+
+    pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
+    }
 }
 
 impl<Page> BTreeNode<Page, BTreeLeafHeader>

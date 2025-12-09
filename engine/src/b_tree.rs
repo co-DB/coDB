@@ -642,23 +642,26 @@ impl BTree {
     /// Tries to optimistically delete a key, failing if a need to redistribute keys or merge or
     /// a structural change occurs.
     fn delete_optimistic(&self, key: &[u8]) -> Result<OptimisticOperationResult, BTreeError> {
-        // Traverse and collect version info.
         let (leaf_page_id, path_versions) = self.traverse_with_versions(key)?;
-
-        // Try upgrading to a write latch on the leaf.
         let mut leaf_node = self.pin_leaf_for_write(leaf_page_id)?;
 
-        // Check if any node in the path changed structurally.
         if self.detect_structural_changes(&path_versions) {
             return Ok(OptimisticOperationResult::StructuralChangeRetry);
         }
 
+        // Pre-check: will this delete cause underflow?
+        if !leaf_node.will_not_underflow_after_delete()? {
+            // Don't delete - let pessimistic handle it
+            return Ok(OptimisticOperationResult::FullNodeRetry);
+        }
+
         match leaf_node.delete(key)? {
             NodeDeleteResult::Success => Ok(OptimisticOperationResult::Success),
-            NodeDeleteResult::SuccessUnderflow => Ok(OptimisticOperationResult::FullNodeRetry),
-            NodeDeleteResult::KeyDoesNotExist => {
-                Ok(OptimisticOperationResult::StructuralChangeRetry)
+            NodeDeleteResult::SuccessUnderflow => {
+                // Shouldn't happen given our pre-check, but be safe
+                unreachable!("Pre-check should have caught this")
             }
+            NodeDeleteResult::KeyDoesNotExist => Err(BTreeError::KeyNotFound),
         }
     }
 
@@ -728,6 +731,8 @@ impl BTree {
                     .expect("right_child_pos must be AfterSlot to have a right sibling");
                 parent_node.update_separator_at_slot(slot_id, &new_separator_key)?;
 
+                self.update_structural_version(parent_id);
+                self.update_structural_version(right_sibling_id);
                 return Ok(());
             }
 
@@ -764,10 +769,13 @@ impl BTree {
 
             // The redistributed key becomes the new separator (it's now the first key of current node).
             let new_separator_key = Self::extract_key_from_leaf_record(&redistributed_record);
-            let slot_id = preceding_child_pos
+            let slot_id = child_pos
                 .slot_id()
-                .expect("preceding_child_pos must be AfterSlot");
+                .expect("child_pos must be AfterSlot when redistributing from left");
             parent_node.update_separator_at_slot(slot_id, &new_separator_key)?;
+
+            self.update_structural_version(parent_id);
+            self.update_structural_version(left_node_id);
 
             node.insert_record(redistributed_record.as_slice())?;
             return Ok(());
@@ -814,7 +822,7 @@ impl BTree {
             .expect("next_child_pos must be AfterSlot");
 
         ctx.parent_node.delete_at(slot_id)?;
-
+        self.update_structural_version(ctx.parent_id);
         self.free_page(sibling_id)?;
 
         if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
@@ -848,7 +856,7 @@ impl BTree {
             .slot_id()
             .expect("child_pos must be AfterSlot for merge_with_left_sibling");
         ctx.parent_node.delete_at(slot_id)?;
-
+        self.update_structural_version(ctx.parent_id);
         self.free_page(node_id)?;
 
         if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
@@ -902,8 +910,11 @@ impl BTree {
                     .slot_id()
                     .expect("right_sibling_pos must be AfterSlot");
                 return self.redistribute_from_right_internal(
+                    underflow_id,
                     &mut underflow_node,
+                    right_sibling_id,
                     &mut right_sibling,
+                    parent_id,
                     &mut parent_node,
                     separator_slot,
                 );
@@ -944,8 +955,11 @@ impl BTree {
 
         if left_sibling.can_redistribute_key()? {
             return self.redistribute_from_left_internal(
+                underflow_id,
                 &mut underflow_node,
+                left_sibling_id,
                 &mut left_sibling,
+                parent_id,
                 &mut parent_node,
                 separator_slot,
             );
@@ -973,8 +987,11 @@ impl BTree {
     /// and the first key of the right sibling becomes the new separator.
     fn redistribute_from_right_internal(
         &self,
+        underflow_id: PageId,
         underflow_node: &mut BTreeInternalNode<PinnedWritePage>,
+        right_sibling_id: PageId,
         right_sibling: &mut BTreeInternalNode<PinnedWritePage>,
+        parent_id: PageId,
         parent_node: &mut BTreeInternalNode<PinnedWritePage>,
         separator_slot: SlotId,
     ) -> Result<(), BTreeError> {
@@ -991,6 +1008,10 @@ impl BTree {
         // Update parent's separator to be the new separator key
         parent_node.update_separator_at_slot(separator_slot, &new_separator_key)?;
 
+        self.update_structural_version(underflow_id);
+        self.update_structural_version(right_sibling_id);
+        self.update_structural_version(parent_id);
+
         Ok(())
     }
 
@@ -1000,8 +1021,11 @@ impl BTree {
     /// and the last key of the left sibling becomes the new separator.
     fn redistribute_from_left_internal(
         &self,
+        underflow_id: PageId,
         underflow_node: &mut BTreeInternalNode<PinnedWritePage>,
+        left_sibling_id: PageId,
         left_sibling: &mut BTreeInternalNode<PinnedWritePage>,
+        parent_id: PageId,
         parent_node: &mut BTreeInternalNode<PinnedWritePage>,
         separator_slot: SlotId,
     ) -> Result<(), BTreeError> {
@@ -1016,6 +1040,10 @@ impl BTree {
 
         // Update parent's separator to be the new separator key
         parent_node.update_separator_at_slot(separator_slot, &new_separator_key)?;
+
+        self.update_structural_version(underflow_id);
+        self.update_structural_version(left_sibling_id);
+        self.update_structural_version(parent_id);
 
         Ok(())
     }
@@ -1049,7 +1077,7 @@ impl BTree {
         }
 
         ctx.parent_node.delete_at(separator_slot)?;
-
+        self.update_structural_version(ctx.parent_id);
         self.free_page(right_sibling_id)?;
 
         if ctx.parent_node.is_underflow()? {
@@ -1099,7 +1127,7 @@ impl BTree {
         }
 
         ctx.parent_node.delete_at(separator_slot)?;
-
+        self.update_structural_version(ctx.parent_id);
         self.free_page(underflow_id)?;
 
         if ctx.parent_node.is_underflow()? {
