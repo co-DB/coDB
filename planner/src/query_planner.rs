@@ -2,9 +2,9 @@ use crate::{
     ast::OrderDirection,
     query_plan::{QueryPlan, SortOrder, StatementPlan, StatementPlanItem},
     resolved_tree::{
-        ResolvedAlterAddColumnStatement, ResolvedCreateStatement, ResolvedExpression,
-        ResolvedInsertStatement, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
-        ResolvedTable, ResolvedTree,
+        ResolvedAlterAddColumnStatement, ResolvedAlterDropColumnStatement, ResolvedColumn,
+        ResolvedCreateStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedNodeId,
+        ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
     },
 };
 
@@ -50,7 +50,9 @@ impl QueryPlanner {
             }
             ResolvedStatement::AlterRenameColumn(alter_rename_column) => todo!(),
             ResolvedStatement::AlterRenameTable(alter_rename_table) => todo!(),
-            ResolvedStatement::AlterDropColumn(alter_drop_column) => todo!(),
+            ResolvedStatement::AlterDropColumn(alter_drop_column) => {
+                self.plan_alter_drop_column_statement(alter_drop_column)
+            }
             ResolvedStatement::Truncate(truncate) => todo!(),
             ResolvedStatement::Drop(drop) => todo!(),
         }
@@ -138,14 +140,41 @@ impl QueryPlanner {
         plan
     }
 
+    fn plan_alter_drop_column_statement(
+        &self,
+        alter_drop_column: &ResolvedAlterDropColumnStatement,
+    ) -> StatementPlan {
+        let mut plan = StatementPlan::new();
+
+        let table = self.get_resolved_table(alter_drop_column.table);
+        let column = self.get_resolved_column(alter_drop_column.column);
+
+        plan.add_item(StatementPlanItem::remove_column(
+            table.name.clone(),
+            column.name.clone(),
+        ));
+
+        plan
+    }
+
     /// Helper to transform generic node into [`ResolvedTable`].
     fn get_resolved_table(&self, id: ResolvedNodeId) -> &ResolvedTable {
         let table_expr = self.tree.node(id);
         let table = match table_expr {
             ResolvedExpression::TableRef(t) => t,
-            _ => panic!("Expected TableRef in SELECT statement"),
+            _ => panic!("Expected TableRef"),
         };
         table
+    }
+
+    /// Helper to transform generic node into [`ResolvedColumn`].
+    fn get_resolved_column(&self, id: ResolvedNodeId) -> &ResolvedColumn {
+        let column_expr = self.tree.node(id);
+        let column = match column_expr {
+            ResolvedExpression::ColumnRef(c) => c,
+            _ => panic!("Expected ColumnRef"),
+        };
+        column
     }
 
     fn map_order(&self, order: &OrderDirection) -> SortOrder {
@@ -164,11 +193,12 @@ mod tests {
         ast::OrderDirection,
         operators::BinaryOperator,
         query_plan::{
-            AddColumn, CreateTable, Filter, Insert, Limit, Projection, QueryPlan, Skip, Sort,
-            SortOrder, StatementPlanItem, TableScan,
+            AddColumn, CreateTable, Filter, Insert, Limit, Projection, QueryPlan, RemoveColumn,
+            Skip, Sort, SortOrder, StatementPlanItem, TableScan,
         },
         query_planner::QueryPlanner,
         resolved_tree::{
+            ResolvedAlterAddColumnStatement, ResolvedAlterDropColumnStatement,
             ResolvedBinaryExpression, ResolvedColumn, ResolvedExpression, ResolvedInsertStatement,
             ResolvedLiteral, ResolvedNodeId, ResolvedOrderByDetails, ResolvedSelectStatement,
             ResolvedStatement, ResolvedTable, ResolvedTree,
@@ -235,6 +265,13 @@ mod tests {
         match item {
             StatementPlanItem::AddColumn(add_column) => add_column,
             _ => panic!("expected: add column, got: {:?}", item),
+        }
+    }
+
+    fn assert_remove_column_item(item: &StatementPlanItem) -> &RemoveColumn {
+        match item {
+            StatementPlanItem::RemoveColumn(remove_column) => remove_column,
+            _ => panic!("expected: remove column, got: {:?}", item),
         }
     }
 
@@ -632,8 +669,6 @@ mod tests {
 
     #[test]
     fn query_planner_alter_add_column_statement() {
-        use crate::resolved_tree::ResolvedAlterAddColumnStatement;
-
         // Setup tree
         let mut tree = ResolvedTree::default();
 
@@ -669,5 +704,50 @@ mod tests {
         assert_eq!(add_column.table_name, "users");
         assert_eq!(add_column.column_name, "email");
         assert_eq!(add_column.column_ty, Type::String);
+    }
+
+    #[test]
+    fn query_planner_alter_drop_column_statement() {
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "users".into(),
+            primary_key_name: "id".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let column = ResolvedColumn {
+            table: table_id,
+            name: "email".into(),
+            ty: Type::String,
+            pos: 2,
+        };
+        let column_id = tree.add_node(ResolvedExpression::ColumnRef(column));
+
+        let alter_drop_column = ResolvedAlterDropColumnStatement {
+            table: table_id,
+            column: column_id,
+        };
+
+        tree.add_statement(ResolvedStatement::AlterDropColumn(alter_drop_column));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        // Assert we only got one plan
+        assert_eq!(plan.plans.len(), 1);
+        let alter_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains only one item (RemoveColumn)
+        assert_eq!(alter_plan.items.len(), 1);
+
+        // Assert remove column is correct
+        let remove_column_item = alter_plan.root();
+        let remove_column = assert_remove_column_item(remove_column_item);
+
+        assert_eq!(remove_column.table_name, "users");
+        assert_eq!(remove_column.column_name, "email");
     }
 }

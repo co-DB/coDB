@@ -1398,7 +1398,7 @@ mod tests {
 
         match &alter_stmt.action {
             AlterAction::Add(add) => {
-                assert_column_identifier_node(&ast, add.column_name, "age", None);
+                assert_identifier_node(&ast, add.column_name, "age");
                 assert!(matches!(add.column_type, Type::I32));
             }
             other => panic!("Expected Add action, got {:#?}", other),

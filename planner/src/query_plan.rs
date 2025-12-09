@@ -70,6 +70,7 @@ pub enum StatementPlanItem {
     Insert(Insert),
     CreateTable(CreateTable),
     AddColumn(AddColumn),
+    RemoveColumn(RemoveColumn),
 }
 
 impl StatementPlanItem {
@@ -153,6 +154,13 @@ impl StatementPlanItem {
             column_ty,
         })
     }
+
+    pub(crate) fn remove_column(table_name: String, column_name: String) -> Self {
+        StatementPlanItem::RemoveColumn(RemoveColumn {
+            table_name,
+            column_name,
+        })
+    }
 }
 
 /// Sequential scan of all table (loads every record).
@@ -233,4 +241,11 @@ pub struct AddColumn {
     pub table_name: String,
     pub column_name: String,
     pub column_ty: Type,
+}
+
+/// Removes a column
+#[derive(Debug)]
+pub struct RemoveColumn {
+    pub table_name: String,
+    pub column_name: String,
 }
