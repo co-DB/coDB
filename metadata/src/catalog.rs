@@ -208,6 +208,7 @@ pub struct NewColumnAdded {
 pub struct ColumnRemoved {
     pub pos: u16,
     pub ty: Type,
+    pub prev_column_base_offset: usize,
 }
 
 impl TableMetadata {
@@ -414,9 +415,17 @@ impl TableMetadata {
                     self.recalculate_columns_metadata_from(idx);
                 }
 
+                let pos = cm.pos();
+                let prev_column_base_offset = if pos > 0 {
+                    self.columns[(pos - 1) as usize].base_offset()
+                } else {
+                    0
+                };
+
                 Ok(ColumnRemoved {
-                    pos: cm.pos(),
+                    pos,
                     ty: cm.ty(),
+                    prev_column_base_offset,
                 })
             }
             None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
@@ -1723,6 +1732,7 @@ mod tests {
         let removed = result.unwrap();
         assert_eq!(removed.pos, 2);
         assert_eq!(removed.ty, Type::F64);
+        assert_eq!(removed.prev_column_base_offset, size_of::<i32>());
 
         // and column no longer exists
         assert!(table.column("score").is_err());
@@ -1773,6 +1783,7 @@ mod tests {
         let removed = result.unwrap();
         assert_eq!(removed.pos, 2);
         assert_eq!(removed.ty, Type::String);
+        assert_eq!(removed.prev_column_base_offset, size_of::<i32>());
 
         // and column no longer exists
         assert!(table.column("email").is_err());
@@ -1889,6 +1900,7 @@ mod tests {
         let removed = result.unwrap();
         assert_eq!(removed.pos, 0);
         assert_eq!(removed.ty, Type::I32);
+        assert_eq!(removed.prev_column_base_offset, 0);
 
         // id shifts to position 0
         let id_col = table.column("id").unwrap();

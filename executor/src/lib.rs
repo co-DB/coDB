@@ -1189,7 +1189,7 @@ mod tests {
 
         // Add column to empty table
         let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN age INT32;");
-        assert_operation_successful(result, 1, StatementType::Alter);
+        assert_operation_successful(result, 0, StatementType::Alter);
 
         // Verify column was added by selecting from table
         let (select_plan, select_ast) =
@@ -1220,7 +1220,7 @@ mod tests {
 
         // Add column
         let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN age INT32;");
-        assert_operation_successful(result, 1, StatementType::Alter);
+        assert_operation_successful(result, 0, StatementType::Alter);
 
         // Verify records have default value
         let (select_plan, select_ast) =
@@ -1252,11 +1252,11 @@ mod tests {
 
         // Add first column
         let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN age INT32;");
-        assert_operation_successful(result, 1, StatementType::Alter);
+        assert_operation_successful(result, 0, StatementType::Alter);
 
         // Add second column
         let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN city STRING;");
-        assert_operation_successful(result, 1, StatementType::Alter);
+        assert_operation_successful(result, 0, StatementType::Alter);
 
         // Verify both columns exist
         let (select_plan, select_ast) =
@@ -1317,5 +1317,189 @@ mod tests {
             .find(|r| *r.fields[0].deref() == Value::Int32(2))
             .unwrap();
         assert_eq!(*bob.fields[2].deref(), Value::Int32(30));
+    }
+
+    #[test]
+    fn test_remove_column_from_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+
+        // Remove column from empty table
+        let result = execute_single(&executor, "ALTER TABLE users DROP COLUMN age;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify column was removed by selecting from table
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[1].name, "name");
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_column_with_existing_records() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Remove column
+        let result = execute_single(&executor, "ALTER TABLE users DROP COLUMN age;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify records no longer have the removed column
+        let (select_plan, select_ast) = create_single_statement("SELECT * FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 2);
+
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(alice.fields.len(), 2);
+        assert_eq!(*alice.fields[1].deref(), Value::String("Alice".into()));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(bob.fields.len(), 2);
+        assert_eq!(*bob.fields[1].deref(), Value::String("Bob".into()));
+    }
+
+    #[test]
+    fn test_remove_multiple_columns_sequentially() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32, city STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age, city) VALUES (1, 'Alice', 25, 'NYC');",
+        );
+
+        // Remove first column
+        let result = execute_single(&executor, "ALTER TABLE users DROP COLUMN age;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Remove second column
+        let result = execute_single(&executor, "ALTER TABLE users DROP COLUMN city;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify only id and name remain
+        let (select_plan, select_ast) = create_single_statement("SELECT * FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[1].name, "name");
+
+        let row = &rows[0];
+        assert_eq!(row.fields.len(), 2);
+        assert_eq!(*row.fields[0].deref(), Value::Int32(1));
+        assert_eq!(*row.fields[1].deref(), Value::String("Alice".into()));
+    }
+
+    #[test]
+    fn test_remove_column_can_insert_new_records() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+
+        // Remove column
+        execute_single(&executor, "ALTER TABLE users DROP COLUMN age;");
+
+        // Insert new record without the removed column
+        let result = execute_single(&executor, "INSERT INTO users (id, name) VALUES (2, 'Bob');");
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        // Verify both records
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(alice.fields.len(), 2);
+        assert_eq!(*alice.fields[1].deref(), Value::String("Alice".into()));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(bob.fields.len(), 2);
+        assert_eq!(*bob.fields[1].deref(), Value::String("Bob".into()));
+    }
+
+    #[test]
+    fn test_add_then_remove_column() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+
+        // Add column
+        execute_single(&executor, "ALTER TABLE users ADD COLUMN age INT32;");
+
+        // Remove the same column
+        let result = execute_single(&executor, "ALTER TABLE users DROP COLUMN age;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify back to original schema
+        let (select_plan, select_ast) = create_single_statement("SELECT * FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(*row.fields[0].deref(), Value::Int32(1));
+        assert_eq!(*row.fields[1].deref(), Value::String("Alice".into()));
     }
 }

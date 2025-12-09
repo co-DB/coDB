@@ -8,8 +8,8 @@ use itertools::Itertools;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
 use planner::{
     query_plan::{
-        AddColumn, CreateTable, Filter, Insert, Limit, Projection, Skip, Sort, SortOrder,
-        StatementPlan, StatementPlanItem, TableScan,
+        AddColumn, CreateTable, Filter, Insert, Limit, Projection, RemoveColumn, Skip, Sort,
+        SortOrder, StatementPlan, StatementPlanItem, TableScan,
     },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
@@ -90,6 +90,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             StatementPlanItem::Insert(insert) => self.insert(insert),
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
             StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
+            StatementPlanItem::RemoveColumn(remove_column) => self.remove_column(remove_column),
             _ => error_factory::runtime_error(format!(
                 "Invalid root operation ({:?}) for mutation statement",
                 item
@@ -360,7 +361,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             ty: add_column.column_ty,
         };
 
-        // Update column in catalog first
+        // Update columns in catalog first
         let column_added = match self
             .executor
             .catalog
@@ -418,7 +419,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         };
 
         StatementResult::OperationSuccessful {
-            rows_affected: 1,
+            rows_affected: 0,
             ty: StatementType::Alter,
         }
     }
@@ -435,6 +436,95 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         self.executor
             .with_heap_file_mut(table_name.as_ref(), |hf| {
                 hf.add_column_migration(position, new_column_min_offset, default_value, new_columns)
+            })??;
+        Ok(())
+    }
+
+    /// Handler for [`RemoveColumn`] statement.
+    fn remove_column(&self, remove_column: &RemoveColumn) -> StatementResult {
+        // Update columns in catalog first
+        let column_removed = match self
+            .executor
+            .catalog
+            .write()
+            .remove_column(&remove_column.table_name, &remove_column.column_name)
+        {
+            Ok(ca) => ca,
+            Err(e) => return error_factory::runtime_error(format!("failed to remove column: {e}")),
+        };
+
+        let revert_changes_in_catalog = || {
+            let column_request = NewColumnRequest {
+                name: remove_column.column_name.clone(),
+                ty: column_removed.ty,
+            };
+
+            if let Err(_) = self
+                .executor
+                .catalog
+                .write()
+                .add_column(&remove_column.table_name, column_request)
+            {
+                // Failed to revert changes - DB state is invalid (TODO: maybe we can do something better here)
+                return Some(error_factory::runtime_error(
+                    "removed column from catalog, but didn't migrate records in heap file - DB content is out of sync",
+                ));
+            }
+            None
+        };
+
+        // Load new columns list
+        let table = match self
+            .executor
+            .catalog
+            .read()
+            .table(&remove_column.table_name)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // Try to revert changes made in catalog
+                if let Some(revert_err) = revert_changes_in_catalog() {
+                    return revert_err;
+                }
+                return error_factory::runtime_error(format!("failed to read table: {e}"));
+            }
+        };
+        let new_columns: Vec<_> = table.columns().collect();
+
+        // Try to migrate records in heap file
+        if let Err(e) = self.remove_field_from_records(
+            &remove_column.table_name,
+            column_removed.pos,
+            column_removed.prev_column_base_offset,
+            new_columns,
+        ) {
+            // Try to revert changes made in catalog
+            if let Some(revert_err) = revert_changes_in_catalog() {
+                return revert_err;
+            }
+
+            return error_factory::runtime_error(format!(
+                "couldn't migrate records in heap file: {e}"
+            ));
+        };
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Alter,
+        }
+    }
+
+    /// Removes field from each record in heap file
+    fn remove_field_from_records(
+        &self,
+        table_name: impl AsRef<str>,
+        position: u16,
+        prev_column_min_offset: usize,
+        new_columns: Vec<ColumnMetadata>,
+    ) -> Result<(), InternalExecutorError> {
+        self.executor
+            .with_heap_file_mut(table_name.as_ref(), |hf| {
+                hf.remove_column_migration(position, prev_column_min_offset, new_columns)
             })??;
         Ok(())
     }
