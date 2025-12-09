@@ -987,6 +987,46 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         Ok(())
     }
 
+    /// Migrate all records to remove a column at the specified position.
+    pub fn remove_column_migration(
+        &mut self,
+        position: u16,
+        // `base_offset` of the first column before the removed one, 0 if removed column was first
+        prev_column_min_offset: usize,
+        new_column_metadata: Vec<ColumnMetadata>,
+    ) -> Result<(), HeapFileError> {
+        let old_columns = mem::replace(&mut self.columns_metadata, new_column_metadata);
+
+        // Iterate through all record pages - we don't need to use PageLockChain
+        // as this whole function has exclusive access to the whole heap file struct.
+        let mut page_id = *self.metadata.first_record_page.lock();
+        while page_id != RecordPageHeader::NO_NEXT_PAGE {
+            let page = self.read_record_page(page_id)?;
+            let next_page_id = page.next_page()?;
+
+            let slots: Vec<_> = page.not_deleted_slot_ids()?.collect();
+            // We drop page here, because in each call to `remove_column_from_record`
+            // we need a write-lock to this page.
+            // If we didn't do it we would end up with a deadlock.
+            drop(page);
+
+            // Update each record on the page
+            for slot_id in slots {
+                let ptr = RecordPtr::new(page_id, slot_id);
+                self.remove_column_from_record(
+                    &ptr,
+                    position,
+                    prev_column_min_offset,
+                    &old_columns,
+                )?;
+            }
+
+            page_id = next_page_id;
+        }
+
+        Ok(())
+    }
+
     /// Reads [`Record`] located at `ptr` and returns its bare bytes.
     fn record_bytes(&self, ptr: &RecordPtr) -> Result<Vec<u8>, HeapFileError> {
         let mut page_chain =
@@ -1658,6 +1698,32 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         let mut bytes_changed = vec![false; new_bytes.len()];
         bytes_changed[new_column_min_offset..].fill(true);
+        self.update_record_bytes(ptr, &new_bytes, &bytes_changed)?;
+
+        Ok(())
+    }
+
+    /// Removes a column from a single record at `ptr` and writes updated value to the disk.
+    fn remove_column_from_record(
+        &self,
+        ptr: &RecordPtr,
+        position: u16,
+        prev_column_min_offset: usize,
+        old_columns: &[ColumnMetadata],
+    ) -> Result<(), HeapFileError> {
+        // Read the record with the old schema
+        let record_bytes = self.record_bytes(ptr)?;
+        let record = Record::deserialize(old_columns, &record_bytes)?;
+
+        let mut fields = record.fields;
+        fields.remove(position as _);
+
+        // Serialize with the new schema
+        let new_record = Record::new(fields);
+        let new_bytes = new_record.serialize();
+
+        let mut bytes_changed = vec![false; new_bytes.len()];
+        bytes_changed[prev_column_min_offset..].fill(true);
         self.update_record_bytes(ptr, &new_bytes, &bytes_changed)?;
 
         Ok(())
@@ -5338,6 +5404,352 @@ mod tests {
         assert_string("Alice", &updated_record.fields[1]);
         assert_i32(25, &updated_record.fields[2]);
         assert_string("NYC", &updated_record.fields[3]);
+    }
+
+    #[test]
+    fn heap_file_remove_column_from_empty_table() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Remove column from empty table
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns.clone())
+            .unwrap();
+
+        // Verify metadata was updated
+        assert_eq!(heap_file.columns_metadata.len(), 2);
+        assert_eq!(heap_file.columns_metadata[0].name(), "id");
+        assert_eq!(heap_file.columns_metadata[1].name(), "name");
+    }
+
+    #[test]
+    fn heap_file_remove_column_single_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+            Value::Int32(25).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove the age column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Read back and verify
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_remove_column_multiple_records() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert multiple records
+        let mut ptrs = vec![];
+        for i in 0..5 {
+            let record = Record::new(vec![
+                Value::Int32(i).into(),
+                Value::String(format!("user_{}", i)).into(),
+                Value::Int32(20 + i).into(),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            ptrs.push(ptr);
+        }
+
+        // Remove the age column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify all records were updated
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let record = heap_file.record(ptr).unwrap();
+            assert_eq!(record.fields.len(), 2);
+            assert_i32(i as i32, &record.fields[0]);
+            assert_string(&format!("user_{}", i), &record.fields[1]);
+        }
+    }
+
+    #[test]
+    fn heap_file_remove_first_column() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("prefix".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("id".into(), Type::I32, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 2, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::String("Mr.".into()).into(),
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove the first column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(0, 0, new_columns)
+            .unwrap();
+
+        // Read and verify order
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_remove_middle_column() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 2, 2 * size_of::<i32>(), 2).unwrap(),
+            ColumnMetadata::new("email".into(), Type::String, 3, 2 * size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::Int32(25).into(),
+            Value::String("Alice".into()).into(),
+            Value::String("alice@test.com".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove the middle column (age)
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("email".into(), Type::String, 2, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(1, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify order
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+        assert_string("alice@test.com", &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_remove_column_from_multi_fragment_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Create a large record that spans multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = 2 * size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead + 500;
+        let large_string = "x".repeat(large_string_size);
+
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String(large_string.clone()).into(),
+            Value::Int32(25).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove the age column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify the large record still works
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string(&large_string, &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_remove_column_across_multiple_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("status".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert records across multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = 2 * size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead;
+
+        let mut ptrs = vec![];
+
+        // Insert 3 large records to span multiple pages
+        for i in 0..3 {
+            let large_string = format!("{}", i).repeat(large_string_size);
+            let record = Record::new(vec![
+                Value::Int32(i).into(),
+                Value::String(large_string).into(),
+                Value::Int32(1).into(),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            ptrs.push(ptr);
+        }
+
+        // Remove the status column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify all records across all pages were updated
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let record = heap_file.record(ptr).unwrap();
+            assert_eq!(record.fields.len(), 2);
+            assert_i32(i as i32, &record.fields[0]);
+        }
+    }
+
+    #[test]
+    fn heap_file_remove_multiple_columns_sequentially() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+            ColumnMetadata::new("city".into(), Type::String, 3, 2 * size_of::<i32>(), 3).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+            Value::Int32(25).into(),
+            Value::String("NYC".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove city column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(3, 2 * size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Remove age column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify both columns were removed
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
     }
 
     #[ignore = "TODO: need to figure out better way to handle benchmark tests"]
