@@ -823,6 +823,8 @@ impl BTree {
 
         ctx.parent_node.delete_at(slot_id)?;
         self.update_structural_version(ctx.parent_id);
+
+        drop(sibling_node);
         self.free_page(sibling_id)?;
 
         if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
@@ -857,6 +859,8 @@ impl BTree {
             .expect("child_pos must be AfterSlot for merge_with_left_sibling");
         ctx.parent_node.delete_at(slot_id)?;
         self.update_structural_version(ctx.parent_id);
+
+        drop(node);
         self.free_page(node_id)?;
 
         if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
@@ -932,6 +936,7 @@ impl BTree {
                     internal_nodes: ctx.internal_nodes,
                     metadata_page: ctx.metadata_page,
                 };
+
                 return self.merge_internal_with_right_sibling(
                     underflow_node,
                     underflow_id,
@@ -972,6 +977,7 @@ impl BTree {
             internal_nodes: ctx.internal_nodes,
             metadata_page: ctx.metadata_page,
         };
+
         self.merge_internal_with_left_sibling(
             underflow_node,
             underflow_id,
@@ -1081,14 +1087,7 @@ impl BTree {
         self.free_page(right_sibling_id)?;
 
         if ctx.parent_node.is_underflow()? {
-            let new_ctx = MergeContext {
-                parent_id: ctx.parent_id,
-                parent_node: ctx.parent_node,
-                child_pos: ctx.child_pos,
-                internal_nodes: ctx.internal_nodes,
-                metadata_page: ctx.metadata_page,
-            };
-            return self.handle_internal_underflow(new_ctx);
+            return self.handle_internal_underflow(ctx);
         }
 
         Ok(())
@@ -1131,14 +1130,7 @@ impl BTree {
         self.free_page(underflow_id)?;
 
         if ctx.parent_node.is_underflow()? {
-            let new_ctx = MergeContext {
-                parent_id: ctx.parent_id,
-                parent_node: ctx.parent_node,
-                child_pos: ctx.child_pos,
-                internal_nodes: ctx.internal_nodes,
-                metadata_page: ctx.metadata_page,
-            };
-            return self.handle_internal_underflow(new_ctx);
+            return self.handle_internal_underflow(ctx);
         }
 
         Ok(())
@@ -2170,7 +2162,7 @@ mod test {
 
         // Only delete half the keys to ensure tree stays multi-level
         let delete_range = num_keys / 2;
-        let num_threads = 8;
+        let num_threads = 16;
         let keys_per_thread = delete_range / num_threads;
 
         let handles: Vec<_> = (0..num_threads)

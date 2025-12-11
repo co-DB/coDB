@@ -371,68 +371,67 @@ where
         Ok(next_slot.map(ChildPosition::AfterSlot))
     }
 
-    /// Search returns which child to follow.
+    ///Search returns which child to follow.
     pub fn search(&self, target_key: &[u8]) -> Result<InternalNodeSearchResult, BTreeNodeError> {
-        let num_slots = self.slotted_page.num_slots()?;
-
-        if num_slots == 0 {
+        if self.slotted_page.num_used_slots()? == 0 {
             return Ok(InternalNodeSearchResult::NotFoundInternal {
                 child_ptr: self.get_btree_header()?.leftmost_child_pointer,
                 child_pos: ChildPosition::Leftmost,
             });
         }
 
-        let mut left = 0;
-        let mut right = num_slots - 1;
+        let num_slots = self.slotted_page.num_slots()?;
+        let mut left: u16 = 0;
+        let mut right: u16 = num_slots - 1;
+        let mut last_less: Option<(PageId, ChildPosition)> = None;
 
         while left <= right {
-            let mut mid = (left + right) / 2;
-            if self.slotted_page.is_slot_deleted(mid)? {
+            let mid = (left + right) / 2;
+            let pivot = if self.slotted_page.is_slot_deleted(mid)? {
                 match self.find_new_mid(mid, left, right)? {
-                    None => {
-                        return Err(BTreeNodeError::CorruptNode {
-                            reason: "An internal node must contain at least 1 key".to_string(),
-                        });
-                    }
-                    Some(new_mid) => {
-                        mid = new_mid;
-                    }
+                    Some(p) => p,
+                    None => break,
                 }
-            }
-            let key = self.get_key(mid)?;
+            } else {
+                mid
+            };
+
+            let key = self.get_key(pivot)?;
 
             match key.cmp(target_key) {
-                Ordering::Less => left = mid + 1,
+                Ordering::Less => {
+                    let child = self.get_child_ptr(pivot)?;
+                    last_less = Some((child, ChildPosition::AfterSlot(pivot)));
+                    left = pivot + 1;
+                }
                 Ordering::Equal => {
-                    let child_ptr = self.get_child_ptr(mid)?;
+                    let child_ptr = self.get_child_ptr(pivot)?;
                     return Ok(InternalNodeSearchResult::FoundExact {
                         child_ptr,
-                        child_pos: ChildPosition::AfterSlot(mid),
+                        child_pos: ChildPosition::AfterSlot(pivot),
                     });
                 }
                 Ordering::Greater => {
-                    if mid == 0 {
+                    if pivot == 0 {
                         break;
                     }
-                    right = mid - 1;
+                    right = pivot - 1;
                 }
             }
         }
 
-        let header = self.get_btree_header()?;
-        let (child_ptr, child_pos) = if left == 0 {
-            (header.leftmost_child_pointer, ChildPosition::Leftmost)
+        if let Some((child_ptr, child_pos)) = last_less {
+            Ok(InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_pos,
+            })
         } else {
-            (
-                self.get_child_ptr(left - 1)?,
-                ChildPosition::AfterSlot(left - 1),
-            )
-        };
-
-        Ok(InternalNodeSearchResult::NotFoundInternal {
-            child_ptr,
-            child_pos,
-        })
+            let header = self.get_btree_header()?;
+            Ok(InternalNodeSearchResult::NotFoundInternal {
+                child_ptr: header.leftmost_child_pointer,
+                child_pos: ChildPosition::Leftmost,
+            })
+        }
     }
 
     pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
@@ -661,49 +660,55 @@ where
 
     /// Search either finds record or insert slot.
     pub fn search(&self, target_key: &[u8]) -> Result<LeafNodeSearchResult, BTreeNodeError> {
-        let num_slots = self.slotted_page.num_slots()?;
-        if num_slots == 0 {
+        if self.slotted_page.num_used_slots()? == 0 {
             return Ok(LeafNodeSearchResult::NotFoundLeaf { insert_slot_id: 0 });
         }
 
-        let mut left = 0;
-        let mut right = num_slots - 1;
+        let num_slots = self.slotted_page.num_slots()?;
+        let mut left: u16 = 0;
+        let mut right: u16 = num_slots - 1;
+        let mut last_less: Option<u16> = None;
 
         while left <= right {
-            let mut mid = (left + right) / 2;
-            if self.slotted_page.is_slot_deleted(mid)? {
-                match self.find_new_mid(mid, left, right)? {
-                    None => {
-                        return Ok(LeafNodeSearchResult::NotFoundLeaf {
-                            insert_slot_id: left,
-                        });
-                    }
-                    Some(new_mid) => {
-                        mid = new_mid;
-                    }
-                }
-            }
+            let mid = (left + right) / 2;
 
-            let key = self.get_key(mid)?;
+            let pivot = if self.slotted_page.is_slot_deleted(mid)? {
+                match self.find_new_mid(mid, left, right)? {
+                    Some(p) => p,
+                    None => break,
+                }
+            } else {
+                mid
+            };
+
+            let key = self.get_key(pivot)?;
 
             match key.cmp(target_key) {
-                Ordering::Less => left = mid + 1,
+                Ordering::Less => {
+                    last_less = Some(pivot);
+                    left = pivot + 1;
+                }
                 Ordering::Equal => {
-                    let record_ptr = self.get_record_ptr(mid)?;
+                    let record_ptr = self.get_record_ptr(pivot)?;
                     return Ok(LeafNodeSearchResult::Found {
-                        position: mid,
+                        position: pivot,
                         record_ptr,
                     });
                 }
                 Ordering::Greater => {
-                    if mid == 0 {
+                    if pivot == 0 {
                         break;
                     }
-                    right = mid - 1;
+                    right = pivot - 1;
                 }
             }
         }
 
+        if let Some(pred_slot) = last_less {
+            return Ok(LeafNodeSearchResult::NotFoundLeaf {
+                insert_slot_id: pred_slot + 1,
+            });
+        }
         Ok(LeafNodeSearchResult::NotFoundLeaf {
             insert_slot_id: left,
         })
@@ -1595,9 +1600,7 @@ mod test {
             keys_and_recs.push((i * 10, RecordPtr::new(1, i as u16)));
         }
 
-        let mut i = 0;
         for (key_val, rec) in &keys_and_recs {
-            i += 1;
             let key = serialize_i32_lexicographically(*key_val);
             node.insert(&key, *rec).unwrap();
         }
