@@ -291,10 +291,12 @@ impl BTree {
         loop {
             // Record page version before descending (necessary here before page read, because if a
             // split happens before pin it won't work)
+            // Ensure the version entry exists so a later removal signals change.
             let version = self
                 .structural_version_numbers
-                .get(&current_page_id)
-                .map_or(0, |v| v.load(Ordering::Acquire));
+                .entry(current_page_id)
+                .or_insert_with(|| AtomicU16::new(0))
+                .load(Ordering::Acquire);
 
             let page = self
                 .cache
@@ -317,11 +319,10 @@ impl BTree {
     /// Checks if any pages in the path have changed since they were read optimistically.
     fn detect_structural_changes(&self, path_versions: &[PageVersion]) -> bool {
         path_versions.iter().any(|page_version| {
-            let current_version = self
-                .structural_version_numbers
-                .get(&page_version.page_id)
-                .map_or(0, |v| v.load(Ordering::Acquire));
-            page_version.version != current_version
+            match self.structural_version_numbers.get(&page_version.page_id) {
+                Some(v) => page_version.version != v.load(Ordering::Acquire),
+                None => true,
+            }
         })
     }
 
@@ -1146,6 +1147,10 @@ impl BTree {
         // If root has more than one child we can keep it with the underflow.
         if root_node.num_children()? == 1 {
             let child_id = root_node.get_child_ptr_at(ChildPosition::Leftmost)?;
+
+            // Root will be replaced by its only child; mark the structural change.
+            self.update_structural_version(root_id);
+            self.update_structural_version(child_id);
 
             let metadata_bytes = &mut metadata_page.page_mut()[0..size_of::<BTreeMetadata>()];
             let metadata =
@@ -2163,16 +2168,21 @@ mod test {
         // Only delete half the keys to ensure tree stays multi-level
         let delete_range = num_keys / 2;
         let num_threads = 16;
-        let keys_per_thread = delete_range / num_threads;
+        // Use ceiling division to avoid leaving a tail of keys undeleted
+        let keys_per_thread = (delete_range + num_threads - 1) / num_threads;
 
         let handles: Vec<_> = (0..num_threads)
             .map(|thread_id| {
                 let btree = btree.clone();
                 thread::spawn(move || {
                     let start = thread_id * keys_per_thread;
-                    let end = start + keys_per_thread;
+                    if start >= delete_range {
+                        return;
+                    }
+                    let end = (start + keys_per_thread).min(delete_range);
                     for i in start..end {
-                        let _ = btree.delete(&key_i32(i as i32));
+                        let result = btree.delete(&key_i32(i as i32));
+                        //println!("Key {i} result: {:?}", result);
                     }
                 })
             })
