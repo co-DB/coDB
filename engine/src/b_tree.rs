@@ -687,7 +687,7 @@ impl BTree {
         }
     }
 
-    /// A function for fixing a leaf node that has an underflow (less than [`BTreeNode:UNDERFLOW_BOUNDARY`]
+    /// A function for fixing a leaf node that has an underflow (less than [`BTreeNode::UNDERFLOW_BOUNDARY`]
     /// fraction of space filled). First tries to move a key from one of the siblings (right, then left)
     /// and if that fails merges with one of the sibling (left one, unless it doesn't exist).
     fn redistribute_or_merge(
@@ -828,7 +828,7 @@ impl BTree {
         drop(sibling_node);
         self.free_page(sibling_id)?;
 
-        if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
+        if ctx.parent_node.is_underflow()? {
             self.handle_internal_underflow(ctx)?;
         }
 
@@ -864,7 +864,7 @@ impl BTree {
         drop(node);
         self.free_page(node_id)?;
 
-        if ctx.parent_node.is_underflow()? && !ctx.internal_nodes.is_empty() {
+        if ctx.parent_node.is_underflow()? {
             self.handle_internal_underflow(ctx)?;
         }
 

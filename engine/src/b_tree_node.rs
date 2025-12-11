@@ -344,7 +344,12 @@ where
                 // Find the first non-deleted slot before this one
                 let preceding_slot = (0..slot_id)
                     .rev()
-                    .find(|&s| !self.slotted_page.is_slot_deleted(s).unwrap_or(true));
+                    .find_map(|s| match self.slotted_page.is_slot_deleted(s) {
+                        Ok(false) => Some(Ok(s)),
+                        Ok(true) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                    .transpose()?;
 
                 match preceding_slot {
                     Some(s) => Ok(Some(ChildPosition::AfterSlot(s))),
@@ -366,12 +371,17 @@ where
         };
 
         let next_slot = (start_slot..self.slotted_page.num_slots()?)
-            .find(|&s| !self.slotted_page.is_slot_deleted(s).unwrap_or(true));
+            .find_map(|s| match self.slotted_page.is_slot_deleted(s) {
+                Ok(false) => Some(Ok(s)),
+                Ok(true) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .transpose()?;
 
         Ok(next_slot.map(ChildPosition::AfterSlot))
     }
 
-    ///Search returns which child to follow.
+    /// Search returns which child to follow.
     pub fn search(&self, target_key: &[u8]) -> Result<InternalNodeSearchResult, BTreeNodeError> {
         if self.slotted_page.num_used_slots()? == 0 {
             return Ok(InternalNodeSearchResult::NotFoundInternal {
