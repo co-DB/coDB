@@ -279,6 +279,8 @@ impl Cache {
     /// until it gets the exclusive lock on the frame. Any changes made to the page
     /// after calling this function will not be flushed to the disk.
     pub fn free_page(&self, id: &FilePageRef) -> Result<(), CacheError> {
+        let pf = self.files.get_or_open_new_file(&id.file_key)?;
+        pf.lock().free_page(id.page_id)?;
         match self.frames.entry(id.clone()) {
             Entry::Occupied(occupied_entry) => {
                 // We hold exclusive lock on the key and remove it from the dashmap,
@@ -290,18 +292,9 @@ impl Cache {
                 drop(w);
                 self.lru.write().pop_entry(id);
 
-                let pf = self.files.get_or_open_new_file(&id.file_key)?;
-                pf.lock().free_page(id.page_id)?;
                 Ok(())
             }
-            Entry::Vacant(_) => {
-                // In this case page is not in the cache. We hold exclusive lock
-                // on its key in the dashmap, so we can safely just free it
-                // in underlying file.
-                let pf = self.files.get_or_open_new_file(&id.file_key)?;
-                pf.lock().free_page(id.page_id)?;
-                Ok(())
-            }
+            Entry::Vacant(_) => Ok(()),
         }
     }
 
