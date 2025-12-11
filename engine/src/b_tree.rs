@@ -848,7 +848,7 @@ impl BTree {
         // Move all keys from left sibling to node.
         let keys_to_move = node.get_all_records()?;
         for key in keys_to_move {
-            sibling_node.insert_record(&key)?;
+            sibling_node.insert_record(key)?;
         }
 
         sibling_node.set_next_leaf_id(node.next_leaf_id()?)?;
@@ -992,6 +992,7 @@ impl BTree {
     ///
     /// The separator in the parent comes down to the underflowing node,
     /// and the first key of the right sibling becomes the new separator.
+    #[allow(clippy::too_many_arguments)]
     fn redistribute_from_right_internal(
         &self,
         underflow_id: PageId,
@@ -1026,6 +1027,7 @@ impl BTree {
     ///
     /// The separator in the parent comes down to the underflowing node,
     /// and the last key of the left sibling becomes the new separator.
+    #[allow(clippy::too_many_arguments)]
     fn redistribute_from_left_internal(
         &self,
         underflow_id: PageId,
@@ -1076,12 +1078,7 @@ impl BTree {
         underflow_node.insert(&separator_key, right_leftmost)?;
 
         let right_records = right_sibling.get_all_records()?;
-        for record in right_records {
-            let key_bytes_end = record.len() - size_of::<PageId>();
-            let key = &record[..key_bytes_end];
-            let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
-            underflow_node.insert(key, child_ptr)?;
-        }
+        self.insert_internal_records(&mut underflow_node, right_records)?;
 
         ctx.parent_node.delete_at(separator_slot)?;
         self.update_structural_version(ctx.parent_id);
@@ -1119,12 +1116,7 @@ impl BTree {
         self.update_structural_version(left_sibling_id);
 
         let underflow_records = underflow_node.get_all_records()?;
-        for record in underflow_records {
-            let key_bytes_end = record.len() - size_of::<PageId>();
-            let key = &record[..key_bytes_end];
-            let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
-            left_sibling.insert(key, child_ptr)?;
-        }
+        self.insert_internal_records(&mut left_sibling, underflow_records)?;
 
         ctx.parent_node.delete_at(separator_slot)?;
         self.update_structural_version(ctx.parent_id);
@@ -1172,6 +1164,21 @@ impl BTree {
         let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
         let key_bytes_end = record.len() - serialized_record_ptr_size;
         record[..key_bytes_end].to_vec()
+    }
+
+    /// Inserts internal-node records (key + child pointer) into the target internal node.
+    fn insert_internal_records(
+        &self,
+        target: &mut BTreeInternalNode<PinnedWritePage>,
+        records: Vec<&[u8]>,
+    ) -> Result<(), BTreeError> {
+        for record in records {
+            let key_bytes_end = record.len() - size_of::<PageId>();
+            let key = &record[..key_bytes_end];
+            let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
+            target.insert(key, child_ptr)?;
+        }
+        Ok(())
     }
 }
 
@@ -2113,7 +2120,7 @@ mod test {
         }
 
         // Verify large keys
-        for i in 0..20 {
+        for (i, _) in large_keys.iter().enumerate().take(20) {
             if i % 2 == 0 {
                 assert_eq!(btree.search(&key_string(&large_keys[i])).unwrap(), None);
             } else {
@@ -2181,8 +2188,10 @@ mod test {
                     }
                     let end = (start + keys_per_thread).min(delete_range);
                     for i in start..end {
-                        let result = btree.delete(&key_i32(i as i32));
-                        //println!("Key {i} result: {:?}", result);
+                        let result = btree.delete(&key_i32(i));
+                        if let Err(e) = result {
+                            panic!("Delete of key {i} failed: {e}");
+                        }
                     }
                 })
             })
@@ -2195,7 +2204,7 @@ mod test {
         // Verify deleted keys are gone
         for i in 0..delete_range {
             assert_eq!(
-                btree.search(&key_i32(i as i32)).unwrap(),
+                btree.search(&key_i32(i)).unwrap(),
                 None,
                 "Key {} should be deleted",
                 i
@@ -2205,7 +2214,7 @@ mod test {
         // Verify remaining keys still exist
         for i in delete_range..num_keys {
             assert!(
-                btree.search(&key_i32(i as i32)).unwrap().is_some(),
+                btree.search(&key_i32(i)).unwrap().is_some(),
                 "Key {} should still exist",
                 i
             );
