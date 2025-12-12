@@ -7,7 +7,15 @@ mod statement_executor;
 
 use std::{path::Path, sync::Arc};
 
+use crate::{
+    consts::HEAP_FILE_BUCKET_SIZE,
+    error_factory::InternalExecutorError,
+    iterators::{ParseErrorIter, QueryResultIter, StatementIter},
+    response::StatementResult,
+    statement_executor::StatementExecutor,
+};
 use dashmap::DashMap;
+use engine::b_tree::{BTree, BTreeFactory};
 use engine::heap_file::{HeapFile, HeapFileFactory};
 use metadata::catalog::Catalog;
 use parking_lot::RwLock;
@@ -28,6 +36,7 @@ use crate::{
 
 pub struct Executor {
     heap_files: DashMap<String, HeapFile<HEAP_FILE_BUCKET_SIZE>>,
+    b_trees: DashMap<String, BTree>,
     cache: Arc<Cache>,
     catalog: Arc<RwLock<Catalog>>,
 }
@@ -46,7 +55,8 @@ impl Executor {
         let catalog = Arc::new(RwLock::new(catalog));
         Ok(Executor {
             heap_files: DashMap::new(),
-            cache: cache,
+            b_trees: DashMap::new(),
+            cache,
             catalog,
         })
     }
@@ -77,15 +87,11 @@ impl Executor {
         table_name: impl Into<String> + Clone + AsRef<str>,
         f: impl FnOnce(&HeapFile<HEAP_FILE_BUCKET_SIZE>) -> R,
     ) -> Result<R, InternalExecutorError> {
-        self.heap_files
+        let entry = self.heap_files
             .entry(table_name.clone().into())
             .or_try_insert_with(|| self.open_heap_file(table_name.clone()))?;
-        let hf = self.heap_files.get(table_name.as_ref()).ok_or(
-            InternalExecutorError::TableDoesNotExist {
-                table_name: table_name.clone().into(),
-            },
-        )?;
-        Ok(f(hf.value()))
+
+        Ok(f(entry.value()))
     }
 
     /// Same as [`Executor::with_heap_file`], but with mutable reference to [`HeapFile`].
@@ -159,6 +165,37 @@ impl Executor {
         })?;
         self.heap_files.insert(table_name.into(), heap_file);
         Ok(())
+    }
+
+    /// Gets B-Tree for given table and passes it to function `f`.
+    /// If B-Tree wasn't used yet it opens it and inserts to [`Executor::b_trees`].
+    fn with_b_tree<R>(
+        &self,
+        table_name: impl Into<String> + Clone + AsRef<str>,
+        f: impl FnOnce(&BTree) -> R,
+    ) -> Result<R, InternalExecutorError> {
+        let entry = self
+            .b_trees
+            .entry(table_name.clone().into())
+            .or_try_insert_with(|| self.open_b_tree(table_name.clone()))?;
+
+        Ok(f(entry.value()))
+    }
+
+    /// Creates new B-Tree for given table.
+    fn open_b_tree(
+        &self,
+        table_name: impl Into<String> + Clone + AsRef<str>,
+    ) -> Result<BTree, InternalExecutorError> {
+        let file_key = FileKey::data(table_name.clone());
+        let cache = self.cache.clone();
+        let b_tree_factory = BTreeFactory::new(file_key, cache);
+        let b_tree = b_tree_factory.create_btree().map_err(|err| {
+            InternalExecutorError::CannotCreateBTree {
+                reason: err.to_string(),
+            }
+        })?;
+        Ok(b_tree)
     }
 }
 

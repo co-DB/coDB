@@ -17,7 +17,7 @@ use thiserror::Error;
 use types::serialization::{DbSerializable, DbSerializationError};
 
 #[derive(Debug, Error)]
-pub(crate) enum BTreeError {
+pub enum BTreeError {
     #[error("cache error occurred: {0}")]
     CacheError(#[from] CacheError),
     #[error("node error occurred: {0}")]
@@ -169,7 +169,7 @@ struct MergeContext {
 /// Structure responsible for managing on-disk index files.
 ///
 /// Each [`BTree`] instance corresponds to a single physical file on disk.
-pub(crate) struct BTree {
+pub struct BTree {
     file_key: FileKey,
     cache: Arc<Cache>,
     /// A concurrent hash map for storing the current structural version numbers (how many times a
@@ -1226,7 +1226,7 @@ impl BTree {
     }
 }
 
-struct BTreeFactory {
+pub struct BTreeFactory {
     file_key: FileKey,
     cache: Arc<Cache>,
 }

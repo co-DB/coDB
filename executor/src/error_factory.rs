@@ -13,6 +13,8 @@ pub(crate) enum InternalExecutorError {
     TableDoesNotExist { table_name: String },
     #[error("Cannot create heap file: {reason}")]
     CannotCreateHeapFile { reason: String },
+    #[error("Cannot create b-tree: {reason}")]
+    CannotCreateBTree { reason: String },
     #[error("{0}")]
     HeapFileError(#[from] HeapFileError),
     #[error("Used invalid operation ({operation}) for data source")]
