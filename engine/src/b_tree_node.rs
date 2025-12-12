@@ -37,6 +37,31 @@ pub(crate) enum NodeInsertResult {
     KeyAlreadyExists,
 }
 
+pub(crate) enum NodeDeleteResult {
+    Success,
+    SuccessUnderflow,
+    KeyDoesNotExist,
+}
+
+/// Represents a child pointer position in an internal B-tree node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildPosition {
+    /// The leftmost child pointer, stored in the node header.
+    Leftmost,
+    /// A child pointer stored in a slot.
+    AfterSlot(SlotId),
+}
+
+impl ChildPosition {
+    /// Returns the slot ID if this is an AfterSlot position, None for Leftmost.
+    pub fn slot_id(&self) -> Option<SlotId> {
+        match self {
+            ChildPosition::Leftmost => None,
+            ChildPosition::AfterSlot(slot_id) => Some(*slot_id),
+        }
+    }
+}
+
 /// Type aliases for making things a little more readable
 pub(crate) type BTreeLeafNode<Page> = BTreeNode<Page, BTreeLeafHeader>;
 pub(crate) type BTreeInternalNode<Page> = BTreeNode<Page, BTreeInternalHeader>;
@@ -46,7 +71,6 @@ pub(crate) type BTreeInternalNode<Page> = BTreeNode<Page, BTreeInternalHeader>;
 #[derive(Pod, Zeroable, Copy, Clone)]
 pub(crate) struct BTreeInternalHeader {
     base_header: SlottedPageBaseHeader,
-    padding: u16,
     /// Stores the page id of the child node with keys lesser than the smallest one in
     /// this node. We store this here, because a btree node with n keys needs n+1 child
     /// pointers and storing the first pointer here is easier than storing it in a
@@ -71,7 +95,6 @@ impl Default for BTreeInternalHeader {
                 size_of::<BTreeInternalHeader>() as u16,
                 PageType::BTreeInternal,
             ),
-            padding: 0,
             leftmost_child_pointer: Self::NO_LEFTMOST_CHILD_POINTER,
         }
     }
@@ -82,7 +105,6 @@ impl Default for BTreeInternalHeader {
 #[derive(Pod, Zeroable, Copy, Clone)]
 pub(crate) struct BTreeLeafHeader {
     base_header: SlottedPageBaseHeader,
-    padding: u16,
     /// Pointer to the right sibling leaf node (for range queries)
     next_leaf_pointer: PageId,
 }
@@ -104,7 +126,6 @@ impl Default for BTreeLeafHeader {
                 size_of::<BTreeLeafHeader>() as u16,
                 PageType::BTreeLeaf,
             ),
-            padding: 0,
             next_leaf_pointer: Self::NO_NEXT_LEAF,
         }
     }
@@ -114,15 +135,45 @@ impl Default for BTreeLeafHeader {
 /// Enum representing possible outcomes of a search operation in leaf node.
 pub(crate) enum LeafNodeSearchResult {
     /// Exact match found.
-    Found { record_ptr: RecordPtr },
+    Found {
+        position: SlotId,
+        record_ptr: RecordPtr,
+    },
 
     /// Key not found, but insertion point identified.
     NotFoundLeaf { insert_slot_id: SlotId },
 }
 
-pub(crate) struct InternalNodeSearchResult {
-    pub(crate) child_ptr: PageId,
-    pub(crate) insert_pos: Option<u16>,
+pub(crate) enum InternalNodeSearchResult {
+    /// Key found exactly
+    FoundExact {
+        child_ptr: PageId,
+        /// The position of the child pointer that was followed.
+        child_pos: ChildPosition,
+    },
+
+    /// Key not found, followed a child pointer during search
+    NotFoundInternal {
+        child_ptr: PageId,
+        /// The position of the child pointer that was followed.
+        child_pos: ChildPosition,
+    },
+}
+
+impl InternalNodeSearchResult {
+    pub(crate) fn child_ptr(&self) -> PageId {
+        match self {
+            InternalNodeSearchResult::FoundExact { child_ptr, .. } => *child_ptr,
+            InternalNodeSearchResult::NotFoundInternal { child_ptr, .. } => *child_ptr,
+        }
+    }
+
+    pub(crate) fn child_pos(&self) -> ChildPosition {
+        match self {
+            InternalNodeSearchResult::FoundExact { child_pos, .. } => *child_pos,
+            InternalNodeSearchResult::NotFoundInternal { child_pos, .. } => *child_pos,
+        }
+    }
 }
 
 /// Struct representing a B-Tree node. It is a wrapper on a slotted page, that uses its api for
@@ -149,6 +200,9 @@ where
     Page: PageRead,
     Header: SlottedPageHeader,
 {
+    /// Boundary at which we consider the node to need merging/borrowing keys from sibling.
+    const UNDERFLOW_BOUNDARY: f32 = 0.33;
+
     pub fn new(page: Page) -> Result<Self, BTreeNodeError> {
         Ok(Self {
             slotted_page: SlottedPage::new(page)?,
@@ -189,6 +243,18 @@ where
 
         Ok(None)
     }
+
+    pub(crate) fn get_all_records(&self) -> Result<Vec<&[u8]>, BTreeNodeError> {
+        Ok(self.slotted_page.read_all_records()?.collect())
+    }
+
+    pub(crate) fn is_underflow(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.fraction_filled()? < Self::UNDERFLOW_BOUNDARY)
+    }
+
+    pub(crate) fn num_keys(&self) -> Result<u16, BTreeNodeError> {
+        Ok(self.slotted_page.num_used_slots()?)
+    }
 }
 
 impl<Page, Header> BTreeNode<Page, Header>
@@ -227,14 +293,23 @@ where
             InsertResult::PageFull => Ok(NodeInsertResult::PageFull),
         }
     }
+
+    pub(crate) fn delete_at(&mut self, slot_id: SlotId) -> Result<(), BTreeNodeError> {
+        Ok(self.slotted_page.delete(slot_id)?)
+    }
 }
 
 impl<Page> BTreeNode<Page, BTreeInternalHeader>
 where
     Page: PageRead,
 {
+    /// Returns the number of children in this internal node (num_keys + 1).
+    pub fn num_children(&self) -> Result<u16, BTreeNodeError> {
+        Ok(self.num_keys()? + 1)
+    }
+
     /// Gets the key stored in the given slot.
-    fn get_key(&self, slot_id: SlotId) -> Result<&[u8], BTreeNodeError> {
+    pub(crate) fn get_key(&self, slot_id: SlotId) -> Result<&[u8], BTreeNodeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
         let key_bytes_end = record_bytes.len() - size_of::<PageId>();
         let key_bytes = &record_bytes[..key_bytes_end];
@@ -249,65 +324,152 @@ where
         Ok(child_ptr)
     }
 
+    /// Gets the child pointer at the given position.
+    pub fn get_child_ptr_at(&self, pos: ChildPosition) -> Result<PageId, BTreeNodeError> {
+        match pos {
+            ChildPosition::Leftmost => Ok(self.get_btree_header()?.leftmost_child_pointer),
+            ChildPosition::AfterSlot(slot_id) => self.get_child_ptr(slot_id),
+        }
+    }
+
+    /// Returns the child position immediately preceding the given position,
+    /// skipping any deleted slots.
+    pub(crate) fn get_preceding_child_pos(
+        &self,
+        pos: ChildPosition,
+    ) -> Result<Option<ChildPosition>, BTreeNodeError> {
+        match pos {
+            ChildPosition::Leftmost => Ok(None),
+            ChildPosition::AfterSlot(slot_id) => {
+                // Find the first non-deleted slot before this one
+                let preceding_slot = (0..slot_id)
+                    .rev()
+                    .find_map(|s| match self.slotted_page.is_slot_deleted(s) {
+                        Ok(false) => Some(Ok(s)),
+                        Ok(true) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                    .transpose()?;
+
+                match preceding_slot {
+                    Some(s) => Ok(Some(ChildPosition::AfterSlot(s))),
+                    None => Ok(Some(ChildPosition::Leftmost)),
+                }
+            }
+        }
+    }
+
+    /// Returns the child position immediately following the given position,
+    /// skipping any deleted slots.
+    pub fn get_next_child_pos(
+        &self,
+        pos: ChildPosition,
+    ) -> Result<Option<ChildPosition>, BTreeNodeError> {
+        let start_slot = match pos {
+            ChildPosition::Leftmost => 0,
+            ChildPosition::AfterSlot(slot_id) => slot_id + 1,
+        };
+
+        let next_slot = (start_slot..self.slotted_page.num_slots()?)
+            .find_map(|s| match self.slotted_page.is_slot_deleted(s) {
+                Ok(false) => Some(Ok(s)),
+                Ok(true) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .transpose()?;
+
+        Ok(next_slot.map(ChildPosition::AfterSlot))
+    }
+
     /// Search returns which child to follow.
     pub fn search(&self, target_key: &[u8]) -> Result<InternalNodeSearchResult, BTreeNodeError> {
-        let num_slots = self.slotted_page.num_slots()?;
-
-        if num_slots == 0 {
-            return Ok(InternalNodeSearchResult {
+        if self.slotted_page.num_used_slots()? == 0 {
+            return Ok(InternalNodeSearchResult::NotFoundInternal {
                 child_ptr: self.get_btree_header()?.leftmost_child_pointer,
-                insert_pos: Some(0),
+                child_pos: ChildPosition::Leftmost,
             });
         }
 
-        let mut left = 0;
-        let mut right = num_slots - 1;
+        let num_slots = self.slotted_page.num_slots()?;
+        let mut left: u16 = 0;
+        let mut right: u16 = num_slots - 1;
+        let mut last_less: Option<(PageId, ChildPosition)> = None;
 
         while left <= right {
-            let mut mid = (left + right) / 2;
-            if self.slotted_page.is_slot_deleted(mid)? {
+            let mid = (left + right) / 2;
+            let pivot = if self.slotted_page.is_slot_deleted(mid)? {
                 match self.find_new_mid(mid, left, right)? {
-                    None => {
-                        return Err(BTreeNodeError::CorruptNode {
-                            reason: "An internal node must contain at least 1 key".to_string(),
-                        });
-                    }
-                    Some(new_mid) => {
-                        mid = new_mid;
-                    }
+                    Some(p) => p,
+                    None => break,
                 }
-            }
-            let key = self.get_key(mid)?;
+            } else {
+                mid
+            };
+
+            let key = self.get_key(pivot)?;
 
             match key.cmp(target_key) {
-                Ordering::Less => left = mid + 1,
+                Ordering::Less => {
+                    let child = self.get_child_ptr(pivot)?;
+                    last_less = Some((child, ChildPosition::AfterSlot(pivot)));
+                    left = pivot + 1;
+                }
                 Ordering::Equal => {
-                    let child_ptr = self.get_child_ptr(mid)?;
-                    return Ok(InternalNodeSearchResult {
+                    let child_ptr = self.get_child_ptr(pivot)?;
+                    return Ok(InternalNodeSearchResult::FoundExact {
                         child_ptr,
-                        insert_pos: None,
+                        child_pos: ChildPosition::AfterSlot(pivot),
                     });
                 }
                 Ordering::Greater => {
-                    if mid == 0 {
+                    if pivot == 0 {
                         break;
                     }
-                    right = mid - 1;
+                    right = pivot - 1;
                 }
             }
         }
 
-        let header = self.get_btree_header()?;
-        let (child_ptr, insert_pos) = if left == 0 {
-            (header.leftmost_child_pointer, 0)
+        if let Some((child_ptr, child_pos)) = last_less {
+            Ok(InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_pos,
+            })
         } else {
-            (self.get_child_ptr(left - 1)?, left)
-        };
+            let header = self.get_btree_header()?;
+            Ok(InternalNodeSearchResult::NotFoundInternal {
+                child_ptr: header.leftmost_child_pointer,
+                child_pos: ChildPosition::Leftmost,
+            })
+        }
+    }
 
-        Ok(InternalNodeSearchResult {
-            child_ptr,
-            insert_pos: Some(insert_pos),
-        })
+    /// Check if this internal node can spare a key for redistribution to a sibling.
+    pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
+    }
+
+    /// Returns the first (smallest) key in this internal node without removing it.
+    pub(crate) fn get_first_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (_, record) = self.slotted_page.read_first_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        Ok(record[..key_bytes_end].to_vec())
+    }
+
+    /// Returns the last (largest) key in this internal node without removing it.
+    pub(crate) fn get_last_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (_, record) = self.slotted_page.read_last_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        Ok(record[..key_bytes_end].to_vec())
+    }
+
+    /// Returns the last (largest) key and its child pointer without removing.
+    pub(crate) fn get_last_key_and_child(&self) -> Result<(Vec<u8>, PageId), BTreeNodeError> {
+        let (_, record) = self.slotted_page.read_last_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        let key = record[..key_bytes_end].to_vec();
+        let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
+        Ok((key, child_ptr))
     }
 }
 
@@ -321,7 +483,6 @@ where
                 size_of::<BTreeInternalHeader>() as u16,
                 PageType::BTreeInternal,
             ),
-            padding: 0,
             leftmost_child_pointer,
         };
 
@@ -335,9 +496,19 @@ where
         key: &[u8],
         new_child_id: PageId,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
-        let position = match self.search(key)?.insert_pos {
-            None => return Err(BTreeNodeError::InternalNodeDuplicateKey),
-            Some(pos) => pos,
+        let position = match self.search(key)? {
+            InternalNodeSearchResult::FoundExact { .. } => {
+                return Err(BTreeNodeError::InternalNodeDuplicateKey);
+            }
+            InternalNodeSearchResult::NotFoundInternal { child_pos, .. } => {
+                // Convert child position to slot index for insertion.
+                // When inserting after Leftmost, we insert at slot 0.
+                // When inserting after slot N, we insert at slot N+1.
+                match child_pos {
+                    ChildPosition::Leftmost => 0,
+                    ChildPosition::AfterSlot(slot_id) => slot_id + 1,
+                }
+            }
         };
         let mut buffer = Vec::new();
         buffer.extend_from_slice(key);
@@ -349,6 +520,27 @@ where
     pub fn set_leftmost_child_id(&mut self, child_id: PageId) -> Result<(), BTreeNodeError> {
         let header = self.get_btree_header_mut()?;
         header.leftmost_child_pointer = child_id;
+        Ok(())
+    }
+
+    /// Updates the separator key at the given slot index while preserving the child pointer.
+    /// This is used during redistribution to update the separator between siblings.
+    pub fn update_separator_at_slot(
+        &mut self,
+        slot_id: SlotId,
+        new_key: &[u8],
+    ) -> Result<(), BTreeNodeError> {
+        let child_ptr = self.get_child_ptr(slot_id)?;
+
+        self.slotted_page.delete(slot_id)?;
+
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(new_key);
+        child_ptr.serialize(&mut buffer);
+
+        let result = self.slotted_page.insert_at(&buffer, slot_id)?;
+        self.handle_insert_result(result, &buffer, slot_id)?;
+
         Ok(())
     }
 
@@ -398,6 +590,56 @@ where
 
         Ok((copied_split_records, separator_key))
     }
+
+    /// Removes the first key from this node.
+    /// Returns the (key, old_leftmost_child).
+    /// Updates the leftmost child pointer to be the child pointer from the removed slot.
+    pub(crate) fn remove_first_key(&mut self) -> Result<(Vec<u8>, PageId), BTreeNodeError> {
+        let (slot_id, record) = self.slotted_page.read_first_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        let key = record[..key_bytes_end].to_vec();
+        let (new_leftmost, _) = PageId::deserialize(&record[key_bytes_end..])?;
+
+        let old_leftmost = self.get_btree_header()?.leftmost_child_pointer;
+
+        self.slotted_page.delete(slot_id)?;
+        self.get_btree_header_mut()?.leftmost_child_pointer = new_leftmost;
+
+        Ok((key, old_leftmost))
+    }
+
+    /// Removes the last key from this node.
+    /// Returns the (key, child_ptr) of the removed entry.
+    pub(crate) fn remove_last_key(&mut self) -> Result<(Vec<u8>, PageId), BTreeNodeError> {
+        let (slot_id, record) = self.slotted_page.read_last_non_deleted_record()?;
+        let key_bytes_end = record.len() - size_of::<PageId>();
+        let key = record[..key_bytes_end].to_vec();
+        let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
+
+        self.slotted_page.delete(slot_id)?;
+
+        Ok((key, child_ptr))
+    }
+
+    /// Inserts a key at the beginning of this node with a new leftmost child.
+    /// The old leftmost child becomes the child pointer for the new key.
+    pub(crate) fn insert_first_with_new_leftmost(
+        &mut self,
+        key: &[u8],
+        new_leftmost: PageId,
+    ) -> Result<NodeInsertResult, BTreeNodeError> {
+        let old_leftmost = self.get_btree_header()?.leftmost_child_pointer;
+        self.get_btree_header_mut()?.leftmost_child_pointer = new_leftmost;
+
+        // Insert the key with old_leftmost as its child pointer
+        // Since this key should be smaller than all existing keys, it goes at position 0
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(key);
+        old_leftmost.serialize(&mut buffer);
+
+        let insert_result = self.slotted_page.insert_at(&buffer, 0)?;
+        self.handle_insert_result(insert_result, &buffer, 0)
+    }
 }
 impl<Page> BTreeNode<Page, BTreeLeafHeader>
 where
@@ -424,46 +666,55 @@ where
 
     /// Search either finds record or insert slot.
     pub fn search(&self, target_key: &[u8]) -> Result<LeafNodeSearchResult, BTreeNodeError> {
-        let num_slots = self.slotted_page.num_slots()?;
-        if num_slots == 0 {
+        if self.slotted_page.num_used_slots()? == 0 {
             return Ok(LeafNodeSearchResult::NotFoundLeaf { insert_slot_id: 0 });
         }
 
-        let mut left = 0;
-        let mut right = num_slots - 1;
+        let num_slots = self.slotted_page.num_slots()?;
+        let mut left: u16 = 0;
+        let mut right: u16 = num_slots - 1;
+        let mut last_less: Option<u16> = None;
 
         while left <= right {
-            let mut mid = (left + right) / 2;
-            if self.slotted_page.is_slot_deleted(mid)? {
-                match self.find_new_mid(mid, left, right)? {
-                    None => {
-                        return Ok(LeafNodeSearchResult::NotFoundLeaf {
-                            insert_slot_id: left,
-                        });
-                    }
-                    Some(new_mid) => {
-                        mid = new_mid;
-                    }
-                }
-            }
+            let mid = (left + right) / 2;
 
-            let key = self.get_key(mid)?;
+            let pivot = if self.slotted_page.is_slot_deleted(mid)? {
+                match self.find_new_mid(mid, left, right)? {
+                    Some(p) => p,
+                    None => break,
+                }
+            } else {
+                mid
+            };
+
+            let key = self.get_key(pivot)?;
 
             match key.cmp(target_key) {
-                Ordering::Less => left = mid + 1,
+                Ordering::Less => {
+                    last_less = Some(pivot);
+                    left = pivot + 1;
+                }
                 Ordering::Equal => {
-                    let record_ptr = self.get_record_ptr(mid)?;
-                    return Ok(LeafNodeSearchResult::Found { record_ptr });
+                    let record_ptr = self.get_record_ptr(pivot)?;
+                    return Ok(LeafNodeSearchResult::Found {
+                        position: pivot,
+                        record_ptr,
+                    });
                 }
                 Ordering::Greater => {
-                    if mid == 0 {
+                    if pivot == 0 {
                         break;
                     }
-                    right = mid - 1;
+                    right = pivot - 1;
                 }
             }
         }
 
+        if let Some(pred_slot) = last_less {
+            return Ok(LeafNodeSearchResult::NotFoundLeaf {
+                insert_slot_id: pred_slot + 1,
+            });
+        }
         Ok(LeafNodeSearchResult::NotFoundLeaf {
             insert_slot_id: left,
         })
@@ -474,6 +725,18 @@ where
             BTreeLeafHeader::NO_NEXT_LEAF => Ok(None),
             val => Ok(Some(val)),
         }
+    }
+
+    /// Returns the first (smallest) key in this leaf node without removing it.
+    pub fn get_first_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (_, record) = self.slotted_page.read_first_non_deleted_record()?;
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = record.len() - serialized_record_ptr_size;
+        Ok(record[..key_bytes_end].to_vec())
+    }
+
+    pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
+        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
     }
 }
 
@@ -487,20 +750,18 @@ where
                 size_of::<BTreeLeafHeader>() as u16,
                 PageType::BTreeLeaf,
             ),
-            padding: 0,
             next_leaf_pointer: next_leaf.unwrap_or(BTreeLeafHeader::NO_NEXT_LEAF),
         };
         let slotted_page = SlottedPage::initialize_with_header(page, header)?;
         Ok(Self { slotted_page })
     }
 
-    pub fn insert(
+    pub(crate) fn insert(
         &mut self,
         key: &[u8],
         record_pointer: RecordPtr,
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let position = match self.search(key)? {
-            // TODO (For indexes): handle duplicated keys
             LeafNodeSearchResult::Found { .. } => return Ok(NodeInsertResult::KeyAlreadyExists),
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => insert_slot_id,
         };
@@ -511,7 +772,27 @@ where
         self.handle_insert_result(insert_result, &buffer, position)
     }
 
-    pub fn set_next_leaf_id(&mut self, next_leaf_id: Option<PageId>) -> Result<(), BTreeNodeError> {
+    pub(crate) fn delete(&mut self, key: &[u8]) -> Result<NodeDeleteResult, BTreeNodeError> {
+        let position = match self.search(key)? {
+            LeafNodeSearchResult::Found { position, .. } => position,
+            LeafNodeSearchResult::NotFoundLeaf { .. } => {
+                return Ok(NodeDeleteResult::KeyDoesNotExist);
+            }
+        };
+
+        self.slotted_page.delete(position)?;
+
+        if self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY {
+            Ok(NodeDeleteResult::Success)
+        } else {
+            Ok(NodeDeleteResult::SuccessUnderflow)
+        }
+    }
+
+    pub(crate) fn set_next_leaf_id(
+        &mut self,
+        next_leaf_id: Option<PageId>,
+    ) -> Result<(), BTreeNodeError> {
         let header = self.get_btree_header_mut()?;
         match next_leaf_id {
             Some(next_leaf) => header.next_leaf_pointer = next_leaf,
@@ -566,6 +847,36 @@ where
         let separator_key = first_record[..key_bytes_end].to_vec();
 
         Ok((copied_split_records, separator_key))
+    }
+
+    pub(crate) fn remove_last_key(&mut self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (id, record) = self.slotted_page.read_last_non_deleted_record()?;
+        let record = record.to_vec();
+        self.slotted_page.delete(id)?;
+        Ok(record)
+    }
+
+    pub(crate) fn remove_first_key(&mut self) -> Result<Vec<u8>, BTreeNodeError> {
+        let (id, record) = self.slotted_page.read_first_non_deleted_record()?;
+        let record = record.to_vec();
+        self.slotted_page.delete(id)?;
+        Ok(record)
+    }
+
+    /// Inserts a record that is not separated into key and record pointer.
+    pub(crate) fn insert_record(
+        &mut self,
+        record: &[u8],
+    ) -> Result<NodeInsertResult, BTreeNodeError> {
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = record.len() - serialized_record_ptr_size;
+        let (key, _) = record.split_at(key_bytes_end);
+        let position = match self.search(key)? {
+            LeafNodeSearchResult::Found { .. } => return Ok(NodeInsertResult::KeyAlreadyExists),
+            LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => insert_slot_id,
+        };
+        self.slotted_page.insert_at(record, position)?;
+        Ok(NodeInsertResult::Success)
     }
 }
 #[cfg(test)]
@@ -690,7 +1001,7 @@ mod test {
                 .search(serialize_i32_lexicographically(*k).as_slice())
                 .unwrap();
             match res {
-                LeafNodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
                     assert_eq!(record_ptr.page_id, rec.page_id);
                     assert_eq!(record_ptr.slot_id, rec.slot_id);
                 }
@@ -749,11 +1060,19 @@ mod test {
         let key = serialize_i32_lexicographically(10);
         let res = node.search(key.as_slice()).unwrap();
 
-        assert_eq!(
-            res.child_ptr, 100,
-            "Empty internal node should return leftmost child"
-        );
-        assert_eq!(res.insert_pos, Some(0), "Insert position should be 0");
+        match res {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_pos,
+            } => {
+                assert_eq!(
+                    child_ptr, 100,
+                    "Empty internal node should return leftmost child"
+                );
+                assert_eq!(child_pos, ChildPosition::Leftmost);
+            }
+            _ => panic!("Expected NotFoundInternal for empty node"),
+        }
     }
 
     #[test]
@@ -763,33 +1082,80 @@ mod test {
 
         let node = make_internal_node(&keys, &children);
 
-        let res = node
+        // Test key < smallest key (should go to leftmost child)
+        match node
             .search(serialize_i32_lexicographically(5).as_slice())
-            .unwrap();
-        assert_eq!(res.child_ptr, 100, "Key 5 should route to leftmost child");
+            .unwrap()
+        {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_pos,
+            } => {
+                assert_eq!(child_ptr, 100, "Key 5 should route to leftmost child");
+                assert_eq!(child_pos, ChildPosition::Leftmost);
+            }
+            _ => panic!("Expected NotFoundInternal"),
+        }
 
-        let res = node
+        // Test exact match on key 10
+        match node
             .search(serialize_i32_lexicographically(10).as_slice())
-            .unwrap();
-        assert_eq!(
-            res.child_ptr, 200,
-            "Key 10 should route to its child pointer"
-        );
+            .unwrap()
+        {
+            InternalNodeSearchResult::FoundExact {
+                child_ptr,
+                child_pos,
+            } => {
+                assert_eq!(child_ptr, 200, "Key 10 should route to its child pointer");
+                assert_eq!(child_pos, ChildPosition::AfterSlot(0));
+            }
+            _ => panic!("Expected FoundExact"),
+        }
 
-        let res = node
+        // Test key between 10 and 20
+        match node
             .search(serialize_i32_lexicographically(15).as_slice())
-            .unwrap();
-        assert_eq!(res.child_ptr, 200, "Key 15 should route to child after 10");
+            .unwrap()
+        {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_pos,
+            } => {
+                assert_eq!(child_ptr, 200, "Key 15 should route to child after 10");
+                assert_eq!(child_pos, ChildPosition::AfterSlot(0));
+            }
+            _ => panic!("Expected NotFoundInternal"),
+        }
 
-        let res = node
+        // Test key between 20 and 30
+        match node
             .search(serialize_i32_lexicographically(25).as_slice())
-            .unwrap();
-        assert_eq!(res.child_ptr, 300, "Key 25 should route to child after 20");
+            .unwrap()
+        {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_pos,
+            } => {
+                assert_eq!(child_ptr, 300, "Key 25 should route to child after 20");
+                assert_eq!(child_pos, ChildPosition::AfterSlot(1));
+            }
+            _ => panic!("Expected NotFoundInternal"),
+        }
 
-        let res = node
+        // Test key > largest key (should go to rightmost child)
+        match node
             .search(serialize_i32_lexicographically(35).as_slice())
-            .unwrap();
-        assert_eq!(res.child_ptr, 400, "Key 35 should route to rightmost child");
+            .unwrap()
+        {
+            InternalNodeSearchResult::NotFoundInternal {
+                child_ptr,
+                child_pos,
+            } => {
+                assert_eq!(child_ptr, 400, "Key 35 should route to rightmost child");
+                assert_eq!(child_pos, ChildPosition::AfterSlot(2));
+            }
+            _ => panic!("Expected NotFoundInternal"),
+        }
     }
 
     #[test]
@@ -805,7 +1171,7 @@ mod test {
 
         let search_result = node.search(&key).unwrap();
         match search_result {
-            LeafNodeSearchResult::Found { record_ptr } => {
+            LeafNodeSearchResult::Found { record_ptr, .. } => {
                 assert_eq!(record_ptr, rec);
             }
             _ => panic!("Expected to find inserted key"),
@@ -834,7 +1200,7 @@ mod test {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
             match search_result {
-                LeafNodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
                     assert_eq!(record_ptr, *expected_rec);
                 }
                 _ => panic!("Expected to find key {}", key_val),
@@ -864,7 +1230,7 @@ mod test {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
             match search_result {
-                LeafNodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
                     assert_eq!(record_ptr, *expected_rec);
                 }
                 _ => panic!("Expected to find key {}", key_val),
@@ -889,7 +1255,7 @@ mod test {
 
         let search_result = node.search(&key).unwrap();
         match search_result {
-            LeafNodeSearchResult::Found { record_ptr } => {
+            LeafNodeSearchResult::Found { record_ptr, .. } => {
                 assert_eq!(record_ptr, rec1);
             }
             _ => panic!("Expected to find original key"),
@@ -908,7 +1274,12 @@ mod test {
         assert!(matches!(result, NodeInsertResult::Success));
 
         let search_result = node.search(&key).unwrap();
-        assert_eq!(search_result.child_ptr, child_id);
+        match search_result {
+            InternalNodeSearchResult::FoundExact { child_ptr, .. } => {
+                assert_eq!(child_ptr, child_id);
+            }
+            _ => panic!("Expected FoundExact after insert"),
+        }
     }
 
     #[test]
@@ -927,7 +1298,12 @@ mod test {
         for (key_val, expected_child) in &keys_and_children {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
-            assert_eq!(search_result.child_ptr, *expected_child);
+            match search_result {
+                InternalNodeSearchResult::FoundExact { child_ptr, .. } => {
+                    assert_eq!(child_ptr, *expected_child);
+                }
+                _ => panic!("Expected FoundExact for key {}", key_val),
+            }
         }
     }
 
@@ -1008,7 +1384,7 @@ mod test {
             let key = serialize_i32_lexicographically(*key_val);
             let search_result = node.search(&key).unwrap();
             match search_result {
-                LeafNodeSearchResult::Found { record_ptr } => {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
                     assert_eq!(record_ptr.slot_id, (i + 1) as u16);
                 }
                 _ => panic!("Expected to find key {}", key_val),
@@ -1102,4 +1478,204 @@ mod test {
         let search_result = node.search(&key_min).unwrap();
         assert!(matches!(search_result, LeafNodeSearchResult::Found { .. }));
     }
+
+    #[test]
+    fn test_leaf_delete_single_key() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+        let rec = RecordPtr::new(1, 1);
+
+        node.insert(&key, rec).unwrap();
+
+        let result = node.delete(&key).unwrap();
+
+        // Don't care about this here.
+        assert!(matches!(result, NodeDeleteResult::SuccessUnderflow));
+
+        let search_result = node.search(&key).unwrap();
+        assert!(matches!(
+            search_result,
+            LeafNodeSearchResult::NotFoundLeaf { .. }
+        ));
+    }
+
+    #[test]
+    fn test_leaf_delete_nonexistent_key() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+
+        let result = node.delete(&key).unwrap();
+        assert!(matches!(result, NodeDeleteResult::KeyDoesNotExist));
+    }
+
+    #[test]
+    fn test_leaf_delete_maintains_order() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let keys_and_recs = vec![
+            (10, RecordPtr::new(1, 1)),
+            (20, RecordPtr::new(1, 2)),
+            (30, RecordPtr::new(2, 3)),
+            (40, RecordPtr::new(2, 4)),
+            (50, RecordPtr::new(3, 5)),
+        ];
+
+        for (key_val, rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            node.insert(&key, *rec).unwrap();
+        }
+
+        let key_to_delete = serialize_i32_lexicographically(30);
+        let result = node.delete(&key_to_delete).unwrap();
+
+        // Don't care about this here.
+        assert!(matches!(result, NodeDeleteResult::SuccessUnderflow));
+
+        let search_result = node.search(&key_to_delete).unwrap();
+        assert!(matches!(
+            search_result,
+            LeafNodeSearchResult::NotFoundLeaf { .. }
+        ));
+
+        for (key_val, expected_rec) in &keys_and_recs {
+            if *key_val == 30 {
+                continue;
+            }
+            let key = serialize_i32_lexicographically(*key_val);
+            let search_result = node.search(&key).unwrap();
+            match search_result {
+                LeafNodeSearchResult::Found { record_ptr, .. } => {
+                    assert_eq!(record_ptr, *expected_rec);
+                }
+                _ => panic!("Expected to find key {}", key_val),
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaf_delete_all_keys_sequentially() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let keys_and_recs = vec![
+            (10, RecordPtr::new(1, 1)),
+            (20, RecordPtr::new(1, 2)),
+            (30, RecordPtr::new(2, 3)),
+        ];
+
+        for (key_val, rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            node.insert(&key, *rec).unwrap();
+        }
+
+        for (key_val, _) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let result = node.delete(&key).unwrap();
+            assert!(matches!(
+                result,
+                NodeDeleteResult::Success | NodeDeleteResult::SuccessUnderflow
+            ));
+        }
+
+        for (key_val, _) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let search_result = node.search(&key).unwrap();
+            assert!(matches!(
+                search_result,
+                LeafNodeSearchResult::NotFoundLeaf { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_leaf_delete_triggers_underflow() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let mut keys_and_recs = vec![];
+        for i in 0..84 {
+            keys_and_recs.push((i * 10, RecordPtr::new(1, i as u16)));
+        }
+
+        for (key_val, rec) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            node.insert(&key, *rec).unwrap();
+        }
+
+        assert!(node.slotted_page.fraction_filled().unwrap() > 0.33);
+
+        let mut deletion_count = 0;
+        for (key_val, _) in &keys_and_recs {
+            let key = serialize_i32_lexicographically(*key_val);
+            let result = node.delete(&key).unwrap();
+            deletion_count += 1;
+
+            match result {
+                NodeDeleteResult::SuccessUnderflow => {
+                    assert!(node.slotted_page.fraction_filled().unwrap() <= 0.33);
+                    break;
+                }
+                NodeDeleteResult::Success => {}
+                NodeDeleteResult::KeyDoesNotExist => {
+                    panic!("Unexpected delete result - key doesn't exist {deletion_count}")
+                }
+            }
+        }
+
+        assert!(deletion_count < keys_and_recs.len());
+    }
+
+    #[test]
+    fn test_leaf_delete_and_reinsert() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+        let rec1 = RecordPtr::new(1, 1);
+        let rec2 = RecordPtr::new(2, 2);
+
+        node.insert(&key, rec1).unwrap();
+        node.delete(&key).unwrap();
+        let result = node.insert(&key, rec2).unwrap();
+
+        assert!(matches!(result, NodeInsertResult::Success));
+
+        let search_result = node.search(&key).unwrap();
+        match search_result {
+            LeafNodeSearchResult::Found { record_ptr, .. } => {
+                assert_eq!(record_ptr, rec2);
+            }
+            _ => panic!("Expected to find re-inserted key"),
+        }
+    }
+
+    #[test]
+    fn test_leaf_delete_multiple_times() {
+        let page = TestPage::new(PAGE_SIZE);
+        let mut node = LeafNode::initialize(page, None).unwrap();
+
+        let key = serialize_i32_lexicographically(10);
+        let rec = RecordPtr::new(1, 1);
+
+        node.insert(&key, rec).unwrap();
+
+        let result = node.delete(&key).unwrap();
+        assert!(matches!(
+            result,
+            NodeDeleteResult::Success | NodeDeleteResult::SuccessUnderflow
+        ));
+
+        let result = node.delete(&key).unwrap();
+        assert!(matches!(result, NodeDeleteResult::KeyDoesNotExist));
+
+        let result = node.delete(&key).unwrap();
+        assert!(matches!(result, NodeDeleteResult::KeyDoesNotExist));
+    }
+
+    // TODO: Add tests for get_preceding and get_next index.
 }

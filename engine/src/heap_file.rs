@@ -624,7 +624,6 @@ trait BaseHeapPageHeader: SlottedPageHeader {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RecordPageHeader {
     base: SlottedPageBaseHeader,
-    _padding: u16,
     next_page: PageId,
 }
 
@@ -632,7 +631,6 @@ impl RecordPageHeader {
     fn new(next_page: PageId) -> Self {
         Self {
             base: SlottedPageBaseHeader::new(size_of::<RecordPageHeader>() as _, PageType::Heap),
-            _padding: Default::default(),
             next_page,
         }
     }
@@ -648,7 +646,6 @@ impl Default for RecordPageHeader {
     fn default() -> Self {
         Self {
             base: SlottedPageBaseHeader::new(size_of::<RecordPageHeader>() as _, PageType::Heap),
-            _padding: Default::default(),
             next_page: Self::NO_NEXT_PAGE,
         }
     }
@@ -666,7 +663,6 @@ impl SlottedPageHeader for RecordPageHeader {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct OverflowPageHeader {
     base: SlottedPageBaseHeader,
-    _padding: u16,
     next_page: PageId,
 }
 
@@ -677,7 +673,6 @@ impl OverflowPageHeader {
                 size_of::<OverflowPageHeader>() as _,
                 PageType::Overflow,
             ),
-            _padding: Default::default(),
             next_page,
         }
     }
@@ -696,7 +691,6 @@ impl Default for OverflowPageHeader {
                 size_of::<OverflowPageHeader>() as _,
                 PageType::Overflow,
             ),
-            _padding: Default::default(),
             next_page: Self::NO_NEXT_PAGE,
         }
     }

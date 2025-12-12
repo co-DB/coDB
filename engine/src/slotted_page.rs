@@ -76,6 +76,8 @@ pub(crate) struct SlottedPageBaseHeader {
     first_free_slot: SlotId,
     /// Total number of slots in the slots directory (including used and free slots).
     num_slots: u16,
+    /// Number of valid (non-deleted) slots. This provides O(1) access to the count of active records.
+    num_used_slots: u16,
     /// Page type enum disk representation
     page_type: PageTypeRepr,
     /// Flags for storing nothing (for now)
@@ -114,6 +116,7 @@ impl SlottedPageBaseHeader {
             first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
             first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
             num_slots: 0,
+            num_used_slots: 0,
             page_type: PageTypeRepr::from(page_type),
             flags: SlottedPageHeaderFlags::NO_FLAGS,
         }
@@ -386,11 +389,21 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(header.num_slots)
     }
 
+    /// Returns the number of used (non-deleted) slots in this page.
+    pub fn num_used_slots(&self) -> Result<u16, SlottedPageError> {
+        let header = self.get_base_header()?;
+        Ok(header.num_used_slots)
+    }
+
     /// Returns the total amount of free space available on this page
     /// This includes both contiguous free space and fragmented free blocks
     pub fn free_space(&self) -> Result<u16, SlottedPageError> {
         let header = self.get_base_header()?;
         Ok(header.total_free_space)
+    }
+
+    pub fn fraction_filled(&self) -> Result<f32, SlottedPageError> {
+        Ok(1.0 - (self.free_space()? as f32 / Self::MAX_FREE_SPACE as f32))
     }
 
     /// Returns a slice containing all slots (cast) in the slot directory
@@ -487,6 +500,35 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             let record_end = record_start + slot.len as usize;
             Some((i as SlotId, &self.page.data()[record_start..record_end]))
         }))
+    }
+
+    /// Reads records from the end until it finds and returns a used one.
+    pub fn read_last_non_deleted_record(&self) -> Result<(SlotId, &[u8]), SlottedPageError> {
+        let slots = self.get_slots()?;
+        let last = slots
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, slot)| !slot.is_deleted());
+
+        match last {
+            None => Err(SlottedPageError::UninitializedPage),
+            Some((id, _)) => Ok((id as SlotId, self.read_record(id as SlotId)?)),
+        }
+    }
+
+    /// Reads records until it finds and returns a used one.
+    pub fn read_first_non_deleted_record(&self) -> Result<(SlotId, &[u8]), SlottedPageError> {
+        let slots = self.get_slots()?;
+        let first = slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| !slot.is_deleted());
+
+        match first {
+            None => Err(SlottedPageError::UninitializedPage),
+            Some((id, _)) => Ok((id as SlotId, self.read_record(id as SlotId)?)),
+        }
     }
 }
 
@@ -651,6 +693,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         let header = self.get_base_header_mut()?;
         header.total_free_space += copied_slot.len;
         header.first_free_slot = slot_id;
+        header.num_used_slots -= 1;
 
         if copied_slot.offset == header.record_area_offset {
             header.contiguous_free_space += copied_slot.len;
@@ -666,6 +709,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     fn calculate_free_block_aligned_offset(actual_offset: u16) -> u16 {
         actual_offset.next_multiple_of(FreeBlock::ALIGNMENT)
     }
+
     /// Adds a free block with given length at the given offset and adds it to the free block linked
     /// list.
     fn add_freeblock(&mut self, offset: u16, len: u16) -> Result<(), SlottedPageError> {
@@ -734,6 +778,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         self.write_slot_at(position, Slot::new(offset, record.len() as u16))?;
 
         let header_mut = self.get_base_header_mut()?;
+        header_mut.num_used_slots += 1;
 
         if needs_new_slot {
             header_mut.num_slots += 1;
@@ -839,6 +884,10 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         // we call reuse or append here instead of just reuse to account for all possible situations.
         let slot_id = self.reuse_or_append_slot(slot)?;
+
+        // Increment valid slot count after successful insert
+        self.get_base_header_mut()?.num_used_slots += 1;
+
         Ok(InsertResult::Success(slot_id))
     }
 
@@ -1068,6 +1117,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         let header = self.get_base_header_mut()?;
         header.num_slots = filled_count as u16;
+        header.num_used_slots = filled_count as u16;
         header.total_free_space += freed_space as u16;
         header.contiguous_free_space += freed_space as u16;
         header.first_free_slot = SlottedPageBaseHeader::NO_FREE_SLOTS;
@@ -1157,6 +1207,7 @@ mod tests {
             first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
             first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
             num_slots: 0,
+            num_used_slots: 0,
             page_type: PageTypeRepr::from(PageType::Generic),
             flags: SlottedPageHeaderFlags::NO_FLAGS,
         };
@@ -1392,6 +1443,7 @@ mod tests {
                         first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
                         first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
                         num_slots: 0,
+                        num_used_slots: 0,
                         page_type: PageTypeRepr::from(PageType::Generic),
                         flags: SlottedPageHeaderFlags::NO_FLAGS,
                     },
@@ -1637,7 +1689,7 @@ mod tests {
 
     #[test]
     fn test_record_defragmentation() {
-        let mut page = create_test_page(132);
+        let mut page = create_test_page(140); // Increased to account for header size
 
         let record_1 = [1u8; 50];
         let record_2 = [2u8; 50];
@@ -1994,5 +2046,155 @@ mod tests {
         // Defragment and update should succeed
         let defrag_result = page.defragment_and_update(0, &large_update).unwrap();
         assert!(matches!(defrag_result, UpdateResult::Success));
+    }
+
+    #[test]
+    fn test_num_valid_slots_starts_at_zero() {
+        let page = create_test_page(PAGE_SIZE);
+        assert_eq!(page.num_used_slots().unwrap(), 0);
+        assert_eq!(page.num_slots().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_num_valid_slots_increments_on_insert() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"first").unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 1);
+        assert_eq!(page.num_slots().unwrap(), 1);
+
+        page.insert(b"second").unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 2);
+        assert_eq!(page.num_slots().unwrap(), 2);
+
+        page.insert(b"third").unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 3);
+        assert_eq!(page.num_slots().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_num_valid_slots_increments_on_insert_at() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert_at(b"first", 0).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 1);
+
+        page.insert_at(b"second", 0).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 2);
+
+        page.insert_at(b"third", 1).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_num_valid_slots_decrements_on_delete() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"first").unwrap();
+        page.insert(b"second").unwrap();
+        page.insert(b"third").unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 3);
+
+        page.delete(1).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 2);
+        assert_eq!(page.num_slots().unwrap(), 3); // Total slots unchanged
+
+        page.delete(0).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 1);
+        assert_eq!(page.num_slots().unwrap(), 3);
+
+        page.delete(2).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 0);
+        assert_eq!(page.num_slots().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_num_valid_slots_after_delete_and_reinsert() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"first").unwrap();
+        page.insert(b"second").unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 2);
+
+        page.delete(0).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 1);
+
+        // Insert reuses the deleted slot
+        page.insert(b"new_first").unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 2);
+        assert_eq!(page.num_slots().unwrap(), 2); // Slot was reused
+    }
+
+    #[test]
+    fn test_num_valid_slots_after_insert_at_deleted_position() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"first").unwrap();
+        page.insert(b"second").unwrap();
+        page.insert(b"third").unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 3);
+
+        page.delete(1).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 2);
+
+        // Insert at the deleted position reuses it
+        page.insert_at(b"new_second", 1).unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 3);
+        assert_eq!(page.num_slots().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_num_valid_slots_after_slot_compaction() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        page.insert(b"keep1").unwrap();
+        page.insert(b"delete1").unwrap();
+        page.insert(b"keep2").unwrap();
+        page.insert(b"delete2").unwrap();
+        page.insert(b"keep3").unwrap();
+
+        page.delete(1).unwrap();
+        page.delete(3).unwrap();
+
+        assert_eq!(page.num_used_slots().unwrap(), 3);
+        assert_eq!(page.num_slots().unwrap(), 5);
+
+        page.compact_slots().unwrap();
+
+        // After compaction, both counts should match
+        assert_eq!(page.num_used_slots().unwrap(), 3);
+        assert_eq!(page.num_slots().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_num_valid_slots_consistency_with_many_operations() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        // Insert 10 records
+        for i in 0..10 {
+            let data = format!("record{}", i);
+            page.insert(data.as_bytes()).unwrap();
+        }
+        assert_eq!(page.num_used_slots().unwrap(), 10);
+
+        // Delete every other record
+        for i in (0..10).step_by(2) {
+            page.delete(i).unwrap();
+        }
+        assert_eq!(page.num_used_slots().unwrap(), 5);
+        assert_eq!(page.num_slots().unwrap(), 10);
+
+        // Insert more records (should reuse deleted slots)
+        for i in 0..3 {
+            let data = format!("new_record{}", i);
+            page.insert(data.as_bytes()).unwrap();
+        }
+        assert_eq!(page.num_used_slots().unwrap(), 8);
+        assert_eq!(page.num_slots().unwrap(), 10);
+
+        // Compact slots
+        page.compact_slots().unwrap();
+        assert_eq!(page.num_used_slots().unwrap(), 8);
+        assert_eq!(page.num_slots().unwrap(), 8);
     }
 }

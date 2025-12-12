@@ -1,10 +1,12 @@
 use storage::paged_file::{Page, PageId, PagedFileError};
 
+use crate::b_tree_node::NodeType::Leaf;
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, LeafNodeSearchResult, NodeInsertResult,
-    NodeType, get_node_type,
+    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, LeafNodeSearchResult,
+    NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
+use crate::slotted_page::SlotId;
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -22,6 +24,8 @@ pub(crate) enum BTreeError {
     NodeError(#[from] BTreeNodeError),
     #[error("tried to insert a duplicate key")]
     DuplicateKey,
+    #[error("tried to delete a key that does not exist")]
+    KeyForDeleteNotFound,
     #[error("deserialization error occurred: {0}")]
     DeserializationError(#[from] DbSerializationError),
     #[error("metadata of the b-tree was corrupted: {reason}")]
@@ -77,10 +81,10 @@ impl TryFrom<&Page> for BTreeMetadata {
     }
 }
 
-/// Result of an optimistic insert attempt
+/// Result of an optimistic operation (insert/delete) attempt
 #[derive(Debug)]
-enum OptimisticInsertResult {
-    InsertSucceeded,
+enum OptimisticOperationResult {
+    Success,
     StructuralChangeRetry,
     FullNodeRetry,
 }
@@ -100,14 +104,39 @@ impl PageVersion {
 /// Stores information about the path from root to leaf during a pessimistic insert, including
 /// ancestor nodes and metadata page.
 struct PessimisticPath {
-    latch_stack: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+    latch_stack: Vec<LatchHandle>,
     leaf_page_id: PageId,
     metadata_page: Option<PinnedWritePage>,
 }
 
+/// A helper struct for all the necessary data needed for performing operations on a node during
+/// tree restructuring operations (split,merge,redistribution).
+struct LatchHandle {
+    /// ID of the page containing the node.
+    page_id: PageId,
+    /// The actual node.
+    node: BTreeInternalNode<PinnedWritePage>,
+    /// Position of the child we descended into in the node. Used in delete to get the chosen node's
+    /// siblings.
+    child_pos: ChildPosition,
+}
+
+impl LatchHandle {
+    fn new(
+        page_id: PageId,
+        node: BTreeInternalNode<PinnedWritePage>,
+        child_pos: ChildPosition,
+    ) -> Self {
+        Self {
+            page_id,
+            node,
+            child_pos,
+        }
+    }
+}
 impl PessimisticPath {
     fn new(
-        latch_stack: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        latch_stack: Vec<LatchHandle>,
         leaf_page_id: PageId,
         metadata_page: Option<PinnedWritePage>,
     ) -> Self {
@@ -117,6 +146,24 @@ impl PessimisticPath {
             metadata_page,
         }
     }
+}
+
+struct InternalNodeLatch {
+    page_id: PageId,
+    node: BTreeInternalNode<PinnedWritePage>,
+}
+
+struct LeafNodeLatch {
+    page_id: PageId,
+    node: BTreeLeafNode<PinnedWritePage>,
+}
+
+struct MergeContext {
+    parent_id: PageId,
+    parent_node: BTreeInternalNode<PinnedWritePage>,
+    child_pos: ChildPosition,
+    internal_nodes: Vec<LatchHandle>,
+    metadata_page: Option<PinnedWritePage>,
 }
 
 /// Structure responsible for managing on-disk index files.
@@ -174,6 +221,14 @@ impl BTree {
         Ok(BTreeLeafNode::<PinnedWritePage>::new(page)?)
     }
 
+    fn pin_internal_for_write(
+        &self,
+        internal_page_id: PageId,
+    ) -> Result<BTreeInternalNode<PinnedWritePage>, BTreeError> {
+        let page = self.pin_write(internal_page_id)?;
+        Ok(BTreeInternalNode::<PinnedWritePage>::new(page)?)
+    }
+
     /// Searches for a key in the B-tree and returns the corresponding record pointer (to heap
     /// file record) if the key was found.
     pub fn search(&self, key: &[u8]) -> Result<Option<RecordPtr>, BTreeError> {
@@ -187,12 +242,12 @@ impl BTree {
             match node_type {
                 NodeType::Internal => {
                     let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
-                    current_page_id = node.search(key)?.child_ptr;
+                    current_page_id = node.search(key)?.child_ptr();
                 }
                 NodeType::Leaf => {
                     let node = BTreeLeafNode::<PinnedReadPage>::new(page)?;
                     return match node.search(key)? {
-                        LeafNodeSearchResult::Found { record_ptr } => Ok(Some(record_ptr)),
+                        LeafNodeSearchResult::Found { record_ptr, .. } => Ok(Some(record_ptr)),
                         LeafNodeSearchResult::NotFoundLeaf { .. } => Ok(None),
                     };
                 }
@@ -219,16 +274,18 @@ impl BTree {
     pub(crate) fn insert(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
         let optimistic_result = self.insert_optimistic(key, &record_pointer)?;
         match optimistic_result {
-            OptimisticInsertResult::InsertSucceeded => Ok(()),
-            OptimisticInsertResult::StructuralChangeRetry => {
+            OptimisticOperationResult::Success => Ok(()),
+            OptimisticOperationResult::StructuralChangeRetry => {
                 // Retry optimistically before going to pessimistic insert. This makes sense as
                 // splits of a node in a given path shouldn't occur too often.
                 match self.insert_optimistic(key, &record_pointer)? {
-                    OptimisticInsertResult::InsertSucceeded => Ok(()),
+                    OptimisticOperationResult::Success => Ok(()),
                     _ => self.insert_pessimistic(key, record_pointer),
                 }
             }
-            OptimisticInsertResult::FullNodeRetry => self.insert_pessimistic(key, record_pointer),
+            OptimisticOperationResult::FullNodeRetry => {
+                self.insert_pessimistic(key, record_pointer)
+            }
         }
     }
 
@@ -240,10 +297,12 @@ impl BTree {
         loop {
             // Record page version before descending (necessary here before page read, because if a
             // split happens before pin it won't work)
+            // Ensure the version entry exists so a later removal signals change.
             let version = self
                 .structural_version_numbers
-                .get(&current_page_id)
-                .map_or(0, |v| v.load(Ordering::Acquire));
+                .entry(current_page_id)
+                .or_insert_with(|| AtomicU16::new(0))
+                .load(Ordering::Acquire);
 
             let page = self
                 .cache
@@ -254,7 +313,7 @@ impl BTree {
             match get_node_type(&page)? {
                 NodeType::Internal => {
                     let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
-                    current_page_id = node.search(key)?.child_ptr;
+                    current_page_id = node.search(key)?.child_ptr();
                 }
                 NodeType::Leaf => {
                     return Ok((current_page_id, path_versions));
@@ -266,11 +325,10 @@ impl BTree {
     /// Checks if any pages in the path have changed since they were read optimistically.
     fn detect_structural_changes(&self, path_versions: &[PageVersion]) -> bool {
         path_versions.iter().any(|page_version| {
-            let current_version = self
-                .structural_version_numbers
-                .get(&page_version.page_id)
-                .map_or(0, |v| v.load(Ordering::Acquire));
-            page_version.version != current_version
+            match self.structural_version_numbers.get(&page_version.page_id) {
+                Some(v) => page_version.version != v.load(Ordering::Acquire),
+                None => true,
+            }
         })
     }
 
@@ -279,7 +337,7 @@ impl BTree {
         &self,
         key: &[u8],
         record_pointer: &RecordPtr,
-    ) -> Result<OptimisticInsertResult, BTreeError> {
+    ) -> Result<OptimisticOperationResult, BTreeError> {
         // Traverse and collect version info.
         let (leaf_page_id, path_versions) = self.traverse_with_versions(key)?;
 
@@ -288,18 +346,25 @@ impl BTree {
 
         // Check if any node in the path changed structurally.
         if self.detect_structural_changes(&path_versions) {
-            return Ok(OptimisticInsertResult::StructuralChangeRetry);
+            return Ok(OptimisticOperationResult::StructuralChangeRetry);
         }
 
         match leaf_node.insert(key, *record_pointer)? {
-            NodeInsertResult::Success => Ok(OptimisticInsertResult::InsertSucceeded),
-            NodeInsertResult::PageFull => Ok(OptimisticInsertResult::FullNodeRetry),
+            NodeInsertResult::Success => Ok(OptimisticOperationResult::Success),
+            NodeInsertResult::PageFull => Ok(OptimisticOperationResult::FullNodeRetry),
             NodeInsertResult::KeyAlreadyExists => Err(BTreeError::DuplicateKey),
         }
     }
 
-    ///  Traverses the tree while keeping write latches on nodes that may need to split.
-    fn traverse_pessimistic(&self, key: &[u8]) -> Result<PessimisticPath, BTreeError> {
+    ///  Traverses the tree while keeping write latches on nodes that may need to split. [`drop_lock_fn`]
+    /// is a function that determines whether we can drop the write latch on an internal node given
+    /// its parameters like for insert whether its child can fit another key and for delete whether
+    /// its child will not underflow after delete.
+    fn traverse_pessimistic(
+        &self,
+        key: &[u8],
+        drop_lock_fn: impl Fn(&BTreeInternalNode<PinnedWritePage>) -> Result<bool, BTreeError>,
+    ) -> Result<PessimisticPath, BTreeError> {
         // Pin the metadata (in case root splits)
         let mut metadata_page = Some(self.pin_write(Self::METADATA_PAGE_ID)?);
         let mut current_page_id =
@@ -316,15 +381,18 @@ impl BTree {
                     let node = BTreeInternalNode::<PinnedWritePage>::new(page)?;
                     let old_page_id = current_page_id;
 
-                    current_page_id = node.search(key)?.child_ptr;
+                    let search_result = node.search(key)?;
 
-                    // If child can fit another, we can safely drop ancestors and metadata.
-                    if node.can_fit_another()? {
+                    current_page_id = search_result.child_ptr();
+                    let child_pos = search_result.child_pos();
+
+                    if drop_lock_fn(&node)? {
                         drop(metadata_page.take());
                         latch_stack.clear();
                     }
 
-                    latch_stack.push((old_page_id, node));
+                    let latch_handle = LatchHandle::new(old_page_id, node, child_pos);
+                    latch_stack.push(latch_handle);
                 }
                 NodeType::Leaf => {
                     return Ok(PessimisticPath {
@@ -339,7 +407,7 @@ impl BTree {
 
     /// Performs a pessimistic insert, splitting nodes as necessary.
     fn insert_pessimistic(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
-        let path = self.traverse_pessimistic(key)?;
+        let path = self.traverse_pessimistic(key, |node| Ok(node.can_fit_another()?))?;
 
         let mut leaf = self.pin_leaf_for_write(path.leaf_page_id)?;
 
@@ -390,7 +458,7 @@ impl BTree {
     /// Splits a leaf node and propagates the separator up the tree.
     fn split_and_propagate(
         &self,
-        internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        internal_nodes: Vec<LatchHandle>,
         leaf_node: (PageId, BTreeLeafNode<PinnedWritePage>),
         key: &[u8],
         record_pointer: RecordPtr,
@@ -447,7 +515,7 @@ impl BTree {
     /// creating a new root if necessary.
     fn propagate_separator_up(
         &self,
-        mut internal_nodes: Vec<(PageId, BTreeInternalNode<PinnedWritePage>)>,
+        mut internal_nodes: Vec<LatchHandle>,
         mut current_separator_key: Vec<u8>,
         mut child_page_id: PageId,
         metadata_page: Option<PinnedWritePage>,
@@ -466,7 +534,12 @@ impl BTree {
         }
 
         // Otherwise, walk ancestors from bottom to top.
-        while let Some((parent_page_id, mut parent_node)) = internal_nodes.pop() {
+        while let Some(handle) = internal_nodes.pop() {
+            let LatchHandle {
+                page_id: parent_page_id,
+                node: mut parent_node,
+                ..
+            } = handle;
             match parent_node.insert(current_separator_key.as_slice(), child_page_id)? {
                 NodeInsertResult::Success => return Ok(()),
                 NodeInsertResult::KeyAlreadyExists => return Err(BTreeError::DuplicateKey),
@@ -550,6 +623,605 @@ impl BTree {
 
         metadata.root_page_id = new_root_id;
 
+        Ok(())
+    }
+
+    /// Deletes a key from the B-Tree. Works similarly to insert in that it first tries an optimistic
+    /// approach, which uses read latches and only upgrades to write latch for the leaf node the key
+    /// is found in. If that fails (due to structural change of the path or the possibility of underflow
+    /// of one of the ancestors) we go to pessimistic strategy, which keeps write latches on all
+    /// nodes in the path until we are sure that they won't need to be merged/redistributed into.
+    /// For a little more info read [`insert`] docs.
+    pub fn delete(&self, key: &[u8]) -> Result<(), BTreeError> {
+        let optimistic_result = self.delete_optimistic(key)?;
+        match optimistic_result {
+            OptimisticOperationResult::Success => Ok(()),
+            OptimisticOperationResult::StructuralChangeRetry => {
+                // Retry optimistically before going to pessimistic delete. This makes sense as
+                // merges of a node in a given path shouldn't occur too often.
+                match self.delete_optimistic(key)? {
+                    OptimisticOperationResult::Success => Ok(()),
+                    _ => self.delete_pessimistic(key),
+                }
+            }
+            OptimisticOperationResult::FullNodeRetry => self.delete_pessimistic(key),
+        }
+    }
+
+    /// Tries to optimistically delete a key, failing if a need to redistribute keys or merge or
+    /// a structural change occurs.
+    fn delete_optimistic(&self, key: &[u8]) -> Result<OptimisticOperationResult, BTreeError> {
+        let (leaf_page_id, path_versions) = self.traverse_with_versions(key)?;
+        let mut leaf_node = self.pin_leaf_for_write(leaf_page_id)?;
+
+        if self.detect_structural_changes(&path_versions) {
+            return Ok(OptimisticOperationResult::StructuralChangeRetry);
+        }
+
+        // Pre-check: will this delete cause underflow?
+        if !leaf_node.will_not_underflow_after_delete()? {
+            // Don't delete - let pessimistic handle it
+            return Ok(OptimisticOperationResult::FullNodeRetry);
+        }
+
+        match leaf_node.delete(key)? {
+            NodeDeleteResult::Success => Ok(OptimisticOperationResult::Success),
+            NodeDeleteResult::SuccessUnderflow => {
+                // Shouldn't happen given our pre-check, but be safe
+                unreachable!("Pre-check should have caught this")
+            }
+            NodeDeleteResult::KeyDoesNotExist => Err(BTreeError::KeyForDeleteNotFound),
+        }
+    }
+
+    /// Deletes the key, while keeping write latches on ancestor nodes, which may structurally change
+    /// (possibly even root). Merges and redistributes as needed.
+    fn delete_pessimistic(&self, key: &[u8]) -> Result<(), BTreeError> {
+        // Keep the full ancestor path latched during delete so we can safely perform
+        // redistributions/merges that bubble up the tree (avoids losing structural context).
+        let path =
+            self.traverse_pessimistic(key, |node| Ok(node.will_not_underflow_after_delete()?))?;
+
+        let mut leaf = self.pin_leaf_for_write(path.leaf_page_id)?;
+
+        match leaf.delete(key)? {
+            NodeDeleteResult::Success => Ok(()),
+            NodeDeleteResult::SuccessUnderflow => self.redistribute_or_merge(
+                path.latch_stack,
+                LeafNodeLatch {
+                    page_id: path.leaf_page_id,
+                    node: leaf,
+                },
+                path.metadata_page,
+            ),
+            NodeDeleteResult::KeyDoesNotExist => Err(BTreeError::KeyForDeleteNotFound),
+        }
+    }
+
+    /// A function for fixing a leaf node that has an underflow (less than [`BTreeNode::UNDERFLOW_BOUNDARY`]
+    /// fraction of space filled). First tries to move a key from one of the siblings (right, then left)
+    /// and if that fails merges with one of the sibling (left one, unless it doesn't exist).
+    fn redistribute_or_merge(
+        &self,
+        mut internal_nodes: Vec<LatchHandle>,
+        mut leaf_latch: LeafNodeLatch,
+        metadata_page: Option<PinnedWritePage>,
+    ) -> Result<(), BTreeError> {
+        // We need the parent for separator updates.
+        let parent = match internal_nodes.pop() {
+            Some(p) => p,
+            None => {
+                // No parent means this is the root, so we can have an underflow here.
+                return Ok(());
+            }
+        };
+
+        let LatchHandle {
+            page_id: parent_id,
+            node: mut parent_node,
+            child_pos,
+        } = parent;
+
+        self.update_structural_version(leaf_latch.page_id);
+
+        // First, try moving a key from the structural right sibling (as defined by the parent).
+        if let Some(right_child_pos) = parent_node.get_next_child_pos(child_pos)? {
+            let right_sibling_id = parent_node.get_child_ptr_at(right_child_pos)?;
+            let mut right_sibling = self.pin_leaf_for_write(right_sibling_id)?;
+
+            if right_sibling.will_not_underflow_after_delete()? {
+                // Move first key from right sibling to current node.
+                let redistributed_record = right_sibling.remove_first_key()?;
+                leaf_latch
+                    .node
+                    .insert_record(redistributed_record.as_slice())?;
+
+                // Update separator in parent - new separator is the new first key of right sibling.
+                let new_separator_key = right_sibling.get_first_key()?;
+                let slot_id = right_child_pos
+                    .slot_id()
+                    .expect("right_child_pos must be AfterSlot to have a right sibling");
+                parent_node.update_separator_at_slot(slot_id, &new_separator_key)?;
+
+                self.update_structural_version(parent_id);
+                self.update_structural_version(right_sibling_id);
+                return Ok(());
+            }
+
+            // No left sibling, so we need to merge.
+            if child_pos == ChildPosition::Leftmost {
+                let ctx = MergeContext {
+                    parent_id,
+                    parent_node,
+                    child_pos,
+                    internal_nodes,
+                    metadata_page,
+                };
+                return self.merge_with_right_sibling(
+                    leaf_latch,
+                    LeafNodeLatch {
+                        page_id: right_sibling_id,
+                        node: right_sibling,
+                    },
+                    ctx,
+                );
+            }
+        }
+
+        // Now do the same with left sibling.
+        let preceding_child_pos = parent_node
+            .get_preceding_child_pos(child_pos)?
+            .expect("We know child pos is not Leftmost, so this will always return a position");
+
+        let left_node_id = parent_node.get_child_ptr_at(preceding_child_pos)?;
+        let mut left_sibling = self.pin_leaf_for_write(left_node_id)?;
+
+        if left_sibling.will_not_underflow_after_delete()? {
+            // Move last key from left sibling to current node.
+            let redistributed_record = left_sibling.remove_last_key()?;
+
+            // The redistributed key becomes the new separator (it's now the first key of current node).
+            let new_separator_key = Self::extract_key_from_leaf_record(&redistributed_record);
+            let slot_id = child_pos
+                .slot_id()
+                .expect("child_pos must be AfterSlot when redistributing from left");
+            parent_node.update_separator_at_slot(slot_id, &new_separator_key)?;
+
+            self.update_structural_version(parent_id);
+            self.update_structural_version(left_node_id);
+
+            leaf_latch
+                .node
+                .insert_record(redistributed_record.as_slice())?;
+            return Ok(());
+        }
+
+        // Can't redistribute keys from neither node meaning we must merge (left node is more
+        // convenient here).
+        let ctx = MergeContext {
+            parent_id,
+            parent_node,
+            child_pos,
+            internal_nodes,
+            metadata_page,
+        };
+        self.merge_with_left_sibling(
+            leaf_latch,
+            LeafNodeLatch {
+                page_id: left_node_id,
+                node: left_sibling,
+            },
+            ctx,
+        )
+    }
+
+    /// Merges with right sibling, moving all keys to the current node and freeing the sibling
+    /// page.
+    fn merge_with_right_sibling(
+        &self,
+        mut current_node_latch: LeafNodeLatch,
+        right_sibling_latch: LeafNodeLatch,
+        mut ctx: MergeContext,
+    ) -> Result<(), BTreeError> {
+        // Move all keys from right sibling to node.
+        let keys_to_move = right_sibling_latch.node.get_all_records()?;
+        for key in keys_to_move {
+            current_node_latch.node.insert_record(key)?;
+        }
+
+        current_node_latch
+            .node
+            .set_next_leaf_id(right_sibling_latch.node.next_leaf_id()?)?;
+        self.update_structural_version(current_node_latch.page_id);
+
+        let next_child_pos = ctx
+            .parent_node
+            .get_next_child_pos(ctx.child_pos)?
+            .expect("We wouldn't have gone into this function if right sibling didn't exist");
+
+        let slot_id = next_child_pos
+            .slot_id()
+            .expect("next_child_pos must be AfterSlot");
+
+        ctx.parent_node.delete_at(slot_id)?;
+        self.update_structural_version(ctx.parent_id);
+
+        drop(right_sibling_latch.node);
+        self.free_page(right_sibling_latch.page_id)?;
+
+        if ctx.parent_node.is_underflow()? {
+            self.handle_internal_underflow(ctx)?;
+        }
+
+        Ok(())
+    }
+
+    /// Merges with left sibling, moving all the current node's keys to it and freeing the current
+    /// node.
+    fn merge_with_left_sibling(
+        &self,
+        current_node_latch: LeafNodeLatch,
+        mut left_sibling_latch: LeafNodeLatch,
+        mut ctx: MergeContext,
+    ) -> Result<(), BTreeError> {
+        let keys_to_move = current_node_latch.node.get_all_records()?;
+        for key in keys_to_move {
+            left_sibling_latch.node.insert_record(key)?;
+        }
+
+        left_sibling_latch
+            .node
+            .set_next_leaf_id(current_node_latch.node.next_leaf_id()?)?;
+        self.update_structural_version(left_sibling_latch.page_id);
+
+        let slot_id = ctx
+            .child_pos
+            .slot_id()
+            .expect("child_pos must be AfterSlot for merge_with_left_sibling");
+        ctx.parent_node.delete_at(slot_id)?;
+        self.update_structural_version(ctx.parent_id);
+
+        drop(current_node_latch.node);
+        self.free_page(current_node_latch.page_id)?;
+
+        if ctx.parent_node.is_underflow()? {
+            self.handle_internal_underflow(ctx)?;
+        }
+
+        Ok(())
+    }
+
+    /// Frees the page at disk level and removes it from structural version numbers map.
+    fn free_page(&self, page_id: PageId) -> Result<(), BTreeError> {
+        self.structural_version_numbers.remove(&page_id);
+        let page_ref = self.page_ref(page_id);
+        Ok(self.cache.free_page(&page_ref)?)
+    }
+
+    /// Takes care of restructuring an internal node if it has an underflow. Works similarly to
+    /// [`redistribute_or_merge`] just for internal nodes.
+    fn handle_internal_underflow(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
+        // The node that has an underflow (it was the parent when handling the leaf).
+        let underflow_id = ctx.parent_id;
+        let mut underflow_node = ctx.parent_node;
+
+        let parent_handle = match ctx.internal_nodes.pop() {
+            // underflow_node is the root.
+            None => {
+                return self.handle_root_underflow(
+                    InternalNodeLatch {
+                        page_id: underflow_id,
+                        node: underflow_node,
+                    },
+                    ctx.metadata_page.unwrap(),
+                );
+            }
+            Some(handle) => handle,
+        };
+
+        let LatchHandle {
+            page_id: parent_id,
+            node: mut parent_node,
+            child_pos: underflow_child_pos,
+        } = parent_handle;
+
+        self.update_structural_version(parent_id);
+
+        // First try to redistribute from right sibling.
+        if let Some(right_sibling_pos) = parent_node.get_next_child_pos(underflow_child_pos)? {
+            let right_sibling_id = parent_node.get_child_ptr_at(right_sibling_pos)?;
+            let right_sibling = self.pin_internal_for_write(right_sibling_id)?;
+
+            if right_sibling.will_not_underflow_after_delete()? {
+                let separator_slot = right_sibling_pos
+                    .slot_id()
+                    .expect("right_sibling_pos must be AfterSlot");
+                return self.redistribute_from_right_internal(
+                    InternalNodeLatch {
+                        page_id: underflow_id,
+                        node: underflow_node,
+                    },
+                    InternalNodeLatch {
+                        page_id: right_sibling_id,
+                        node: right_sibling,
+                    },
+                    InternalNodeLatch {
+                        page_id: parent_id,
+                        node: parent_node,
+                    },
+                    separator_slot,
+                );
+            }
+
+            // No left sibling, must merge with right
+            if matches!(underflow_child_pos, ChildPosition::Leftmost) {
+                let separator_slot = right_sibling_pos
+                    .slot_id()
+                    .expect("right_sibling_pos must be AfterSlot");
+                let new_ctx = MergeContext {
+                    parent_id,
+                    parent_node,
+                    child_pos: underflow_child_pos,
+                    internal_nodes: ctx.internal_nodes,
+                    metadata_page: ctx.metadata_page,
+                };
+
+                return self.merge_internal_with_right_sibling(
+                    InternalNodeLatch {
+                        page_id: underflow_id,
+                        node: underflow_node,
+                    },
+                    InternalNodeLatch {
+                        page_id: right_sibling_id,
+                        node: right_sibling,
+                    },
+                    separator_slot,
+                    new_ctx,
+                );
+            }
+        }
+
+        let preceding_child_pos = parent_node
+            .get_preceding_child_pos(underflow_child_pos)?
+            .expect("underflow_child_pos is not Leftmost, so there must be a preceding position");
+        let left_sibling_id = parent_node.get_child_ptr_at(preceding_child_pos)?;
+        let left_sibling = self.pin_internal_for_write(left_sibling_id)?;
+
+        let separator_slot = underflow_child_pos
+            .slot_id()
+            .expect("underflow_child_pos must be AfterSlot when we have a left sibling");
+
+        if left_sibling.will_not_underflow_after_delete()? {
+            return self.redistribute_from_left_internal(
+                InternalNodeLatch {
+                    page_id: underflow_id,
+                    node: underflow_node,
+                },
+                InternalNodeLatch {
+                    page_id: left_sibling_id,
+                    node: left_sibling,
+                },
+                InternalNodeLatch {
+                    page_id: parent_id,
+                    node: parent_node,
+                },
+                separator_slot,
+            );
+        }
+
+        let new_ctx = MergeContext {
+            parent_id,
+            parent_node,
+            child_pos: underflow_child_pos,
+            internal_nodes: ctx.internal_nodes,
+            metadata_page: ctx.metadata_page,
+        };
+
+        self.merge_internal_with_left_sibling(
+            InternalNodeLatch {
+                page_id: underflow_id,
+                node: underflow_node,
+            },
+            InternalNodeLatch {
+                page_id: left_sibling_id,
+                node: left_sibling,
+            },
+            new_ctx,
+        )
+    }
+
+    /// Redistributes a key from the right sibling to the underflowing node.
+    ///
+    /// The separator in the parent comes down to the underflowing node,
+    /// and the first key of the right sibling becomes the new separator.
+    fn redistribute_from_right_internal(
+        &self,
+        mut underflow_node_latch: InternalNodeLatch,
+        mut right_sibling_latch: InternalNodeLatch,
+        mut parent_latch: InternalNodeLatch,
+        separator_slot: SlotId,
+    ) -> Result<(), BTreeError> {
+        // Get current separator from parent
+        let separator_key = parent_latch.node.get_key(separator_slot)?.to_vec();
+
+        // Get first key and old leftmost from right sibling
+        // This removes the first key and updates right's leftmost to be the child ptr from that slot
+        let (new_separator_key, old_right_leftmost) =
+            right_sibling_latch.node.remove_first_key()?;
+
+        // Insert separator into underflow_node with old_right_leftmost as child
+        underflow_node_latch
+            .node
+            .insert(separator_key.as_slice(), old_right_leftmost)?;
+
+        // Update parent's separator to be the new separator key
+        parent_latch
+            .node
+            .update_separator_at_slot(separator_slot, &new_separator_key)?;
+
+        self.update_structural_version(underflow_node_latch.page_id);
+        self.update_structural_version(right_sibling_latch.page_id);
+        self.update_structural_version(parent_latch.page_id);
+
+        Ok(())
+    }
+
+    /// Redistributes a key from the left sibling to the underflowing node.
+    ///
+    /// The separator in the parent comes down to the underflowing node,
+    /// and the last key of the left sibling becomes the new separator.
+    fn redistribute_from_left_internal(
+        &self,
+        mut underflow_node_latch: InternalNodeLatch,
+        mut left_sibling_latch: InternalNodeLatch,
+        mut parent_latch: InternalNodeLatch,
+        separator_slot: SlotId,
+    ) -> Result<(), BTreeError> {
+        // Get current separator from parent
+        let separator_key = parent_latch.node.get_key(separator_slot)?.to_vec();
+
+        // Get last key and its child from left sibling
+        let (new_separator_key, left_last_child) = left_sibling_latch.node.remove_last_key()?;
+
+        // Insert separator at the beginning of underflow_node with left_last_child as new leftmost
+        underflow_node_latch
+            .node
+            .insert_first_with_new_leftmost(&separator_key, left_last_child)?;
+
+        // Update parent's separator to be the new separator key
+        parent_latch
+            .node
+            .update_separator_at_slot(separator_slot, &new_separator_key)?;
+
+        self.update_structural_version(underflow_node_latch.page_id);
+        self.update_structural_version(left_sibling_latch.page_id);
+        self.update_structural_version(parent_latch.page_id);
+
+        Ok(())
+    }
+
+    /// Merges the underflowing node with its right sibling.
+    ///
+    /// The separator from parent comes down, all keys from right sibling move to underflow_node,
+    /// and the right sibling is freed.
+    fn merge_internal_with_right_sibling(
+        &self,
+        mut underflow_node_latch: InternalNodeLatch,
+        right_sibling_latch: InternalNodeLatch,
+        separator_slot: SlotId,
+        mut ctx: MergeContext,
+    ) -> Result<(), BTreeError> {
+        let separator_key = ctx.parent_node.get_key(separator_slot)?.to_vec();
+
+        let right_leftmost = right_sibling_latch
+            .node
+            .get_child_ptr_at(ChildPosition::Leftmost)?;
+
+        self.update_structural_version(underflow_node_latch.page_id);
+        underflow_node_latch
+            .node
+            .insert(&separator_key, right_leftmost)?;
+
+        let right_records = right_sibling_latch.node.get_all_records()?;
+        self.insert_internal_records(&mut underflow_node_latch.node, right_records)?;
+
+        ctx.parent_node.delete_at(separator_slot)?;
+        self.update_structural_version(ctx.parent_id);
+        self.free_page(right_sibling_latch.page_id)?;
+
+        if ctx.parent_node.is_underflow()? {
+            return self.handle_internal_underflow(ctx);
+        }
+
+        Ok(())
+    }
+
+    /// Merges the underflowing node with its left sibling.
+    ///
+    /// The separator from parent comes down, all keys from underflow_node move to left sibling,
+    /// and the underflow_node is freed.
+    fn merge_internal_with_left_sibling(
+        &self,
+        underflow_node_latch: InternalNodeLatch,
+        mut left_sibling_latch: InternalNodeLatch,
+        mut ctx: MergeContext,
+    ) -> Result<(), BTreeError> {
+        let separator_slot = ctx
+            .child_pos
+            .slot_id()
+            .expect("child_pos must be AfterSlot for merge_with_left_sibling");
+
+        let separator_key = ctx.parent_node.get_key(separator_slot)?.to_vec();
+
+        let underflow_leftmost = underflow_node_latch
+            .node
+            .get_child_ptr_at(ChildPosition::Leftmost)?;
+
+        left_sibling_latch
+            .node
+            .insert(&separator_key, underflow_leftmost)?;
+        self.update_structural_version(left_sibling_latch.page_id);
+
+        let underflow_records = underflow_node_latch.node.get_all_records()?;
+        self.insert_internal_records(&mut left_sibling_latch.node, underflow_records)?;
+
+        ctx.parent_node.delete_at(separator_slot)?;
+        self.update_structural_version(ctx.parent_id);
+        self.free_page(underflow_node_latch.page_id)?;
+
+        if ctx.parent_node.is_underflow()? {
+            return self.handle_internal_underflow(ctx);
+        }
+
+        Ok(())
+    }
+
+    /// Handles the underflow of root. If it has one child, it becomes the root.
+    fn handle_root_underflow(
+        &self,
+        root_latch: InternalNodeLatch,
+        mut metadata_page: PinnedWritePage,
+    ) -> Result<(), BTreeError> {
+        // If root has more than one child we can keep it with the underflow.
+        if root_latch.node.num_children()? == 1 {
+            let child_id = root_latch.node.get_child_ptr_at(ChildPosition::Leftmost)?;
+
+            self.update_structural_version(child_id);
+
+            let metadata_bytes = &mut metadata_page.page_mut()[0..size_of::<BTreeMetadata>()];
+            let metadata =
+                bytemuck::try_from_bytes_mut::<BTreeMetadata>(metadata_bytes).map_err(|e| {
+                    BTreeError::CorruptMetadata {
+                        reason: e.to_string(),
+                    }
+                })?;
+
+            metadata.root_page_id = child_id;
+            self.free_page(root_latch.page_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Extracts the key portion from a leaf record (key + RecordPtr).
+    fn extract_key_from_leaf_record(record: &[u8]) -> Vec<u8> {
+        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
+        let key_bytes_end = record.len() - serialized_record_ptr_size;
+        record[..key_bytes_end].to_vec()
+    }
+
+    /// Inserts internal-node records (key + child pointer) into the target internal node.
+    fn insert_internal_records(
+        &self,
+        target: &mut BTreeInternalNode<PinnedWritePage>,
+        records: Vec<&[u8]>,
+    ) -> Result<(), BTreeError> {
+        for record in records {
+            let key_bytes_end = record.len() - size_of::<PageId>();
+            let key = &record[..key_bytes_end];
+            let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
+            target.insert(key, child_ptr)?;
+        }
         Ok(())
     }
 }
@@ -1160,5 +1832,597 @@ mod test {
             "\nSpeedup: {:.2}x",
             pessimistic_duration.as_secs_f64() / optimistic_duration.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn test_delete_single_key() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate with enough keys to create internal nodes
+        for i in 0..100 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Verify all keys exist
+        for i in 0..100 {
+            assert!(btree.search(&key_i32(i)).unwrap().is_some());
+        }
+
+        // Now delete a single key
+        btree.delete(&key_i32(50)).unwrap();
+        assert_eq!(btree.search(&key_i32(50)).unwrap(), None);
+
+        // Verify other keys still exist
+        for i in 0..100 {
+            if i != 50 {
+                assert!(
+                    btree.search(&key_i32(i)).unwrap().is_some(),
+                    "Key {} should still exist after deleting 50",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_multiple_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Populate with enough keys to create internal nodes
+        for i in 0..200 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete some keys
+        btree.delete(&key_i32(20)).unwrap();
+        btree.delete(&key_i32(40)).unwrap();
+        btree.delete(&key_i32(100)).unwrap();
+        btree.delete(&key_i32(150)).unwrap();
+
+        // Verify deleted keys are gone
+        assert_eq!(btree.search(&key_i32(20)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(40)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(100)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(150)).unwrap(), None);
+
+        // Verify remaining keys still exist
+        assert!(btree.search(&key_i32(10)).unwrap().is_some());
+        assert!(btree.search(&key_i32(30)).unwrap().is_some());
+        assert!(btree.search(&key_i32(50)).unwrap().is_some());
+        assert!(btree.search(&key_i32(199)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_portion_of_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Use enough keys to create a multi-level tree
+        let keys: Vec<i32> = (0..500).collect();
+        for &k in &keys {
+            btree.insert(&key_i32(k), record_ptr(k as u32, 0)).unwrap();
+        }
+
+        // Delete ~20% of keys (100 out of 500)
+        for &k in &keys[..100] {
+            btree
+                .delete(&key_i32(k))
+                .unwrap_or_else(|_| panic!("Failed to delete key {}", k));
+        }
+
+        // Verify deleted keys are gone
+        for &k in &keys[..100] {
+            assert_eq!(
+                btree.search(&key_i32(k)).unwrap(),
+                None,
+                "Key {} should be deleted",
+                k
+            );
+        }
+
+        // Verify remaining keys exist
+        for &k in &keys[100..] {
+            assert!(
+                btree.search(&key_i32(k)).unwrap().is_some(),
+                "Key {} should still exist",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_in_reverse_order() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Use enough keys to create a multi-level tree
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete a portion in reverse order (keep some keys to maintain structure)
+        for i in (200..500).rev() {
+            btree
+                .delete(&key_i32(i))
+                .unwrap_or_else(|e| panic!("Failed to delete key {} {e}", i));
+            assert_eq!(btree.search(&key_i32(i)).unwrap(), None);
+        }
+
+        // Verify remaining keys still exist
+        for i in 0..200 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_in_order() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Use enough keys to create a multi-level tree
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete a portion in order (keep some keys to maintain structure)
+        for i in 0..300 {
+            btree
+                .delete(&key_i32(i))
+                .unwrap_or_else(|e| panic!("Failed to delete key {} {e}", i));
+            assert_eq!(btree.search(&key_i32(i)).unwrap(), None);
+        }
+
+        // Verify remaining keys still exist
+        for i in 300..500 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_random_order() {
+        use rand::seq::SliceRandom;
+
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Use enough keys to create a multi-level tree
+        let all_keys: Vec<i32> = (0..500).collect();
+        for &k in &all_keys {
+            btree.insert(&key_i32(k), record_ptr(k as u32, 0)).unwrap();
+        }
+
+        // Only delete half the keys
+        let mut keys_to_delete: Vec<i32> = (0..250).collect();
+        keys_to_delete.shuffle(&mut rand::rng());
+        for &k in &keys_to_delete {
+            btree
+                .delete(&key_i32(k))
+                .unwrap_or_else(|_| panic!("Failed to delete key {}", k));
+            assert_eq!(btree.search(&key_i32(k)).unwrap(), None);
+        }
+
+        // Verify remaining keys still exist
+        for k in 250..500 {
+            assert!(
+                btree.search(&key_i32(k)).unwrap().is_some(),
+                "Key {} should still exist",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_and_reinsert() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate to create a multi-level tree
+        for i in 0..100 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        let key = key_i32(42);
+        let ptr2 = record_ptr(20, 10);
+
+        // Verify key exists
+        assert!(btree.search(&key).unwrap().is_some());
+
+        // Delete and verify
+        btree.delete(&key).unwrap();
+        assert_eq!(btree.search(&key).unwrap(), None);
+
+        // Reinsert with different pointer
+        btree.insert(&key, ptr2).unwrap();
+        assert_eq!(btree.search(&key).unwrap(), Some(ptr2));
+    }
+
+    #[test]
+    fn test_delete_after_splits() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Insert enough keys to trigger multiple splits
+        let num_keys = 1000;
+        for i in 0..num_keys {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete every third key (keeping 2/3 of keys to maintain tree structure)
+        for i in (0..num_keys).step_by(3) {
+            btree
+                .delete(&key_i32(i))
+                .unwrap_or_else(|e| panic!("Failed to delete key {i}: {e}"));
+        }
+
+        // Verify deleted keys are gone and remaining keys exist
+        for i in 0..num_keys {
+            if i % 3 == 0 {
+                assert_eq!(
+                    btree.search(&key_i32(i)).unwrap(),
+                    None,
+                    "Key {} should be deleted",
+                    i
+                );
+            } else {
+                assert!(
+                    btree.search(&key_i32(i)).unwrap().is_some(),
+                    "Key {} should still exist",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_triggers_merges() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Insert enough keys to build a multi-level tree
+        let num_keys = 1000;
+        for i in 0..num_keys {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete half the keys to trigger merges (but keep enough to maintain structure)
+        for i in 0..500 {
+            match btree.delete(&key_i32(i)) {
+                Ok(()) => {}
+                Err(e) => panic!("Failed to delete key {}", e),
+            }
+        }
+
+        // Verify remaining keys still work
+        for i in 500..num_keys {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist after merges",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_alternating_insert_delete() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate to create a multi-level tree
+        for i in 0..200 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Now do alternating inserts and deletes
+        for i in 200..300 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+
+            if i > 200 && (i - 200) % 3 == 0 {
+                // Delete a previous key from the newly inserted range
+                btree.delete(&key_i32(i - 2)).unwrap();
+            }
+        }
+
+        // Verify we can search for keys that weren't deleted
+        assert!(btree.search(&key_i32(0)).unwrap().is_some());
+        assert!(btree.search(&key_i32(100)).unwrap().is_some());
+        assert!(btree.search(&key_i32(299)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_from_tree_with_large_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate with small keys to create tree structure
+        for i in 0..100 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Then add large keys
+        let mut large_keys = Vec::new();
+        for i in 0..20 {
+            let key = format!("KEY_{}_{}", i, random_string(200));
+            large_keys.push(key.clone());
+            btree
+                .insert(&key_string(&key), record_ptr(100 + i, 0))
+                .unwrap();
+        }
+
+        // Delete half the large keys
+        for i in (0..20).step_by(2) {
+            btree.delete(&key_string(&large_keys[i])).unwrap();
+        }
+
+        // Verify large keys
+        for (i, _) in large_keys.iter().enumerate().take(20) {
+            if i % 2 == 0 {
+                assert_eq!(btree.search(&key_string(&large_keys[i])).unwrap(), None);
+            } else {
+                assert!(btree.search(&key_string(&large_keys[i])).unwrap().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_boundary_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First populate with regular keys to create tree structure
+        for i in 0..200 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Insert boundary keys
+        btree
+            .insert(&key_i32(i32::MIN), record_ptr(1000, 0))
+            .unwrap();
+        btree
+            .insert(&key_i32(i32::MAX), record_ptr(1001, 0))
+            .unwrap();
+
+        // Delete boundary keys
+        btree.delete(&key_i32(i32::MIN)).unwrap();
+        btree.delete(&key_i32(i32::MAX)).unwrap();
+
+        assert_eq!(btree.search(&key_i32(i32::MIN)).unwrap(), None);
+        assert_eq!(btree.search(&key_i32(i32::MAX)).unwrap(), None);
+
+        // Regular keys should still exist
+        assert!(btree.search(&key_i32(0)).unwrap().is_some());
+        assert!(btree.search(&key_i32(100)).unwrap().is_some());
+        assert!(btree.search(&key_i32(199)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_concurrent_deletes() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
+
+        let num_keys = 2000; // Use more keys to ensure multi-level tree
+
+        // Pre-populate
+        for i in 0..num_keys {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Only delete half the keys to ensure tree stays multi-level
+        let delete_range = num_keys / 2;
+        let num_threads = 16;
+        // Use ceiling division to avoid leaving a tail of keys undeleted
+        let keys_per_thread = (delete_range + num_threads - 1) / num_threads;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|thread_id| {
+                let btree = btree.clone();
+                thread::spawn(move || {
+                    let start = thread_id * keys_per_thread;
+                    if start >= delete_range {
+                        return;
+                    }
+                    let end = (start + keys_per_thread).min(delete_range);
+                    for i in start..end {
+                        let result = btree.delete(&key_i32(i));
+                        if let Err(e) = result {
+                            panic!("Delete of key {i} failed: {e}");
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify deleted keys are gone
+        for i in 0..delete_range {
+            assert_eq!(
+                btree.search(&key_i32(i)).unwrap(),
+                None,
+                "Key {} should be deleted",
+                i
+            );
+        }
+
+        // Verify remaining keys still exist
+        for i in delete_range..num_keys {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_concurrent_inserts_and_deletes() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
+
+        // Pre-populate with keys 0-499
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        let btree_insert = btree.clone();
+        let btree_delete = btree.clone();
+
+        // Insert keys 500-999 while deleting keys 0-249
+        let insert_handle = thread::spawn(move || {
+            for i in 500..1000 {
+                btree_insert
+                    .insert(&key_i32(i), record_ptr(i as u32, 0))
+                    .unwrap();
+            }
+        });
+
+        let delete_handle = thread::spawn(move || {
+            for i in 0..250 {
+                btree_delete
+                    .delete(&key_i32(i))
+                    .unwrap_or_else(|e| panic!("Delete of key {i} failed: {e}"));
+            }
+        });
+
+        insert_handle.join().unwrap();
+        delete_handle.join().unwrap();
+
+        // Verify: keys 0-249 should be deleted, 250-999 should exist
+        for i in 0..250 {
+            assert_eq!(
+                btree.search(&key_i32(i)).unwrap(),
+                None,
+                "Key {} should be deleted",
+                i
+            );
+        }
+        for i in 250..1000 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_empty_tree() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Deleting from empty tree should not panic
+        // The behavior depends on implementation - it might be Ok or an error
+        let _ = btree.delete(&key_i32(42));
+    }
+
+    #[test]
+    fn test_delete_stress_insert_delete_cycles() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // First create a substantial base multi-level tree
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Multiple cycles of insert and delete starting from offset 500
+        for cycle in 0..5 {
+            let offset = 500 + cycle * 100;
+
+            // Insert 100 keys
+            for i in 0..100 {
+                btree
+                    .insert(&key_i32(offset + i), record_ptr((offset + i) as u32, 0))
+                    .unwrap();
+            }
+
+            // Delete only 30 keys (less aggressive to maintain tree structure)
+            for i in 0..30 {
+                btree
+                    .delete(&key_i32(offset + i))
+                    .unwrap_or_else(|_| panic!("Failed to delete key {}", offset + i));
+            }
+        }
+
+        // Verify some of the final state
+        for cycle in 0..5 {
+            let offset = 500 + cycle * 100;
+            for i in 0..30 {
+                assert_eq!(
+                    btree.search(&key_i32(offset + i)).unwrap(),
+                    None,
+                    "Key {} should be deleted",
+                    offset + i
+                );
+            }
+            for i in 30..100 {
+                assert!(
+                    btree.search(&key_i32(offset + i)).unwrap().is_some(),
+                    "Key {} should exist",
+                    offset + i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_interleaved_with_search() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Create a multi-level tree with 300 keys
+        for i in 0..300 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Delete keys in the middle range, interleaved with searches
+        for i in 100..200 {
+            // Search before delete
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should exist before delete",
+                i
+            );
+
+            // Delete
+            btree
+                .delete(&key_i32(i))
+                .unwrap_or_else(|_| panic!("Failed to delete key {}", i));
+
+            // Search after delete
+            assert_eq!(
+                btree.search(&key_i32(i)).unwrap(),
+                None,
+                "Key {} should not exist after delete",
+                i
+            );
+        }
+
+        // Verify keys outside the deleted range still exist
+        for i in 0..100 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
+        for i in 200..300 {
+            assert!(
+                btree.search(&key_i32(i)).unwrap().is_some(),
+                "Key {} should still exist",
+                i
+            );
+        }
     }
 }
