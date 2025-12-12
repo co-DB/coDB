@@ -550,7 +550,7 @@ impl<'hf, const BUCKETS_COUNT: usize, P> SinglePageLockChain<'hf, BUCKETS_COUNT,
 }
 
 impl<'hf, const BUCKETS_COUNT: usize> SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedReadPage> {
-    /// Creates new [`PageLockChain`] that starts with record page
+    /// Creates new [`SinglePageLockChain`] that starts with record page
     fn with_record(
         heap_file: &'hf HeapFile<BUCKETS_COUNT>,
         page_id: PageId,
@@ -565,7 +565,7 @@ impl<'hf, const BUCKETS_COUNT: usize> SinglePageLockChain<'hf, BUCKETS_COUNT, Pi
 }
 
 impl<'hf, const BUCKETS_COUNT: usize> SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage> {
-    /// Creates new [`PageLockChain`] that starts with record page
+    /// Creates new [`SinglePageLockChain`] that starts with record page
     fn with_record(
         heap_file: &'hf HeapFile<BUCKETS_COUNT>,
         page_id: PageId,
@@ -620,6 +620,116 @@ impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<PinnedWritePage>
 
         // Drop previous page
         self.record_page = None;
+        self.overflow_page = Some(new_page);
+        Ok(())
+    }
+
+    fn record_page(&self) -> &HeapPage<PinnedWritePage, RecordPageHeader> {
+        self._record_page()
+    }
+
+    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, RecordPageHeader> {
+        self._record_page_mut()
+    }
+
+    fn overflow_page(&self) -> &HeapPage<PinnedWritePage, OverflowPageHeader> {
+        self._overflow_page()
+    }
+
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, OverflowPageHeader> {
+        self._overflow_page_mut()
+    }
+}
+
+struct PageLockChainWithLockedRecordPage<'hf, 'rp, const BUCKETS_COUNT: usize, P> {
+    heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+    record_page: &'rp mut HeapPage<P, RecordPageHeader>,
+    overflow_page: Option<HeapPage<P, OverflowPageHeader>>,
+}
+
+impl<'hf, 'rp, const BUCKETS_COUNT: usize, P>
+    PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, P>
+{
+    /// Creates new [`PageLockChainWithLockedRecordPage`] that starts with record page
+    fn with_record(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        record_page: &'rp mut HeapPage<P, RecordPageHeader>,
+    ) -> Result<Self, HeapFileError> {
+        Ok(PageLockChainWithLockedRecordPage {
+            heap_file,
+            record_page,
+            overflow_page: None,
+        })
+    }
+
+    /// Gets current record page.
+    fn _record_page(&self) -> &HeapPage<P, RecordPageHeader> {
+        self.record_page
+    }
+
+    /// Gets mutable current record page.
+    fn _record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
+        &mut self.record_page
+    }
+
+    /// Gets current overflow page.
+    ///
+    /// Panics if we hold record page instead.
+    fn _overflow_page(&self) -> &HeapPage<P, OverflowPageHeader> {
+        match &self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get overflow page when record page is stored instead"
+            ),
+        }
+    }
+
+    /// Gets mutable current overflow page.
+    ///
+    /// Panics if we hold record page instead.
+    fn _overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader> {
+        match &mut self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
+    }
+}
+
+impl<'hf, 'rp, const BUCKETS_COUNT: usize> PageLockChain<PinnedReadPage>
+    for PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, PinnedReadPage>
+{
+    /// Locks the next page
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
+        let new_page = self.heap_file.read_overflow_page(next_page_id)?;
+        self.overflow_page = Some(new_page);
+        Ok(())
+    }
+
+    fn record_page(&self) -> &HeapPage<PinnedReadPage, RecordPageHeader> {
+        self._record_page()
+    }
+
+    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, RecordPageHeader> {
+        self._record_page_mut()
+    }
+
+    fn overflow_page(&self) -> &HeapPage<PinnedReadPage, OverflowPageHeader> {
+        self._overflow_page()
+    }
+
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, OverflowPageHeader> {
+        self._overflow_page_mut()
+    }
+}
+
+impl<'hf, 'rp, const BUCKETS_COUNT: usize> PageLockChain<PinnedWritePage>
+    for PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, PinnedWritePage>
+{
+    /// Locks the next page
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
+        let new_page = self.heap_file.write_overflow_page(next_page_id)?;
         self.overflow_page = Some(new_page);
         Ok(())
     }
@@ -876,7 +986,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
     /// Reads [`Record`] located at `ptr` and deserializes it.
     pub fn record(&self, ptr: &RecordPtr) -> Result<Record, HeapFileError> {
-        let record_bytes = self.record_bytes(ptr)?;
+        let page_chain =
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(self, ptr.page_id)?;
+        let record_bytes = self.record_bytes(ptr, page_chain)?;
         let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
         Ok(record)
     }
@@ -912,7 +1024,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         updated_fields: Vec<FieldUpdateDescriptor>,
     ) -> Result<(), HeapFileError> {
         // Read record bytes from disk
-        let mut record_bytes = self.record_bytes(ptr)?;
+        let page_chain =
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(&self, ptr.page_id)?;
+        let mut record_bytes = self.record_bytes(ptr, page_chain)?;
         let mut bytes_changed = vec![false; record_bytes.len()];
 
         // Update fields
@@ -926,7 +1040,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         }
 
         // Save back to disk at the same ptr
-        self.update_record_bytes(ptr, &record_bytes, &bytes_changed)?;
+        let page_chain =
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
+        self.update_record_bytes(ptr, &record_bytes, &bytes_changed, page_chain)?;
 
         Ok(())
     }
@@ -987,19 +1103,16 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // as this whole function has exclusive access to the whole heap file struct.
         let mut page_id = *self.metadata.first_record_page.lock();
         while page_id != RecordPageHeader::NO_NEXT_PAGE {
-            let page = self.read_record_page(page_id)?;
+            let mut page = self.write_record_page(page_id)?;
             let next_page_id = page.next_page()?;
 
             let slots: Vec<_> = page.not_deleted_slot_ids()?.collect();
-            // We drop page here, because in each call to `add_column_to_record`
-            // we need a write-lock to this page.
-            // If we didn't do it we would end up with a deadlock.
-            drop(page);
 
             // Update each record on the page
             for slot_id in slots {
                 let ptr = RecordPtr::new(page_id, slot_id);
                 self.add_column_to_record(
+                    &mut page,
                     &ptr,
                     position,
                     new_column_min_offset,
@@ -1028,19 +1141,16 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // as this whole function has exclusive access to the whole heap file struct.
         let mut page_id = *self.metadata.first_record_page.lock();
         while page_id != RecordPageHeader::NO_NEXT_PAGE {
-            let page = self.read_record_page(page_id)?;
+            let mut page = self.write_record_page(page_id)?;
             let next_page_id = page.next_page()?;
 
             let slots: Vec<_> = page.not_deleted_slot_ids()?.collect();
-            // We drop page here, because in each call to `remove_column_from_record`
-            // we need a write-lock to this page.
-            // If we didn't do it we would end up with a deadlock.
-            drop(page);
 
             // Update each record on the page
             for slot_id in slots {
                 let ptr = RecordPtr::new(page_id, slot_id);
                 self.remove_column_from_record(
+                    &mut page,
                     &ptr,
                     position,
                     prev_column_min_offset,
@@ -1055,10 +1165,14 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Reads [`Record`] located at `ptr` and returns its bare bytes.
-    fn record_bytes(&self, ptr: &RecordPtr) -> Result<Vec<u8>, HeapFileError> {
-        let mut page_chain =
-            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(&self, ptr.page_id)?;
-
+    fn record_bytes<P>(
+        &self,
+        ptr: &RecordPtr,
+        mut page_chain: impl PageLockChain<P>,
+    ) -> Result<Vec<u8>, HeapFileError>
+    where
+        P: PageRead,
+    {
         // Read first fragment
         let first_page = page_chain.record_page();
         let fragment = first_page.record_fragment(ptr.slot_id)?;
@@ -1157,17 +1271,21 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// If length is different then the difference is applied at the end of pages chain.
     ///
     /// This function assumes that `bytes` and `bytes_changed` have the same length.
-    fn update_record_bytes(
+    fn update_record_bytes<P>(
         &self,
         start: &RecordPtr,
         bytes: &[u8],
         bytes_changed: &[bool],
-    ) -> Result<(), HeapFileError> {
+        mut page_chain: impl PageLockChain<P>,
+    ) -> Result<(), HeapFileError>
+    where
+        P: PageRead + PageWrite,
+    {
         let mut processor = FragmentProcessor::new(bytes, bytes_changed);
-        let mut page_chain = SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(
-            &self,
-            start.page_id,
-        )?;
+        // let mut page_chain = SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(
+        //     &self,
+        //     start.page_id,
+        // )?;
 
         let mut first_page = page_chain.record_page_mut();
         let previous_first_fragment = first_page.record_fragment(start.slot_id)?;
@@ -1329,9 +1447,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     ///
     /// Returns `Ok(true)` if update was successful, `Ok(false)` if there wasn't enough space
     /// and the caller should handle splitting the record.
-    fn try_update_fragment_in_place<H>(
+    fn try_update_fragment_in_place<P, H>(
         &self,
-        page: &mut HeapPage<PinnedWritePage, H>,
+        page: &mut HeapPage<P, H>,
         slot: SlotId,
         page_id: PageId,
         remaining_bytes: &[u8],
@@ -1339,6 +1457,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
     ) -> Result<bool, HeapFileError>
     where
+        P: PageRead + PageWrite,
         H: BaseHeapPageHeader,
     {
         // We can safely store updated record at previous position because we know we have enough space
@@ -1374,9 +1493,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Takes the maximum amount of data that can fit in the current fragment (accounting for
     /// the RecordPtr overhead), stores it with a continuation tag, and recursively stores
     /// the remaining data in overflow pages.
-    fn split_and_extend_fragment<H>(
+    fn split_and_extend_fragment<P, H>(
         &self,
-        page: &mut HeapPage<PinnedWritePage, H>,
+        page: &mut HeapPage<P, H>,
         slot: SlotId,
         page_id: PageId,
         remaining_bytes: &[u8],
@@ -1384,6 +1503,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
     ) -> Result<(), HeapFileError>
     where
+        P: PageRead + PageWrite,
         H: BaseHeapPageHeader,
     {
         // When converting from Final to HasContinuation, we need space for RecordPtr
@@ -1434,14 +1554,17 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Deletes all record fragments from chain of overflow pages starting in `next_ptr`.
-    fn delete_record_fragments_from_overflow_pages_chain<'hf>(
+    fn delete_record_fragments_from_overflow_pages_chain<'hf, P>(
         &'hf self,
-        mut chain: SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage>,
+        mut page_chain: impl PageLockChain<P>,
         mut next_ptr: Option<RecordPtr>,
-    ) -> Result<(), HeapFileError> {
+    ) -> Result<(), HeapFileError>
+    where
+        P: PageRead + PageWrite,
+    {
         while let Some(next) = next_ptr {
-            chain.advance(next.page_id)?;
-            let page = chain.overflow_page_mut();
+            page_chain.advance(next.page_id)?;
+            let page = page_chain.overflow_page_mut();
             let record_fragment = page.record_fragment(next.slot_id)?;
             next_ptr = record_fragment.next_fragment;
             page.delete(next.slot_id)?;
@@ -1667,15 +1790,16 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Generic helper for updating a record and registering the page in FSM
-    fn update_page_with_fsm<H>(
+    fn update_page_with_fsm<P, H>(
         &self,
-        page: &mut HeapPage<PinnedWritePage, H>,
+        page: &mut HeapPage<P, H>,
         slot: SlotId,
         data: &[u8],
         page_id: PageId,
         fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
     ) -> Result<(), HeapFileError>
     where
+        P: PageRead + PageWrite,
         H: BaseHeapPageHeader,
     {
         page.update(slot, data)?;
@@ -1684,30 +1808,23 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Updates a record on a record page and updates FSM
-    fn update_record_page_with_fsm(
+    fn update_record_page_with_fsm<P>(
         &self,
-        page: &mut HeapPage<PinnedWritePage, RecordPageHeader>,
+        page: &mut HeapPage<P, RecordPageHeader>,
         slot: SlotId,
         data: &[u8],
         page_id: PageId,
-    ) -> Result<(), HeapFileError> {
+    ) -> Result<(), HeapFileError>
+    where
+        P: PageRead + PageWrite,
+    {
         self.update_page_with_fsm(page, slot, data, page_id, &self.record_pages_fsm)
-    }
-
-    /// Updates a record on an overflow page and updates FSM
-    fn update_overflow_page_with_fsm(
-        &self,
-        page: &mut HeapPage<PinnedWritePage, OverflowPageHeader>,
-        slot: SlotId,
-        data: &[u8],
-        page_id: PageId,
-    ) -> Result<(), HeapFileError> {
-        self.update_page_with_fsm(page, slot, data, page_id, &self.overflow_pages_fsm)
     }
 
     /// Adds a column to a single record at `ptr` and writes updated value to the disk
     fn add_column_to_record(
         &self,
+        page: &mut HeapPage<PinnedWritePage, RecordPageHeader>,
         ptr: &RecordPtr,
         position: u16,
         new_column_min_offset: usize,
@@ -1715,7 +1832,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         old_columns: &[ColumnMetadata],
     ) -> Result<(), HeapFileError> {
         // Read the record with the old schema
-        let record_bytes = self.record_bytes(ptr)?;
+        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        let record_bytes = self.record_bytes(ptr, page_chain)?;
         let record = Record::deserialize(old_columns, &record_bytes)?;
 
         let mut fields = record.fields;
@@ -1727,7 +1845,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         let mut bytes_changed = vec![false; new_bytes.len()];
         bytes_changed[new_column_min_offset..].fill(true);
-        self.update_record_bytes(ptr, &new_bytes, &bytes_changed)?;
+
+        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        self.update_record_bytes(ptr, &new_bytes, &bytes_changed, page_chain)?;
 
         Ok(())
     }
@@ -1735,13 +1855,15 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Removes a column from a single record at `ptr` and writes updated value to the disk.
     fn remove_column_from_record(
         &self,
+        page: &mut HeapPage<PinnedWritePage, RecordPageHeader>,
         ptr: &RecordPtr,
         position: u16,
         prev_column_min_offset: usize,
         old_columns: &[ColumnMetadata],
     ) -> Result<(), HeapFileError> {
         // Read the record with the old schema
-        let record_bytes = self.record_bytes(ptr)?;
+        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        let record_bytes = self.record_bytes(ptr, page_chain)?;
         let record = Record::deserialize(old_columns, &record_bytes)?;
 
         let mut fields = record.fields;
@@ -1753,7 +1875,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         let mut bytes_changed = vec![false; new_bytes.len()];
         bytes_changed[prev_column_min_offset..].fill(true);
-        self.update_record_bytes(ptr, &new_bytes, &bytes_changed)?;
+
+        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        self.update_record_bytes(ptr, &new_bytes, &bytes_changed, page_chain)?;
 
         Ok(())
     }
