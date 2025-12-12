@@ -136,7 +136,7 @@ impl Default for BTreeLeafHeader {
 pub(crate) enum LeafNodeSearchResult {
     /// Exact match found.
     Found {
-        position: u16,
+        position: SlotId,
         record_ptr: RecordPtr,
     },
 
@@ -444,12 +444,8 @@ where
         }
     }
 
-    pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
-        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
-    }
-
     /// Check if this internal node can spare a key for redistribution to a sibling.
-    pub(crate) fn can_redistribute_key(&self) -> Result<bool, BTreeNodeError> {
+    pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
         Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
     }
 
@@ -729,10 +725,6 @@ where
             BTreeLeafHeader::NO_NEXT_LEAF => Ok(None),
             val => Ok(Some(val)),
         }
-    }
-
-    pub(crate) fn can_redistribute_key(&self) -> Result<bool, BTreeNodeError> {
-        Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
     }
 
     /// Returns the first (smallest) key in this leaf node without removing it.
