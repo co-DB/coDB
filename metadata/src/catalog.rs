@@ -480,6 +480,11 @@ impl TableMetadata {
     pub fn primary_key_column_name(&self) -> &str {
         &self.primary_key_column_name
     }
+
+    /// Returns the position of the primary key column
+    pub fn primary_key_pos(&self) -> Result<u16, TableMetadataError> {
+        Ok(self.column(&self.primary_key_column_name)?.pos)
+    }
 }
 
 pub struct NewColumnRequest {

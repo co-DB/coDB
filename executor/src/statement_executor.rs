@@ -277,13 +277,45 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     fn process_insert(&self, insert: &Insert) -> Result<(), InternalExecutorError> {
         let record = self.build_record(&insert.columns, &insert.values)?;
 
-        let _ptr = self.executor.with_heap_file(&insert.table_name, |hf| {
+        let primary_key_field = self.get_primary_key_field(&insert.table_name, &record)?;
+        let key_bytes = primary_key_field.encode_key();
+
+        let ptr = self.executor.with_heap_file(&insert.table_name, |hf| {
             let ptr = hf.insert(record)?;
             Ok::<RecordPtr, HeapFileError>(ptr)
         })??;
-        // TODO: we should insert this `_ptr` into btree
+
+        self.executor.with_b_tree(&insert.table_name, |btree| {
+            btree.insert(key_bytes.as_slice(), ptr)
+        })??;
 
         Ok(())
+    }
+
+    fn get_primary_key_field(
+        &self,
+        table_name: &str,
+        record: &Record,
+    ) -> Result<Field, InternalExecutorError> {
+        let table_metadata = self
+            .executor
+            .catalog
+            .read()
+            .table(table_name)
+            .map_err(|_| InternalExecutorError::TableDoesNotExist {
+                table_name: table_name.to_string(),
+            })?;
+        let primary_pos = table_metadata.primary_key_pos().map_err(|_| {
+            InternalExecutorError::PrimaryKeyDoesNotExist {
+                table_name: table_name.to_string(),
+            }
+        })?;
+        let primary_key_field = record
+            .fields
+            .get(primary_pos as usize)
+            .cloned()
+            .ok_or(InternalExecutorError::InvalidRecord)?;
+        Ok(primary_key_field)
     }
 
     /// Sorts `values` by their corresponding `column` position and evaluates them.

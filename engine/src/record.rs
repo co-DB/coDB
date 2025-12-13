@@ -2,6 +2,7 @@
 
 use metadata::catalog::ColumnMetadata;
 use thiserror::Error;
+use types::lexicographic_serialization::DecodeError;
 use types::{data::Value, schema::Type, serialization::DbSerializationError};
 
 /// Error for record related operations
@@ -59,7 +60,6 @@ impl Record {
     /// Fields are serialized in order using little-endian byte ordering.
     /// Variable-length fields (like strings) are prefixed with their length.
     pub fn serialize(self) -> Vec<u8> {
-        // TODO: Figure out where and when to return serialized record size for slotted page header and deserialization
         let mut bytes = vec![];
         for field in self.fields {
             field.serialize(&mut bytes);
@@ -92,21 +92,40 @@ pub struct Field(Value);
 
 impl Field {
     /// Serializes this field into the provided buffer.
-    pub(crate) fn serialize(self, buffer: &mut Vec<u8>) {
+    pub fn serialize(self, buffer: &mut Vec<u8>) {
         self.0.serialize(buffer);
     }
 
     /// Deserializes a field from bytes using the provided type.
     ///
     /// Returns both the deserialized field and the remaining unconsumed bytes.
-    pub(crate) fn deserialize<'a>(
-        buffer: &'a [u8],
+    pub(crate) fn deserialize(
+        buffer: &[u8],
         column_type: Type,
         column_name: impl Into<String>,
-    ) -> Result<(Self, &'a [u8]), RecordError> {
+    ) -> Result<(Self, &[u8]), RecordError> {
         let (value, rest) = Value::deserialize(buffer, column_type)
             .map_err(|err| RecordError::map_serialization_error(err, column_name))?;
         Ok((value.into(), rest))
+    }
+
+    /// Encodes this field's value into a byte vector suitable for use as a key.
+    pub fn encode_key(self) -> Vec<u8> {
+        self.0.encode_key()
+    }
+
+    /// Decodes a field from bytes using the provided type.
+    pub fn decode_key(
+        bytes: &[u8],
+        column_type: Type,
+        column_name: impl Into<String>,
+    ) -> Result<Self, RecordError> {
+        let value = Value::decode_key(bytes, column_type).map_err(|_| {
+            RecordError::FailedToDeserialize {
+                field_name: column_name.into(),
+            }
+        })?;
+        Ok(value.into())
     }
 }
 
