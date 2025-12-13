@@ -5,6 +5,7 @@ use engine::{
     record::{Field, Record},
 };
 use itertools::Itertools;
+use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
 use planner::{
     query_plan::{
@@ -361,46 +362,41 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             ty: add_column.column_ty,
         };
 
-        // Update columns in catalog first
-        let column_added = match self
+        // We obtain the write-lock to be sure that no other thread can modify catalog when we do our changes
+        let mut w_lock = self.executor.catalog.write();
+
+        // This way we ensure that heap file is loaded into memory.
+        // If we didn't do it and this function is the first function that is called on this heap file
+        // then we get deadlock as heap file uses read-lock to load metadata from catalog.
+        if let Err(e) = self
             .executor
-            .catalog
-            .write()
-            .add_column(&add_column.table_name, column_request)
+            .insert_heap_file_with_catalog_lock(&add_column.table_name, &w_lock)
         {
-            Ok(ca) => ca,
-            Err(e) => return error_factory::runtime_error(format!("failed to add column: {e}")),
+            return error_factory::runtime_error(format!("failed to insert heap file: {e}"));
         };
 
-        let revert_changes_in_catalog = || {
-            if let Err(e) = self
-                .executor
-                .catalog
-                .write()
-                .remove_column(&add_column.table_name, &add_column.column_name)
-            {
-                // Failed to revert changes - DB state is invalid (TODO: maybe we can do something better here)
-                return Some(error_factory::runtime_error(format!(
-                    "added column to catalog, but didn't migrate records in heap file - DB content is out of sync (failed to revert column addition: {e})"
-                )));
-            }
-            None
-        };
-
-        // Load new columns list
-        let table = match self.executor.catalog.read().table(&add_column.table_name) {
-            Ok(t) => t,
-            Err(e) => {
-                // Try to revert changes made in catalog
-                if let Some(revert_err) = revert_changes_in_catalog() {
-                    return revert_err;
+        // Add column and load new columns metadata setup
+        // If we fail at any point we rollback changes made to the catalog
+        let (column_added, new_columns) = {
+            let column_added = match w_lock.add_column(&add_column.table_name, column_request) {
+                Ok(ca) => ca,
+                Err(e) => {
+                    return error_factory::runtime_error(format!("failed to add column: {e}"));
                 }
-                return error_factory::runtime_error(format!("failed to read table: {e}"));
-            }
-        };
-        let new_columns: Vec<_> = table.columns().collect();
+            };
 
-        // Try to migrate records in heap file
+            let table = match w_lock.table(&add_column.table_name) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = w_lock.rollback_staged();
+                    return error_factory::runtime_error(format!("failed to read table: {e}"));
+                }
+            };
+            let new_columns: Vec<_> = table.columns().collect();
+            (column_added, new_columns)
+        };
+
+        // Migrate data in heap file, once again if we fail we rollback the changes made to catalog
         if let Err(e) = self.add_new_field_to_records(
             &add_column.table_name,
             column_added.pos,
@@ -408,15 +404,16 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             Value::default_for_ty(&column_added.ty),
             new_columns,
         ) {
-            // Try to revert changes made in catalog
-            if let Some(revert_err) = revert_changes_in_catalog() {
-                return revert_err;
-            }
-
+            let _ = w_lock.rollback_staged();
             return error_factory::runtime_error(format!(
                 "couldn't migrate records in heap file: {e}"
             ));
-        };
+        }
+
+        if let Err(e) = w_lock.commit_staged() {
+            // Here we don't rollback, because we already have tmp file - it will be loaded when reloading database.
+            warn!("heap migrated but failed to commit catalog: {e}");
+        }
 
         StatementResult::OperationSuccessful {
             rows_affected: 0,
@@ -442,71 +439,59 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
     /// Handler for [`RemoveColumn`] statement.
     fn remove_column(&self, remove_column: &RemoveColumn) -> StatementResult {
-        // Update columns in catalog first
-        let column_removed = match self
+        // We obtain the write-lock to be sure that no other thread can modify catalog when we do our changes
+        let mut w_lock = self.executor.catalog.write();
+
+        // This way we ensure that heap file is loaded into memory.
+        // If we didn't do it and this function is the first function that is called on this heap file
+        // then we get deadlock as heap file uses read-lock to load metadata from catalog.
+        if let Err(e) = self
             .executor
-            .catalog
-            .write()
-            .remove_column(&remove_column.table_name, &remove_column.column_name)
+            .insert_heap_file_with_catalog_lock(&remove_column.table_name, &w_lock)
         {
-            Ok(ca) => ca,
-            Err(e) => return error_factory::runtime_error(format!("failed to remove column: {e}")),
+            return error_factory::runtime_error(format!("failed to insert heap file: {e}"));
         };
 
-        let revert_changes_in_catalog = || {
-            let column_request = NewColumnRequest {
-                name: remove_column.column_name.clone(),
-                ty: column_removed.ty,
+        // Remove column and load new columns metadata setup
+        // If we fail at any point we rollback changes made to the catalog
+        let (column_removed, new_columns) = {
+            let column_removed = match w_lock
+                .remove_column(&remove_column.table_name, &remove_column.column_name)
+            {
+                Ok(cr) => cr,
+                Err(e) => {
+                    return error_factory::runtime_error(format!("failed to remove column: {e}"));
+                }
             };
 
-            if let Err(e) = self
-                .executor
-                .catalog
-                .write()
-                .add_column(&remove_column.table_name, column_request)
-            {
-                // Failed to revert changes - DB state is invalid (TODO: maybe we can do something better here)
-                return Some(error_factory::runtime_error(format!(
-                    "removed column from catalog, but didn't migrate records in heap file - DB content is out of sync (failed to revert column removal: {e})",
-                )));
-            }
-            None
-        };
-
-        // Load new columns list
-        let table = match self
-            .executor
-            .catalog
-            .read()
-            .table(&remove_column.table_name)
-        {
-            Ok(t) => t,
-            Err(e) => {
-                // Try to revert changes made in catalog
-                if let Some(revert_err) = revert_changes_in_catalog() {
-                    return revert_err;
+            let table = match w_lock.table(&remove_column.table_name) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = w_lock.rollback_staged();
+                    return error_factory::runtime_error(format!("failed to read table: {e}"));
                 }
-                return error_factory::runtime_error(format!("failed to read table: {e}"));
-            }
+            };
+            let new_columns: Vec<_> = table.columns().collect();
+            (column_removed, new_columns)
         };
-        let new_columns: Vec<_> = table.columns().collect();
 
-        // Try to migrate records in heap file
+        // Migrate data in heap file, once again if we fail we rollback the changes made to catalog
         if let Err(e) = self.remove_field_from_records(
             &remove_column.table_name,
             column_removed.pos,
             column_removed.prev_column_base_offset,
             new_columns,
         ) {
-            // Try to revert changes made in catalog
-            if let Some(revert_err) = revert_changes_in_catalog() {
-                return revert_err;
-            }
-
+            let _ = w_lock.rollback_staged();
             return error_factory::runtime_error(format!(
                 "couldn't migrate records in heap file: {e}"
             ));
-        };
+        }
+
+        if let Err(e) = w_lock.commit_staged() {
+            // Here we don't rollback, because we already have tmp file - it will be loaded when reloading database.
+            warn!("heap migrated but failed to commit catalog: {e}");
+        }
 
         StatementResult::OperationSuccessful {
             rows_affected: 0,

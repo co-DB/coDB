@@ -345,6 +345,7 @@ dependencies = [
  "dashmap",
  "engine",
  "itertools",
+ "log",
  "metadata",
  "parking_lot",
  "planner",

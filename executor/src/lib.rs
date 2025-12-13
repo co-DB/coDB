@@ -132,6 +132,34 @@ impl Executor {
         })?;
         Ok(heap_file)
     }
+
+    /// Similar to [`Executor::open_heap_file`], but uses catalog passed in arguments + inserts heap file to dashmap.
+    ///
+    /// This way we can open heap file while holding write lock to catalog
+    /// (this is used in alter column statements).
+    fn insert_heap_file_with_catalog_lock(
+        &self,
+        table_name: impl Into<String> + Clone + AsRef<str>,
+        catalog_lock: &Catalog,
+    ) -> Result<(), InternalExecutorError> {
+        let file_key = FileKey::data(table_name.clone());
+        let cache = self.cache.clone();
+        let columns_metadata = catalog_lock
+            .table(table_name.as_ref())
+            .map_err(|_| InternalExecutorError::TableDoesNotExist {
+                table_name: table_name.clone().into(),
+            })?
+            .columns()
+            .collect();
+        let heap_file_factory = HeapFileFactory::new(file_key, cache, columns_metadata);
+        let heap_file = heap_file_factory.create_heap_file().map_err(|err| {
+            InternalExecutorError::CannotCreateHeapFile {
+                reason: err.to_string(),
+            }
+        })?;
+        self.heap_files.insert(table_name.into(), heap_file);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ pub(crate) struct MetadataFileHelper;
 impl MetadataFileHelper {
     /// Removes all temporary files from the file system.
     /// Can fail if io error occurs.
-    fn remove_tmp_files<Err>(tmp_files: &mut Vec<PathBuf>) -> Result<(), Err>
+    pub(crate) fn remove_tmp_files<Err>(tmp_files: &mut Vec<PathBuf>) -> Result<(), Err>
     where
         Err: From<io::Error>,
     {
@@ -138,6 +138,52 @@ impl MetadataFileHelper {
         Ok(catalog_json)
     }
 
+    /// Writes data to a tmp file next to `file_path` but does not rename it.
+    /// Returns the tmp path.
+    pub(crate) fn write_tmp<T, TErr>(
+        file_path: impl AsRef<Path>,
+        data: &T,
+        serialize_fn: impl Fn(&T) -> Result<String, TErr>,
+    ) -> Result<PathBuf, TErr>
+    where
+        TErr: From<io::Error>,
+    {
+        let content = serialize_fn(data)?;
+        let epoch = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let tmp_path = file_path.as_ref().with_file_name(format!(
+            "{}.tmp-{}",
+            file_path.as_ref().file_name().unwrap().to_string_lossy(),
+            epoch
+        ));
+
+        let mut tmp_file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+
+        tmp_file.write_all(content.as_bytes())?;
+        tmp_file.sync_all()?;
+
+        Ok(tmp_path)
+    }
+
+    /// Atomically replaces `file_path` with `tmp_path`.
+    pub(crate) fn commit_tmp<TErr>(
+        tmp_path: impl AsRef<Path>,
+        file_path: impl AsRef<Path>,
+    ) -> Result<(), TErr>
+    where
+        TErr: From<io::Error>,
+    {
+        fs::rename(tmp_path, file_path)?;
+        Ok(())
+    }
+
     /// Safely writes metadata to disk using a temporary file for atomic writes.
     ///
     /// This ensures atomic writes: the content is first written to a temporary file,
@@ -162,33 +208,8 @@ impl MetadataFileHelper {
     where
         TErr: From<io::Error>,
     {
-        let content = serialize_fn(data)?;
-
-        // We can unwrap here, because we know `UNIX_EPOCH` was before `SystemTime::now`
-        let epoch = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        let tmp_path = file_path.as_ref().with_file_name(format!(
-            "{}.tmp-{}",
-            file_path.as_ref().file_name().unwrap().to_string_lossy(),
-            epoch
-        ));
-
-        // We firstly store content in temporary file, only when all content is successfully saved to file
-        // we swap it with previous file content.
-        let mut tmp_file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-
-        tmp_file.write_all(content.as_bytes())?;
-        tmp_file.sync_all()?;
-
-        fs::rename(&tmp_path, file_path.as_ref())?;
-
+        let tmp_path = Self::write_tmp(&file_path, data, serialize_fn)?;
+        Self::commit_tmp(&tmp_path, &file_path)?;
         Ok(())
     }
 
