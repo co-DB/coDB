@@ -1,6 +1,5 @@
-﻿use std::ops::Deref;
-
-use metadata::catalog::ColumnMetadata;
+﻿use metadata::catalog::ColumnMetadata;
+use std::ops::Deref;
 use thiserror::Error;
 use types::{data::Value, schema::Type, serialization::DbSerializationError};
 
@@ -59,7 +58,6 @@ impl Record {
     /// Fields are serialized in order using little-endian byte ordering.
     /// Variable-length fields (like strings) are prefixed with their length.
     pub fn serialize(self) -> Vec<u8> {
-        // TODO: Figure out where and when to return serialized record size for slotted page header and deserialization
         let mut bytes = vec![];
         for field in self.fields {
             field.serialize(&mut bytes);
@@ -92,18 +90,18 @@ pub struct Field(Value);
 
 impl Field {
     /// Serializes this field into the provided buffer.
-    pub(crate) fn serialize(self, buffer: &mut Vec<u8>) {
+    pub fn serialize(self, buffer: &mut Vec<u8>) {
         self.0.serialize(buffer);
     }
 
     /// Deserializes a field from bytes using the provided type.
     ///
     /// Returns both the deserialized field and the remaining unconsumed bytes.
-    pub(crate) fn deserialize<'a>(
-        buffer: &'a [u8],
+    pub(crate) fn deserialize(
+        buffer: &[u8],
         column_type: Type,
         column_name: impl Into<String>,
-    ) -> Result<(Self, &'a [u8]), RecordError> {
+    ) -> Result<(Self, &[u8]), RecordError> {
         let (value, rest) = Value::deserialize(buffer, column_type)
             .map_err(|err| RecordError::map_serialization_error(err, column_name))?;
         Ok((value.into(), rest))

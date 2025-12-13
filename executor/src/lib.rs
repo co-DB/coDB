@@ -26,14 +26,6 @@ use storage::{
 };
 use thiserror::Error;
 
-use crate::{
-    consts::HEAP_FILE_BUCKET_SIZE,
-    error_factory::InternalExecutorError,
-    iterators::{ParseErrorIter, QueryResultIter, StatementIter},
-    response::StatementResult,
-    statement_executor::StatementExecutor,
-};
-
 pub struct Executor {
     heap_files: DashMap<String, HeapFile<HEAP_FILE_BUCKET_SIZE>>,
     b_trees: DashMap<String, BTree>,
@@ -87,7 +79,8 @@ impl Executor {
         table_name: impl Into<String> + Clone + AsRef<str>,
         f: impl FnOnce(&HeapFile<HEAP_FILE_BUCKET_SIZE>) -> R,
     ) -> Result<R, InternalExecutorError> {
-        let entry = self.heap_files
+        let entry = self
+            .heap_files
             .entry(table_name.clone().into())
             .or_try_insert_with(|| self.open_heap_file(table_name.clone()))?;
 
@@ -187,7 +180,7 @@ impl Executor {
         &self,
         table_name: impl Into<String> + Clone + AsRef<str>,
     ) -> Result<BTree, InternalExecutorError> {
-        let file_key = FileKey::data(table_name.clone());
+        let file_key = FileKey::index(table_name.clone());
         let cache = self.cache.clone();
         let b_tree_factory = BTreeFactory::new(file_key, cache);
         let b_tree = b_tree_factory.create_btree().map_err(|err| {
@@ -1240,6 +1233,42 @@ mod tests {
         assert_eq!(*row.fields[0].deref(), Value::Int32(1));
         assert!(matches!(&row.fields[1].deref(), Value::String(s) if s == "Alice"));
         assert_eq!(*row.fields[2].deref(), Value::Int32(25));
+    }
+
+    #[test]
+    fn test_execute_insert_twice_with_the_same_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        let (create_plan, create_ast) = create_single_statement(
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+            &executor,
+        );
+        executor.execute_statement(&create_plan, &create_ast);
+
+        // Insert first row
+        let (insert_plan, insert_ast) = create_single_statement(
+            "INSERT INTO users (age, name, id) VALUES (25, 'Alice', 1);",
+            &executor,
+        );
+        let insert_result = executor.execute_statement(&insert_plan, &insert_ast);
+        assert_operation_successful(insert_result, 1, StatementType::Insert);
+
+        // Insert second row with the same primary key
+        let (insert_plan, insert_ast) = create_single_statement(
+            "INSERT INTO users (age, name, id) VALUES (41, 'Sigma', 1);",
+            &executor,
+        );
+        let insert_result = executor.execute_statement(&insert_plan, &insert_ast);
+        match insert_result {
+            StatementResult::RuntimeError { error } => {
+                assert!(error.contains("tried to insert a duplicate key"));
+            }
+            other_result => panic!(
+                "Expected error due to duplicate primary key and instead got {:?}",
+                other_result
+            ),
+        }
     }
 
     #[test]

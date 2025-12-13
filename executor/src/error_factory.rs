@@ -1,5 +1,6 @@
 //! error_factory - provides helpers for creating errors across `executor` crate.
 
+use engine::b_tree::BTreeError;
 use engine::heap_file::HeapFileError;
 use thiserror::Error;
 use types::{data::Value, schema::Type};
@@ -11,12 +12,18 @@ use crate::StatementResult;
 pub(crate) enum InternalExecutorError {
     #[error("Table '{table_name}' does not exist.")]
     TableDoesNotExist { table_name: String },
+    #[error("Primary key doesn't exist in table '{table_name}'.")]
+    PrimaryKeyDoesNotExist { table_name: String },
+    #[error("Invalid record provided")]
+    InvalidRecord,
     #[error("Cannot create heap file: {reason}")]
     CannotCreateHeapFile { reason: String },
     #[error("Cannot create b-tree: {reason}")]
     CannotCreateBTree { reason: String },
     #[error("{0}")]
     HeapFileError(#[from] HeapFileError),
+    #[error("{0}")]
+    BTreeError(#[from] BTreeError),
     #[error("Used invalid operation ({operation}) for data source")]
     InvalidOperationInDataSource { operation: String },
     #[error("Received unexpected node type ({node_type}) while processing expression")]

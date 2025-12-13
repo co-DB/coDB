@@ -271,7 +271,7 @@ impl BTree {
     /// their child, that we descend into, has enough space to fit another key. That's because
     /// we know that the child can't become full and won't need to be split. If we reach the leaf
     /// and the node is still full we start the recursive split operation.
-    pub(crate) fn insert(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
+    pub fn insert(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
         let optimistic_result = self.insert_optimistic(key, &record_pointer)?;
         match optimistic_result {
             OptimisticOperationResult::Success => Ok(()),
