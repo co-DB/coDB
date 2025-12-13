@@ -1,19 +1,21 @@
-﻿use std::array::TryFromSliceError;
+﻿use crate::data::{DbDate, DbDateTime};
+use std::array::TryFromSliceError;
 use std::string::FromUtf8Error;
 use thiserror::Error;
-use types::data::{DbDate, DbDateTime};
 
 #[derive(Error, Debug)]
-enum DecodeError {
+pub enum DecodeError {
     #[error("invalid length of the bytes: expected {expected}, got {got}")]
     InvalidLength { expected: usize, got: usize },
     #[error("bytes don't contain valid utf-8 string: {0}")]
     InvalidUtf8(#[from] FromUtf8Error),
     #[error("error occurred with slice conversion: {0}")]
     SliceConversion(#[from] TryFromSliceError),
+    #[error("unsupported type: {ty}")]
+    UnsupportedType { ty: String },
 }
 
-trait SortableSerialize: Sized {
+pub trait SortableSerialize: Sized {
     fn encode_key(self) -> Vec<u8>;
     fn decode_key(bytes: &[u8]) -> Result<Self, DecodeError>;
 }
@@ -23,11 +25,9 @@ const NEGATION_BIT_I32: u32 = 1 << 31;
 /// Converts i32 to u32, such that the negative values of i32 are smaller than the positives, and
 /// thus keeping the same order.
 fn convert_i32_to_sortable_u32(value: i32) -> u32 {
-    const NEGATION_BIT: u32 = 1 << 31;
-
     // Casting i32 as u32 makes the negative values of i32 be bigger than the positives so we
     // must flip the most significant bit (the one responsible for a number being plus or minus in i32).
-    (value as u32) ^ NEGATION_BIT
+    (value as u32) ^ NEGATION_BIT_I32
 }
 
 /// Converts a sortable u32 back into the original u32.
@@ -41,11 +41,9 @@ const NEGATION_BIT_I64: u64 = 1 << 63;
 /// Converts i64 to u64, such that the negative values of i64 are smaller than the positives, and
 /// thus keeping the same order.
 fn convert_i64_to_sortable_u64(value: i64) -> u64 {
-    const NEGATION_BIT: u64 = 1 << 63;
-
     // Same idea as with i32: cast to u64, then flip the sign bit to make negative values come
     // before positives.
-    (value as u64) ^ NEGATION_BIT
+    (value as u64) ^ NEGATION_BIT_I64
 }
 
 /// Converts a sortable u64 back into the original i64.

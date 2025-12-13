@@ -1,6 +1,8 @@
-﻿use metadata::catalog::ColumnMetadata;
-use std::ops::Deref;
+﻿use std::ops::Deref;
+
+use metadata::catalog::ColumnMetadata;
 use thiserror::Error;
+use types::lexicographic_serialization::DecodeError;
 use types::{data::Value, schema::Type, serialization::DbSerializationError};
 
 /// Error for record related operations
@@ -105,6 +107,25 @@ impl Field {
         let (value, rest) = Value::deserialize(buffer, column_type)
             .map_err(|err| RecordError::map_serialization_error(err, column_name))?;
         Ok((value.into(), rest))
+    }
+
+    /// Encodes this field's value into a byte vector suitable for use as a key.
+    pub fn encode_key(self) -> Vec<u8> {
+        self.0.encode_key()
+    }
+
+    /// Decodes a field from bytes using the provided type.
+    pub fn decode_key(
+        bytes: &[u8],
+        column_type: Type,
+        column_name: impl Into<String>,
+    ) -> Result<Self, RecordError> {
+        let value = Value::decode_key(bytes, column_type).map_err(|_| {
+            RecordError::FailedToDeserialize {
+                field_name: column_name.into(),
+            }
+        })?;
+        Ok(value.into())
     }
 }
 

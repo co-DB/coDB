@@ -278,8 +278,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         let record = self.build_record(&insert.columns, &insert.values)?;
 
         let primary_key_field = self.get_primary_key_field(&insert.table_name, &record)?;
-        let mut key_bytes = Vec::new();
-        primary_key_field.serialize(&mut key_bytes);
+        let key_bytes = primary_key_field.encode_key();
 
         let ptr = self.executor.with_heap_file(&insert.table_name, |hf| {
             let ptr = hf.insert(record)?;

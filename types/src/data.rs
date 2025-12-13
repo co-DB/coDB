@@ -1,5 +1,6 @@
 use time::{Date, Duration, PrimitiveDateTime, Time};
 
+use crate::lexicographic_serialization::{DecodeError, SortableSerialize};
 use crate::{
     schema::Type,
     serialization::{DbSerializable, DbSerializationError},
@@ -14,7 +15,7 @@ const EPOCH_DATE: Date = match Date::from_ordinal_date(1970, 1) {
 /// Wrapper struct for internal representation of the Date type (days since epoch).
 ///
 /// Exposes functions for extracting parts of the date (year,month,day) for convenience
-#[derive(Debug, PartialEq, Ord, PartialOrd, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Ord, PartialOrd, Eq, Copy, Clone, Default)]
 pub struct DbDate {
     days_since_epoch: i32,
 }
@@ -58,19 +59,11 @@ impl From<DbDate> for Date {
     }
 }
 
-impl Default for DbDate {
-    fn default() -> Self {
-        Self {
-            days_since_epoch: 0,
-        }
-    }
-}
-
 /// Wrapper struct for internal representation of the DateTime type (days since epoch + seconds since
 /// midnight). Uses the [`DbDate`] struct for representing the day part for easy access to y/m/d methods.
 ///
 /// Exposes functions for extracting parts of the date (year,month,day) and time (hours,minutes,seconds)
-#[derive(Debug, PartialEq, Ord, PartialOrd, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Ord, PartialOrd, Eq, Clone, Copy, Default)]
 pub struct DbDateTime {
     date: DbDate,
     milliseconds_since_midnight: u32,
@@ -157,15 +150,6 @@ impl From<DbDateTime> for PrimitiveDateTime {
             Time::from_hms_milli(hours as u8, minutes as u8, seconds as u8, millis as u16).unwrap();
 
         PrimitiveDateTime::new(base_date, base_time)
-    }
-}
-
-impl Default for DbDateTime {
-    fn default() -> Self {
-        Self {
-            date: DbDate::default(),
-            milliseconds_since_midnight: 0,
-        }
     }
 }
 
@@ -256,10 +240,10 @@ impl Value {
     /// Deserializes a value from bytes using the provided type.
     ///
     /// Returns both the deserialized value and the remaining unconsumed bytes.
-    pub fn deserialize<'a>(
-        buffer: &'a [u8],
+    pub fn deserialize(
+        buffer: &[u8],
         column_type: Type,
-    ) -> Result<(Self, &'a [u8]), DbSerializationError> {
+    ) -> Result<(Self, &[u8]), DbSerializationError> {
         match column_type {
             Type::Bool => Self::deserialize_and_wrap(buffer, Value::Bool),
             Type::I32 => Self::deserialize_and_wrap(buffer, Value::Int32),
@@ -273,15 +257,39 @@ impl Value {
     }
 
     /// Deserializes raw data type, wraps it into the corresponding value.
-    fn deserialize_and_wrap<'a, T, F>(
-        buffer: &'a [u8],
+    fn deserialize_and_wrap<T, F>(
+        buffer: &[u8],
         constructor: F,
-    ) -> Result<(Value, &'a [u8]), DbSerializationError>
+    ) -> Result<(Value, &[u8]), DbSerializationError>
     where
         T: DbSerializable,
         F: FnOnce(T) -> Value,
     {
         T::deserialize(buffer).map(|(val, rest)| (constructor(val), rest))
+    }
+
+    /// Encodes this value as a key for use in indexes.
+    pub fn encode_key(self) -> Vec<u8> {
+        match self {
+            Value::Int32(i) => i.encode_key(),
+            Value::Int64(i) => i.encode_key(),
+            Value::DateTime(dt) => dt.encode_key(),
+            Value::Date(d) => d.encode_key(),
+            Value::String(s) => s.encode_key(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Decodes a value from a key buffer using the provided type.
+    pub fn decode_key(buffer: &[u8], column_type: Type) -> Result<Self, DecodeError> {
+        match column_type {
+            Type::I32 => i32::decode_key(buffer).map(Value::Int32),
+            Type::I64 => i64::decode_key(buffer).map(Value::Int64),
+            Type::Date => DbDate::decode_key(buffer).map(Value::Date),
+            Type::DateTime => DbDateTime::decode_key(buffer).map(Value::DateTime),
+            Type::String => String::decode_key(buffer).map(Value::String),
+            ty => Err(DecodeError::UnsupportedType { ty: ty.to_string() }),
+        }
     }
 
     pub fn as_i32(&self) -> Option<i32> {
