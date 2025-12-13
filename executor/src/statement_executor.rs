@@ -5,11 +5,12 @@ use engine::{
     record::{Field, Record},
 };
 use itertools::Itertools;
-use metadata::catalog::{NewColumnDto, TableMetadataFactory};
+use log::warn;
+use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
 use planner::{
     query_plan::{
-        CreateTable, Filter, Insert, Limit, Projection, Skip, Sort, SortOrder, StatementPlan,
-        StatementPlanItem, TableScan,
+        AddColumn, CreateTable, Filter, Insert, Limit, Projection, RemoveColumn, Skip, Sort,
+        SortOrder, StatementPlan, StatementPlanItem, TableScan,
     },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
@@ -89,6 +90,8 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         match item {
             StatementPlanItem::Insert(insert) => self.insert(insert),
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
+            StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
+            StatementPlanItem::RemoveColumn(remove_column) => self.remove_column(remove_column),
             _ => error_factory::runtime_error(format!(
                 "Invalid root operation ({:?}) for mutation statement",
                 item
@@ -311,15 +314,15 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         Ok(record)
     }
 
-    /// Handler for [`CreateTable`] table statement.
+    /// Handler for [`CreateTable`] statement.
     fn create_table(&self, create_table: &CreateTable) -> StatementResult {
-        let new_column_dtos = self.map_to_new_columns_dto(
+        let new_columns = self.map_to_new_columns_request(
             iter::once(&create_table.primary_key_column).chain(create_table.columns.iter()),
         );
 
         let tm_factory = TableMetadataFactory::new(
             &create_table.name,
-            new_column_dtos,
+            new_columns,
             &create_table.primary_key_column.name,
         );
         let table_metadata = match tm_factory.create_table_metadata() {
@@ -340,16 +343,175 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         }
     }
 
-    fn map_to_new_columns_dto(
+    fn map_to_new_columns_request(
         &self,
         columns: impl Iterator<Item = &'q ResolvedCreateColumnDescriptor>,
-    ) -> Vec<NewColumnDto> {
+    ) -> Vec<NewColumnRequest> {
         columns
-            .map(|c| NewColumnDto {
+            .map(|c| NewColumnRequest {
                 name: c.name.clone(),
                 ty: c.ty,
             })
             .collect()
+    }
+
+    /// Handler for [`AddColumn`] statement.
+    fn add_column(&self, add_column: &AddColumn) -> StatementResult {
+        let column_request = NewColumnRequest {
+            name: add_column.column_name.clone(),
+            ty: add_column.column_ty,
+        };
+
+        // We obtain the write-lock to be sure that no other thread can modify catalog when we do our changes
+        let mut w_lock = self.executor.catalog.write();
+
+        // This way we ensure that heap file is loaded into memory.
+        // If we didn't do it and this function is the first function that is called on this heap file
+        // then we get deadlock as heap file uses read-lock to load metadata from catalog.
+        if let Err(e) = self
+            .executor
+            .insert_heap_file_with_catalog_lock(&add_column.table_name, &w_lock)
+        {
+            return error_factory::runtime_error(format!("failed to insert heap file: {e}"));
+        };
+
+        // Add column and load new columns metadata setup
+        // If we fail at any point we rollback changes made to the catalog
+        let (column_added, new_columns) = {
+            let column_added = match w_lock.add_column(&add_column.table_name, column_request) {
+                Ok(ca) => ca,
+                Err(e) => {
+                    return error_factory::runtime_error(format!("failed to add column: {e}"));
+                }
+            };
+
+            let table = match w_lock.table(&add_column.table_name) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = w_lock.rollback_staged();
+                    return error_factory::runtime_error(format!("failed to read table: {e}"));
+                }
+            };
+            let new_columns: Vec<_> = table.columns().collect();
+            (column_added, new_columns)
+        };
+
+        // Migrate data in heap file, once again if we fail we rollback the changes made to catalog
+        if let Err(e) = self.add_new_field_to_records(
+            &add_column.table_name,
+            column_added.pos,
+            column_added.base_offset,
+            Value::default_for_ty(&column_added.ty),
+            new_columns,
+        ) {
+            let _ = w_lock.rollback_staged();
+            return error_factory::runtime_error(format!(
+                "couldn't migrate records in heap file: {e}"
+            ));
+        }
+
+        if let Err(e) = w_lock.commit_staged() {
+            // Here we don't rollback, because we already have tmp file - it will be loaded when reloading database.
+            warn!("heap migrated but failed to commit catalog: {e}");
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Alter,
+        }
+    }
+
+    /// Adds new field to each record in heap file
+    fn add_new_field_to_records(
+        &self,
+        table_name: impl AsRef<str>,
+        position: u16,
+        new_column_min_offset: usize,
+        default_value: Value,
+        new_columns: Vec<ColumnMetadata>,
+    ) -> Result<(), InternalExecutorError> {
+        self.executor
+            .with_heap_file_mut(table_name.as_ref(), |hf| {
+                hf.add_column_migration(position, new_column_min_offset, default_value, new_columns)
+            })??;
+        Ok(())
+    }
+
+    /// Handler for [`RemoveColumn`] statement.
+    fn remove_column(&self, remove_column: &RemoveColumn) -> StatementResult {
+        // We obtain the write-lock to be sure that no other thread can modify catalog when we do our changes
+        let mut w_lock = self.executor.catalog.write();
+
+        // This way we ensure that heap file is loaded into memory.
+        // If we didn't do it and this function is the first function that is called on this heap file
+        // then we get deadlock as heap file uses read-lock to load metadata from catalog.
+        if let Err(e) = self
+            .executor
+            .insert_heap_file_with_catalog_lock(&remove_column.table_name, &w_lock)
+        {
+            return error_factory::runtime_error(format!("failed to insert heap file: {e}"));
+        };
+
+        // Remove column and load new columns metadata setup
+        // If we fail at any point we rollback changes made to the catalog
+        let (column_removed, new_columns) = {
+            let column_removed = match w_lock
+                .remove_column(&remove_column.table_name, &remove_column.column_name)
+            {
+                Ok(cr) => cr,
+                Err(e) => {
+                    return error_factory::runtime_error(format!("failed to remove column: {e}"));
+                }
+            };
+
+            let table = match w_lock.table(&remove_column.table_name) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = w_lock.rollback_staged();
+                    return error_factory::runtime_error(format!("failed to read table: {e}"));
+                }
+            };
+            let new_columns: Vec<_> = table.columns().collect();
+            (column_removed, new_columns)
+        };
+
+        // Migrate data in heap file, once again if we fail we rollback the changes made to catalog
+        if let Err(e) = self.remove_field_from_records(
+            &remove_column.table_name,
+            column_removed.pos,
+            column_removed.prev_column_base_offset,
+            new_columns,
+        ) {
+            let _ = w_lock.rollback_staged();
+            return error_factory::runtime_error(format!(
+                "couldn't migrate records in heap file: {e}"
+            ));
+        }
+
+        if let Err(e) = w_lock.commit_staged() {
+            // Here we don't rollback, because we already have tmp file - it will be loaded when reloading database.
+            warn!("heap migrated but failed to commit catalog: {e}");
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Alter,
+        }
+    }
+
+    /// Removes field from each record in heap file
+    fn remove_field_from_records(
+        &self,
+        table_name: impl AsRef<str>,
+        position: u16,
+        prev_column_min_offset: usize,
+        new_columns: Vec<ColumnMetadata>,
+    ) -> Result<(), InternalExecutorError> {
+        self.executor
+            .with_heap_file_mut(table_name.as_ref(), |hf| {
+                hf.remove_column_migration(position, prev_column_min_offset, new_columns)
+            })??;
+        Ok(())
     }
 
     /// Creates iterator that maps `expressions` into [`ProjectColumn`]s.

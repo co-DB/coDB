@@ -22,7 +22,9 @@ use types::schema::{self, Type};
 /// is small enough that [`Catalog`] can be used as an in-memory data structure.
 #[derive(Debug)]
 pub struct Catalog {
-    /// Path to underlying file
+    /// Path to database directory (where catalog file and tmp files are located)
+    dir_path: PathBuf,
+    /// Path to underlying catalog file
     file_path: PathBuf,
     /// Maps each table name to its metadata. Stores all tables from database.
     tables: HashMap<String, TableMetadata>,
@@ -55,23 +57,17 @@ impl Catalog {
     where
         P: AsRef<Path>,
     {
-        let catalog_json = MetadataFileHelper::latest_catalog_json(
-            &main_dir_path.as_ref().join(database_name.as_ref()),
-            |path| CatalogJson::read_from_file(path),
-        )?;
-        let tables = catalog_json
-            .tables
-            .into_iter()
-            .map(|t| {
-                let name = t.name.clone();
-                TableMetadata::try_from(t).map(|tm| (name, tm))
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
-        let file_path = main_dir_path
-            .as_ref()
-            .join(database_name.as_ref())
-            .join(METADATA_FILE_NAME);
-        Ok(Catalog { file_path, tables })
+        let db_dir = main_dir_path.as_ref().join(database_name.as_ref());
+        let catalog_json = MetadataFileHelper::latest_catalog_json(&db_dir, |path| {
+            CatalogJson::read_from_file(path)
+        })?;
+        let tables = catalog_json.to_tables()?;
+        let file_path = db_dir.join(METADATA_FILE_NAME);
+        Ok(Catalog {
+            dir_path: db_dir,
+            file_path,
+            tables,
+        })
     }
 
     /// Returns table with `table_name` name.
@@ -124,15 +120,17 @@ impl Catalog {
     /// It works by delegating this to [`TableMetadata::add_column`].
     ///
     /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
-    /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
+    ///
+    /// Changes made by this function are flushed to disk, but only to tmp file.
+    /// To make sure that this is persisted to main file [`Catalog::commit_staged`] must be called.
     pub fn add_column(
         &mut self,
         table_name: impl AsRef<str>,
-        column_dto: NewColumnDto,
+        column_request: NewColumnRequest,
     ) -> Result<NewColumnAdded, CatalogError> {
         let table: &mut TableMetadata = self.table_mut(table_name.as_ref())?;
-        let new_column = table.add_column(column_dto)?;
-        self.sync_to_disk()?;
+        let new_column = table.add_column(column_request)?;
+        self.stage_to_disk()?;
         Ok(new_column)
     }
 
@@ -140,7 +138,9 @@ impl Catalog {
     /// It works by delegating this to [`TableMetadata::remove_column`].
     ///
     /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
-    /// This way we can ensure that after each change [`Catalog::sync_to_disk`] is called.
+    ///
+    /// Changes made by this function are flushed to disk, but only to tmp file.
+    /// To make sure that this is persisted to main file [`Catalog::commit_staged`] must be called.
     pub fn remove_column(
         &mut self,
         table_name: impl AsRef<str>,
@@ -148,8 +148,43 @@ impl Catalog {
     ) -> Result<ColumnRemoved, CatalogError> {
         let table = self.table_mut(table_name.as_ref())?;
         let cr = table.remove_column(column_name.as_ref())?;
-        self.sync_to_disk()?;
+        self.stage_to_disk()?;
         Ok(cr)
+    }
+
+    /// Commits the most recent tmp file by atomically renaming it to the main file.
+    /// Removes all other tmp files.
+    pub fn commit_staged(&self) -> Result<(), CatalogError> {
+        let tmp_file_prefix = format!("{}.tmp-", METADATA_FILE_NAME);
+        let mut tmp_files = MetadataFileHelper::list_catalog_tmp_files::<CatalogError>(
+            &self.dir_path,
+            &tmp_file_prefix,
+        )?;
+
+        if let Some(latest_tmp) = tmp_files.pop() {
+            MetadataFileHelper::commit_tmp::<CatalogError>(&latest_tmp, &self.file_path)?;
+        }
+
+        MetadataFileHelper::remove_tmp_files::<CatalogError>(&mut tmp_files)?;
+
+        Ok(())
+    }
+
+    /// Rolls back staged changes by removing all tmp files.
+    pub fn rollback_staged(&mut self) -> Result<(), CatalogError> {
+        let tmp_file_prefix = format!("{}.tmp-", METADATA_FILE_NAME);
+
+        let mut tmp_files = MetadataFileHelper::list_catalog_tmp_files::<CatalogError>(
+            &self.dir_path,
+            &tmp_file_prefix,
+        )?;
+
+        MetadataFileHelper::remove_tmp_files::<CatalogError>(&mut tmp_files)?;
+
+        let catalog_json = CatalogJson::read_from_file(&self.file_path)?;
+        self.tables = catalog_json.to_tables()?;
+
+        Ok(())
     }
 
     /// Syncs in-memory [`Catalog`] instance with underlying file.
@@ -157,8 +192,17 @@ impl Catalog {
     fn sync_to_disk(&mut self) -> Result<(), CatalogError> {
         MetadataFileHelper::sync_to_disk(&self.file_path, self, |catalog| {
             let catalog_json = CatalogJson::from(catalog);
-            Ok(serde_json::to_string_pretty(&catalog_json)?)
+            catalog_json.to_pretty_string()
         })
+    }
+
+    /// Writes current in-memory state to a tmp file (does not atomically rename).
+    fn stage_to_disk(&self) -> Result<(), CatalogError> {
+        MetadataFileHelper::write_tmp(&self.file_path, self, |catalog| {
+            let catalog_json = CatalogJson::from(catalog);
+            catalog_json.to_pretty_string()
+        })?;
+        Ok(())
     }
 }
 
@@ -200,6 +244,7 @@ pub enum TableMetadataError {
 #[derive(Debug)]
 pub struct NewColumnAdded {
     pub pos: u16,
+    pub base_offset: usize,
     pub ty: Type,
 }
 
@@ -207,6 +252,7 @@ pub struct NewColumnAdded {
 pub struct ColumnRemoved {
     pub pos: u16,
     pub ty: Type,
+    pub prev_column_base_offset: usize,
 }
 
 impl TableMetadata {
@@ -261,20 +307,26 @@ impl TableMetadata {
     /// Can fail if column with same name already exists.
     fn add_column(
         &mut self,
-        column_dto: NewColumnDto,
+        column_request: NewColumnRequest,
     ) -> Result<NewColumnAdded, TableMetadataError> {
-        let already_exists = self.columns_by_name.contains_key(&column_dto.name);
+        let already_exists = self.columns_by_name.contains_key(&column_request.name);
         if already_exists {
-            Err(TableMetadataError::ColumnAlreadyExists(column_dto.name))
+            Err(TableMetadataError::ColumnAlreadyExists(column_request.name))
         } else {
-            let pos = match column_dto.ty.is_fixed_size() {
-                true => self.add_fixed_size_column(column_dto.name.clone(), column_dto.ty)?,
-                false => self.add_variable_size_column(column_dto.name.clone(), column_dto.ty)?,
+            let pos = match column_request.ty.is_fixed_size() {
+                true => {
+                    self.add_fixed_size_column(column_request.name.clone(), column_request.ty)?
+                }
+                false => {
+                    self.add_variable_size_column(column_request.name.clone(), column_request.ty)?
+                }
             };
-            self.columns_by_name.insert(column_dto.name, pos);
+            self.columns_by_name.insert(column_request.name, pos);
+            let base_offset = self.columns[pos].base_offset();
             Ok(NewColumnAdded {
                 pos: pos as _,
-                ty: column_dto.ty,
+                base_offset,
+                ty: column_request.ty,
             })
         }
     }
@@ -407,9 +459,17 @@ impl TableMetadata {
                     self.recalculate_columns_metadata_from(idx);
                 }
 
+                let pos = cm.pos();
+                let prev_column_base_offset = if pos > 0 {
+                    self.columns[(pos - 1) as usize].base_offset()
+                } else {
+                    0
+                };
+
                 Ok(ColumnRemoved {
-                    pos: cm.pos(),
+                    pos,
                     ty: cm.ty(),
+                    prev_column_base_offset,
                 })
             }
             None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
@@ -422,14 +482,14 @@ impl TableMetadata {
     }
 }
 
-pub struct NewColumnDto {
+pub struct NewColumnRequest {
     pub name: String,
     pub ty: Type,
 }
 
 /// Structure for creating new [`TableMetadata`].
 pub struct TableMetadataFactory {
-    column_dtos: Vec<NewColumnDto>,
+    column_requests: Vec<NewColumnRequest>,
     name: String,
     primary_key_column_name: String,
     columns: Vec<ColumnMetadata>,
@@ -439,13 +499,13 @@ pub struct TableMetadataFactory {
 impl TableMetadataFactory {
     pub fn new(
         name: impl Into<String>,
-        column_dtos: Vec<NewColumnDto>,
+        column_requests: Vec<NewColumnRequest>,
         primary_key_column_name: impl Into<String>,
     ) -> Self {
         TableMetadataFactory {
-            columns: Vec::with_capacity(column_dtos.len()),
-            columns_by_name: HashMap::with_capacity(column_dtos.len()),
-            column_dtos,
+            columns: Vec::with_capacity(column_requests.len()),
+            columns_by_name: HashMap::with_capacity(column_requests.len()),
+            column_requests,
             name: name.into(),
             primary_key_column_name: primary_key_column_name.into(),
         }
@@ -488,15 +548,15 @@ impl TableMetadataFactory {
         Ok(())
     }
 
-    /// Creates [`TableMetadataFactory::columns`] based on [`TableMetadataFactory::column_dtos`]
+    /// Creates [`TableMetadataFactory::columns`] based on [`TableMetadataFactory::column_requests`]
     fn create_columns(&mut self) -> Result<(), TableMetadataError> {
-        self.sort_column_dtos_by_fixed_size();
+        self.sort_column_requests_by_fixed_size();
 
         let mut pos = 0;
         let mut last_fixed_pos = 0;
         let mut base_offset = 0;
 
-        for col in &self.column_dtos {
+        for col in &self.column_requests {
             let column_metadata =
                 ColumnMetadata::new(col.name.clone(), col.ty, pos, base_offset, last_fixed_pos)?;
             self.columns.push(column_metadata);
@@ -510,8 +570,8 @@ impl TableMetadataFactory {
     }
 
     /// Sorts columns by whether they are fixed-size (fixed-size columns are first).
-    fn sort_column_dtos_by_fixed_size<'c>(&mut self) {
-        self.column_dtos.sort_unstable_by(|a, b| {
+    fn sort_column_requests_by_fixed_size<'c>(&mut self) {
+        self.column_requests.sort_unstable_by(|a, b| {
             let a_fixed = a.ty.is_fixed_size();
             let b_fixed = b.ty.is_fixed_size();
             b_fixed.cmp(&a_fixed)
@@ -608,6 +668,11 @@ pub(crate) struct CatalogJson {
 }
 
 impl CatalogJson {
+    /// Serialize to pretty JSON string.
+    pub(crate) fn to_pretty_string(&self) -> Result<String, CatalogError> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+
     pub(crate) fn read_from_file(path: impl AsRef<Path>) -> Result<Self, CatalogError> {
         let content = fs::read_to_string(path)?;
         let catalog_json = serde_json::from_str(&content)?;
@@ -615,9 +680,21 @@ impl CatalogJson {
     }
 
     pub(crate) fn write_to_json(&self, path: impl AsRef<Path>) -> Result<(), CatalogError> {
-        let content = serde_json::to_string(self)?;
+        let content = self.to_pretty_string()?;
         fs::write(path, content)?;
         Ok(())
+    }
+
+    pub(crate) fn to_tables(self) -> Result<HashMap<String, TableMetadata>, CatalogError> {
+        let tables = self
+            .tables
+            .into_iter()
+            .map(|t| {
+                let name = t.name.clone();
+                TableMetadata::try_from(t).map(|tm| (name, tm))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(tables)
     }
 }
 
@@ -912,8 +989,11 @@ mod tests {
     // Helper to create [`Catalog`] that will be used only in-memory
     fn in_memory_catalog(tables: HashMap<String, TableMetadata>) -> Catalog {
         let file = NamedTempFile::new().unwrap();
+        let file_path = file.into_temp_path().to_path_buf();
+        let dir_path = file_path.parent().unwrap().to_path_buf();
         Catalog {
-            file_path: file.into_temp_path().to_path_buf(),
+            dir_path,
+            file_path,
             tables,
         }
     }
@@ -926,7 +1006,9 @@ mod tests {
         let content = serde_json::to_string_pretty(&catalog_json).unwrap();
         fs::write(&path, content).unwrap();
 
+        let dir_path = path.parent().unwrap().to_path_buf();
         Catalog {
+            dir_path,
             file_path: path,
             tables,
         }
@@ -964,9 +1046,8 @@ mod tests {
     }
 
     // Helper to check if no tmp files are in the directory
-    fn assert_no_tmp_files(dir: impl AsRef<Path>, db: &str) {
+    fn assert_no_tmp_files(db_dir: impl AsRef<Path>) {
         let prefix = format!("{}.tmp-", METADATA_FILE_NAME);
-        let db_dir = dir.as_ref().join(db);
         for entry in fs::read_dir(&db_dir).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -1132,7 +1213,7 @@ mod tests {
         // tmp file should be loaded
         assert!(catalog.tables.contains_key("tmp"));
         assert!(!catalog.tables.contains_key("main"));
-        assert_no_tmp_files(setup.path(), setup.db_name());
+        assert_no_tmp_files(setup.path().join(setup.db_name()));
 
         // main file should now contain the newest tmp json
         assert_file_json_eq(setup.db_path(), tmp_json);
@@ -1189,7 +1270,7 @@ mod tests {
         assert!(catalog.tables.contains_key("tmp2"));
         assert!(!catalog.tables.contains_key("main"));
         assert!(!catalog.tables.contains_key("tmp1"));
-        assert_no_tmp_files(setup.path(), setup.db_name());
+        assert_no_tmp_files(setup.path().join(setup.db_name()));
 
         // main file should now contain the newest tmp json
         assert_file_json_eq(setup.db_path(), tmp_json2);
@@ -1234,7 +1315,7 @@ mod tests {
         // valid tmp file should be loaded and renamed
         assert!(catalog.tables.contains_key("valid"));
         assert!(!catalog.tables.contains_key("main"));
-        assert_no_tmp_files(setup.path(), setup.db_name());
+        assert_no_tmp_files(setup.path().join(setup.db_name()));
 
         // main file should now contain the valid tmp json
         assert_file_json_eq(setup.db_path(), tmp_json_valid);
@@ -1265,7 +1346,7 @@ mod tests {
 
         // main file should be loaded
         assert!(catalog.tables.contains_key("main"));
-        assert_no_tmp_files(setup.path(), setup.db_name());
+        assert_no_tmp_files(setup.path().join(setup.db_name()));
 
         // main file should still contain the original json
         assert_file_json_eq(setup.db_path(), main_json);
@@ -1433,6 +1514,287 @@ mod tests {
         });
     }
 
+    #[test]
+    fn catalog_add_column_stages_to_tmp_file() {
+        // given catalog with table "users"
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+
+        // when adding a column
+        let result = fixture.catalog_mut().add_column(
+            "users",
+            NewColumnRequest {
+                name: "email".to_string(),
+                ty: Type::String,
+            },
+        );
+
+        // then operation succeeds and tmp file is created
+        assert!(result.is_ok());
+        let tmp_files = MetadataFileHelper::list_catalog_tmp_files::<CatalogError>(
+            fixture.db_path().parent().unwrap(),
+            &format!("{}.tmp-", METADATA_FILE_NAME),
+        )
+        .unwrap();
+        assert_eq!(tmp_files.len(), 1);
+
+        // main file should still have old content
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 2);
+        });
+    }
+
+    #[test]
+    fn catalog_remove_column_stages_to_tmp_file() {
+        // given catalog with table "users" with 3 columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
+            dummy_column("email", Type::String, 2),
+        ];
+        let table = dummy_table("users", columns, "id");
+        let mut fixture = CatalogTestFixture::with_table(table);
+
+        // when removing a column
+        let result = fixture.catalog_mut().remove_column("users", "email");
+
+        // then operation succeeds and tmp file is created
+        assert!(result.is_ok());
+        let tmp_files = MetadataFileHelper::list_catalog_tmp_files::<CatalogError>(
+            fixture.db_path().parent().unwrap(),
+            &format!("{}.tmp-", METADATA_FILE_NAME),
+        )
+        .unwrap();
+        assert_eq!(tmp_files.len(), 1);
+
+        // main file should still have old content
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 3);
+        });
+    }
+
+    #[test]
+    fn catalog_commit_staged_commits_latest_tmp_file() {
+        // given catalog with staged changes (tmp file exists)
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+        fixture
+            .catalog_mut()
+            .add_column(
+                "users",
+                NewColumnRequest {
+                    name: "email".to_string(),
+                    ty: Type::String,
+                },
+            )
+            .unwrap();
+
+        // when committing staged changes
+        let result = fixture.catalog().commit_staged();
+
+        // then commit succeeds
+        assert!(result.is_ok());
+
+        // main file now contains new column
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 3);
+            assert_eq!(tables[0].columns[2].name, "email");
+        });
+
+        // tmp files are removed
+        assert_no_tmp_files(fixture.db_path().parent().unwrap());
+    }
+
+    #[test]
+    fn catalog_commit_staged_commits_latest_of_multiple_tmp_files() {
+        // given catalog with multiple staged changes
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+
+        fixture
+            .catalog_mut()
+            .add_column(
+                "users",
+                NewColumnRequest {
+                    name: "email".to_string(),
+                    ty: Type::String,
+                },
+            )
+            .unwrap();
+
+        // Add another column creating second tmp file
+        fixture
+            .catalog_mut()
+            .add_column(
+                "users",
+                NewColumnRequest {
+                    name: "age".to_string(),
+                    ty: Type::I32,
+                },
+            )
+            .unwrap();
+
+        // when committing staged changes
+        let result = fixture.catalog().commit_staged();
+
+        // then commit succeeds
+        assert!(result.is_ok());
+
+        // main file now contains both new columns
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 4);
+            assert!(tables[0].columns.iter().any(|c| c.name == "email"));
+            assert!(tables[0].columns.iter().any(|c| c.name == "age"));
+        });
+
+        // all tmp files are removed
+        assert_no_tmp_files(fixture.db_path().parent().unwrap());
+    }
+
+    #[test]
+    fn catalog_commit_staged_does_nothing_when_no_tmp_files() {
+        // given catalog without any staged changes
+        let fixture = CatalogTestFixture::with_table(users_table());
+
+        // when committing
+        let result = fixture.catalog().commit_staged();
+
+        // then commit succeeds (noop)
+        assert!(result.is_ok());
+
+        // main file unchanged
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 2);
+        });
+    }
+
+    #[test]
+    fn catalog_rollback_staged_removes_tmp_files_and_reverts_memory() {
+        // given catalog with staged changes
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+
+        fixture
+            .catalog_mut()
+            .add_column(
+                "users",
+                NewColumnRequest {
+                    name: "email".to_string(),
+                    ty: Type::String,
+                },
+            )
+            .unwrap();
+
+        // verify column exists in memory
+        assert!(
+            fixture
+                .catalog()
+                .table("users")
+                .unwrap()
+                .column("email")
+                .is_ok()
+        );
+
+        // when rolling back staged changes
+        let result = fixture.catalog_mut().rollback_staged();
+
+        // then rollback succeeds
+        assert!(result.is_ok());
+
+        // tmp files are removed
+        assert_no_tmp_files(fixture.db_path().parent().unwrap());
+
+        // in-memory state is reverted (email column no longer exists)
+        let table = fixture.catalog().table("users").unwrap();
+        assert!(table.column("email").is_err());
+        assert_eq!(table.columns().count(), 2);
+
+        // main file unchanged
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 2);
+        });
+    }
+
+    #[test]
+    fn catalog_rollback_staged_removes_multiple_tmp_files() {
+        // given catalog with multiple staged changes
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+
+        fixture
+            .catalog_mut()
+            .add_column(
+                "users",
+                NewColumnRequest {
+                    name: "email".to_string(),
+                    ty: Type::String,
+                },
+            )
+            .unwrap();
+
+        fixture
+            .catalog_mut()
+            .add_column(
+                "users",
+                NewColumnRequest {
+                    name: "age".to_string(),
+                    ty: Type::I32,
+                },
+            )
+            .unwrap();
+
+        // when rolling back
+        let result = fixture.catalog_mut().rollback_staged();
+
+        // then rollback succeeds
+        assert!(result.is_ok());
+
+        // all tmp files are removed
+        assert_no_tmp_files(fixture.db_path().parent().unwrap());
+
+        // in-memory state is reverted
+        let table = fixture.catalog().table("users").unwrap();
+        assert!(table.column("email").is_err());
+        assert!(table.column("age").is_err());
+        assert_eq!(table.columns().count(), 2);
+    }
+
+    #[test]
+    fn catalog_rollback_after_remove_column_restores_column() {
+        // given catalog with table containing 3 columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
+            dummy_column("email", Type::String, 2),
+        ];
+        let table = dummy_table("users", columns, "id");
+        let mut fixture = CatalogTestFixture::with_table(table);
+
+        // when removing column and then rolling back
+        fixture
+            .catalog_mut()
+            .remove_column("users", "email")
+            .unwrap();
+
+        // verify column removed in memory
+        assert!(
+            fixture
+                .catalog()
+                .table("users")
+                .unwrap()
+                .column("email")
+                .is_err()
+        );
+
+        let result = fixture.catalog_mut().rollback_staged();
+
+        // then rollback succeeds and column is restored
+        assert!(result.is_ok());
+        let table = fixture.catalog().table("users").unwrap();
+        assert!(table.column("email").is_ok());
+        assert_eq!(table.columns().count(), 3);
+
+        // main file still has all 3 columns
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].columns.len(), 3);
+        });
+    }
+
     // Helper to check if error variant is as expected
     fn assert_table_metadata_error_variant(
         actual: &TableMetadataError,
@@ -1541,7 +1903,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding new fixed-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "score".to_string(),
             ty: Type::F64,
         });
@@ -1551,6 +1913,7 @@ mod tests {
         let added = result.unwrap();
         assert_eq!(added.pos, 2);
         assert_eq!(added.ty, Type::F64);
+        assert_eq!(added.base_offset, 8);
 
         let score_col = table.column("score").unwrap();
         assert_eq!(score_col.pos(), 2);
@@ -1568,7 +1931,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding new fixed-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "age".to_string(),
             ty: Type::I32,
         });
@@ -1578,6 +1941,7 @@ mod tests {
         let added = result.unwrap();
         assert_eq!(added.pos, 1);
         assert_eq!(added.ty, Type::I32);
+        assert_eq!(added.base_offset, 4);
 
         let age_col = table.column("age").unwrap();
         assert_eq!(age_col.pos(), 1);
@@ -1601,7 +1965,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding new variable-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "email".to_string(),
             ty: Type::String,
         });
@@ -1611,6 +1975,7 @@ mod tests {
         let added = result.unwrap();
         assert_eq!(added.pos, 2);
         assert_eq!(added.ty, Type::String);
+        assert_eq!(added.base_offset, 4);
 
         let email_col = table.column("email").unwrap();
         assert_eq!(email_col.pos(), 2);
@@ -1629,7 +1994,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding new fixed-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "age".to_string(),
             ty: Type::I32,
         });
@@ -1658,7 +2023,7 @@ mod tests {
         let mut table = users_table();
 
         // when adding column with duplicate name
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "id".to_string(),
             ty: Type::I32,
         });
@@ -1681,7 +2046,7 @@ mod tests {
         let mut table = TableMetadata::new("users", columns, "id").unwrap();
 
         // when adding first variable-size column
-        let result = table.add_column(NewColumnDto {
+        let result = table.add_column(NewColumnRequest {
             name: "name".to_string(),
             ty: Type::String,
         });
@@ -1713,6 +2078,7 @@ mod tests {
         let removed = result.unwrap();
         assert_eq!(removed.pos, 2);
         assert_eq!(removed.ty, Type::F64);
+        assert_eq!(removed.prev_column_base_offset, size_of::<i32>());
 
         // and column no longer exists
         assert!(table.column("score").is_err());
@@ -1763,6 +2129,7 @@ mod tests {
         let removed = result.unwrap();
         assert_eq!(removed.pos, 2);
         assert_eq!(removed.ty, Type::String);
+        assert_eq!(removed.prev_column_base_offset, size_of::<i32>());
 
         // and column no longer exists
         assert!(table.column("email").is_err());
@@ -1879,6 +2246,7 @@ mod tests {
         let removed = result.unwrap();
         assert_eq!(removed.pos, 0);
         assert_eq!(removed.ty, Type::I32);
+        assert_eq!(removed.prev_column_base_offset, 0);
 
         // id shifts to position 0
         let id_col = table.column("id").unwrap();
@@ -1906,23 +2274,23 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_calculates_correct_offsets() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "score".to_string(),
                 ty: Type::F64,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "surname".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "active".to_string(),
                 ty: Type::Bool,
             },
@@ -1960,19 +2328,19 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_all_fixed_size_types() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "value".to_string(),
                 ty: Type::I64,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "ratio".to_string(),
                 ty: Type::F64,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "active".to_string(),
                 ty: Type::Bool,
             },
@@ -2001,11 +2369,11 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_primary_key_column() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::String,
             },
@@ -2020,15 +2388,15 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_duplicate_column_name() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::I32,
             },
@@ -2047,11 +2415,11 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_unknown_primary_key() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "name".to_string(),
                 ty: Type::String,
             },
@@ -2069,7 +2437,7 @@ mod tests {
 
     #[test]
     fn test_table_metadata_factory_single_column() {
-        let columns = vec![NewColumnDto {
+        let columns = vec![NewColumnRequest {
             name: "id".to_string(),
             ty: Type::I32,
         }];
@@ -2086,19 +2454,19 @@ mod tests {
     #[test]
     fn test_table_metadata_factory_multiple_variable_size_columns() {
         let columns = vec![
-            NewColumnDto {
+            NewColumnRequest {
                 name: "id".to_string(),
                 ty: Type::I32,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "first_name".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "last_name".to_string(),
                 ty: Type::String,
             },
-            NewColumnDto {
+            NewColumnRequest {
                 name: "email".to_string(),
                 ty: Type::String,
             },

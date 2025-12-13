@@ -1,6 +1,7 @@
 use std::{
     array,
     marker::PhantomData,
+    mem,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -468,28 +469,41 @@ impl<'a> FragmentProcessor<'a> {
     }
 }
 
+/// Trait encapsulating logic behind locking pages.
+///
+/// When dealing with record that spans multiple pages (multi-fragment record) pages shouldn't be read by hand,
+/// but instead struct that implements this trait should be used.
+trait PageLockChain<P> {
+    /// Locks the next page
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError>;
+    /// Gets current record page (undefined when only overflow page is held at the time).
+    fn record_page(&self) -> &HeapPage<P, RecordPageHeader>;
+    /// Gets mutable current record page (undefined when only overflow page is held at the time).
+    fn record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader>;
+    /// Gets current overflow page (undefined when only record page is held at the time).
+    fn overflow_page(&self) -> &HeapPage<P, OverflowPageHeader>;
+    /// Gets mutable current overflow page (undefined when only record page is held at the time).
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader>;
+}
+
 /// Helper struct used for locking pages when working with records.
 ///
-/// Locking pages in [`HeapFile`] should work as follows:
+/// Locking pages with this struct works as follows:
 /// - read page
 /// - do an action on the page
 /// - read next page
 /// - drop the previous page
-/// This struct encapsulates this drop-only-after-read strategy.
-///
-/// When dealing with record that spans multiple pages (multi-fragment record) pages shouldn't be read by hand,
-/// but instead this struct should be used.
-struct PageLockChain<'hf, const BUCKETS_COUNT: usize, P> {
+struct SinglePageLockChain<'hf, const BUCKETS_COUNT: usize, P> {
     heap_file: &'hf HeapFile<BUCKETS_COUNT>,
     record_page: Option<HeapPage<P, RecordPageHeader>>,
     overflow_page: Option<HeapPage<P, OverflowPageHeader>>,
 }
 
-impl<'hf, const BUCKETS_COUNT: usize, P> PageLockChain<'hf, BUCKETS_COUNT, P> {
+impl<'hf, const BUCKETS_COUNT: usize, P> SinglePageLockChain<'hf, BUCKETS_COUNT, P> {
     /// Gets current record page.
     ///
     /// Panics if we hold overflow page instead.
-    fn record_page(&self) -> &HeapPage<P, RecordPageHeader> {
+    fn _record_page(&self) -> &HeapPage<P, RecordPageHeader> {
         match &self.record_page {
             Some(record_page) => record_page,
             None => panic!(
@@ -501,7 +515,7 @@ impl<'hf, const BUCKETS_COUNT: usize, P> PageLockChain<'hf, BUCKETS_COUNT, P> {
     /// Gets mutable current record page.
     ///
     /// Panics if we hold overflow page instead.
-    fn record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
+    fn _record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
         match &mut self.record_page {
             Some(record_page) => record_page,
             None => panic!(
@@ -513,7 +527,7 @@ impl<'hf, const BUCKETS_COUNT: usize, P> PageLockChain<'hf, BUCKETS_COUNT, P> {
     /// Gets current overflow page.
     ///
     /// Panics if we hold record page instead.
-    fn overflow_page(&self) -> &HeapPage<P, OverflowPageHeader> {
+    fn _overflow_page(&self) -> &HeapPage<P, OverflowPageHeader> {
         match &self.overflow_page {
             Some(overflow_page) => overflow_page,
             None => panic!(
@@ -525,7 +539,7 @@ impl<'hf, const BUCKETS_COUNT: usize, P> PageLockChain<'hf, BUCKETS_COUNT, P> {
     /// Gets mutable current overflow page.
     ///
     /// Panics if we hold record page instead.
-    fn overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader> {
+    fn _overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader> {
         match &mut self.overflow_page {
             Some(overflow_page) => overflow_page,
             None => panic!(
@@ -535,33 +549,39 @@ impl<'hf, const BUCKETS_COUNT: usize, P> PageLockChain<'hf, BUCKETS_COUNT, P> {
     }
 }
 
-impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<'hf, BUCKETS_COUNT, PinnedReadPage> {
-    /// Creates new [`PageLockChain`] that starts with record page
+impl<'hf, const BUCKETS_COUNT: usize> SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedReadPage> {
+    /// Creates new [`SinglePageLockChain`] that starts with record page
     fn with_record(
         heap_file: &'hf HeapFile<BUCKETS_COUNT>,
         page_id: PageId,
     ) -> Result<Self, HeapFileError> {
         let record_page = heap_file.read_record_page(page_id)?;
-        Ok(PageLockChain {
+        Ok(SinglePageLockChain {
             heap_file,
             record_page: Some(record_page),
             overflow_page: None,
         })
     }
+}
 
-    /// Creates new [`PageLockChain`] that starts with overflow page
-    fn with_overflow(
+impl<'hf, const BUCKETS_COUNT: usize> SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage> {
+    /// Creates new [`SinglePageLockChain`] that starts with record page
+    fn with_record(
         heap_file: &'hf HeapFile<BUCKETS_COUNT>,
         page_id: PageId,
     ) -> Result<Self, HeapFileError> {
-        let overflow_page = heap_file.read_overflow_page(page_id)?;
-        Ok(PageLockChain {
+        let record_page = heap_file.write_record_page(page_id)?;
+        Ok(SinglePageLockChain {
             heap_file,
-            record_page: None,
-            overflow_page: Some(overflow_page),
+            record_page: Some(record_page),
+            overflow_page: None,
         })
     }
+}
 
+impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<PinnedReadPage>
+    for SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedReadPage>
+{
     /// Locks the next page and only then drops the previous one
     fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
         // Read next page
@@ -572,35 +592,27 @@ impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<'hf, BUCKETS_COUNT, PinnedRe
         self.overflow_page = Some(new_page);
         Ok(())
     }
+
+    fn record_page(&self) -> &HeapPage<PinnedReadPage, RecordPageHeader> {
+        self._record_page()
+    }
+
+    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, RecordPageHeader> {
+        self._record_page_mut()
+    }
+
+    fn overflow_page(&self) -> &HeapPage<PinnedReadPage, OverflowPageHeader> {
+        self._overflow_page()
+    }
+
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, OverflowPageHeader> {
+        self._overflow_page_mut()
+    }
 }
 
-impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage> {
-    /// Creates new [`PageLockChain`] that starts with record page
-    fn with_record(
-        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
-        page_id: PageId,
-    ) -> Result<Self, HeapFileError> {
-        let record_page = heap_file.write_record_page(page_id)?;
-        Ok(PageLockChain {
-            heap_file,
-            record_page: Some(record_page),
-            overflow_page: None,
-        })
-    }
-
-    /// Creates new [`PageLockChain`] that starts with overflow page
-    fn with_overflow(
-        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
-        page_id: PageId,
-    ) -> Result<Self, HeapFileError> {
-        let overflow_page = heap_file.write_overflow_page(page_id)?;
-        Ok(PageLockChain {
-            heap_file,
-            record_page: None,
-            overflow_page: Some(overflow_page),
-        })
-    }
-
+impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<PinnedWritePage>
+    for SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage>
+{
     /// Locks the next page and only then drops the previous one
     fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
         // Read next page
@@ -610,6 +622,132 @@ impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<'hf, BUCKETS_COUNT, PinnedWr
         self.record_page = None;
         self.overflow_page = Some(new_page);
         Ok(())
+    }
+
+    fn record_page(&self) -> &HeapPage<PinnedWritePage, RecordPageHeader> {
+        self._record_page()
+    }
+
+    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, RecordPageHeader> {
+        self._record_page_mut()
+    }
+
+    fn overflow_page(&self) -> &HeapPage<PinnedWritePage, OverflowPageHeader> {
+        self._overflow_page()
+    }
+
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, OverflowPageHeader> {
+        self._overflow_page_mut()
+    }
+}
+
+struct PageLockChainWithLockedRecordPage<'hf, 'rp, const BUCKETS_COUNT: usize, P> {
+    heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+    record_page: &'rp mut HeapPage<P, RecordPageHeader>,
+    overflow_page: Option<HeapPage<P, OverflowPageHeader>>,
+}
+
+impl<'hf, 'rp, const BUCKETS_COUNT: usize, P>
+    PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, P>
+{
+    /// Creates new [`PageLockChainWithLockedRecordPage`] that starts with record page
+    fn with_record(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        record_page: &'rp mut HeapPage<P, RecordPageHeader>,
+    ) -> Result<Self, HeapFileError> {
+        Ok(PageLockChainWithLockedRecordPage {
+            heap_file,
+            record_page,
+            overflow_page: None,
+        })
+    }
+
+    /// Gets current record page.
+    fn _record_page(&self) -> &HeapPage<P, RecordPageHeader> {
+        self.record_page
+    }
+
+    /// Gets mutable current record page.
+    fn _record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
+        &mut self.record_page
+    }
+
+    /// Gets current overflow page.
+    ///
+    /// Panics if we hold record page instead.
+    fn _overflow_page(&self) -> &HeapPage<P, OverflowPageHeader> {
+        match &self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get overflow page when record page is stored instead"
+            ),
+        }
+    }
+
+    /// Gets mutable current overflow page.
+    ///
+    /// Panics if we hold record page instead.
+    fn _overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader> {
+        match &mut self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
+    }
+}
+
+impl<'hf, 'rp, const BUCKETS_COUNT: usize> PageLockChain<PinnedReadPage>
+    for PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, PinnedReadPage>
+{
+    /// Locks the next page
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
+        let new_page = self.heap_file.read_overflow_page(next_page_id)?;
+        self.overflow_page = Some(new_page);
+        Ok(())
+    }
+
+    fn record_page(&self) -> &HeapPage<PinnedReadPage, RecordPageHeader> {
+        self._record_page()
+    }
+
+    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, RecordPageHeader> {
+        self._record_page_mut()
+    }
+
+    fn overflow_page(&self) -> &HeapPage<PinnedReadPage, OverflowPageHeader> {
+        self._overflow_page()
+    }
+
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, OverflowPageHeader> {
+        self._overflow_page_mut()
+    }
+}
+
+impl<'hf, 'rp, const BUCKETS_COUNT: usize> PageLockChain<PinnedWritePage>
+    for PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, PinnedWritePage>
+{
+    /// Locks the next page
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
+        let new_page = self.heap_file.write_overflow_page(next_page_id)?;
+        self.overflow_page = Some(new_page);
+        Ok(())
+    }
+
+    fn record_page(&self) -> &HeapPage<PinnedWritePage, RecordPageHeader> {
+        self._record_page()
+    }
+
+    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, RecordPageHeader> {
+        self._record_page_mut()
+    }
+
+    fn overflow_page(&self) -> &HeapPage<PinnedWritePage, OverflowPageHeader> {
+        self._overflow_page()
+    }
+
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, OverflowPageHeader> {
+        self._overflow_page_mut()
     }
 }
 
@@ -842,7 +980,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
     /// Reads [`Record`] located at `ptr` and deserializes it.
     pub fn record(&self, ptr: &RecordPtr) -> Result<Record, HeapFileError> {
-        let record_bytes = self.record_bytes(ptr)?;
+        let page_chain =
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(self, ptr.page_id)?;
+        let record_bytes = self.record_bytes(ptr, page_chain)?;
         let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
         Ok(record)
     }
@@ -878,7 +1018,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         updated_fields: Vec<FieldUpdateDescriptor>,
     ) -> Result<(), HeapFileError> {
         // Read record bytes from disk
-        let mut record_bytes = self.record_bytes(ptr)?;
+        let page_chain =
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(&self, ptr.page_id)?;
+        let mut record_bytes = self.record_bytes(ptr, page_chain)?;
         let mut bytes_changed = vec![false; record_bytes.len()];
 
         // Update fields
@@ -892,7 +1034,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         }
 
         // Save back to disk at the same ptr
-        self.update_record_bytes(ptr, &record_bytes, &bytes_changed)?;
+        let page_chain =
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
+        self.update_record_bytes(ptr, &record_bytes, &bytes_changed, page_chain)?;
 
         Ok(())
     }
@@ -900,7 +1044,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Removes [`Record`] located at `ptr`.
     pub fn delete(&self, ptr: &RecordPtr) -> Result<(), HeapFileError> {
         let mut page_chain =
-            PageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
         let first_page = page_chain.record_page_mut();
         let record_first_fragment = first_page.record_fragment(ptr.slot_id)?;
 
@@ -939,11 +1083,90 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         }
     }
 
-    /// Reads [`Record`] located at `ptr` and returns its bare bytes.
-    fn record_bytes(&self, ptr: &RecordPtr) -> Result<Vec<u8>, HeapFileError> {
-        let mut page_chain =
-            PageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(&self, ptr.page_id)?;
+    /// Migrates all records to add a new column at the specified position with a default value.
+    pub fn add_column_migration(
+        &mut self,
+        position: u16,
+        new_column_min_offset: usize,
+        default_value: Value,
+        new_column_metadata: Vec<ColumnMetadata>,
+    ) -> Result<(), HeapFileError> {
+        let old_columns = mem::replace(&mut self.columns_metadata, new_column_metadata);
 
+        // Iterate through all record pages - we don't need to use PageLockChain
+        // as this whole function has exclusive access to the whole heap file struct.
+        let mut page_id = *self.metadata.first_record_page.lock();
+        while page_id != RecordPageHeader::NO_NEXT_PAGE {
+            let mut page = self.write_record_page(page_id)?;
+            let next_page_id = page.next_page()?;
+
+            let slots: Vec<_> = page.not_deleted_slot_ids()?.collect();
+
+            // Update each record on the page
+            for slot_id in slots {
+                let ptr = RecordPtr::new(page_id, slot_id);
+                self.add_column_to_record(
+                    &mut page,
+                    &ptr,
+                    position,
+                    new_column_min_offset,
+                    default_value.clone(),
+                    &old_columns,
+                )?;
+            }
+
+            page_id = next_page_id;
+        }
+
+        Ok(())
+    }
+
+    /// Migrate all records to remove a column at the specified position.
+    pub fn remove_column_migration(
+        &mut self,
+        position: u16,
+        // `base_offset` of the first column before the removed one, 0 if removed column was first
+        prev_column_min_offset: usize,
+        new_column_metadata: Vec<ColumnMetadata>,
+    ) -> Result<(), HeapFileError> {
+        let old_columns = mem::replace(&mut self.columns_metadata, new_column_metadata);
+
+        // Iterate through all record pages - we don't need to use PageLockChain
+        // as this whole function has exclusive access to the whole heap file struct.
+        let mut page_id = *self.metadata.first_record_page.lock();
+        while page_id != RecordPageHeader::NO_NEXT_PAGE {
+            let mut page = self.write_record_page(page_id)?;
+            let next_page_id = page.next_page()?;
+
+            let slots: Vec<_> = page.not_deleted_slot_ids()?.collect();
+
+            // Update each record on the page
+            for slot_id in slots {
+                let ptr = RecordPtr::new(page_id, slot_id);
+                self.remove_column_from_record(
+                    &mut page,
+                    &ptr,
+                    position,
+                    prev_column_min_offset,
+                    &old_columns,
+                )?;
+            }
+
+            page_id = next_page_id;
+        }
+
+        Ok(())
+    }
+
+    /// Reads [`Record`] located at `ptr` and returns its bare bytes.
+    fn record_bytes<P>(
+        &self,
+        ptr: &RecordPtr,
+        mut page_chain: impl PageLockChain<P>,
+    ) -> Result<Vec<u8>, HeapFileError>
+    where
+        P: PageRead,
+    {
         // Read first fragment
         let first_page = page_chain.record_page();
         let fragment = first_page.record_fragment(ptr.slot_id)?;
@@ -1042,15 +1265,17 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// If length is different then the difference is applied at the end of pages chain.
     ///
     /// This function assumes that `bytes` and `bytes_changed` have the same length.
-    fn update_record_bytes(
+    fn update_record_bytes<P>(
         &self,
         start: &RecordPtr,
         bytes: &[u8],
         bytes_changed: &[bool],
-    ) -> Result<(), HeapFileError> {
+        mut page_chain: impl PageLockChain<P>,
+    ) -> Result<(), HeapFileError>
+    where
+        P: PageRead + PageWrite,
+    {
         let mut processor = FragmentProcessor::new(bytes, bytes_changed);
-        let mut page_chain =
-            PageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, start.page_id)?;
 
         let mut first_page = page_chain.record_page_mut();
         let previous_first_fragment = first_page.record_fragment(start.slot_id)?;
@@ -1212,9 +1437,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     ///
     /// Returns `Ok(true)` if update was successful, `Ok(false)` if there wasn't enough space
     /// and the caller should handle splitting the record.
-    fn try_update_fragment_in_place<H>(
+    fn try_update_fragment_in_place<P, H>(
         &self,
-        page: &mut HeapPage<PinnedWritePage, H>,
+        page: &mut HeapPage<P, H>,
         slot: SlotId,
         page_id: PageId,
         remaining_bytes: &[u8],
@@ -1222,6 +1447,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
     ) -> Result<bool, HeapFileError>
     where
+        P: PageRead + PageWrite,
         H: BaseHeapPageHeader,
     {
         // We can safely store updated record at previous position because we know we have enough space
@@ -1257,9 +1483,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Takes the maximum amount of data that can fit in the current fragment (accounting for
     /// the RecordPtr overhead), stores it with a continuation tag, and recursively stores
     /// the remaining data in overflow pages.
-    fn split_and_extend_fragment<H>(
+    fn split_and_extend_fragment<P, H>(
         &self,
-        page: &mut HeapPage<PinnedWritePage, H>,
+        page: &mut HeapPage<P, H>,
         slot: SlotId,
         page_id: PageId,
         remaining_bytes: &[u8],
@@ -1267,6 +1493,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
     ) -> Result<(), HeapFileError>
     where
+        P: PageRead + PageWrite,
         H: BaseHeapPageHeader,
     {
         // When converting from Final to HasContinuation, we need space for RecordPtr
@@ -1317,14 +1544,17 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Deletes all record fragments from chain of overflow pages starting in `next_ptr`.
-    fn delete_record_fragments_from_overflow_pages_chain<'hf>(
+    fn delete_record_fragments_from_overflow_pages_chain<'hf, P>(
         &'hf self,
-        mut chain: PageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage>,
+        mut page_chain: impl PageLockChain<P>,
         mut next_ptr: Option<RecordPtr>,
-    ) -> Result<(), HeapFileError> {
+    ) -> Result<(), HeapFileError>
+    where
+        P: PageRead + PageWrite,
+    {
         while let Some(next) = next_ptr {
-            chain.advance(next.page_id)?;
-            let page = chain.overflow_page_mut();
+            page_chain.advance(next.page_id)?;
+            let page = page_chain.overflow_page_mut();
             let record_fragment = page.record_fragment(next.slot_id)?;
             next_ptr = record_fragment.next_fragment;
             page.delete(next.slot_id)?;
@@ -1550,15 +1780,16 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Generic helper for updating a record and registering the page in FSM
-    fn update_page_with_fsm<H>(
+    fn update_page_with_fsm<P, H>(
         &self,
-        page: &mut HeapPage<PinnedWritePage, H>,
+        page: &mut HeapPage<P, H>,
         slot: SlotId,
         data: &[u8],
         page_id: PageId,
         fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
     ) -> Result<(), HeapFileError>
     where
+        P: PageRead + PageWrite,
         H: BaseHeapPageHeader,
     {
         page.update(slot, data)?;
@@ -1567,25 +1798,78 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Updates a record on a record page and updates FSM
-    fn update_record_page_with_fsm(
+    fn update_record_page_with_fsm<P>(
         &self,
-        page: &mut HeapPage<PinnedWritePage, RecordPageHeader>,
+        page: &mut HeapPage<P, RecordPageHeader>,
         slot: SlotId,
         data: &[u8],
         page_id: PageId,
-    ) -> Result<(), HeapFileError> {
+    ) -> Result<(), HeapFileError>
+    where
+        P: PageRead + PageWrite,
+    {
         self.update_page_with_fsm(page, slot, data, page_id, &self.record_pages_fsm)
     }
 
-    /// Updates a record on an overflow page and updates FSM
-    fn update_overflow_page_with_fsm(
+    /// Adds a column to a single record at `ptr` and writes updated value to the disk
+    fn add_column_to_record(
         &self,
-        page: &mut HeapPage<PinnedWritePage, OverflowPageHeader>,
-        slot: SlotId,
-        data: &[u8],
-        page_id: PageId,
+        page: &mut HeapPage<PinnedWritePage, RecordPageHeader>,
+        ptr: &RecordPtr,
+        position: u16,
+        new_column_min_offset: usize,
+        default_value: Value,
+        old_columns: &[ColumnMetadata],
     ) -> Result<(), HeapFileError> {
-        self.update_page_with_fsm(page, slot, data, page_id, &self.overflow_pages_fsm)
+        // Read the record with the old schema
+        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        let record_bytes = self.record_bytes(ptr, page_chain)?;
+        let record = Record::deserialize(old_columns, &record_bytes)?;
+
+        let mut fields = record.fields;
+        fields.insert(position as _, default_value.into());
+
+        // Serialize with the new schema
+        let new_record = Record::new(fields);
+        let new_bytes = new_record.serialize();
+
+        let mut bytes_changed = vec![false; new_bytes.len()];
+        bytes_changed[new_column_min_offset..].fill(true);
+
+        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        self.update_record_bytes(ptr, &new_bytes, &bytes_changed, page_chain)?;
+
+        Ok(())
+    }
+
+    /// Removes a column from a single record at `ptr` and writes updated value to the disk.
+    fn remove_column_from_record(
+        &self,
+        page: &mut HeapPage<PinnedWritePage, RecordPageHeader>,
+        ptr: &RecordPtr,
+        position: u16,
+        prev_column_min_offset: usize,
+        old_columns: &[ColumnMetadata],
+    ) -> Result<(), HeapFileError> {
+        // Read the record with the old schema
+        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        let record_bytes = self.record_bytes(ptr, page_chain)?;
+        let record = Record::deserialize(old_columns, &record_bytes)?;
+
+        let mut fields = record.fields;
+        fields.remove(position as _);
+
+        // Serialize with the new schema
+        let new_record = Record::new(fields);
+        let new_bytes = new_record.serialize();
+
+        let mut bytes_changed = vec![false; new_bytes.len()];
+        bytes_changed[prev_column_min_offset..].fill(true);
+
+        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        self.update_record_bytes(ptr, &new_bytes, &bytes_changed, page_chain)?;
+
+        Ok(())
     }
 
     /// Creates a `FilePageRef` for `page_id` using heap file key.
@@ -4990,6 +5274,625 @@ mod tests {
             result.unwrap_err(),
             HeapFileError::SlottedPageError(_)
         ));
+    }
+
+    #[test]
+    fn heap_file_add_column_to_empty_table() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Add a new column to empty table
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(25), new_columns.clone())
+            .unwrap();
+
+        // Verify metadata was updated
+        assert_eq!(heap_file.columns_metadata.len(), 3);
+        assert_eq!(heap_file.columns_metadata[2].name(), "age");
+    }
+
+    #[test]
+    fn heap_file_add_column_single_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Add new column with default value
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let new_column_offset = size_of::<i32>();
+        heap_file
+            .add_column_migration(2, new_column_offset, Value::Int32(25), new_columns.clone())
+            .unwrap();
+
+        // Read back and verify
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+        assert_i32(25, &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_add_column_multiple_records() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert multiple records
+        let mut ptrs = vec![];
+        for i in 0..5 {
+            let record = Record::new(vec![
+                Value::Int32(i).into(),
+                Value::String(format!("user_{}", i)).into(),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            ptrs.push(ptr);
+        }
+
+        // Add new column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(30), new_columns)
+            .unwrap();
+
+        // Verify all records were updated
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let record = heap_file.record(ptr).unwrap();
+            assert_eq!(record.fields.len(), 3);
+            assert_i32(i as i32, &record.fields[0]);
+            assert_string(&format!("user_{}", i), &record.fields[1]);
+            assert_i32(30, &record.fields[2]);
+        }
+    }
+
+    #[test]
+    fn heap_file_add_column_at_beginning() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Add new column at the beginning
+        let new_columns = vec![
+            ColumnMetadata::new("prefix".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("id".into(), Type::I32, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 2, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(0, 0, Value::String("Mr.".into()), new_columns)
+            .unwrap();
+
+        // Read and verify order
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_string("Mr.", &updated_record.fields[0]);
+        assert_i32(1, &updated_record.fields[1]);
+        assert_string("Alice", &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_add_column_multi_fragment_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Create a large record that spans multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead + 500;
+        let large_string = "x".repeat(large_string_size);
+
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String(large_string.clone()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Add new column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(25), new_columns)
+            .unwrap();
+
+        // Verify the large record still works
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string(&large_string, &updated_record.fields[1]);
+        assert_i32(25, &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_add_column_across_multiple_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert records across multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead;
+
+        let mut ptrs = vec![];
+
+        // Insert 3 large records to span multiple pages
+        for i in 0..3 {
+            let large_string = format!("{}", i).repeat(large_string_size);
+            let record = Record::new(vec![
+                Value::Int32(i).into(),
+                Value::String(large_string).into(),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            ptrs.push(ptr);
+        }
+
+        // Add new column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("status".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(1), new_columns)
+            .unwrap();
+
+        // Verify all records across all pages were updated
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let record = heap_file.record(ptr).unwrap();
+            assert_eq!(record.fields.len(), 3);
+            assert_i32(i as i32, &record.fields[0]);
+            assert_i32(1, &record.fields[2]);
+        }
+    }
+
+    #[test]
+    fn heap_file_add_multiple_columns_sequentially() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Add first column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(2, size_of::<i32>(), Value::Int32(25), new_columns)
+            .unwrap();
+
+        // Add second column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+            ColumnMetadata::new("city".into(), Type::String, 3, 2 * size_of::<i32>(), 3).unwrap(),
+        ];
+
+        heap_file
+            .add_column_migration(
+                3,
+                2 * size_of::<i32>(),
+                Value::String("NYC".into()),
+                new_columns,
+            )
+            .unwrap();
+
+        // Verify both columns were added
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 4);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+        assert_i32(25, &updated_record.fields[2]);
+        assert_string("NYC", &updated_record.fields[3]);
+    }
+
+    #[test]
+    fn heap_file_remove_column_from_empty_table() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Remove column from empty table
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns.clone())
+            .unwrap();
+
+        // Verify metadata was updated
+        assert_eq!(heap_file.columns_metadata.len(), 2);
+        assert_eq!(heap_file.columns_metadata[0].name(), "id");
+        assert_eq!(heap_file.columns_metadata[1].name(), "name");
+    }
+
+    #[test]
+    fn heap_file_remove_column_single_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+            Value::Int32(25).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove the age column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Read back and verify
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_remove_column_multiple_records() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert multiple records
+        let mut ptrs = vec![];
+        for i in 0..5 {
+            let record = Record::new(vec![
+                Value::Int32(i).into(),
+                Value::String(format!("user_{}", i)).into(),
+                Value::Int32(20 + i).into(),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            ptrs.push(ptr);
+        }
+
+        // Remove the age column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify all records were updated
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let record = heap_file.record(ptr).unwrap();
+            assert_eq!(record.fields.len(), 2);
+            assert_i32(i as i32, &record.fields[0]);
+            assert_string(&format!("user_{}", i), &record.fields[1]);
+        }
+    }
+
+    #[test]
+    fn heap_file_remove_first_column() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("prefix".into(), Type::String, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("id".into(), Type::I32, 1, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 2, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::String("Mr.".into()).into(),
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove the first column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(0, 0, new_columns)
+            .unwrap();
+
+        // Read and verify order
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_remove_middle_column() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 2, 2 * size_of::<i32>(), 2).unwrap(),
+            ColumnMetadata::new("email".into(), Type::String, 3, 2 * size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::Int32(25).into(),
+            Value::String("Alice".into()).into(),
+            Value::String("alice@test.com".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove the middle column (age)
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("email".into(), Type::String, 2, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(1, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify order
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 3);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
+        assert_string("alice@test.com", &updated_record.fields[2]);
+    }
+
+    #[test]
+    fn heap_file_remove_column_from_multi_fragment_record() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Create a large record that spans multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = 2 * size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead + 500;
+        let large_string = "x".repeat(large_string_size);
+
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String(large_string.clone()).into(),
+            Value::Int32(25).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove the age column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify the large record still works
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string(&large_string, &updated_record.fields[1]);
+    }
+
+    #[test]
+    fn heap_file_remove_column_across_multiple_pages() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("status".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert records across multiple pages
+        let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
+            - size_of::<Slot>()
+            - size_of::<RecordTag>();
+        let record_overhead = 2 * size_of::<i32>() + size_of::<u16>();
+        let large_string_size = max_single_page_size - record_overhead;
+
+        let mut ptrs = vec![];
+
+        // Insert 3 large records to span multiple pages
+        for i in 0..3 {
+            let large_string = format!("{}", i).repeat(large_string_size);
+            let record = Record::new(vec![
+                Value::Int32(i).into(),
+                Value::String(large_string).into(),
+                Value::Int32(1).into(),
+            ]);
+            let ptr = heap_file.insert(record).unwrap();
+            ptrs.push(ptr);
+        }
+
+        // Remove the status column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify all records across all pages were updated
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let record = heap_file.record(ptr).unwrap();
+            assert_eq!(record.fields.len(), 2);
+            assert_i32(i as i32, &record.fields[0]);
+        }
+    }
+
+    #[test]
+    fn heap_file_remove_multiple_columns_sequentially() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        let columns_metadata = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+            ColumnMetadata::new("city".into(), Type::String, 3, 2 * size_of::<i32>(), 3).unwrap(),
+        ];
+
+        let factory = HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), columns_metadata);
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        let record = Record::new(vec![
+            Value::Int32(1).into(),
+            Value::String("Alice".into()).into(),
+            Value::Int32(25).into(),
+            Value::String("NYC".into()).into(),
+        ]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Remove city column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+            ColumnMetadata::new("age".into(), Type::I32, 2, size_of::<i32>(), 2).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(3, 2 * size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Remove age column
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file
+            .remove_column_migration(2, size_of::<i32>(), new_columns)
+            .unwrap();
+
+        // Verify both columns were removed
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(1, &updated_record.fields[0]);
+        assert_string("Alice", &updated_record.fields[1]);
     }
 
     #[ignore = "TODO: need to figure out better way to handle benchmark tests"]

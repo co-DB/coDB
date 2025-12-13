@@ -1,3 +1,5 @@
+use types::schema::Type;
+
 use crate::resolved_tree::{ResolvedCreateColumnDescriptor, ResolvedNodeId, ResolvedTree};
 
 /// [`QueryPlan`] represents the logical steps that should be executed to perform the query.
@@ -67,6 +69,8 @@ pub enum StatementPlanItem {
     Projection(Projection),
     Insert(Insert),
     CreateTable(CreateTable),
+    AddColumn(AddColumn),
+    RemoveColumn(RemoveColumn),
 }
 
 impl StatementPlanItem {
@@ -142,6 +146,21 @@ impl StatementPlanItem {
             columns,
         })
     }
+
+    pub(crate) fn add_column(table_name: String, column_name: String, column_ty: Type) -> Self {
+        StatementPlanItem::AddColumn(AddColumn {
+            table_name,
+            column_name,
+            column_ty,
+        })
+    }
+
+    pub(crate) fn remove_column(table_name: String, column_name: String) -> Self {
+        StatementPlanItem::RemoveColumn(RemoveColumn {
+            table_name,
+            column_name,
+        })
+    }
 }
 
 /// Sequential scan of all table (loads every record).
@@ -208,10 +227,25 @@ pub struct Insert {
     pub values: Vec<ResolvedNodeId>,
 }
 
-/// Creates a new table
+/// Creates a new table.
 #[derive(Debug)]
 pub struct CreateTable {
     pub name: String,
     pub primary_key_column: ResolvedCreateColumnDescriptor,
     pub columns: Vec<ResolvedCreateColumnDescriptor>,
+}
+
+/// Adds a new column.
+#[derive(Debug)]
+pub struct AddColumn {
+    pub table_name: String,
+    pub column_name: String,
+    pub column_ty: Type,
+}
+
+/// Removes a column.
+#[derive(Debug)]
+pub struct RemoveColumn {
+    pub table_name: String,
+    pub column_name: String,
 }

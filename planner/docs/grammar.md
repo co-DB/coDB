@@ -190,7 +190,7 @@ Precedence (from lowest to highest)
 ```
  <alter_stmt> :: ALTER TABLE <table_name> <alter_action>
  <alter_action> :: <add_alter_action> | <rename_alter_action> | <drop_alter_action>
- <add_alter_action> :: ADD <column_name> <type>
+ <add_alter_action> :: ADD COLUMN <column_name> <type>
  <rename_alter_action> :: RENAME <rename_target>
  <rename_target> :: COLUMN <column_name> TO <column_name> | TABLE TO <table_name>
  <drop_alter_action> :: DROP COLUMN <column_name>

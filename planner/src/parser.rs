@@ -777,10 +777,14 @@ impl Parser {
     /// Parses ADD variant of the ALTER statement.
     ///
     /// Syntax:
-    /// `<add_alter_action> -> ADD <column> <type>`
+    /// `<add_alter_action> -> ADD COLUMN <column> <type>`
     fn parse_alter_add(&mut self) -> Result<AlterAction, ParserError> {
         self.expect_token(TokenType::Add)?;
-        let column_name = self.parse_column_name()?;
+        self.expect_token(TokenType::Column)?;
+        // Here we don't use `Self::parse_column_name` because in add column statement
+        // column does not exist yet.
+        let column_ident = self.expect_ident()?;
+        let column_name = self.add_identifier_node(column_ident);
         let column_type = self.parse_type()?;
         Ok(AlterAction::Add(AddAlterAction {
             column_name,
@@ -1382,7 +1386,7 @@ mod tests {
 
     #[test]
     fn parses_alter_add_correctly() {
-        let parser = Parser::new("ALTER TABLE users ADD age INT32;");
+        let parser = Parser::new("ALTER TABLE users ADD COLUMN age INT32;");
         let ast = parser.parse_program().unwrap();
         assert_eq!(ast.statements.len(), 1);
 
@@ -1394,7 +1398,7 @@ mod tests {
 
         match &alter_stmt.action {
             AlterAction::Add(add) => {
-                assert_column_identifier_node(&ast, add.column_name, "age", None);
+                assert_identifier_node(&ast, add.column_name, "age");
                 assert!(matches!(add.column_type, Type::I32));
             }
             other => panic!("Expected Add action, got {:#?}", other),
