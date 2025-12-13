@@ -476,13 +476,13 @@ impl<'a> FragmentProcessor<'a> {
 trait PageLockChain<P> {
     /// Locks the next page
     fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError>;
-    /// Gets current record page (undefined when only overflow page is hold at the time).
+    /// Gets current record page (undefined when only overflow page is held at the time).
     fn record_page(&self) -> &HeapPage<P, RecordPageHeader>;
-    /// Gets mutable current record page (undefined when only overflow page is hold at the time).
+    /// Gets mutable current record page (undefined when only overflow page is held at the time).
     fn record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader>;
-    /// Gets current overflow page (undefined when only record page is hold at the time).
+    /// Gets current overflow page (undefined when only record page is held at the time).
     fn overflow_page(&self) -> &HeapPage<P, OverflowPageHeader>;
-    /// Gets mutable current overflow page (undefined when only record page is hold at the time).
+    /// Gets mutable current overflow page (undefined when only record page is held at the time).
     fn overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader>;
 }
 
@@ -1282,10 +1282,6 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         P: PageRead + PageWrite,
     {
         let mut processor = FragmentProcessor::new(bytes, bytes_changed);
-        // let mut page_chain = SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(
-        //     &self,
-        //     start.page_id,
-        // )?;
 
         let mut first_page = page_chain.record_page_mut();
         let previous_first_fragment = first_page.record_fragment(start.slot_id)?;
