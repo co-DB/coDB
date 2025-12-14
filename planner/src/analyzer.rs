@@ -1,11 +1,11 @@
+use metadata::catalog::{Catalog, CatalogError, ColumnMetadata, TableMetadata, TableMetadataError};
+use parking_lot::RwLock;
+use std::cmp::PartialEq;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     sync::Arc,
 };
-
-use metadata::catalog::{Catalog, CatalogError, ColumnMetadata, TableMetadata, TableMetadataError};
-use parking_lot::RwLock;
 use thiserror::Error;
 use types::schema::Type;
 
@@ -416,6 +416,12 @@ impl<'a> Analyzer<'a> {
                         ResolvedExpression::Binary(left_bin),
                         ResolvedExpression::Binary(right_bin),
                     ) => {
+                        if left_bin.op == BinaryOperator::Equal
+                            && right_bin.op == BinaryOperator::Equal
+                        {
+                            return None;
+                        }
+
                         let left_ok = self.is_indexable_comparison(left_bin, primary_key_name);
                         let right_ok = self.is_indexable_comparison(right_bin, primary_key_name);
 
