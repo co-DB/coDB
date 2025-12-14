@@ -2005,6 +2005,640 @@ mod tests {
     }
 
     #[test]
+    fn test_update_all_records() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
+
+        // Update all records
+        let result = execute_single(&executor, "UPDATE users SET age = 40;");
+        assert_operation_successful(result, 3, StatementType::Update);
+
+        // Verify all records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+
+        // All users should have age = 40
+        assert!(
+            rows.iter()
+                .all(|r| *r.fields[2].deref() == Value::Int32(40))
+        );
+    }
+
+    #[test]
+    fn test_update_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create empty table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+
+        // Try to update empty table
+        let result = execute_single(&executor, "UPDATE users SET age = 40;");
+        assert_operation_successful(result, 0, StatementType::Update);
+
+        // Verify table is still empty
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_update_with_where_clause_single_match() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
+
+        // Update one record
+        let result = execute_single(&executor, "UPDATE users SET age = 26 WHERE id = 1;");
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify correct record was updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[2].deref(), Value::Int32(26));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*bob.fields[2].deref(), Value::Int32(30));
+
+        let charlie = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
+            .unwrap();
+        assert_eq!(*charlie.fields[2].deref(), Value::Int32(35));
+    }
+
+    #[test]
+    fn test_update_with_where_clause_multiple_matches() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (4, 'David', 30);",
+        );
+
+        // Update multiple records matching condition
+        let result = execute_single(&executor, "UPDATE users SET age = 26 WHERE age = 25;");
+        assert_operation_successful(result, 2, StatementType::Update);
+
+        // Verify correct records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 4);
+
+        // Users who had age 25 should now have age 26
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[2].deref(), Value::Int32(26));
+
+        let charlie = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
+            .unwrap();
+        assert_eq!(*charlie.fields[2].deref(), Value::Int32(26));
+
+        // Users who had age 30 should still have age 30
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*bob.fields[2].deref(), Value::Int32(30));
+
+        let david = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(4))
+            .unwrap();
+        assert_eq!(*david.fields[2].deref(), Value::Int32(30));
+    }
+
+    #[test]
+    fn test_update_with_where_clause_no_matches() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Try to update with non-matching condition
+        let result = execute_single(&executor, "UPDATE users SET age = 99 WHERE age = 100;");
+        assert_operation_successful(result, 0, StatementType::Update);
+
+        // Verify no records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[2].deref(), Value::Int32(25));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*bob.fields[2].deref(), Value::Int32(30));
+    }
+
+    #[test]
+    fn test_update_with_comparison_operators() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (1, 'Product A', 100);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (2, 'Product B', 200);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (3, 'Product C', 150);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (4, 'Product D', 50);",
+        );
+
+        // Update products with price > 100
+        let result = execute_single(
+            &executor,
+            "UPDATE products SET price = 99 WHERE price > 100;",
+        );
+        assert_operation_successful(result, 2, StatementType::Update);
+
+        // Verify correct records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, price FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 4);
+
+        // Products with original price > 100 should now have price 99
+        let product_b = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*product_b.fields[2].deref(), Value::Int32(99));
+
+        let product_c = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
+            .unwrap();
+        assert_eq!(*product_c.fields[2].deref(), Value::Int32(99));
+
+        // Products with original price <= 100 should remain unchanged
+        let product_a = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*product_a.fields[2].deref(), Value::Int32(100));
+
+        let product_d = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(4))
+            .unwrap();
+        assert_eq!(*product_d.fields[2].deref(), Value::Int32(50));
+    }
+
+    #[test]
+    fn test_update_string_column() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, department STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, department) VALUES (1, 'Alice', 'Engineering');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, department) VALUES (2, 'Bob', 'Sales');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, department) VALUES (3, 'Charlie', 'Engineering');",
+        );
+
+        // Update department for Engineering users
+        let result = execute_single(
+            &executor,
+            "UPDATE users SET department = 'R&D' WHERE department = 'Engineering';",
+        );
+        assert_operation_successful(result, 2, StatementType::Update);
+
+        // Verify correct records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, department FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[2].deref(), Value::String("R&D".into()));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*bob.fields[2].deref(), Value::String("Sales".into()));
+
+        let charlie = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
+            .unwrap();
+        assert_eq!(*charlie.fields[2].deref(), Value::String("R&D".into()));
+    }
+
+    #[test]
+    fn test_update_multiple_columns() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Update multiple columns
+        let result = execute_single(
+            &executor,
+            "UPDATE users SET name = 'Alicia', age = 26 WHERE id = 1;",
+        );
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify both columns were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[1].deref(), Value::String("Alicia".into()));
+        assert_eq!(*alice.fields[2].deref(), Value::Int32(26));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*bob.fields[1].deref(), Value::String("Bob".into()));
+        assert_eq!(*bob.fields[2].deref(), Value::Int32(30));
+    }
+
+    #[test]
+    fn test_update_with_boolean_column() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, in_stock BOOL);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, in_stock) VALUES (1, 'Product A', TRUE);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, in_stock) VALUES (2, 'Product B', FALSE);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, in_stock) VALUES (3, 'Product C', TRUE);",
+        );
+
+        // Update in_stock for products that are currently in stock
+        let result = execute_single(
+            &executor,
+            "UPDATE products SET in_stock = FALSE WHERE in_stock = TRUE;",
+        );
+        assert_operation_successful(result, 2, StatementType::Update);
+
+        // Verify correct records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, in_stock FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+
+        // All products should now be out of stock
+        assert!(
+            rows.iter()
+                .all(|r| *r.fields[2].deref() == Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn test_update_with_complex_where_clause() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32, in_stock BOOL);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, in_stock) VALUES (1, 'Product A', 100, TRUE);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, in_stock) VALUES (2, 'Product B', 200, FALSE);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, in_stock) VALUES (3, 'Product C', 150, TRUE);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, in_stock) VALUES (4, 'Product D', 50, FALSE);",
+        );
+
+        // Update price for products that are in stock AND price > 100
+        let result = execute_single(
+            &executor,
+            "UPDATE products SET price = 175 WHERE in_stock = TRUE AND price > 100;",
+        );
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify correct record was updated (only Product C should be updated)
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, price, in_stock FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 4);
+
+        let product_a = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*product_a.fields[2].deref(), Value::Int32(100)); // Unchanged
+
+        let product_b = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*product_b.fields[2].deref(), Value::Int32(200)); // Unchanged
+
+        let product_c = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
+            .unwrap();
+        assert_eq!(*product_c.fields[2].deref(), Value::Int32(175)); // Updated
+
+        let product_d = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(4))
+            .unwrap();
+        assert_eq!(*product_d.fields[2].deref(), Value::Int32(50)); // Unchanged
+    }
+
+    #[test]
+    fn test_update_with_float_column() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price FLOAT64);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (1, 'Product A', 99.99);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (2, 'Product B', 149.99);",
+        );
+
+        // Update price
+        let result = execute_single(
+            &executor,
+            "UPDATE products SET price = 129.99 WHERE id = 2;",
+        );
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify record was updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, price FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        let product_b = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        // Use approximate comparison for float values
+        if let Value::Float64(price) = *product_b.fields[2].deref() {
+            assert!((price - 129.99).abs() < 0.01);
+        } else {
+            panic!("Expected Float64 value");
+        }
+    }
+
+    #[test]
+    fn test_update_then_select_with_where() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
+
+        // Update records
+        execute_single(&executor, "UPDATE users SET age = 40 WHERE age >= 30;");
+
+        // Select only updated records
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users WHERE age = 40;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(3)));
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(1)));
+    }
+
+    #[test]
+    fn test_update_after_delete() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
+
+        // Delete one record
+        execute_single(&executor, "DELETE FROM users WHERE id = 2;");
+
+        // Update remaining records
+        let result = execute_single(&executor, "UPDATE users SET age = 50;");
+        assert_operation_successful(result, 2, StatementType::Update);
+
+        // Verify correct records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        assert!(
+            rows.iter()
+                .all(|r| *r.fields[2].deref() == Value::Int32(50))
+        );
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+    }
+
+    #[test]
     fn test_drop_table_empty_table() {
         let (executor, _temp_dir) = create_test_executor();
 
