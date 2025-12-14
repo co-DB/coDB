@@ -365,7 +365,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             }
         };
 
-        let mut rows_affected = 0;
+        let rows_affected = records.len();
 
         for record_handle in records {
             let primary_key_field =
@@ -388,8 +388,6 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             }) {
                 return StatementResult::from(&err);
             }
-
-            rows_affected += 1;
         }
 
         StatementResult::OperationSuccessful {
