@@ -121,9 +121,14 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
     /// Handler for [`TableScan`] statement.
     fn table_scan(&self, table_scan: &TableScan) -> Result<Vec<Record>, InternalExecutorError> {
+        // TODO: instead of collecting we should refactor statement executor to use iterators instead of vectors
         let records = self
             .executor
-            .with_heap_file(&table_scan.table_name, |hf| hf.all_records())??;
+            .with_heap_file(&table_scan.table_name, |hf| {
+                hf.all_records()
+                    .map(|r| r.map(|r| r.record))
+                    .collect::<Result<Vec<Record>, HeapFileError>>()
+            })??;
         Ok(records)
     }
 

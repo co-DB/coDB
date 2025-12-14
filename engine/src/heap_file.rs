@@ -954,6 +954,64 @@ pub enum HeapFileError {
     DBSerializationError(#[from] DbSerializationError),
 }
 
+/// Handle to record and its pointer in heap file.
+pub struct RecordHandle {
+    pub record: Record,
+    pub record_ptr: RecordPtr,
+}
+
+impl RecordHandle {
+    fn new(record: Record, record_ptr: RecordPtr) -> Self {
+        RecordHandle { record, record_ptr }
+    }
+}
+
+/// Iterator over all records in a heap file
+pub struct AllRecordsIterator<'hf, const BUCKETS_COUNT: usize> {
+    heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+    current_page_records: Vec<RecordHandle>,
+    next_page_id: PageId,
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> AllRecordsIterator<'hf, BUCKETS_COUNT> {
+    fn new(heap_file: &'hf HeapFile<BUCKETS_COUNT>, next_page_id: PageId) -> Self {
+        AllRecordsIterator {
+            heap_file,
+            current_page_records: vec![],
+            next_page_id,
+        }
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> Iterator for AllRecordsIterator<'hf, BUCKETS_COUNT> {
+    type Item = Result<RecordHandle, HeapFileError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // If we have records left from the ones already read just return the first one
+        if !self.current_page_records.is_empty() {
+            let record = self.current_page_records.remove(0);
+            return Some(Ok(record));
+        }
+
+        // No more records in the current page, if it was last page we can stop
+        if self.next_page_id == RecordPageHeader::NO_NEXT_PAGE {
+            return None;
+        }
+
+        // Load next page
+        match self.heap_file.read_all_record_from_page(self.next_page_id) {
+            Ok((next_page_id, records)) => {
+                self.next_page_id = next_page_id;
+                self.current_page_records = records;
+
+                // Recursively call to return first record from newly loaded page
+                self.next()
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 /// Structure responsible for managing on-disk heap files.
 ///
 /// Each [`HeapFile`] instance corresponds to a single physical file on disk.
@@ -988,15 +1046,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Reads all [`Record`]s stored in heap file.
-    pub fn all_records(&self) -> Result<Vec<Record>, HeapFileError> {
-        let mut page_id = *self.metadata.first_record_page.lock();
-        let mut all_records = vec![];
-        while page_id != RecordPageHeader::NO_NEXT_PAGE {
-            let (next_page_id, mut records) = self.read_all_record_from_page(page_id)?;
-            all_records.append(&mut records);
-            page_id = next_page_id;
-        }
-        Ok(all_records)
+    pub fn all_records(&'_ self) -> AllRecordsIterator<'_, BUCKETS_COUNT> {
+        let first_page_id = *self.metadata.first_record_page.lock();
+        AllRecordsIterator::new(self, first_page_id)
     }
 
     /// Inserts `record` into heap file and returns its [`RecordPtr`].
@@ -1189,7 +1241,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     fn read_all_record_from_page(
         &self,
         page_id: PageId,
-    ) -> Result<(PageId, Vec<Record>), HeapFileError> {
+    ) -> Result<(PageId, Vec<RecordHandle>), HeapFileError> {
         let page = self.read_record_page(page_id)?;
         let next_page_id = page.next_page()?;
 
@@ -1197,7 +1249,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             .not_deleted_slot_ids()?
             .map(|slot_id| {
                 let ptr = RecordPtr::new(page_id, slot_id);
-                self.record(&ptr)
+                let record = self.record(&ptr)?;
+                Ok::<RecordHandle, HeapFileError>(RecordHandle::new(record, ptr))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -2243,6 +2296,14 @@ mod tests {
         record.serialize()
     }
 
+    /// Helper to collect all records from iterator, unwrapping errors
+    fn collect_all_records(heap_file: &HeapFile<4>) -> Vec<Record> {
+        heap_file
+            .all_records()
+            .map(|result| result.unwrap().record)
+            .collect()
+    }
+
     // FSM
 
     #[test]
@@ -3187,7 +3248,7 @@ mod tests {
         let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
         let heap_file = factory.create_heap_file().unwrap();
 
-        let all_records = heap_file.all_records().unwrap();
+        let all_records = collect_all_records(&heap_file);
         assert_eq!(all_records.len(), 0);
     }
 
@@ -3205,7 +3266,7 @@ mod tests {
         ]);
         heap_file.insert(record).unwrap();
 
-        let all_records = heap_file.all_records().unwrap();
+        let all_records = collect_all_records(&heap_file);
         assert_eq!(all_records.len(), 1);
         assert_i32(1, &all_records[0].fields[0]);
         assert_string("test", &all_records[0].fields[1]);
@@ -3227,7 +3288,7 @@ mod tests {
             heap_file.insert(record).unwrap();
         }
 
-        let all_records = heap_file.all_records().unwrap();
+        let all_records = collect_all_records(&heap_file);
         assert_eq!(all_records.len(), 10);
 
         for (i, record) in all_records.iter().enumerate() {
@@ -3267,8 +3328,7 @@ mod tests {
             heap_file.insert(record).unwrap();
         }
 
-        let all_records = heap_file.all_records().unwrap();
-        assert_eq!(all_records.len(), 5);
+        let all_records = collect_all_records(&heap_file);
 
         // Verify all records are present (order may vary due to page allocation)
         let mut found_ids = all_records
@@ -3319,7 +3379,7 @@ mod tests {
         ]);
         heap_file.insert(small_record2).unwrap();
 
-        let all_records = heap_file.all_records().unwrap();
+        let all_records = collect_all_records(&heap_file);
         assert_eq!(all_records.len(), 3);
 
         // Find records by ID (order may vary)
@@ -3372,7 +3432,7 @@ mod tests {
         heap_file.delete(&record_ptrs[1]).unwrap();
         heap_file.delete(&record_ptrs[3]).unwrap();
 
-        let all_records = heap_file.all_records().unwrap();
+        let all_records = collect_all_records(&heap_file);
         assert_eq!(all_records.len(), 3);
 
         // Verify remaining IDs (0, 2, 4)
@@ -3427,7 +3487,7 @@ mod tests {
             .update(&record_ptrs[1], vec![update_descriptor])
             .unwrap();
 
-        let all_records = heap_file.all_records().unwrap();
+        let all_records = collect_all_records(&heap_file);
         assert_eq!(all_records.len(), 3);
 
         // Find and verify each record
@@ -3468,7 +3528,7 @@ mod tests {
         for _ in 0..5 {
             let heap_file_clone = heap_file.clone();
             let handle = thread::spawn(move || {
-                let all_records = heap_file_clone.all_records().unwrap();
+                let all_records = collect_all_records(&heap_file_clone);
                 assert_eq!(all_records.len(), 20);
 
                 // Verify all IDs are present
@@ -6186,7 +6246,7 @@ mod tests {
         assert_eq!(errors, 0, "Found {} verification errors", errors);
 
         // Verify all_records returns correct count
-        let all_records = heap_file.all_records().unwrap();
+        let all_records = collect_all_records(&heap_file);
         assert_eq!(all_records.len(), total_records);
 
         // Verify no duplicate IDs
