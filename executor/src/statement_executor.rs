@@ -1,5 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, iter, mem, ops::Deref};
-
+use engine::heap_file::FieldUpdateDescriptor;
 use engine::{
     heap_file::{HeapFileError, RecordHandle, RecordPtr},
     record::{Field, Record},
@@ -7,17 +6,17 @@ use engine::{
 use itertools::Itertools;
 use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
-use planner::query_plan::Delete;
 use planner::{
     query_plan::{
-        AddColumn, CreateTable, Filter, Insert, Limit, Projection, RemoveColumn, RemoveTable, Skip,
-        Sort, SortOrder, StatementPlan, StatementPlanItem, TableScan,
+        AddColumn, CreateTable, Delete, Filter, Insert, Limit, Projection, RemoveColumn,
+        RemoveTable, Skip, Sort, SortOrder, StatementPlan, StatementPlanItem, TableScan, Update,
     },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
         ResolvedTree,
     },
 };
+use std::{cmp::Ordering, collections::HashMap, iter, mem, ops::Deref};
 use storage::files_manager::FileKey;
 use types::data::Value;
 
@@ -92,6 +91,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         match item {
             StatementPlanItem::Insert(insert) => self.insert(insert),
             StatementPlanItem::Delete(delete) => self.delete(delete),
+            StatementPlanItem::Update(update) => self.update(update),
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
             StatementPlanItem::RemoveTable(remove_table) => self.remove_table(remove_table),
             StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
@@ -396,6 +396,82 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             rows_affected,
             ty: StatementType::Delete,
         }
+    }
+
+    /// Handler for [`Update`] statement.
+    fn update(&self, update: &Update) -> StatementResult {
+        let data_source = self.statement.item(update.data_source);
+        let records = match self.execute_data_source(data_source) {
+            Ok(records) => records,
+            Err(err) => {
+                return StatementResult::from(&err);
+            }
+        };
+
+        let rows_affected = records.len();
+
+        for record_handle in records {
+            let mut update_descriptors = Vec::new();
+            for (column, expression) in update.columns.iter().zip(update.values.iter()) {
+                let column_metadata =
+                    match self.get_column_metadata_from_node_id(&update.table_name, *column) {
+                        Ok(cm) => cm,
+                        Err(e) => return StatementResult::from(&e),
+                    };
+                let e = ExpressionExecutor::with_single_record(&record_handle.record, self.ast);
+                match e.execute_expression(*expression) {
+                    Ok(value) => {
+                        let field_update_descriptor =
+                            match FieldUpdateDescriptor::new(column_metadata, value.into_owned()) {
+                                Ok(fud) => fud,
+                                _ => {
+                                    return error_factory::runtime_error(
+                                        "failed to create field update descriptor",
+                                    );
+                                }
+                            };
+                        update_descriptors.push(field_update_descriptor);
+                    }
+                    Err(e) => return StatementResult::from(&e),
+                }
+            }
+            if let Err(e) = self.executor.with_heap_file_mut(&update.table_name, |hf| {
+                hf.update(&record_handle.record_ptr, update_descriptors)
+            }) {
+                return StatementResult::from(&e);
+            }
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected,
+            ty: StatementType::Update,
+        }
+    }
+
+    fn get_column_metadata_from_node_id(
+        &self,
+        table_name: &str,
+        column_id: ResolvedNodeId,
+    ) -> Result<ColumnMetadata, InternalExecutorError> {
+        let column_name = match self.ast.node(column_id) {
+            ResolvedExpression::ColumnRef(cr) => &cr.name,
+            _ => unreachable!(),
+        };
+        let table_metadata = self
+            .executor
+            .catalog
+            .read()
+            .table(table_name)
+            .map_err(|_| InternalExecutorError::TableDoesNotExist {
+                table_name: table_name.to_string(),
+            })?;
+        let column_metadata = table_metadata.column(column_name).map_err(|_| {
+            InternalExecutorError::ColumnDoesNotExist {
+                table_name: table_name.to_string(),
+                column_name: column_name.to_string(),
+            }
+        })?;
+        Ok(column_metadata.clone())
     }
 
     /// Handler for [`CreateTable`] statement.

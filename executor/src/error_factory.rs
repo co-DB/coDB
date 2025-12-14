@@ -13,6 +13,11 @@ use crate::StatementResult;
 pub(crate) enum InternalExecutorError {
     #[error("Table '{table_name}' does not exist.")]
     TableDoesNotExist { table_name: String },
+    #[error("Column '{column_name}' does not exist in table '{table_name}'.")]
+    ColumnDoesNotExist {
+        table_name: String,
+        column_name: String,
+    },
     #[error("Primary key doesn't exist in table '{table_name}'.")]
     PrimaryKeyDoesNotExist { table_name: String },
     #[error("Invalid record provided")]

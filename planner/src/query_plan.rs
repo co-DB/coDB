@@ -69,6 +69,7 @@ pub enum StatementPlanItem {
     Projection(Projection),
     Insert(Insert),
     Delete(Delete),
+    Update(Update),
     CreateTable(CreateTable),
     RemoveTable(RemoveTable),
     ClearTable(ClearTable),
@@ -144,6 +145,20 @@ impl StatementPlanItem {
         StatementPlanItem::Delete(Delete {
             data_source,
             table_name,
+        })
+    }
+
+    pub(crate) fn update(
+        data_source: StatementPlanItemId,
+        table_name: String,
+        columns: Vec<ResolvedNodeId>,
+        values: Vec<ResolvedNodeId>,
+    ) -> Self {
+        StatementPlanItem::Update(Update {
+            data_source,
+            table_name,
+            columns,
+            values,
         })
     }
 
@@ -271,6 +286,15 @@ pub struct Insert {
 pub struct Delete {
     pub data_source: StatementPlanItemId,
     pub table_name: String,
+}
+
+/// Updates elements in table.
+#[derive(Debug)]
+pub struct Update {
+    pub data_source: StatementPlanItemId,
+    pub table_name: String,
+    pub columns: Vec<ResolvedNodeId>,
+    pub values: Vec<ResolvedNodeId>,
 }
 
 /// Creates a new table.
