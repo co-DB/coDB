@@ -70,8 +70,12 @@ pub enum StatementPlanItem {
     Insert(Insert),
     Delete(Delete),
     CreateTable(CreateTable),
+    RemoveTable(RemoveTable),
+    ClearTable(ClearTable),
+    RenameTable(RenameTable),
     AddColumn(AddColumn),
     RemoveColumn(RemoveColumn),
+    RenameColumn(RenameColumn),
 }
 
 impl StatementPlanItem {
@@ -155,6 +159,21 @@ impl StatementPlanItem {
         })
     }
 
+    pub(crate) fn remove_table(name: String) -> Self {
+        StatementPlanItem::RemoveTable(RemoveTable { name })
+    }
+
+    pub(crate) fn clear_table(name: String) -> Self {
+        StatementPlanItem::ClearTable(ClearTable { name })
+    }
+
+    pub(crate) fn rename_table(prev_name: String, new_name: String) -> Self {
+        StatementPlanItem::RenameTable(RenameTable {
+            prev_name,
+            new_name,
+        })
+    }
+
     pub(crate) fn add_column(table_name: String, column_name: String, column_ty: Type) -> Self {
         StatementPlanItem::AddColumn(AddColumn {
             table_name,
@@ -167,6 +186,18 @@ impl StatementPlanItem {
         StatementPlanItem::RemoveColumn(RemoveColumn {
             table_name,
             column_name,
+        })
+    }
+
+    pub(crate) fn rename_column(
+        table_name: String,
+        prev_column_name: String,
+        new_column_name: String,
+    ) -> Self {
+        StatementPlanItem::RenameColumn(RenameColumn {
+            table_name,
+            prev_column_name,
+            new_column_name,
         })
     }
 }
@@ -250,6 +281,25 @@ pub struct CreateTable {
     pub columns: Vec<ResolvedCreateColumnDescriptor>,
 }
 
+/// Removes a table
+#[derive(Debug)]
+pub struct RemoveTable {
+    pub name: String,
+}
+
+/// Removes all records from the table
+#[derive(Debug)]
+pub struct ClearTable {
+    pub name: String,
+}
+
+/// Renames a table
+#[derive(Debug)]
+pub struct RenameTable {
+    pub prev_name: String,
+    pub new_name: String,
+}
+
 /// Adds a new column.
 #[derive(Debug)]
 pub struct AddColumn {
@@ -263,4 +313,12 @@ pub struct AddColumn {
 pub struct RemoveColumn {
     pub table_name: String,
     pub column_name: String,
+}
+
+/// Renames a column
+#[derive(Debug)]
+pub struct RenameColumn {
+    pub table_name: String,
+    pub prev_column_name: String,
+    pub new_column_name: String,
 }

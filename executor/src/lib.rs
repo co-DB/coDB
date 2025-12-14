@@ -57,7 +57,7 @@ impl Executor {
     pub fn execute<'e>(&'e self, query: &str) -> QueryResultIter<'e> {
         let parse_output = planner::process_query(query, self.catalog.clone());
         match parse_output {
-            Ok(query_plan) => StatementIter::new(query_plan.plans, query_plan.tree, &self).into(),
+            Ok(query_plan) => StatementIter::new(query_plan.plans, query_plan.tree, self).into(),
             Err(errors) => ParseErrorIter::new(errors).into(),
         }
     }
@@ -160,6 +160,10 @@ impl Executor {
         Ok(())
     }
 
+    fn remove_heap_file(&self, table_name: impl AsRef<str>) {
+        self.heap_files.remove(table_name.as_ref());
+    }
+
     /// Gets B-Tree for given table and passes it to function `f`.
     /// If B-Tree wasn't used yet it opens it and inserts to [`Executor::b_trees`].
     fn with_b_tree<R>(
@@ -189,6 +193,10 @@ impl Executor {
             }
         })?;
         Ok(b_tree)
+    }
+
+    fn remove_b_tree(&self, table_name: impl AsRef<str>) {
+        self.b_trees.remove(table_name.as_ref());
     }
 }
 
@@ -265,6 +273,15 @@ mod tests {
                 assert_eq!(ty, expected_ty);
             }
             _ => panic!("Expected OperationSuccessful, got {:?}", result),
+        }
+    }
+
+    fn assert_parse_error_contains(result: StatementResult, expected_message: &str) {
+        match result {
+            StatementResult::ParseError { error } => {
+                assert!(error.contains(expected_message));
+            }
+            other => panic!("Expected ParseError, got {:?}", other),
         }
     }
 
@@ -1985,5 +2002,120 @@ mod tests {
         assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(4)));
         assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(1)));
         assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+    }
+
+    #[test]
+    fn test_drop_table_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+
+        // Drop the table
+        let result = execute_single(&executor, "DROP TABLE users;");
+        assert_operation_successful(result, 0, StatementType::Drop);
+
+        // Verify table no longer exists by trying to select from it
+        let result = execute_single(&executor, "SELECT * FROM users;");
+        assert_parse_error_contains(result, "table 'users' was not found in database");
+    }
+
+    #[test]
+    fn test_drop_table_with_data() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Drop the table
+        let result = execute_single(&executor, "DROP TABLE users;");
+        assert_operation_successful(result, 0, StatementType::Drop);
+
+        // Verify table no longer exists
+        let result = execute_single(&executor, "SELECT * FROM users;");
+        assert_parse_error_contains(result, "table 'users' was not found in database");
+    }
+
+    #[test]
+    fn test_drop_then_recreate_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+
+        // Drop the table
+        execute_single(&executor, "DROP TABLE users;");
+
+        // Recreate table with same name
+        let result = execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, email STRING);",
+        );
+        assert_operation_successful(result, 0, StatementType::Create);
+
+        // Verify new table exists and is empty
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, email FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[1].name, "email");
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_drop_multiple_tables() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create multiple tables
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, title STRING);",
+        );
+
+        // Drop first table
+        let result = execute_single(&executor, "DROP TABLE users;");
+        assert_operation_successful(result, 0, StatementType::Drop);
+
+        // Verify first table is gone but second still exists
+        let result = execute_single(&executor, "SELECT * FROM users;");
+        assert_parse_error_contains(result, "table 'users' was not found in database");
+
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT * FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+        let (columns, _) = expect_select_successful(result);
+        assert_eq!(columns.len(), 2);
+
+        // Drop second table
+        let result = execute_single(&executor, "DROP TABLE products;");
+        assert_operation_successful(result, 0, StatementType::Drop);
     }
 }

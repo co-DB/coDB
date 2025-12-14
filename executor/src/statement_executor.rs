@@ -10,14 +10,15 @@ use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
 use planner::query_plan::Delete;
 use planner::{
     query_plan::{
-        AddColumn, CreateTable, Filter, Insert, Limit, Projection, RemoveColumn, Skip, Sort,
-        SortOrder, StatementPlan, StatementPlanItem, TableScan,
+        AddColumn, CreateTable, Filter, Insert, Limit, Projection, RemoveColumn, RemoveTable, Skip,
+        Sort, SortOrder, StatementPlan, StatementPlanItem, TableScan,
     },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
         ResolvedTree,
     },
 };
+use storage::files_manager::FileKey;
 use types::data::Value;
 
 use crate::{
@@ -92,6 +93,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             StatementPlanItem::Insert(insert) => self.insert(insert),
             StatementPlanItem::Delete(delete) => self.delete(delete),
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
+            StatementPlanItem::RemoveTable(remove_table) => self.remove_table(remove_table),
             StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
             StatementPlanItem::RemoveColumn(remove_column) => self.remove_column(remove_column),
             _ => error_factory::runtime_error(format!(
@@ -435,6 +437,46 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 ty: c.ty,
             })
             .collect()
+    }
+
+    /// Handler for [`RemoveTable`] statement.
+    fn remove_table(&self, remove_table: &RemoveTable) -> StatementResult {
+        let mut catalog = self.executor.catalog.write();
+
+        // Remove heap file and btree from executor
+        // We are holding write lock on catalog, so we are sure no other thread can create them back
+        // during this statement.
+        self.executor.remove_heap_file(&remove_table.name);
+        self.executor.remove_b_tree(&remove_table.name);
+
+        // Remove all pages from cache
+        if let Err(e) = self.remove_table_content_from_cache(&remove_table.name) {
+            return StatementResult::from(&e);
+        }
+
+        // Remove table from catalog and files from disk
+        if let Err(e) = catalog.remove_table(&remove_table.name) {
+            return error_factory::runtime_error(format!("failed to remove table: {e:?}"));
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Drop,
+        }
+    }
+
+    /// Removes pages for both index file and data file from cache
+    fn remove_table_content_from_cache(
+        &self,
+        table_name: impl Into<String> + Clone,
+    ) -> Result<(), InternalExecutorError> {
+        self.executor
+            .cache
+            .remove_file(&FileKey::data(table_name.clone().into()))?;
+        self.executor
+            .cache
+            .remove_file(&FileKey::index(table_name.clone().into()))?;
+        Ok(())
     }
 
     /// Handler for [`AddColumn`] statement.

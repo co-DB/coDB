@@ -206,12 +206,12 @@ impl Parser {
         };
         let column_name_id = self.add_identifier_node(column_name);
         let table_alias_id = table_alias.map(|ta| self.add_identifier_node(ta));
-        return Ok(self
+        Ok(self
             .ast
             .add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
                 identifier: column_name_id,
                 table_alias: table_alias_id,
-            })));
+            })))
     }
 
     /// Parses an integer literal as an expression.

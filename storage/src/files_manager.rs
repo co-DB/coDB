@@ -113,7 +113,7 @@ impl FilesManager {
 
     /// Closes a file and removes its entry from the stored [`PagedFile`]s. Can be used for when
     /// a table is deleted or renamed.
-    pub(crate) fn close_file(&mut self, key: &FileKey) {
+    pub(crate) fn close_file(&self, key: &FileKey) {
         self.open_files.remove(key);
     }
 }
