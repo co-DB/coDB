@@ -1,12 +1,13 @@
 use std::{cmp::Ordering, collections::HashMap, iter, mem, ops::Deref};
 
 use engine::{
-    heap_file::{HeapFileError, RecordPtr},
+    heap_file::{HeapFileError, RecordHandle, RecordPtr},
     record::{Field, Record},
 };
 use itertools::Itertools;
 use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
+use planner::query_plan::Delete;
 use planner::{
     query_plan::{
         AddColumn, CreateTable, Filter, Insert, Limit, Projection, RemoveColumn, Skip, Sort,
@@ -89,6 +90,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     fn execute_mutation(&self, item: &StatementPlanItem) -> StatementResult {
         match item {
             StatementPlanItem::Insert(insert) => self.insert(insert),
+            StatementPlanItem::Delete(delete) => self.delete(delete),
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
             StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
             StatementPlanItem::RemoveColumn(remove_column) => self.remove_column(remove_column),
@@ -103,7 +105,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     fn execute_data_source(
         &self,
         data_source: &StatementPlanItem,
-    ) -> Result<Vec<Record>, InternalExecutorError> {
+    ) -> Result<Vec<RecordHandle>, InternalExecutorError> {
         match data_source {
             StatementPlanItem::TableScan(table_scan) => {
                 let records = self.table_scan(table_scan)?;
@@ -120,20 +122,22 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     }
 
     /// Handler for [`TableScan`] statement.
-    fn table_scan(&self, table_scan: &TableScan) -> Result<Vec<Record>, InternalExecutorError> {
+    fn table_scan(
+        &self,
+        table_scan: &TableScan,
+    ) -> Result<Vec<RecordHandle>, InternalExecutorError> {
         // TODO: instead of collecting we should refactor statement executor to use iterators instead of vectors
         let records = self
             .executor
             .with_heap_file(&table_scan.table_name, |hf| {
                 hf.all_records()
-                    .map(|r| r.map(|r| r.record))
-                    .collect::<Result<Vec<Record>, HeapFileError>>()
+                    .collect::<Result<Vec<RecordHandle>, HeapFileError>>()
             })??;
         Ok(records)
     }
 
     /// Handler for [`Filter`] statement.
-    fn filter(&self, filter: &Filter) -> Result<Vec<Record>, InternalExecutorError> {
+    fn filter(&self, filter: &Filter) -> Result<Vec<RecordHandle>, InternalExecutorError> {
         let data_source = self.statement.item(filter.data_source);
         let records = self.execute_data_source(data_source)?;
         self.apply_filter(records.into_iter(), filter.predicate)
@@ -142,15 +146,15 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     /// Applies filter to `records`, returning only those where the `predicate` evaluates to `true`.
     fn apply_filter(
         &self,
-        records: impl Iterator<Item = Record>,
+        records: impl Iterator<Item = RecordHandle>,
         predicate: ResolvedNodeId,
-    ) -> Result<Vec<Record>, InternalExecutorError> {
+    ) -> Result<Vec<RecordHandle>, InternalExecutorError> {
         records
-            .filter_map(|record| {
-                let e = ExpressionExecutor::with_single_record(&record, self.ast);
+            .filter_map(|record_handle| {
+                let e = ExpressionExecutor::with_single_record(&record_handle.record, self.ast);
                 match e.execute_expression(predicate) {
                     Ok(result) => match result.as_bool() {
-                        Some(true) => Some(Ok(record)),
+                        Some(true) => Some(Ok(record_handle)),
                         Some(false) => None,
                         None => Some(Err(error_factory::unexpected_type("bool", result.as_ref()))),
                     },
@@ -161,7 +165,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     }
 
     /// Handler for [`Sort`] statement.
-    fn sort(&self, sort: &Sort) -> Result<Vec<Record>, InternalExecutorError> {
+    fn sort(&self, sort: &Sort) -> Result<Vec<RecordHandle>, InternalExecutorError> {
         let data_source = self.statement.item(sort.data_source);
         let records = self.execute_data_source(data_source)?;
         let column_pos = self.get_column_position(sort.column);
@@ -172,14 +176,14 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     /// If any comparison fails the error is returned.
     fn apply_sorting(
         &self,
-        mut records: Vec<Record>,
+        mut records: Vec<RecordHandle>,
         column_pos: usize,
         order: SortOrder,
-    ) -> Result<Vec<Record>, InternalExecutorError> {
+    ) -> Result<Vec<RecordHandle>, InternalExecutorError> {
         let mut e = None;
         records.sort_by(|lhs, rhs| {
-            let lhs_value = lhs.fields[column_pos].deref();
-            let rhs_value = rhs.fields[column_pos].deref();
+            let lhs_value = lhs.record.fields[column_pos].deref();
+            let rhs_value = rhs.record.fields[column_pos].deref();
             let cmp_res = match order {
                 SortOrder::Ascending => self.cmp_fields(lhs_value, rhs_value),
                 SortOrder::Descending => self.cmp_fields(rhs_value, lhs_value),
@@ -199,14 +203,14 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
     }
 
     /// Handler for [`Skip`] statement.
-    fn skip(&self, skip: &Skip) -> Result<Vec<Record>, InternalExecutorError> {
+    fn skip(&self, skip: &Skip) -> Result<Vec<RecordHandle>, InternalExecutorError> {
         let data_source = self.statement.item(skip.data_source);
         let records = self.execute_data_source(data_source)?;
         Ok(records.into_iter().skip(skip.count as _).collect())
     }
 
     /// Handler for [`Limit`] statement.
-    fn limit(&self, limit: &Limit) -> Result<Vec<Record>, InternalExecutorError> {
+    fn limit(&self, limit: &Limit) -> Result<Vec<RecordHandle>, InternalExecutorError> {
         let data_source = self.statement.item(limit.data_source);
         let records = self.execute_data_source(data_source)?;
         Ok(records.into_iter().take(limit.count as _).collect())
@@ -221,7 +225,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 return StatementResult::from(&err);
             }
         };
-        match self.project_records(records.into_iter(), &projection.columns) {
+        match self.project_records(records.into_iter().map(|rh| rh.record), &projection.columns) {
             Ok(projected_records) => StatementResult::SelectSuccessful {
                 columns: projected_records.columns,
                 rows: projected_records.records,
@@ -349,6 +353,47 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             .collect();
         let record = Record::new(fields);
         Ok(record)
+    }
+
+    /// Handler for [`Delete`] statement.
+    fn delete(&self, delete: &Delete) -> StatementResult {
+        let data_source = self.statement.item(delete.data_source);
+        let records = match self.execute_data_source(data_source) {
+            Ok(records) => records,
+            Err(err) => {
+                return StatementResult::from(&err);
+            }
+        };
+
+        let rows_affected = records.len();
+
+        for record_handle in records {
+            let primary_key_field =
+                match self.get_primary_key_field(&delete.table_name, &record_handle.record) {
+                    Ok(field) => field,
+                    Err(err) => {
+                        return StatementResult::from(&err);
+                    }
+                };
+            let key_bytes = primary_key_field.encode_key();
+
+            if let Err(err) = self.executor.with_b_tree(&delete.table_name, |btree| {
+                btree.delete(key_bytes.as_slice())
+            }) {
+                return StatementResult::from(&err);
+            }
+
+            if let Err(err) = self.executor.with_heap_file(&delete.table_name, |hf| {
+                hf.delete(&record_handle.record_ptr)
+            }) {
+                return StatementResult::from(&err);
+            }
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected,
+            ty: StatementType::Delete,
+        }
     }
 
     /// Handler for [`CreateTable`] statement.
