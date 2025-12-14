@@ -1,3 +1,4 @@
+use crate::resolved_tree::ResolvedDeleteStatement;
 use crate::{
     ast::OrderDirection,
     query_plan::{QueryPlan, SortOrder, StatementPlan, StatementPlanItem},
@@ -43,7 +44,7 @@ impl QueryPlanner {
             ResolvedStatement::Select(select) => self.plan_select_statement(select),
             ResolvedStatement::Insert(insert) => self.plan_insert_statement(insert),
             ResolvedStatement::Update(update) => todo!(),
-            ResolvedStatement::Delete(delete) => todo!(),
+            ResolvedStatement::Delete(delete) => self.plan_delete_statement(delete),
             ResolvedStatement::Create(create) => self.plan_create_statement(create),
             ResolvedStatement::AlterAddColumn(alter_add_column) => {
                 self.plan_alter_add_column_statement(alter_add_column)
@@ -105,6 +106,22 @@ impl QueryPlanner {
             insert.columns.clone(),
             insert.values.clone(),
         ));
+
+        plan
+    }
+
+    fn plan_delete_statement(&self, delete: &ResolvedDeleteStatement) -> StatementPlan {
+        let mut plan = StatementPlan::new();
+
+        let table = self.get_resolved_table(delete.table);
+
+        let mut root = plan.add_item(StatementPlanItem::table_scan(table.name.clone()));
+
+        if let Some(where_node) = delete.where_clause {
+            root = plan.add_item(StatementPlanItem::filter(root, where_node));
+        }
+
+        plan.add_item(StatementPlanItem::delete(root, table.name.clone()));
 
         plan
     }
