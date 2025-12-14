@@ -329,7 +329,7 @@ impl Cache {
             if self.frames.remove(&page_ref).is_some() {
                 // If some other thread at this moment is using this frame we don't care
                 // It will drop it eventually and it won't be persisted to disk anyway,
-                // because the persistent is done by cache, which won't know it after this func.
+                // because the persistence is done by cache, which won't know it after this func.
 
                 // Remove from LRU as well
                 self.lru.write().pop_entry(&page_ref);

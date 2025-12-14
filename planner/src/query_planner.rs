@@ -240,20 +240,20 @@ impl QueryPlanner {
     fn get_resolved_table(&self, id: ResolvedNodeId) -> &ResolvedTable {
         let table_expr = self.tree.node(id);
 
-        (match table_expr {
+        match table_expr {
             ResolvedExpression::TableRef(t) => t,
             _ => panic!("Expected TableRef"),
-        }) as _
+        }
     }
 
     /// Helper to transform generic node into [`ResolvedColumn`].
     fn get_resolved_column(&self, id: ResolvedNodeId) -> &ResolvedColumn {
         let column_expr = self.tree.node(id);
 
-        (match column_expr {
+        match column_expr {
             ResolvedExpression::ColumnRef(c) => c,
             _ => panic!("Expected ColumnRef"),
-        }) as _
+        }
     }
 
     fn map_order(&self, order: &OrderDirection) -> SortOrder {

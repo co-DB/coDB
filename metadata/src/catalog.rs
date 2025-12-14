@@ -111,9 +111,9 @@ impl Catalog {
             .remove(table_name)
             .ok_or(CatalogError::TableNotFound(table_name.into()))
             .map(|_| ())?;
-        self.sync_to_disk()?;
         let path_to_dir = self.dir_path.join(table_name);
         fs::remove_dir_all(path_to_dir)?;
+        self.sync_to_disk()?;
         Ok(())
     }
 
