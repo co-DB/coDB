@@ -1,11 +1,11 @@
+use metadata::catalog::{Catalog, CatalogError, ColumnMetadata, TableMetadata, TableMetadataError};
+use parking_lot::RwLock;
+use std::cmp::PartialEq;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     sync::Arc,
 };
-
-use metadata::catalog::{Catalog, CatalogError, ColumnMetadata, TableMetadata, TableMetadataError};
-use parking_lot::RwLock;
 use thiserror::Error;
 use types::schema::Type;
 
@@ -18,9 +18,9 @@ use crate::{
         SelectStatement, Statement, TableIdentifierNode, TruncateStatement, UnaryExpressionNode,
         UpdateStatement,
     },
-    operators::{BinaryOperator, SupportsType},
+    operators::{BinaryOperator, LogicalOperator, SupportsType},
     resolved_tree::{
-        ResolvedAlterAddColumnStatement, ResolvedAlterDropColumnStatement,
+        IndexBounds, ResolvedAlterAddColumnStatement, ResolvedAlterDropColumnStatement,
         ResolvedAlterRenameColumnStatement, ResolvedAlterRenameTableStatement,
         ResolvedBinaryExpression, ResolvedCast, ResolvedColumn, ResolvedCreateColumnAddon,
         ResolvedCreateColumnDescriptor, ResolvedCreateStatement, ResolvedDeleteStatement,
@@ -258,6 +258,14 @@ impl<'a> Analyzer<'a> {
     /// If successful [`ResolvedSelectStatement`] is added to [`Analyzer::resolved_tree`].
     fn analyze_select_statement(&mut self, select: &SelectStatement) -> Result<(), AnalyzerError> {
         let resolved_table = self.resolve_expression(select.table_name)?;
+        let table = self.get_table_name(resolved_table)?;
+        let primary_key = self
+            .statement_context
+            .tables_metadata
+            .get(&table)
+            .ok_or(AnalyzerError::TableNotFound { table })?
+            .primary_key_column_name()
+            .to_string();
         let resolved_columns = match &select.columns {
             Some(columns) => self.resolve_columns(columns)?,
             None => self.resolve_all_columns_from_table(resolved_table)?,
@@ -285,6 +293,7 @@ impl<'a> Analyzer<'a> {
             .limit
             .map(|limit| self.resolve_u32(limit, "LIMIT"))
             .transpose()?;
+        let index_bounds = self.extract_index_bounds(resolved_where_clause, &primary_key);
         let select_statement = ResolvedSelectStatement {
             table: resolved_table,
             columns: resolved_columns,
@@ -292,6 +301,7 @@ impl<'a> Analyzer<'a> {
             order_by: resolved_order_by,
             limit: resolved_limit,
             offset: resolved_offset,
+            index_bounds,
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Select(select_statement));
@@ -376,6 +386,164 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
+    /// Given a where clause returns the bounds for index scan. The bounds can be based on a single
+    /// comparison (id = 10) or on two inequalities joined with AND logical op (id > 10 AND id <100).
+    /// This function doesn't validate that the lower bound is <= upper bound.
+    fn extract_index_bounds(
+        &mut self,
+        where_clause: Option<ResolvedNodeId>,
+        primary_key_name: &str,
+    ) -> Option<IndexBounds> {
+        let where_clause = where_clause?;
+
+        match self.resolved_tree.node(where_clause) {
+            // Single comparison e.g. id = 10
+            ResolvedExpression::Binary(binary_expr) => {
+                if self.is_indexable_comparison(binary_expr, primary_key_name) {
+                    self.comparison_to_bounds(binary_expr)
+                } else {
+                    None
+                }
+            }
+
+            // Two inequalities combined with AND e.g. id > 10 AND id <= 20
+            ResolvedExpression::Logical(logical) if logical.op == LogicalOperator::And => {
+                match (
+                    self.resolved_tree.node(logical.left),
+                    self.resolved_tree.node(logical.right),
+                ) {
+                    (
+                        ResolvedExpression::Binary(left_bin),
+                        ResolvedExpression::Binary(right_bin),
+                    ) => {
+                        if left_bin.op == BinaryOperator::Equal
+                            && right_bin.op == BinaryOperator::Equal
+                        {
+                            return None;
+                        }
+
+                        let left_ok = self.is_indexable_comparison(left_bin, primary_key_name);
+                        let right_ok = self.is_indexable_comparison(right_bin, primary_key_name);
+
+                        if left_ok && right_ok {
+                            self.merge_bounds(
+                                self.comparison_to_bounds(left_bin),
+                                self.comparison_to_bounds(right_bin),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Checks whether a comparison is compatible with index scan. Comparison must contain
+    /// one column reference to the primary key and one expression evaluating to the primary column's
+    /// type.
+    fn is_indexable_comparison(
+        &self,
+        binary_expression: &ResolvedBinaryExpression,
+        primary_key_name: &str,
+    ) -> bool {
+        let (column, resolved_type) = match (
+            &self.resolved_tree.node(binary_expression.left),
+            &self.resolved_tree.node(binary_expression.right),
+        ) {
+            (ResolvedExpression::ColumnRef(_), ResolvedExpression::ColumnRef(_)) => return false,
+            (ResolvedExpression::ColumnRef(col), expression) => (col, expression.resolved_type()),
+            (expression, ResolvedExpression::ColumnRef(col)) => (col, expression.resolved_type()),
+            _ => return false,
+        };
+
+        let has_correct_op = matches!(
+            binary_expression.op,
+            BinaryOperator::Equal
+                | BinaryOperator::Greater
+                | BinaryOperator::GreaterEqual
+                | BinaryOperator::Less
+                | BinaryOperator::LessEqual
+        );
+
+        column.name == primary_key_name
+            && matches!(resolved_type, ResolvedType::LiteralType(_))
+            && has_correct_op
+    }
+
+    /// Maps a binary expression to index bounds.
+    fn comparison_to_bounds(&self, binary_expr: &ResolvedBinaryExpression) -> Option<IndexBounds> {
+        let (expr_node, op) = self.extract_expr_and_op(binary_expr)?;
+
+        match op {
+            BinaryOperator::Equal => Some(IndexBounds {
+                lower_bound: Some((expr_node, true)),
+                upper_bound: Some((expr_node, true)),
+            }),
+            BinaryOperator::Greater => Some(IndexBounds {
+                lower_bound: Some((expr_node, false)),
+                upper_bound: None,
+            }),
+            BinaryOperator::GreaterEqual => Some(IndexBounds {
+                lower_bound: Some((expr_node, true)),
+                upper_bound: None,
+            }),
+            BinaryOperator::Less => Some(IndexBounds {
+                lower_bound: None,
+                upper_bound: Some((expr_node, false)),
+            }),
+            BinaryOperator::LessEqual => Some(IndexBounds {
+                lower_bound: None,
+                upper_bound: Some((expr_node, true)),
+            }),
+            _ => None,
+        }
+    }
+
+    fn merge_bounds(
+        &self,
+        left: Option<IndexBounds>,
+        right: Option<IndexBounds>,
+    ) -> Option<IndexBounds> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(IndexBounds {
+                lower_bound: left.lower_bound.or(right.lower_bound),
+                upper_bound: left.upper_bound.or(right.upper_bound),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Given a binary expression with one part that is a column reference and the other part is
+    /// any other type of expression, returns the other expression and the operator.
+    fn extract_expr_and_op(
+        &self,
+        binary_expr: &ResolvedBinaryExpression,
+    ) -> Option<(ResolvedNodeId, BinaryOperator)> {
+        let left = self.resolved_tree.node(binary_expr.left);
+        let right = self.resolved_tree.node(binary_expr.right);
+
+        match (left, right) {
+            (ResolvedExpression::ColumnRef(_), ResolvedExpression::ColumnRef(_)) => None,
+            (ResolvedExpression::ColumnRef(_), _) => Some((binary_expr.right, binary_expr.op)),
+            (_, ResolvedExpression::ColumnRef(_)) => {
+                let flipped_op = match binary_expr.op {
+                    BinaryOperator::Greater => BinaryOperator::Less,
+                    BinaryOperator::GreaterEqual => BinaryOperator::LessEqual,
+                    BinaryOperator::Less => BinaryOperator::Greater,
+                    BinaryOperator::LessEqual => BinaryOperator::GreaterEqual,
+                    BinaryOperator::Equal => BinaryOperator::Equal,
+                    _ => return None,
+                };
+                Some((binary_expr.left, flipped_op))
+            }
+            _ => None,
+        }
+    }
+
     /// Analyzes create statement.
     /// If successful [`ResolvedCreateStatement`] is added to [`Analyzer::resolved_tree`].
     fn analyze_create_statement(&mut self, create: &CreateStatement) -> Result<(), AnalyzerError> {
@@ -405,7 +573,7 @@ impl<'a> Analyzer<'a> {
             let resolved = ResolvedCreateColumnDescriptor {
                 name: self.get_identifier_value(col.name)?,
                 ty: col.ty,
-                addon: addon,
+                addon,
             };
 
             if addon == ResolvedCreateColumnAddon::PrimaryKey {
@@ -801,8 +969,8 @@ impl<'a> Analyzer<'a> {
         &mut self,
         column_name: &str,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
-        let table_name = self.find_table_for_column(&column_name)?;
-        self.resolve_column_from_table(&table_name, &column_name)
+        let table_name = self.find_table_for_column(column_name)?;
+        self.resolve_column_from_table(&table_name, column_name)
     }
 
     /// Resolves column once its table is known.
@@ -1085,8 +1253,8 @@ impl<'a> Analyzer<'a> {
             },
         )?;
 
-        // It means that column_type can be casted to value_type, but in this case
-        // we only allow value_type to be casted.
+        // It means that column_type can be cast to value_type, but in this case
+        // we only allow value_type to be cast.
         if column_type != common_type {
             return Err(AnalyzerError::ColumnAndValueTypeDontMatch {
                 column_type: column_type.to_string(),
@@ -1120,7 +1288,7 @@ impl<'a> Analyzer<'a> {
     ) -> Result<bool, AnalyzerError> {
         let table_name = self.get_table_name(resolved_table)?;
         let tm = self.get_table_metadata(&table_name)?;
-        let column_exists = self.get_column_metadata(&tm, &column_name).is_ok();
+        let column_exists = self.get_column_metadata(&tm, column_name).is_ok();
         Ok(column_exists)
     }
 
@@ -1565,8 +1733,8 @@ mod tests {
         let left_bool = expect_literal_bool(&analyzer.resolved_tree, l.left);
         let right_bool = expect_literal_bool(&analyzer.resolved_tree, l.right);
         assert!(matches!(l.op, LogicalOperator::And));
-        assert_eq!(left_bool, true);
-        assert_eq!(right_bool, false);
+        assert!(left_bool);
+        assert!(!right_bool);
     }
 
     #[test]
@@ -1717,7 +1885,7 @@ mod tests {
         assert_eq!(u.ty, Type::Bool);
         assert!(matches!(u.op, UnaryOperator::Bang));
         let v = expect_literal_bool(&analyzer.resolved_tree, u.expression);
-        assert_eq!(v, true);
+        assert!(v);
     }
 
     #[test]
@@ -2121,10 +2289,7 @@ mod tests {
         let col = expect_column(&rt, order_by.column);
         assert_eq!(col.name, "id");
         assert_eq!(col.ty, Type::I32);
-        assert!(matches!(
-            order_by.direction,
-            crate::ast::OrderDirection::Ascending
-        ));
+        assert!(matches!(order_by.direction, OrderDirection::Ascending));
     }
 
     #[test]
@@ -2174,10 +2339,7 @@ mod tests {
         let col = expect_column(&rt, order_by.column);
         assert_eq!(col.name, "name");
         assert_eq!(col.ty, Type::String);
-        assert!(matches!(
-            order_by.direction,
-            crate::ast::OrderDirection::Descending
-        ));
+        assert!(matches!(order_by.direction, OrderDirection::Descending));
     }
 
     #[test]
@@ -3794,5 +3956,541 @@ mod tests {
         let rt = analyzer.analyze().expect("all DDL should succeed");
 
         assert_eq!(rt.statements.len(), 2);
+    }
+
+    #[test]
+    fn index_bounds_equal() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users WHERE id = 5
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let literal_5 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(5),
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_id,
+            right_id: literal_5,
+            op: BinaryOperator::Equal,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_some());
+
+        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        assert!(bounds.lower_bound.is_some());
+        assert!(bounds.upper_bound.is_some());
+
+        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
+        let (upper_node, upper_inclusive) = bounds.upper_bound.unwrap();
+
+        assert!(lower_inclusive);
+        assert!(upper_inclusive);
+        assert_eq!(expect_literal_i32(&rt, lower_node), 5);
+        assert_eq!(expect_literal_i32(&rt, upper_node), 5);
+    }
+
+    #[test]
+    fn index_bounds_greater_than() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users WHERE id > 10
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let literal_10 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(10),
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_id,
+            right_id: literal_10,
+            op: BinaryOperator::Greater,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_some());
+
+        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        assert!(bounds.lower_bound.is_some());
+        assert!(bounds.upper_bound.is_none());
+
+        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
+        assert!(!lower_inclusive); // Greater than is not inclusive
+        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
+    }
+
+    #[test]
+    fn index_bounds_greater_or_equal() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users WHERE id >= 10
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let literal_10 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(10),
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_id,
+            right_id: literal_10,
+            op: BinaryOperator::GreaterEqual,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_some());
+
+        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        assert!(bounds.lower_bound.is_some());
+        assert!(bounds.upper_bound.is_none());
+
+        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
+        assert!(lower_inclusive); // Greater or equal is inclusive
+        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
+    }
+
+    #[test]
+    fn index_bounds_range_both_inclusive() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users WHERE id >= 10 AND id <= 20
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident_1 = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id_1 = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident_1,
+            table_alias: None,
+        }));
+
+        let literal_10 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(10),
+        }));
+
+        let left_expr = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_id_1,
+            right_id: literal_10,
+            op: BinaryOperator::GreaterEqual,
+        }));
+
+        let id_ident_2 = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id_2 = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident_2,
+            table_alias: None,
+        }));
+
+        let literal_20 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(20),
+        }));
+
+        let right_expr = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_id_2,
+            right_id: literal_20,
+            op: BinaryOperator::LessEqual,
+        }));
+
+        let where_clause = ast.add_node(Expression::Logical(LogicalExpressionNode {
+            left_id: left_expr,
+            right_id: right_expr,
+            op: LogicalOperator::And,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_some());
+
+        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        assert!(bounds.lower_bound.is_some());
+        assert!(bounds.upper_bound.is_some());
+
+        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
+        let (upper_node, upper_inclusive) = bounds.upper_bound.unwrap();
+
+        assert!(lower_inclusive);
+        assert!(upper_inclusive);
+        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
+        assert_eq!(expect_literal_i32(&rt, upper_node), 20);
+    }
+
+    #[test]
+    fn index_bounds_range_exclusive() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users WHERE id > 10 AND id < 20
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident_1 = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id_1 = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident_1,
+            table_alias: None,
+        }));
+
+        let literal_10 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(10),
+        }));
+
+        let left_expr = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_id_1,
+            right_id: literal_10,
+            op: BinaryOperator::Greater,
+        }));
+
+        let id_ident_2 = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id_2 = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident_2,
+            table_alias: None,
+        }));
+
+        let literal_20 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(20),
+        }));
+
+        let right_expr = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_id_2,
+            right_id: literal_20,
+            op: BinaryOperator::Less,
+        }));
+
+        let where_clause = ast.add_node(Expression::Logical(LogicalExpressionNode {
+            left_id: left_expr,
+            right_id: right_expr,
+            op: LogicalOperator::And,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_some());
+
+        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        assert!(bounds.lower_bound.is_some());
+        assert!(bounds.upper_bound.is_some());
+
+        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
+        let (upper_node, upper_inclusive) = bounds.upper_bound.unwrap();
+
+        assert!(!lower_inclusive);
+        assert!(!upper_inclusive);
+        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
+        assert_eq!(expect_literal_i32(&rt, upper_node), 20);
+    }
+
+    #[test]
+    fn index_bounds_flipped_operands() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users WHERE 10 < id (equivalent to id > 10)
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let literal_10 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(10),
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: literal_10,
+            right_id: col_id,
+            op: BinaryOperator::Less, // 10 < id => id > 10
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_some());
+
+        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        assert!(bounds.lower_bound.is_some());
+        assert!(bounds.upper_bound.is_none());
+
+        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
+        assert!(!lower_inclusive); // Should be > not >=
+        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
+    }
+
+    #[test]
+    fn index_bounds_no_bounds_on_non_primary_key() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users WHERE name = 'John'
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let col_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
+        }));
+
+        let literal_john = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("John".into()),
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_name,
+            right_id: literal_john,
+            op: BinaryOperator::Equal,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_none());
+    }
+
+    #[test]
+    fn index_bounds_no_bounds_without_where_clause() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_none());
+    }
+
+    #[test]
+    fn index_bounds_no_bounds_on_column_to_column_comparison() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM users WHERE id = id (comparing column to itself)
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident_1 = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id_1 = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident_1,
+            table_alias: None,
+        }));
+
+        let id_ident_2 = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id_2 = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident_2,
+            table_alias: None,
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: col_id_1,
+            right_id: col_id_2,
+            op: BinaryOperator::Equal,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        assert!(select_stmt.index_bounds.is_none());
     }
 }

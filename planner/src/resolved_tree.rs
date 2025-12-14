@@ -79,6 +79,7 @@ pub(crate) struct ResolvedSelectStatement {
     pub(crate) order_by: Option<ResolvedOrderByDetails>,
     pub(crate) limit: Option<u32>,
     pub(crate) offset: Option<u32>,
+    pub(crate) index_bounds: Option<IndexBounds>,
 }
 
 #[derive(Debug)]
@@ -180,6 +181,13 @@ impl Display for ResolvedCreateColumnAddon {
 pub struct ResolvedOrderByDetails {
     pub column: ResolvedNodeId,
     pub direction: OrderDirection,
+}
+
+/// Used to describe index scan bounds. The bool indicates whether the bound is inclusive.
+#[derive(Debug)]
+pub struct IndexBounds {
+    pub lower_bound: Option<(ResolvedNodeId, bool)>,
+    pub upper_bound: Option<(ResolvedNodeId, bool)>,
 }
 
 #[derive(Debug)]
