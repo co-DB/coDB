@@ -2,9 +2,11 @@ use crate::{
     ast::OrderDirection,
     query_plan::{QueryPlan, SortOrder, StatementPlan, StatementPlanItem},
     resolved_tree::{
-        ResolvedAlterAddColumnStatement, ResolvedAlterDropColumnStatement, ResolvedColumn,
-        ResolvedCreateStatement, ResolvedExpression, ResolvedInsertStatement, ResolvedNodeId,
-        ResolvedSelectStatement, ResolvedStatement, ResolvedTable, ResolvedTree,
+        ResolvedAlterAddColumnStatement, ResolvedAlterDropColumnStatement,
+        ResolvedAlterRenameColumnStatement, ResolvedAlterRenameTableStatement, ResolvedColumn,
+        ResolvedCreateStatement, ResolvedDropStatement, ResolvedExpression,
+        ResolvedInsertStatement, ResolvedNodeId, ResolvedSelectStatement, ResolvedStatement,
+        ResolvedTable, ResolvedTree, ResolvedTruncateStatement,
     },
 };
 
@@ -48,13 +50,17 @@ impl QueryPlanner {
             ResolvedStatement::AlterAddColumn(alter_add_column) => {
                 self.plan_alter_add_column_statement(alter_add_column)
             }
-            ResolvedStatement::AlterRenameColumn(alter_rename_column) => todo!(),
-            ResolvedStatement::AlterRenameTable(alter_rename_table) => todo!(),
+            ResolvedStatement::AlterRenameColumn(alter_rename_column) => {
+                self.plan_alter_rename_column_statement(alter_rename_column)
+            }
+            ResolvedStatement::AlterRenameTable(alter_rename_table) => {
+                self.plan_alter_rename_table_statement(alter_rename_table)
+            }
             ResolvedStatement::AlterDropColumn(alter_drop_column) => {
                 self.plan_alter_drop_column_statement(alter_drop_column)
             }
-            ResolvedStatement::Truncate(truncate) => todo!(),
-            ResolvedStatement::Drop(drop) => todo!(),
+            ResolvedStatement::Truncate(truncate) => self.plan_truncate_table_statement(truncate),
+            ResolvedStatement::Drop(drop) => self.plan_drop_table_statement(drop),
         }
     }
 
@@ -139,6 +145,40 @@ impl QueryPlanner {
         plan
     }
 
+    fn plan_alter_rename_column_statement(
+        &self,
+        alter_rename_column: &ResolvedAlterRenameColumnStatement,
+    ) -> StatementPlan {
+        let mut plan = StatementPlan::new();
+
+        let table = self.get_resolved_table(alter_rename_column.table);
+        let column = self.get_resolved_column(alter_rename_column.column);
+
+        plan.add_item(StatementPlanItem::rename_column(
+            table.name.clone(),
+            column.name.clone(),
+            alter_rename_column.new_name.clone(),
+        ));
+
+        plan
+    }
+
+    fn plan_alter_rename_table_statement(
+        &self,
+        alter_rename_table: &ResolvedAlterRenameTableStatement,
+    ) -> StatementPlan {
+        let mut plan = StatementPlan::new();
+
+        let table = self.get_resolved_table(alter_rename_table.table);
+
+        plan.add_item(StatementPlanItem::rename_table(
+            table.name.clone(),
+            alter_rename_table.new_name.clone(),
+        ));
+
+        plan
+    }
+
     fn plan_alter_drop_column_statement(
         &self,
         alter_drop_column: &ResolvedAlterDropColumnStatement,
@@ -156,24 +196,47 @@ impl QueryPlanner {
         plan
     }
 
+    fn plan_truncate_table_statement(
+        &self,
+        truncate_table: &ResolvedTruncateStatement,
+    ) -> StatementPlan {
+        let mut plan = StatementPlan::new();
+
+        let table = self.get_resolved_table(truncate_table.table);
+
+        plan.add_item(StatementPlanItem::clear_table(table.name.clone()));
+
+        plan
+    }
+
+    fn plan_drop_table_statement(&self, drop_table: &ResolvedDropStatement) -> StatementPlan {
+        let mut plan = StatementPlan::new();
+
+        let table = self.get_resolved_table(drop_table.table);
+
+        plan.add_item(StatementPlanItem::remove_table(table.name.clone()));
+
+        plan
+    }
+
     /// Helper to transform generic node into [`ResolvedTable`].
     fn get_resolved_table(&self, id: ResolvedNodeId) -> &ResolvedTable {
         let table_expr = self.tree.node(id);
-        let table = match table_expr {
+
+        (match table_expr {
             ResolvedExpression::TableRef(t) => t,
             _ => panic!("Expected TableRef"),
-        };
-        table
+        }) as _
     }
 
     /// Helper to transform generic node into [`ResolvedColumn`].
     fn get_resolved_column(&self, id: ResolvedNodeId) -> &ResolvedColumn {
         let column_expr = self.tree.node(id);
-        let column = match column_expr {
+
+        (match column_expr {
             ResolvedExpression::ColumnRef(c) => c,
             _ => panic!("Expected ColumnRef"),
-        };
-        column
+        }) as _
     }
 
     fn map_order(&self, order: &OrderDirection) -> SortOrder {
@@ -188,7 +251,10 @@ impl QueryPlanner {
 mod tests {
     use types::schema::Type;
 
-    use crate::resolved_tree::IndexBounds;
+    use crate::resolved_tree::{
+        IndexBounds, ResolvedAlterRenameColumnStatement, ResolvedDropStatement,
+        ResolvedTruncateStatement,
+    };
     use crate::{
         ast::OrderDirection,
         operators::BinaryOperator,
@@ -710,6 +776,98 @@ mod tests {
     }
 
     #[test]
+    fn query_planner_alter_rename_column_statement() {
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "users".into(),
+            primary_key_name: "id".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let column = ResolvedColumn {
+            table: table_id,
+            name: "email".into(),
+            ty: Type::String,
+            pos: 2,
+        };
+        let column_id = tree.add_node(ResolvedExpression::ColumnRef(column));
+
+        let alter_rename_column = ResolvedAlterRenameColumnStatement {
+            table: table_id,
+            column: column_id,
+            new_name: "email_address".into(),
+        };
+
+        tree.add_statement(ResolvedStatement::AlterRenameColumn(alter_rename_column));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        // Assert we only got one plan
+        assert_eq!(plan.plans.len(), 1);
+        let alter_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains only one item (RenameColumn)
+        assert_eq!(alter_plan.items.len(), 1);
+
+        // Assert rename column is correct
+        let rename_column_item = alter_plan.root();
+        let rename_column = match rename_column_item {
+            StatementPlanItem::RenameColumn(rename_column) => rename_column,
+            _ => panic!("expected: rename column, got: {:?}", rename_column_item),
+        };
+
+        assert_eq!(rename_column.table_name, "users");
+        assert_eq!(rename_column.prev_column_name, "email");
+        assert_eq!(rename_column.new_column_name, "email_address");
+    }
+
+    #[test]
+    fn query_planner_alter_rename_table_statement() {
+        use crate::resolved_tree::ResolvedAlterRenameTableStatement;
+
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "users".into(),
+            primary_key_name: "id".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let alter_rename_table = ResolvedAlterRenameTableStatement {
+            table: table_id,
+            new_name: "customers".into(),
+        };
+
+        tree.add_statement(ResolvedStatement::AlterRenameTable(alter_rename_table));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        // Assert we only got one plan
+        assert_eq!(plan.plans.len(), 1);
+        let alter_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains only one item (RenameTable)
+        assert_eq!(alter_plan.items.len(), 1);
+
+        // Assert rename table is correct
+        let rename_table_item = alter_plan.root();
+        let rename_table = match rename_table_item {
+            StatementPlanItem::RenameTable(rename_table) => rename_table,
+            _ => panic!("expected: rename table, got: {:?}", rename_table_item),
+        };
+
+        assert_eq!(rename_table.prev_name, "users");
+        assert_eq!(rename_table.new_name, "customers");
+    }
+
+    #[test]
     fn query_planner_alter_drop_column_statement() {
         // Setup tree
         let mut tree = ResolvedTree::default();
@@ -752,5 +910,77 @@ mod tests {
 
         assert_eq!(remove_column.table_name, "users");
         assert_eq!(remove_column.column_name, "email");
+    }
+
+    #[test]
+    fn query_planner_truncate_table_statement() {
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "users".into(),
+            primary_key_name: "id".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let truncate = ResolvedTruncateStatement { table: table_id };
+
+        tree.add_statement(ResolvedStatement::Truncate(truncate));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        // Assert we only got one plan
+        assert_eq!(plan.plans.len(), 1);
+        let truncate_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains only one item (ClearTable)
+        assert_eq!(truncate_plan.items.len(), 1);
+
+        // Assert clear table is correct
+        let clear_table_item = truncate_plan.root();
+        let clear_table = match clear_table_item {
+            StatementPlanItem::ClearTable(clear_table) => clear_table,
+            _ => panic!("expected: clear table, got: {:?}", clear_table_item),
+        };
+
+        assert_eq!(clear_table.name, "users");
+    }
+
+    #[test]
+    fn query_planner_drop_table_statement() {
+        // Setup tree
+        let mut tree = ResolvedTree::default();
+
+        let table = ResolvedTable {
+            name: "users".into(),
+            primary_key_name: "id".into(),
+        };
+        let table_id = tree.add_node(ResolvedExpression::TableRef(table));
+
+        let drop = ResolvedDropStatement { table: table_id };
+
+        tree.add_statement(ResolvedStatement::Drop(drop));
+
+        // Plan query
+        let qp = QueryPlanner::new(tree);
+        let mut plan = qp.plan_query();
+
+        // Assert we only got one plan
+        assert_eq!(plan.plans.len(), 1);
+        let drop_plan = plan.plans.pop().unwrap();
+
+        // Assert plan contains only one item (RemoveTable)
+        assert_eq!(drop_plan.items.len(), 1);
+
+        // Assert remove table is correct
+        let remove_table_item = drop_plan.root();
+        let remove_table = match remove_table_item {
+            StatementPlanItem::RemoveTable(remove_table) => remove_table,
+            _ => panic!("expected: remove table, got: {:?}", remove_table_item),
+        };
+
+        assert_eq!(remove_table.name, "users");
     }
 }
