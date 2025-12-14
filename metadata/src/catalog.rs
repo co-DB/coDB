@@ -61,7 +61,7 @@ impl Catalog {
         let catalog_json = MetadataFileHelper::latest_catalog_json(&db_dir, |path| {
             CatalogJson::read_from_file(path)
         })?;
-        let tables = catalog_json.to_tables()?;
+        let tables = catalog_json.tables()?;
         let file_path = db_dir.join(METADATA_FILE_NAME);
         Ok(Catalog {
             dir_path: db_dir,
@@ -105,7 +105,6 @@ impl Catalog {
     }
 
     /// Removes table with `table_name` name from list of tables in the catalog.
-    /// IMPORTANT NOTE: this function is purely for changing contents of metadata file. It is NOT responsible for managing table related files (e.g. removing folder `{PATH_TO_CODB}/{DATABASE_NAME}/{TABLE_NAME}` and its files).
     /// Can fail if table with `table_name` does not exist.
     pub fn remove_table(&mut self, table_name: &str) -> Result<(), CatalogError> {
         self.tables
@@ -113,6 +112,8 @@ impl Catalog {
             .ok_or(CatalogError::TableNotFound(table_name.into()))
             .map(|_| ())?;
         self.sync_to_disk()?;
+        let path_to_dir = self.dir_path.join(table_name);
+        fs::remove_dir_all(path_to_dir)?;
         Ok(())
     }
 
@@ -182,7 +183,7 @@ impl Catalog {
         MetadataFileHelper::remove_tmp_files::<CatalogError>(&mut tmp_files)?;
 
         let catalog_json = CatalogJson::read_from_file(&self.file_path)?;
-        self.tables = catalog_json.to_tables()?;
+        self.tables = catalog_json.tables()?;
 
         Ok(())
     }
@@ -418,7 +419,7 @@ impl TableMetadata {
                 let pos = from as u16;
                 let prev = &self.columns[from - 1];
                 let (last_fixed_pos, base_offset) = match schema::type_size_on_disk(&prev.ty) {
-                    Some(size) => (from as u16, prev.base_offset() + size as usize),
+                    Some(size) => (from as u16, prev.base_offset() + size),
                     None => (prev.base_offset_pos(), prev.base_offset()),
                 };
                 (pos, last_fixed_pos, base_offset)
@@ -557,15 +558,18 @@ impl TableMetadataFactory {
     fn create_columns(&mut self) -> Result<(), TableMetadataError> {
         self.sort_column_requests_by_fixed_size();
 
-        let mut pos = 0;
         let mut last_fixed_pos = 0;
         let mut base_offset = 0;
 
-        for col in &self.column_requests {
-            let column_metadata =
-                ColumnMetadata::new(col.name.clone(), col.ty, pos, base_offset, last_fixed_pos)?;
+        for (pos, col) in self.column_requests.iter().enumerate() {
+            let column_metadata = ColumnMetadata::new(
+                col.name.clone(),
+                col.ty,
+                pos as _,
+                base_offset,
+                last_fixed_pos,
+            )?;
             self.columns.push(column_metadata);
-            pos += 1;
             if let Some(offset) = schema::type_size_on_disk(&col.ty) {
                 last_fixed_pos += 1;
                 base_offset += offset;
@@ -575,7 +579,7 @@ impl TableMetadataFactory {
     }
 
     /// Sorts columns by whether they are fixed-size (fixed-size columns are first).
-    fn sort_column_requests_by_fixed_size<'c>(&mut self) {
+    fn sort_column_requests_by_fixed_size(&mut self) {
         self.column_requests.sort_unstable_by(|a, b| {
             let a_fixed = a.ty.is_fixed_size();
             let b_fixed = b.ty.is_fixed_size();
@@ -667,7 +671,7 @@ impl ColumnMetadata {
 }
 
 /// [`CatalogJson`] is a representation of [`Catalog`] on disk. Used only for serializing to/deserializing from JSON file.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub(crate) struct CatalogJson {
     tables: Vec<TableJson>,
 }
@@ -690,7 +694,7 @@ impl CatalogJson {
         Ok(())
     }
 
-    pub(crate) fn to_tables(self) -> Result<HashMap<String, TableMetadata>, CatalogError> {
+    pub(crate) fn tables(self) -> Result<HashMap<String, TableMetadata>, CatalogError> {
         let tables = self
             .tables
             .into_iter()
@@ -700,12 +704,6 @@ impl CatalogJson {
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
         Ok(tables)
-    }
-}
-
-impl Default for CatalogJson {
-    fn default() -> Self {
-        Self { tables: Vec::new() }
     }
 }
 
@@ -1485,19 +1483,51 @@ mod tests {
     }
 
     #[test]
-    fn catalog_remove_table_removes_existing_table() {
+    fn catalog_remove_table_removes_table_directory_from_disk() {
         // given catalog with table `users`
         let mut fixture = CatalogTestFixture::with_table(users_table());
 
-        // when removing table with name `users`
+        // create table directory on disk
+        let table_dir = fixture.db_path().parent().unwrap().join("users");
+        fs::create_dir(&table_dir).unwrap();
+
+        // create some dummy files in table directory
+        fs::write(table_dir.join("data.bin"), b"test data").unwrap();
+        fs::write(table_dir.join("index.bin"), b"test index").unwrap();
+
+        // verify directory exists before removal
+        assert!(table_dir.exists());
+
+        // when removing table
         let result = fixture.catalog_mut().remove_table("users");
 
-        // then Ok(()) is returned and table is removed
+        // then Ok(()) is returned
         assert!(result.is_ok());
+
+        // table is removed from catalog
         assert!(!fixture.catalog().tables.contains_key("users"));
 
-        // and is removed from disk
+        // table directory is removed from disk
+        assert!(!table_dir.exists());
+
+        // and metadata file is updated
         assert_catalog_on_disk(fixture.db_path(), 0, |_| {});
+    }
+
+    #[test]
+    fn catalog_remove_table_returns_error_when_table_does_not_exist() {
+        // given empty catalog
+        let mut fixture = CatalogTestFixture::new();
+
+        // when removing non-existent table
+        let result = fixture.catalog_mut().remove_table("nonexistent");
+
+        // then Err(CatalogError::TableNotFound) is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::TableNotFound("nonexistent".into()),
+        );
     }
 
     #[test]

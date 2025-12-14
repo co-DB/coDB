@@ -2,6 +2,7 @@
 
 use engine::b_tree::BTreeError;
 use engine::heap_file::HeapFileError;
+use storage::cache::CacheError;
 use thiserror::Error;
 use types::{data::Value, schema::Type};
 
@@ -24,6 +25,8 @@ pub(crate) enum InternalExecutorError {
     HeapFileError(#[from] HeapFileError),
     #[error("{0}")]
     BTreeError(#[from] BTreeError),
+    #[error("{0}")]
+    CacheError(#[from] CacheError),
     #[error("Used invalid operation ({operation}) for data source")]
     InvalidOperationInDataSource { operation: String },
     #[error("Received unexpected node type ({node_type}) while processing expression")]

@@ -298,6 +298,47 @@ impl Cache {
         }
     }
 
+    /// Removes file from cache.
+    ///
+    /// First, it removes all pages of this file from cache (without flushing).
+    /// Then it removes it from list of open files in [`FilesManager`].
+    pub fn remove_file(&self, file_key: &FileKey) -> Result<(), CacheError> {
+        self.remove_all_pages_from_file_without_flushing(file_key)?;
+        self.files.close_file(file_key);
+        Ok(())
+    }
+
+    /// Removes all pages from file with `file_key`.
+    /// Each frame is just dropped, no flushing to disk happens.
+    fn remove_all_pages_from_file_without_flushing(
+        &self,
+        file_key: &FileKey,
+    ) -> Result<(), CacheError> {
+        let pf = self.files.get_or_open_new_file(file_key)?;
+        // Acquire lock on the file to prevent other threads from creating new frames for this file
+        let _pf_lock = pf.lock();
+
+        let pages_to_remove: Vec<_> = self
+            .frames
+            .iter()
+            .filter(|entry| entry.key().file_key() == file_key)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for page_ref in pages_to_remove {
+            if self.frames.remove(&page_ref).is_some() {
+                // If some other thread at this moment is using this frame we don't care
+                // It will drop it eventually and it won't be persisted to disk anyway,
+                // because the persistent is done by cache, which won't know it after this func.
+
+                // Remove from LRU as well
+                self.lru.write().pop_entry(&page_ref);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns [`Arc<PageFrame>`] and pinnes the underlying [`PageFrame`].
     /// It first looks for frame in [`Cache::frames`]. If it's found there then its key in [`Cache::lru`] is updated (making it MRU).
     /// Otherwise [`PageFrame`] is loaded from disk using [`FilesManager`] and frame's key is inserted into [`Cache::lru`].
@@ -1362,5 +1403,208 @@ mod tests {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&page[0..8]);
         assert_eq!(u64::from_be_bytes(buf), 0xDEADu64);
+    }
+
+    #[test]
+    fn cache_remove_all_pages_single_threaded() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_remove");
+
+        // Create several pages in the file
+        let pid1 = alloc_page_with_u64(&files, &file_key, 0x1111);
+        let pid2 = alloc_page_with_u64(&files, &file_key, 0x2222);
+        let pid3 = alloc_page_with_u64(&files, &file_key, 0x3333);
+
+        let cache = Cache::new(5, files.clone());
+
+        let id1 = FilePageRef {
+            page_id: pid1,
+            file_key: file_key.clone(),
+        };
+        let id2 = FilePageRef {
+            page_id: pid2,
+            file_key: file_key.clone(),
+        };
+        let id3 = FilePageRef {
+            page_id: pid3,
+            file_key: file_key.clone(),
+        };
+
+        // Load all pages into cache
+        {
+            let _p1 = cache.pin_read(&id1).expect("pin_read id1");
+            let _p2 = cache.pin_read(&id2).expect("pin_read id2");
+            let _p3 = cache.pin_read(&id3).expect("pin_read id3");
+        }
+
+        // Verify they're all cached
+        assert_cached(&cache, &id1);
+        assert_cached(&cache, &id2);
+        assert_cached(&cache, &id3);
+        assert_eq!(cache.frames.len(), 3);
+
+        // Remove all pages from this file
+        cache
+            .remove_all_pages_from_file_without_flushing(&file_key)
+            .expect("remove_all_pages failed");
+
+        // Verify all frames for this file are removed
+        assert!(!cache.frames.contains_key(&id1));
+        assert!(!cache.frames.contains_key(&id2));
+        assert!(!cache.frames.contains_key(&id3));
+        assert_eq!(cache.frames.len(), 0);
+
+        // Verify LRU is also cleaned
+        assert!(!cache.lru.read().contains(&id1));
+        assert!(!cache.lru.read().contains(&id2));
+        assert!(!cache.lru.read().contains(&id3));
+    }
+
+    #[test]
+    fn cache_remove_all_pages_does_not_affect_other_files() {
+        let files = create_files_manager();
+        let file_key1 = FileKey::data("table_remove_1");
+        let file_key2 = FileKey::data("table_remove_2");
+
+        // Create pages in both files
+        let pid1 = alloc_page_with_u64(&files, &file_key1, 0x1111);
+        let pid2 = alloc_page_with_u64(&files, &file_key2, 0x2222);
+
+        let cache = Cache::new(5, files.clone());
+
+        let id1 = FilePageRef {
+            page_id: pid1,
+            file_key: file_key1.clone(),
+        };
+        let id2 = FilePageRef {
+            page_id: pid2,
+            file_key: file_key2.clone(),
+        };
+
+        // Load both pages
+        {
+            let _p1 = cache.pin_read(&id1).expect("pin_read id1");
+            let _p2 = cache.pin_read(&id2).expect("pin_read id2");
+        }
+
+        assert_eq!(cache.frames.len(), 2);
+
+        // Remove only pages from file_key1
+        cache
+            .remove_all_pages_from_file_without_flushing(&file_key1)
+            .expect("remove_all_pages failed");
+
+        // id1 should be gone, id2 should remain
+        assert!(!cache.frames.contains_key(&id1));
+        assert_cached(&cache, &id2);
+        assert_eq!(cache.frames.len(), 1);
+    }
+
+    #[test]
+    fn cache_remove_all_pages_with_dirty_frames_no_flush() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_remove_dirty");
+
+        let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
+        let cache = Cache::new(5, files.clone());
+
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+
+        // Write to page (make it dirty)
+        {
+            let mut w = cache.pin_write(&id).expect("pin_write");
+            w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+        }
+
+        // Verify it's dirty and cached
+        assert_cached(&cache, &id);
+        let frame = cache.frames.get(&id).unwrap();
+        assert!(frame.dirty.load(Ordering::Acquire));
+        drop(frame);
+
+        // Remove without flushing
+        cache
+            .remove_all_pages_from_file_without_flushing(&file_key)
+            .expect("remove_all_pages failed");
+
+        // Frame should be gone
+        assert!(!cache.frames.contains_key(&id));
+
+        // Read from disk directly - should still have OLD value (0x1111), not 0xBEEF
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let page = pf.lock().read_page(pid).expect("read_page");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0x1111u64);
+    }
+
+    #[test]
+    fn cache_remove_all_pages_empty_file() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_empty");
+
+        let cache = Cache::new(5, files.clone());
+
+        // Try to remove pages from a file that has no cached pages
+        cache
+            .remove_all_pages_from_file_without_flushing(&file_key)
+            .expect("remove_all_pages should succeed on empty");
+
+        assert_eq!(cache.frames.len(), 0);
+    }
+
+    #[test]
+    fn cache_remove_all_pages_with_held_frame_no_flush() {
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_remove_held");
+
+        let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
+        let cache = Cache::new(5, files.clone());
+
+        let id = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+
+        // Pin the page for write and make it dirty
+        let mut w = cache.pin_write(&id).expect("pin_write");
+        w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+
+        // While still holding the write lock, remove all pages from this file
+        cache
+            .remove_all_pages_from_file_without_flushing(&file_key)
+            .expect("remove_all_pages failed");
+
+        // Frame should be removed from cache even though we still hold the lock
+        assert!(!cache.frames.contains_key(&id));
+        assert!(!cache.lru.read().contains(&id));
+
+        // Continue modifying the page while holding the frame
+        w.page_mut()[8..16].copy_from_slice(&0xDEADu64.to_be_bytes());
+
+        // Drop the write lock
+        drop(w);
+
+        // Read from disk directly - should still have ORIGINAL value (0x1111)
+        // because the frame was removed from cache and never flushed
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let page = pf.lock().read_page(pid).expect("read_page");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page[0..8]);
+        assert_eq!(
+            u64::from_be_bytes(buf),
+            0x1111u64,
+            "First 8 bytes should be original value"
+        );
+
+        buf.copy_from_slice(&page[8..16]);
+        assert_eq!(
+            u64::from_be_bytes(buf),
+            0x0u64,
+            "Next 8 bytes should be zeros (unmodified)"
+        );
     }
 }
