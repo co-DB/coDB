@@ -8,8 +8,8 @@ use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
 use planner::{
     query_plan::{
-        AddColumn, CreateTable, Delete, Filter, Insert, Limit, Projection, RemoveColumn, Skip,
-        Sort, SortOrder, StatementPlan, StatementPlanItem, TableScan, Update,RemoveTable
+        AddColumn, CreateTable, Delete, Filter, Insert, Limit, Projection, RemoveColumn,
+        RemoveTable, Skip, Sort, SortOrder, StatementPlan, StatementPlanItem, TableScan, Update,
     },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
