@@ -1,4 +1,4 @@
-use crate::resolved_tree::ResolvedDeleteStatement;
+use crate::resolved_tree::{ResolvedDeleteStatement, ResolvedUpdateStatement};
 use crate::{
     ast::OrderDirection,
     query_plan::{QueryPlan, SortOrder, StatementPlan, StatementPlanItem},
@@ -45,7 +45,7 @@ impl QueryPlanner {
         match statement {
             ResolvedStatement::Select(select) => self.plan_select_statement(select),
             ResolvedStatement::Insert(insert) => self.plan_insert_statement(insert),
-            ResolvedStatement::Update(update) => todo!(),
+            ResolvedStatement::Update(update) => self.plan_update_statement(update),
             ResolvedStatement::Delete(delete) => self.plan_delete_statement(delete),
             ResolvedStatement::Create(create) => self.plan_create_statement(create),
             ResolvedStatement::AlterAddColumn(alter_add_column) => {
@@ -121,6 +121,7 @@ impl QueryPlanner {
 
         let table = self.get_resolved_table(delete.table);
 
+        // TODO: Use index bounds from select.index_bounds
         let mut root = plan.add_item(StatementPlanItem::table_scan(table.name.clone()));
 
         if let Some(where_node) = delete.where_clause {
@@ -128,6 +129,28 @@ impl QueryPlanner {
         }
 
         plan.add_item(StatementPlanItem::delete(root, table.name.clone()));
+
+        plan
+    }
+
+    fn plan_update_statement(&self, update: &ResolvedUpdateStatement) -> StatementPlan {
+        let mut plan = StatementPlan::new();
+
+        let table = self.get_resolved_table(update.table);
+
+        // TODO: Use index bounds from select.index_bounds
+        let mut root = plan.add_item(StatementPlanItem::table_scan(table.name.clone()));
+
+        if let Some(where_node) = update.where_clause {
+            root = plan.add_item(StatementPlanItem::filter(root, where_node));
+        }
+
+        plan.add_item(StatementPlanItem::update(
+            root,
+            table.name.clone(),
+            update.columns.clone(),
+            update.values.clone(),
+        ));
 
         plan
     }
