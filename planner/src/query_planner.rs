@@ -63,8 +63,7 @@ impl QueryPlanner {
 
         let table = self.get_resolved_table(select.table);
 
-        // TODO: if possible we should check if where clause contain only primary_key (index) and
-        // in that case use IndexScan with proper range
+        // TODO: Use index bounds from select.index_bounds
         let mut root = plan.add_item(StatementPlanItem::table_scan(table.name.clone()));
 
         // Handle where
@@ -189,6 +188,7 @@ impl QueryPlanner {
 mod tests {
     use types::schema::Type;
 
+    use crate::resolved_tree::IndexBounds;
     use crate::{
         ast::OrderDirection,
         operators::BinaryOperator,
@@ -283,6 +283,7 @@ mod tests {
         order_by: Option<ResolvedOrderByDetails>,
         limit: Option<u32>,
         offset: Option<u32>,
+        index_bounds: Option<IndexBounds>,
     }
 
     impl SelectStatementBuilder {
@@ -303,6 +304,7 @@ mod tests {
                 order_by: None,
                 limit: None,
                 offset: None,
+                index_bounds: None,
             }
         }
 
@@ -364,6 +366,7 @@ mod tests {
                 order_by: self.order_by,
                 limit: self.limit,
                 offset: self.offset,
+                index_bounds: self.index_bounds,
             };
 
             self.tree.add_statement(ResolvedStatement::Select(select));
