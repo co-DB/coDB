@@ -420,14 +420,9 @@ impl<'a> Analyzer<'a> {
                         let right_ok = self.is_indexable_comparison(right_bin, primary_key_name);
 
                         if left_ok && right_ok {
-                            // We unwrap here because we already checked that both comparisons are indexable.
-                            Some(
-                                self.merge_bounds(
-                                    self.comparison_to_bounds(left_bin)
-                                        .expect("Comparison is indexable"),
-                                    self.comparison_to_bounds(right_bin)
-                                        .expect("Comparison is indexable"),
-                                ),
+                            self.merge_bounds(
+                                self.comparison_to_bounds(left_bin),
+                                self.comparison_to_bounds(right_bin),
                             )
                         } else {
                             None
@@ -459,7 +454,18 @@ impl<'a> Analyzer<'a> {
             _ => return false,
         };
 
-        column.name == primary_key_name && matches!(resolved_type, ResolvedType::LiteralType(_))
+        let has_correct_op = matches!(
+            binary_expression.op,
+            BinaryOperator::Equal
+                | BinaryOperator::Greater
+                | BinaryOperator::GreaterEqual
+                | BinaryOperator::Less
+                | BinaryOperator::LessEqual
+        );
+
+        column.name == primary_key_name
+            && matches!(resolved_type, ResolvedType::LiteralType(_))
+            && has_correct_op
     }
 
     /// Maps a binary expression to index bounds.
@@ -491,10 +497,17 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn merge_bounds(&self, left: IndexBounds, right: IndexBounds) -> IndexBounds {
-        IndexBounds {
-            lower_bound: left.lower_bound.or(right.lower_bound),
-            upper_bound: left.upper_bound.or(right.upper_bound),
+    fn merge_bounds(
+        &self,
+        left: Option<IndexBounds>,
+        right: Option<IndexBounds>,
+    ) -> Option<IndexBounds> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(IndexBounds {
+                lower_bound: left.lower_bound.or(right.lower_bound),
+                upper_bound: left.upper_bound.or(right.upper_bound),
+            }),
+            _ => None,
         }
     }
 
