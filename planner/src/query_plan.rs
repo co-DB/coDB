@@ -68,6 +68,7 @@ pub enum StatementPlanItem {
     // Terminal operators (must always be root)
     Projection(Projection),
     Insert(Insert),
+    Delete(Delete),
     CreateTable(CreateTable),
     RemoveTable(RemoveTable),
     ClearTable(ClearTable),
@@ -136,6 +137,13 @@ impl StatementPlanItem {
             table_name,
             columns,
             values,
+        })
+    }
+
+    pub(crate) fn delete(data_source: StatementPlanItemId, table_name: String) -> Self {
+        StatementPlanItem::Delete(Delete {
+            data_source,
+            table_name,
         })
     }
 
@@ -256,6 +264,13 @@ pub struct Insert {
     pub table_name: String,
     pub columns: Vec<ResolvedNodeId>,
     pub values: Vec<ResolvedNodeId>,
+}
+
+/// Deletes elements from table.
+#[derive(Debug)]
+pub struct Delete {
+    pub data_source: StatementPlanItemId,
+    pub table_name: String,
 }
 
 /// Creates a new table.

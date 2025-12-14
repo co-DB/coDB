@@ -1615,6 +1615,396 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_all_records() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
+
+        // Delete all records
+        let result = execute_single(&executor, "DELETE FROM users;");
+        assert_operation_successful(result, 3, StatementType::Delete);
+
+        // Verify table is empty
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_delete_from_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create empty table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+
+        // Try to delete from empty table
+        let result = execute_single(&executor, "DELETE FROM users;");
+        assert_operation_successful(result, 0, StatementType::Delete);
+
+        // Verify table is still empty
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_delete_with_where_clause_single_match() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
+
+        // Delete one record
+        let result = execute_single(&executor, "DELETE FROM users WHERE id = 2;");
+        assert_operation_successful(result, 1, StatementType::Delete);
+
+        // Verify correct record was deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(1)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(3)));
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+    }
+
+    #[test]
+    fn test_delete_with_where_clause_multiple_matches() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (4, 'David', 30);",
+        );
+
+        // Delete multiple records matching condition
+        let result = execute_single(&executor, "DELETE FROM users WHERE age = 30;");
+        assert_operation_successful(result, 2, StatementType::Delete);
+
+        // Verify correct records were deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        // Only users with age 25 should remain
+        assert!(
+            rows.iter()
+                .all(|r| *r.fields[2].deref() == Value::Int32(25))
+        );
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(1)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(3)));
+    }
+
+    #[test]
+    fn test_delete_with_where_clause_no_matches() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Try to delete with non-matching condition
+        let result = execute_single(&executor, "DELETE FROM users WHERE age = 99;");
+        assert_operation_successful(result, 0, StatementType::Delete);
+
+        // Verify no records were deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_with_comparison_operators() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (1, 'Product A', 100);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (2, 'Product B', 200);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (3, 'Product C', 150);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price) VALUES (4, 'Product D', 50);",
+        );
+
+        // Delete products with price > 100
+        let result = execute_single(&executor, "DELETE FROM products WHERE price > 100;");
+        assert_operation_successful(result, 2, StatementType::Delete);
+
+        // Verify correct records were deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, price FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(1)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(4)));
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(3)));
+    }
+
+    #[test]
+    fn test_delete_with_string_condition() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, department STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, department) VALUES (1, 'Alice', 'Engineering');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, department) VALUES (2, 'Bob', 'Sales');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, department) VALUES (3, 'Charlie', 'Engineering');",
+        );
+
+        // Delete users from Engineering department
+        let result = execute_single(
+            &executor,
+            "DELETE FROM users WHERE department = 'Engineering';",
+        );
+        assert_operation_successful(result, 2, StatementType::Delete);
+
+        // Verify correct records were deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, department FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(*row.fields[0].deref(), Value::Int32(2));
+        assert_eq!(*row.fields[1].deref(), Value::String("Bob".into()));
+        assert_eq!(*row.fields[2].deref(), Value::String("Sales".into()));
+    }
+
+    #[test]
+    fn test_delete_then_insert_same_primary_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+
+        // Delete the record
+        let result = execute_single(&executor, "DELETE FROM users WHERE id = 1;");
+        assert_operation_successful(result, 1, StatementType::Delete);
+
+        // Insert new record with the same primary key
+        let result = execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Bob', 30);",
+        );
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        // Verify the new record is present
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(*row.fields[0].deref(), Value::Int32(1));
+        assert_eq!(*row.fields[1].deref(), Value::String("Bob".into()));
+        assert_eq!(*row.fields[2].deref(), Value::Int32(30));
+    }
+
+    #[test]
+    fn test_delete_with_complex_where_clause() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32, in_stock BOOL);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, in_stock) VALUES (1, 'Product A', 100, TRUE);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, in_stock) VALUES (2, 'Product B', 200, FALSE);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, in_stock) VALUES (3, 'Product C', 150, TRUE);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO products (id, name, price, in_stock) VALUES (4, 'Product D', 50, FALSE);",
+        );
+
+        // Delete products that are not in stock AND price > 100
+        let result = execute_single(
+            &executor,
+            "DELETE FROM products WHERE in_stock = FALSE AND price > 100;",
+        );
+        assert_operation_successful(result, 1, StatementType::Delete);
+
+        // Verify correct record was deleted (only Product B should be deleted)
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, price, in_stock FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(1)));
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(3)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(4)));
+    }
+
+    #[test]
+    fn test_delete_all_then_select() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+        execute_single(&executor, "INSERT INTO users (id, name) VALUES (2, 'Bob');");
+
+        // Delete all records
+        execute_single(&executor, "DELETE FROM users;");
+
+        // Insert new records after deletion
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (3, 'Charlie');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (4, 'David');",
+        );
+
+        // Verify only new records are present
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(3)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(4)));
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(1)));
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+    }
+
+    #[test]
     fn test_drop_table_empty_table() {
         let (executor, _temp_dir) = create_test_executor();
 
