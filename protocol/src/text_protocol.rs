@@ -44,7 +44,7 @@ pub enum Request {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Response {

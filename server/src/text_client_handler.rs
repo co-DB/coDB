@@ -32,7 +32,7 @@ enum ReadResult {
 }
 
 #[derive(Error, Debug)]
-enum ClientError {
+pub(crate) enum ClientError {
     #[error("invalid JSON: {0}")]
     InvalidJson(#[from] serde_json::Error),
 
