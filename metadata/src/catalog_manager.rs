@@ -54,39 +54,43 @@ impl CatalogManager {
             None => Err(CatalogManagerError::NoValidCatalogDirectory),
             Some(project_dir) => {
                 let base_path = project_dir.data_local_dir().to_path_buf();
-
-                // If the directory doesn't exist yet, initialize a fresh catalog
-                if !base_path.exists() {
-                    return Self::initialize_catalog(base_path);
-                }
-
-                // Try to load existing database list from disk
-                let result = MetadataFileHelper::latest_catalog_json(&base_path, |path| {
-                    DatabaseList::read_from_json(path)
-                });
-
-                match result {
-                    Ok(database_list) => Ok(Self {
-                        main_directory_path: base_path,
-                        database_list,
-                    }),
-                    // If metadata file doesn't exist, create an empty catalog
-                    Err(CatalogManagerError::IoError(ref e))
-                        if e.kind() == io::ErrorKind::NotFound =>
-                    {
-                        let database_list = DatabaseList {
-                            names: HashSet::new(),
-                        };
-                        let path = base_path.join(METADATA_FILE_NAME);
-                        database_list.write_to_json(&path)?;
-                        Ok(Self {
-                            main_directory_path: base_path,
-                            database_list,
-                        })
-                    }
-                    Err(e) => Err(e),
-                }
+                Self::with_path(base_path)
             }
+        }
+    }
+
+    /// Creates a new `CatalogManager` instance with a custom base path.
+    ///
+    /// This is useful for testing or when you want to use a non-standard directory.
+    pub fn with_path(base_path: PathBuf) -> Result<Self, CatalogManagerError> {
+        // If the directory doesn't exist yet, initialize a fresh catalog
+        if !base_path.exists() {
+            return Self::initialize_catalog(base_path);
+        }
+
+        // Try to load existing database list from disk
+        let result = MetadataFileHelper::latest_catalog_json(&base_path, |path| {
+            DatabaseList::read_from_json(path)
+        });
+
+        match result {
+            Ok(database_list) => Ok(Self {
+                main_directory_path: base_path,
+                database_list,
+            }),
+            // If metadata file doesn't exist, create an empty catalog
+            Err(CatalogManagerError::IoError(ref e)) if e.kind() == io::ErrorKind::NotFound => {
+                let database_list = DatabaseList {
+                    names: HashSet::new(),
+                };
+                let path = base_path.join(METADATA_FILE_NAME);
+                database_list.write_to_json(&path)?;
+                Ok(Self {
+                    main_directory_path: base_path,
+                    database_list,
+                })
+            }
+            Err(e) => Err(e),
         }
     }
 

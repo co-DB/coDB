@@ -2,9 +2,6 @@ mod server;
 mod text_client_handler;
 mod text_protocol_mappings;
 
-#[cfg(test)]
-mod tests;
-
 use crate::server::{Server, ServerError};
 
 #[tokio::main]
