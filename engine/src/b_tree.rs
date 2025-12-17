@@ -1,5 +1,6 @@
 use storage::paged_file::{Page, PageId, PagedFileError};
 
+use crate::b_tree_key::Key;
 use crate::b_tree_node::{
     BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, LeafNodeSearchResult,
     NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
@@ -230,7 +231,7 @@ impl BTree {
 
     /// Searches for a key in the B-tree and returns the corresponding record pointer (to heap
     /// file record) if the key was found.
-    pub fn search(&self, key: &[u8]) -> Result<Option<RecordPtr>, BTreeError> {
+    pub fn search(&self, key: &Key) -> Result<Option<RecordPtr>, BTreeError> {
         let mut current_page_id = self.read_root_page_id()?;
 
         loop {
@@ -241,11 +242,11 @@ impl BTree {
             match node_type {
                 NodeType::Internal => {
                     let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
-                    current_page_id = node.search(key)?.child_ptr();
+                    current_page_id = node.search(key.as_bytes())?.child_ptr();
                 }
                 NodeType::Leaf => {
                     let node = BTreeLeafNode::<PinnedReadPage>::new(page)?;
-                    return match node.search(key)? {
+                    return match node.search(key.as_bytes())? {
                         LeafNodeSearchResult::Found { record_ptr, .. } => Ok(Some(record_ptr)),
                         LeafNodeSearchResult::NotFoundLeaf { .. } => Ok(None),
                     };
@@ -270,20 +271,20 @@ impl BTree {
     /// their child, that we descend into, has enough space to fit another key. That's because
     /// we know that the child can't become full and won't need to be split. If we reach the leaf
     /// and the node is still full we start the recursive split operation.
-    pub fn insert(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
-        let optimistic_result = self.insert_optimistic(key, &record_pointer)?;
+    pub fn insert(&self, key: &Key, record_pointer: RecordPtr) -> Result<(), BTreeError> {
+        let optimistic_result = self.insert_optimistic(key.as_bytes(), &record_pointer)?;
         match optimistic_result {
             OptimisticOperationResult::Success => Ok(()),
             OptimisticOperationResult::StructuralChangeRetry => {
                 // Retry optimistically before going to pessimistic insert. This makes sense as
                 // splits of a node in a given path shouldn't occur too often.
-                match self.insert_optimistic(key, &record_pointer)? {
+                match self.insert_optimistic(key.as_bytes(), &record_pointer)? {
                     OptimisticOperationResult::Success => Ok(()),
-                    _ => self.insert_pessimistic(key, record_pointer),
+                    _ => self.insert_pessimistic(key.as_bytes(), record_pointer),
                 }
             }
             OptimisticOperationResult::FullNodeRetry => {
-                self.insert_pessimistic(key, record_pointer)
+                self.insert_pessimistic(key.as_bytes(), record_pointer)
             }
         }
     }
@@ -631,19 +632,19 @@ impl BTree {
     /// of one of the ancestors) we go to pessimistic strategy, which keeps write latches on all
     /// nodes in the path until we are sure that they won't need to be merged/redistributed into.
     /// For a little more info read [`insert`] docs.
-    pub fn delete(&self, key: &[u8]) -> Result<(), BTreeError> {
-        let optimistic_result = self.delete_optimistic(key)?;
+    pub fn delete(&self, key: &Key) -> Result<(), BTreeError> {
+        let optimistic_result = self.delete_optimistic(key.as_bytes())?;
         match optimistic_result {
             OptimisticOperationResult::Success => Ok(()),
             OptimisticOperationResult::StructuralChangeRetry => {
                 // Retry optimistically before going to pessimistic delete. This makes sense as
                 // merges of a node in a given path shouldn't occur too often.
-                match self.delete_optimistic(key)? {
+                match self.delete_optimistic(key.as_bytes())? {
                     OptimisticOperationResult::Success => Ok(()),
-                    _ => self.delete_pessimistic(key),
+                    _ => self.delete_pessimistic(key.as_bytes()),
                 }
             }
-            OptimisticOperationResult::FullNodeRetry => self.delete_pessimistic(key),
+            OptimisticOperationResult::FullNodeRetry => self.delete_pessimistic(key.as_bytes()),
         }
     }
 
@@ -1331,7 +1332,7 @@ mod test {
     fn create_btree_with_data(
         cache: Arc<Cache>,
         file_key: FileKey,
-        data: Vec<(Vec<u8>, RecordPtr)>,
+        data: Vec<(Key, RecordPtr)>,
     ) -> Result<BTree, BTreeError> {
         let btree = create_empty_btree(cache, file_key)?;
         for (key, record_ptr) in data {
@@ -1344,16 +1345,12 @@ mod test {
         RecordPtr::new(page_id, slot_id)
     }
 
-    fn key_i32(value: i32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        value.serialize(&mut buf);
-        buf
+    fn key_i32(value: i32) -> Key {
+        Key::try_from(types::data::Value::Int32(value)).unwrap()
     }
 
-    fn key_string(value: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        value.to_string().serialize(&mut buf);
-        buf
+    fn key_string(value: &str) -> Key {
+        Key::try_from(types::data::Value::String(value.to_string())).unwrap()
     }
 
     fn random_string(len: usize) -> String {
@@ -1404,11 +1401,13 @@ mod test {
             (key_i32(50), record_ptr(2, 1)),
         ];
 
-        let btree = create_btree_with_data(cache, file_key, data.clone()).unwrap();
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
 
-        for (key, expected_ptr) in data {
-            assert_eq!(btree.search(&key).unwrap(), Some(expected_ptr));
-        }
+        assert_eq!(btree.search(&key_i32(10)).unwrap(), Some(record_ptr(1, 0)));
+        assert_eq!(btree.search(&key_i32(20)).unwrap(), Some(record_ptr(1, 1)));
+        assert_eq!(btree.search(&key_i32(30)).unwrap(), Some(record_ptr(1, 2)));
+        assert_eq!(btree.search(&key_i32(40)).unwrap(), Some(record_ptr(2, 0)));
+        assert_eq!(btree.search(&key_i32(50)).unwrap(), Some(record_ptr(2, 1)));
     }
 
     #[test]
@@ -1425,11 +1424,15 @@ mod test {
             (key_i32(80), record_ptr(8, 0)),
         ];
 
-        let btree = create_btree_with_data(cache, file_key, data.clone()).unwrap();
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
 
-        for (key, expected_ptr) in data {
-            assert_eq!(btree.search(&key).unwrap(), Some(expected_ptr));
-        }
+        assert_eq!(btree.search(&key_i32(50)).unwrap(), Some(record_ptr(5, 0)));
+        assert_eq!(btree.search(&key_i32(30)).unwrap(), Some(record_ptr(3, 0)));
+        assert_eq!(btree.search(&key_i32(70)).unwrap(), Some(record_ptr(7, 0)));
+        assert_eq!(btree.search(&key_i32(20)).unwrap(), Some(record_ptr(2, 0)));
+        assert_eq!(btree.search(&key_i32(40)).unwrap(), Some(record_ptr(4, 0)));
+        assert_eq!(btree.search(&key_i32(60)).unwrap(), Some(record_ptr(6, 0)));
+        assert_eq!(btree.search(&key_i32(80)).unwrap(), Some(record_ptr(8, 0)));
     }
 
     #[test]
@@ -1698,11 +1701,12 @@ mod test {
         let (cache, file_key, _temp_dir) = setup_test_cache();
         let btree = create_empty_btree(cache, file_key).unwrap();
 
-        let empty_key = vec![];
+        // Test with a minimal valid key (Int32 with value 0)
+        let key = key_i32(0);
         let ptr = record_ptr(1, 0);
 
-        btree.insert(&empty_key, ptr).unwrap();
-        assert_eq!(btree.search(&empty_key).unwrap(), Some(ptr));
+        btree.insert(&key, ptr).unwrap();
+        assert_eq!(btree.search(&key).unwrap(), Some(ptr));
     }
 
     #[test]
@@ -1710,12 +1714,13 @@ mod test {
         let (cache, file_key, _temp_dir) = setup_test_cache();
         let btree = create_empty_btree(cache, file_key).unwrap();
 
-        for byte in 0u8..100 {
-            btree.insert(&[byte], record_ptr(byte as u32, 0)).unwrap();
+        // Use small Int32 values instead of raw bytes
+        for i in 0i32..100 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
         }
 
-        for byte in 0u8..100 {
-            assert!(btree.search(&[byte]).unwrap().is_some());
+        for i in 0i32..100 {
+            assert!(btree.search(&key_i32(i)).unwrap().is_some());
         }
     }
 
@@ -1813,8 +1818,10 @@ mod test {
                     let start_idx = thread_id * keys_per_thread;
                     let end_idx = start_idx + keys_per_thread;
                     for &key_val in &keys[start_idx..end_idx] {
-                        let _ = btree
-                            .insert_pessimistic(&key_i32(key_val), record_ptr(key_val as u32, 0));
+                        let _ = btree.insert_pessimistic(
+                            key_i32(key_val).as_bytes(),
+                            record_ptr(key_val as u32, 0),
+                        );
                     }
                 })
             })

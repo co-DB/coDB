@@ -10,6 +10,8 @@ pub enum BTreeKeyError {
     #[error("failed to decode key: {0}")]
     DecodeError(#[from] DecodeError),
 }
+
+#[derive(Clone, Debug)]
 pub struct Key {
     bytes: Vec<u8>,
 }
@@ -45,6 +47,13 @@ impl Key {
 
 impl AsRef<[u8]> for Key {
     fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Key {
+    /// Returns the raw bytes of the key.
+    pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 }

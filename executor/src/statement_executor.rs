@@ -1,5 +1,6 @@
 use engine::heap_file::FieldUpdateDescriptor;
 use engine::{
+    b_tree_key::Key,
     heap_file::{HeapFileError, RecordHandle, RecordPtr},
     record::{Field, Record},
 };
@@ -289,16 +290,17 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         let record = self.build_record(&insert.columns, &insert.values)?;
 
         let primary_key_field = self.get_primary_key_field(&insert.table_name, &record)?;
-        let key_bytes = primary_key_field.encode_key();
+        let primary_key_value: Value = primary_key_field.clone().into();
+        let key =
+            Key::try_from(primary_key_value).map_err(|_| InternalExecutorError::InvalidRecord)?;
 
         let ptr = self.executor.with_heap_file(&insert.table_name, |hf| {
             let ptr = hf.insert(record)?;
             Ok::<RecordPtr, HeapFileError>(ptr)
         })??;
 
-        self.executor.with_b_tree(&insert.table_name, |btree| {
-            btree.insert(key_bytes.as_slice(), ptr)
-        })??;
+        self.executor
+            .with_b_tree(&insert.table_name, |btree| btree.insert(&key, ptr))??;
 
         Ok(())
     }
@@ -377,11 +379,18 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                         return StatementResult::from(&err);
                     }
                 };
-            let key_bytes = primary_key_field.encode_key();
+            let primary_key_value: Value = primary_key_field.into();
+            let key = match Key::try_from(primary_key_value) {
+                Ok(k) => k,
+                Err(_) => {
+                    return StatementResult::from(&InternalExecutorError::InvalidRecord);
+                }
+            };
 
-            if let Err(err) = self.executor.with_b_tree(&delete.table_name, |btree| {
-                btree.delete(key_bytes.as_slice())
-            }) {
+            if let Err(err) = self
+                .executor
+                .with_b_tree(&delete.table_name, |btree| btree.delete(&key))
+            {
                 return StatementResult::from(&err);
             }
 
