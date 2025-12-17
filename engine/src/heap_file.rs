@@ -69,6 +69,8 @@ struct FreeSpaceMap<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> {
     _page_type_marker: PhantomData<H>,
 }
 
+type FsmPage<H> = SlottedPage<PinnedWritePage, H>;
+
 impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COUNT, H> {
     fn new(cache: Arc<Cache>, file_key: FileKey, first_page_id: PageId) -> Self {
         let buckets: [SegQueue<PageId>; BUCKETS_COUNT] = array::from_fn(|_| SegQueue::new());
@@ -91,7 +93,7 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
     fn page_with_free_space(
         &self,
         needed_space: usize,
-    ) -> Result<Option<(PageId, SlottedPage<PinnedWritePage, H>)>, HeapFileError> {
+    ) -> Result<Option<(PageId, FsmPage<H>)>, HeapFileError> {
         let start_bucket_idx = self.bucket_for_space(needed_space);
         let mut insert_back = vec![];
         for b in start_bucket_idx..BUCKETS_COUNT {
@@ -129,7 +131,7 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
     fn page_with_free_space_from_disk(
         &self,
         needed_space: usize,
-    ) -> Result<Option<(PageId, SlottedPage<PinnedWritePage, H>)>, HeapFileError> {
+    ) -> Result<Option<(PageId, FsmPage<H>)>, HeapFileError> {
         while let Some((page_id, slotted_page)) = self.load_next_page()? {
             // It means this page was already in FSM and we already checked it
             if self.already_read.contains(&page_id) {
@@ -147,9 +149,7 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
 
     /// Loads page with id [`Self::next_page_to_read`] and updates it to the next pointer.
     /// Returns id and loaded page or `None` if there is no more page to read.
-    fn load_next_page(
-        &self,
-    ) -> Result<Option<(PageId, SlottedPage<PinnedWritePage, H>)>, HeapFileError> {
+    fn load_next_page(&self) -> Result<Option<(PageId, FsmPage<H>)>, HeapFileError> {
         let mut page_id = self.next_page_to_read.lock();
         if *page_id == H::NO_NEXT_PAGE {
             return Ok(None);
@@ -349,7 +349,7 @@ impl RecordTag {
     fn with_final(buffer: &[u8]) -> Vec<u8> {
         let mut new_buffer = Vec::with_capacity(buffer.len() + size_of::<RecordTag>());
         new_buffer.push(RecordTag::Final as _);
-        new_buffer.extend_from_slice(&buffer);
+        new_buffer.extend_from_slice(buffer);
         new_buffer
     }
 
@@ -669,7 +669,7 @@ impl<'hf, 'rp, const BUCKETS_COUNT: usize, P>
 
     /// Gets mutable current record page.
     fn _record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
-        &mut self.record_page
+        self.record_page
     }
 
     /// Gets current overflow page.
@@ -1071,7 +1071,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     ) -> Result<(), HeapFileError> {
         // Read record bytes from disk
         let page_chain =
-            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(&self, ptr.page_id)?;
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(self, ptr.page_id)?;
         let mut record_bytes = self.record_bytes(ptr, page_chain)?;
         let mut bytes_changed = vec![false; record_bytes.len()];
 
@@ -1087,7 +1087,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         // Save back to disk at the same ptr
         let page_chain =
-            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(self, ptr.page_id)?;
         self.update_record_bytes(ptr, &record_bytes, &bytes_changed, page_chain)?;
 
         Ok(())
@@ -1096,7 +1096,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Removes [`Record`] located at `ptr`.
     pub fn delete(&self, ptr: &RecordPtr) -> Result<(), HeapFileError> {
         let mut page_chain =
-            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(&self, ptr.page_id)?;
+            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(self, ptr.page_id)?;
         let first_page = page_chain.record_page_mut();
         let record_first_fragment = first_page.record_fragment(ptr.slot_id)?;
 
@@ -1330,15 +1330,16 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     {
         let mut processor = FragmentProcessor::new(bytes, bytes_changed);
 
-        let mut first_page = page_chain.record_page_mut();
+        let first_page = page_chain.record_page_mut();
         let previous_first_fragment = first_page.record_fragment(start.slot_id)?;
 
         // Previously record was stored on single page.
         if previous_first_fragment.next_fragment.is_none() {
             let previous_len = previous_first_fragment.data.len();
 
-            if !processor.has_changes(previous_len) {
-                // No changes in this fragment, skip update
+            // Check if there are any changes in the entire record
+            if !processor.has_changes(processor.remaining_bytes.len()) {
+                // No changes at all
                 return Ok(());
             }
 
@@ -1357,7 +1358,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             // Record cannot fit in this page. We store as much as before (`- RecordPtr` to be sure continuation will fit)
             // in the first page and save `rest` in other page(s).
             self.split_and_extend_fragment(
-                &mut first_page,
+                first_page,
                 start.slot_id,
                 start.page_id,
                 processor.remaining_bytes,
@@ -1371,13 +1372,13 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // We already checked and know that `next_fragment` cannot be `None`
         let next_tag = previous_first_fragment.next_fragment.unwrap();
 
-        // Check if first fragment has any changes
-        if processor.has_changes(first_frag_len) {
+        // Check if first fragment has any changes or if the record now needs fewer fragments
+        if processor.has_changes(first_frag_len) || processor.is_last_fragment(first_frag_len) {
             // Record was stored across more than one page, but it now can be saved only in first page
             if processor.is_last_fragment(first_frag_len) {
                 let with_tag = RecordTag::with_final(processor.remaining_bytes);
                 self.update_record_page_with_fsm(
-                    &mut first_page,
+                    first_page,
                     start.slot_id,
                     &with_tag,
                     start.page_id,
@@ -1392,7 +1393,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             let first_page_part_with_tag =
                 RecordTag::with_has_continuation(first_page_part, &next_tag);
             self.update_record_page_with_fsm(
-                &mut first_page,
+                first_page,
                 start.slot_id,
                 &first_page_part_with_tag,
                 start.page_id,
@@ -1405,7 +1406,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         while !processor.is_complete() {
             page_chain.advance(current_ptr.page_id)?;
-            let mut current_page = page_chain.overflow_page_mut();
+            let current_page = page_chain.overflow_page_mut();
             let current_fragment = current_page.record_fragment(current_ptr.slot_id)?;
 
             let current_frag_len = current_fragment.data.len();
@@ -1445,7 +1446,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
             // Try to update in place
             if self.try_update_fragment_in_place(
-                &mut current_page,
+                current_page,
                 current_ptr.slot_id,
                 current_ptr.page_id,
                 processor.remaining_bytes,
@@ -1463,14 +1464,14 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                     let (current_page_part, _) =
                         processor.remaining_bytes.split_at(current_frag_len);
                     let current_with_tag =
-                        RecordTag::with_has_continuation(&current_page_part, &next_ptr);
+                        RecordTag::with_has_continuation(current_page_part, &next_ptr);
                     current_page.update(current_ptr.slot_id, &current_with_tag)?;
                     current_ptr = next_ptr;
                 }
                 None => {
                     // This is the last fragment from original chain, so additional bytes can be added wherever we want
                     self.split_and_extend_fragment(
-                        &mut current_page,
+                        current_page,
                         current_ptr.slot_id,
                         current_ptr.page_id,
                         processor.remaining_bytes,
@@ -1593,12 +1594,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         self.overflow_pages_fsm
             .update_page_bucket(page_id, page.page.free_space()? as _);
 
-        return Ok(RecordPtr { page_id, slot_id });
+        Ok(RecordPtr { page_id, slot_id })
     }
 
     /// Deletes all record fragments from chain of overflow pages starting in `next_ptr`.
-    fn delete_record_fragments_from_overflow_pages_chain<'hf, P>(
-        &'hf self,
+    fn delete_record_fragments_from_overflow_pages_chain<P>(
+        &self,
         mut page_chain: impl PageLockChain<P>,
         mut next_ptr: Option<RecordPtr>,
     ) -> Result<(), HeapFileError>
@@ -2000,18 +2001,17 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
                 {
                     // This mean that metadata page was not allocated yet, so the file was just created
                     let (mut metadata_page, metadata_page_id) =
-                        self.cache.allocate_page(&key.file_key())?;
+                        self.cache.allocate_page(key.file_key())?;
                     debug_assert_eq!(
                         metadata_page_id,
                         HeapFile::<BUCKETS_COUNT>::METADATA_PAGE_ID
                     );
 
-                    let (record_page, record_page_id) =
-                        self.cache.allocate_page(&key.file_key())?;
+                    let (record_page, record_page_id) = self.cache.allocate_page(key.file_key())?;
                     SlottedPage::<_, RecordPageHeader>::initialize_default(record_page).unwrap();
 
                     let (overflow_page, overflow_page_id) =
-                        self.cache.allocate_page(&key.file_key())?;
+                        self.cache.allocate_page(key.file_key())?;
                     SlottedPage::<_, OverflowPageHeader>::initialize_default(overflow_page)
                         .unwrap();
 
@@ -3385,28 +3385,19 @@ mod tests {
         // Find records by ID (order may vary)
         let record1 = all_records
             .iter()
-            .find(|r| match &r.fields[0].deref() {
-                Value::Int32(1) => true,
-                _ => false,
-            })
+            .find(|r| matches!(r.fields[0].deref(), Value::Int32(1)))
             .unwrap();
         assert_string("small", &record1.fields[1]);
 
         let record2 = all_records
             .iter()
-            .find(|r| match &r.fields[0].deref() {
-                Value::Int32(2) => true,
-                _ => false,
-            })
+            .find(|r| matches!(r.fields[0].deref(), Value::Int32(2)))
             .unwrap();
         assert_string(&large_string, &record2.fields[1]);
 
         let record3 = all_records
             .iter()
-            .find(|r| match &r.fields[0].deref() {
-                Value::Int32(3) => true,
-                _ => false,
-            })
+            .find(|r| matches!(r.fields[0].deref(), Value::Int32(3)))
             .unwrap();
         assert_string("small2", &record3.fields[1]);
     }
@@ -3481,8 +3472,7 @@ mod tests {
         // Update record with ID 1
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Value::String("updated_1".into()).into())
-                .unwrap();
+            FieldUpdateDescriptor::new(column_metadata, Value::String("updated_1".into())).unwrap();
         heap_file
             .update(&record_ptrs[1], vec![update_descriptor])
             .unwrap();
@@ -4502,7 +4492,7 @@ mod tests {
             "this_is_a_much_longer_string_than_the_original_one_but_still_fits_in_single_page";
         let column_metadata = heap_file.columns_metadata[1].clone();
         let update_descriptor =
-            FieldUpdateDescriptor::new(column_metadata, Value::String(longer_string.into()).into())
+            FieldUpdateDescriptor::new(column_metadata, Value::String(longer_string.into()))
                 .unwrap();
 
         heap_file
@@ -4976,7 +4966,7 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Insert a record with 5 small strings
-        let original_strings = vec![
+        let original_strings = [
             "field1_initial",
             "field2_initial",
             "field3_initial",
@@ -5016,6 +5006,70 @@ mod tests {
         for (i, expected_string) in updated_strings.iter().enumerate() {
             assert_string(expected_string, &updated_record.fields[i]);
         }
+    }
+
+    #[test]
+    fn heap_file_update_appends_bytes_without_changing_existing() {
+        let (cache, _, file_key) = setup_test_cache();
+        setup_heap_file_structure(&cache, &file_key);
+
+        // Start with a simple schema
+        let initial_columns = vec![ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap()];
+
+        let factory =
+            HeapFileFactory::<4>::new(file_key.clone(), cache.clone(), initial_columns.clone());
+        let mut heap_file = factory.create_heap_file().unwrap();
+
+        // Insert a record with just the ID
+        let record = Record::new(vec![Value::Int32(42).into()]);
+        let ptr = heap_file.insert(record).unwrap();
+
+        // Verify initial record
+        let initial_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(initial_record.fields.len(), 1);
+        assert_i32(42, &initial_record.fields[0]);
+
+        // Now manually construct an update that only appends new bytes at the end
+        // We'll directly manipulate the record bytes to simulate adding a string field
+        // without changing the existing Int32 bytes
+
+        // Read current record bytes
+        let page_chain =
+            SinglePageLockChain::<4, PinnedReadPage>::with_record(&heap_file, ptr.page_id).unwrap();
+        let current_bytes = heap_file.record_bytes(&ptr, page_chain).unwrap();
+
+        let new_string = "appended_text";
+        let mut new_bytes = current_bytes.clone();
+
+        let string_len = new_string.len() as u16;
+        new_bytes.extend_from_slice(&string_len.to_le_bytes());
+        new_bytes.extend_from_slice(new_string.as_bytes());
+
+        // Create bytes_changed array (first 4 bytes unchanged, rest are new)
+        let mut bytes_changed = vec![false; new_bytes.len()];
+        bytes_changed[4..].fill(true);
+
+        // Perform the update
+        let page_chain =
+            SinglePageLockChain::<4, PinnedWritePage>::with_record(&heap_file, ptr.page_id)
+                .unwrap();
+        heap_file
+            .update_record_bytes(&ptr, &new_bytes, &bytes_changed, page_chain)
+            .unwrap();
+
+        // Now update the heap_file's column metadata to match the new schema
+        let new_columns = vec![
+            ColumnMetadata::new("id".into(), Type::I32, 0, 0, 0).unwrap(),
+            ColumnMetadata::new("name".into(), Type::String, 1, size_of::<i32>(), 1).unwrap(),
+        ];
+
+        heap_file.columns_metadata = new_columns;
+
+        // Read back and verify both fields
+        let updated_record = heap_file.record(&ptr).unwrap();
+        assert_eq!(updated_record.fields.len(), 2);
+        assert_i32(42, &updated_record.fields[0]);
+        assert_string(new_string, &updated_record.fields[1]);
     }
 
     #[test]
@@ -5068,7 +5122,7 @@ mod tests {
         let mut reader_handles = vec![];
         for _ in 0..num_reader_threads {
             let heap_file_clone = heap_file.clone();
-            let ptr = record_ptr.clone();
+            let ptr = record_ptr;
             let exp_f1_abc = expected_field1_abc.clone();
             let exp_f2_abc = expected_field2_abc.clone();
             let exp_f3_abc = expected_field3_abc.clone();
@@ -5105,7 +5159,7 @@ mod tests {
         let mut writer_handles = vec![];
         for _ in 0..num_writer_threads {
             let heap_file_clone = heap_file.clone();
-            let ptr = record_ptr.clone();
+            let ptr = record_ptr;
             let cols = columns_metadata.clone();
 
             let handle = thread::spawn(move || {
@@ -5296,7 +5350,7 @@ mod tests {
         // Spawn reader threads
         for _ in 0..num_reader_threads {
             let heap_file_clone = heap_file.clone();
-            let ptr = record_ptr.clone();
+            let ptr = record_ptr;
             let expected_string = large_string.clone();
 
             let handle = thread::spawn(move || {

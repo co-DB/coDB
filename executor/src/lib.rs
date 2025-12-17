@@ -1431,6 +1431,37 @@ mod tests {
     }
 
     #[test]
+    fn test_add_column_to_primary_key_only_table_with_existing_records() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table with only primary key
+        execute_single(&executor, "CREATE TABLE users (id INT32 PRIMARY_KEY);");
+
+        // Insert some records
+        execute_single(&executor, "INSERT INTO users (id) VALUES (1);");
+        execute_single(&executor, "INSERT INTO users (id) VALUES (2);");
+        execute_single(&executor, "INSERT INTO users (id) VALUES (3);");
+
+        // Add string column
+        let result = execute_single(&executor, "ALTER TABLE users ADD COLUMN name STRING;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify column was added with default values
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 3);
+
+        for row in &rows {
+            assert_eq!(row.fields.len(), 2);
+            assert_eq!(*row.fields[1].deref(), Value::default_for_ty(&Type::String));
+        }
+    }
+
+    #[test]
     fn test_remove_column_from_empty_table() {
         let (executor, _temp_dir) = create_test_executor();
 
