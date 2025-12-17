@@ -2752,4 +2752,123 @@ mod tests {
         let result = execute_single(&executor, "DROP TABLE products;");
         assert_operation_successful(result, 0, StatementType::Drop);
     }
+
+    #[test]
+    fn test_truncate_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create empty table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+
+        // Truncate empty table
+        let result = execute_single(&executor, "TRUNCATE TABLE users;");
+        assert_operation_successful(result, 0, StatementType::Truncate);
+
+        // Verify table still exists and is empty
+        let (select_plan, select_ast) = create_single_statement("SELECT * FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_truncate_table_with_data() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
+
+        // Truncate table
+        let result = execute_single(&executor, "TRUNCATE TABLE users;");
+        assert_operation_successful(result, 0, StatementType::Truncate);
+
+        // Verify table exists but is empty
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[1].name, "name");
+        assert_eq!(columns[2].name, "age");
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_truncate_then_insert() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Truncate table
+        execute_single(&executor, "TRUNCATE TABLE users;");
+
+        // Insert new data with same primary keys as before
+        let result = execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Charlie', 35);",
+        );
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        let result = execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'David', 40);",
+        );
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        // Verify only new data exists
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        let charlie = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*charlie.fields[1].deref(), Value::String("Charlie".into()));
+        assert_eq!(*charlie.fields[2].deref(), Value::Int32(35));
+
+        let david = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*david.fields[1].deref(), Value::String("David".into()));
+        assert_eq!(*david.fields[2].deref(), Value::Int32(40));
+    }
 }

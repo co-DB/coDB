@@ -111,9 +111,15 @@ impl Catalog {
             .remove(table_name)
             .ok_or(CatalogError::TableNotFound(table_name.into()))
             .map(|_| ())?;
+        self.delete_table_content_from_disk(table_name)?;
+        self.sync_to_disk()?;
+        Ok(())
+    }
+
+    /// Deletes `{PATH_TO_CODB}/{DATABASE_NAME}/{TABLE_NAME}` directory and all its content.
+    pub fn delete_table_content_from_disk(&mut self, table_name: &str) -> Result<(), CatalogError> {
         let path_to_dir = self.dir_path.join(table_name);
         fs::remove_dir_all(path_to_dir)?;
-        self.sync_to_disk()?;
         Ok(())
     }
 

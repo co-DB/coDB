@@ -8,8 +8,9 @@ use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
 use planner::{
     query_plan::{
-        AddColumn, CreateTable, Delete, Filter, Insert, Limit, Projection, RemoveColumn,
-        RemoveTable, Skip, Sort, SortOrder, StatementPlan, StatementPlanItem, TableScan, Update,
+        AddColumn, ClearTable, CreateTable, Delete, Filter, Insert, Limit, Projection,
+        RemoveColumn, RemoveTable, Skip, Sort, SortOrder, StatementPlan, StatementPlanItem,
+        TableScan, Update,
     },
     resolved_tree::{
         ResolvedColumn, ResolvedCreateColumnDescriptor, ResolvedExpression, ResolvedNodeId,
@@ -94,6 +95,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             StatementPlanItem::Update(update) => self.update(update),
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
             StatementPlanItem::RemoveTable(remove_table) => self.remove_table(remove_table),
+            StatementPlanItem::ClearTable(clear_table) => self.clear_table(clear_table),
             StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
             StatementPlanItem::RemoveColumn(remove_column) => self.remove_column(remove_column),
             _ => error_factory::runtime_error(format!(
@@ -553,6 +555,32 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             .cache
             .remove_file(&FileKey::index(table_name.clone().into()))?;
         Ok(())
+    }
+
+    /// Handler for [`ClearTable`] statement.
+    fn clear_table(&self, clear_table: &ClearTable) -> StatementResult {
+        let mut catalog = self.executor.catalog.write();
+
+        // Remove heap file and btree from executor
+        // We are holding write lock on catalog, so we are sure no other thread can create them back
+        // during this statement.
+        self.executor.remove_heap_file(&clear_table.name);
+        self.executor.remove_b_tree(&clear_table.name);
+
+        // Remove all pages from cache
+        if let Err(e) = self.remove_table_content_from_cache(&clear_table.name) {
+            return StatementResult::from(&e);
+        }
+
+        // Remove table files from disk (they will be recreated on next usage of this table)
+        if let Err(e) = catalog.delete_table_content_from_disk(&clear_table.name) {
+            return error_factory::runtime_error(format!("failed to truncate table: {e:?}"));
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Truncate,
+        }
     }
 
     /// Handler for [`AddColumn`] statement.
