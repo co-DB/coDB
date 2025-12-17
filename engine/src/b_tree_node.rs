@@ -11,7 +11,7 @@ use thiserror::Error;
 use types::serialization::{DbSerializable, DbSerializationError};
 
 #[derive(Error, Debug)]
-pub(crate) enum BTreeNodeError {
+pub enum BTreeNodeError {
     #[error("internal error from slotted page occurred: {0}")]
     SlottedPageInternalError(#[from] SlottedPageError),
     #[error("error occurred while deserializing: {0}")]

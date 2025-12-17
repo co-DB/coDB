@@ -1,6 +1,5 @@
 use storage::paged_file::{Page, PageId, PagedFileError};
 
-use crate::b_tree_node::NodeType::Leaf;
 use crate::b_tree_node::{
     BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, LeafNodeSearchResult,
     NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
@@ -903,7 +902,7 @@ impl BTree {
     fn handle_internal_underflow(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
         // The node that has an underflow (it was the parent when handling the leaf).
         let underflow_id = ctx.parent_id;
-        let mut underflow_node = ctx.parent_node;
+        let underflow_node = ctx.parent_node;
 
         let parent_handle = match ctx.internal_nodes.pop() {
             // underflow_node is the root.
@@ -921,7 +920,7 @@ impl BTree {
 
         let LatchHandle {
             page_id: parent_id,
-            node: mut parent_node,
+            node: parent_node,
             child_pos: underflow_child_pos,
         } = parent_handle;
 
