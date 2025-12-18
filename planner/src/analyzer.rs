@@ -165,6 +165,7 @@ impl StatementContext {
     }
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(PartialEq, Eq)]
 enum StatementCategory {
     DDL,
@@ -897,7 +898,7 @@ impl<'a> Analyzer<'a> {
     // TODO: should be implemented once functions are added to coDB
     fn resolve_function_call(
         &mut self,
-        function_call: &FunctionCallNode,
+        _function_call: &FunctionCallNode,
     ) -> Result<ResolvedNodeId, AnalyzerError> {
         todo!()
     }

@@ -11,6 +11,7 @@ use crate::consts::METADATA_FILE_NAME;
 use crate::metadata_file_helper::MetadataFileHelper;
 
 use serde::{Deserialize, Serialize};
+use storage::files_manager::FileKey;
 use thiserror::Error;
 use types::schema::{self, Type};
 
@@ -120,6 +121,48 @@ impl Catalog {
     pub fn delete_table_content_from_disk(&mut self, table_name: &str) -> Result<(), CatalogError> {
         let path_to_dir = self.dir_path.join(table_name);
         fs::remove_dir_all(path_to_dir)?;
+        Ok(())
+    }
+
+    /// Renames table from `prev_name` to `new_name`.
+    pub fn rename_table(&mut self, prev_name: &str, new_name: &str) -> Result<(), CatalogError> {
+        // Removes table from in memory catalog
+        let mut tm = self
+            .tables
+            .remove(prev_name)
+            .ok_or(CatalogError::TableNotFound(prev_name.into()))?;
+
+        // Rename table folder
+        let old_dir = self.dir_path.join(prev_name);
+        let new_dir = self.dir_path.join(new_name);
+        fs::create_dir(&new_dir)?;
+
+        // Rename idx file
+        let old_idx = old_dir.join(FileKey::index(prev_name).file_name());
+        let new_idx = new_dir.join(FileKey::index(new_name).file_name());
+        if let Err(e) = fs::rename(&old_idx, &new_idx) {
+            let _ = fs::remove_dir(new_dir);
+            self.tables.insert(prev_name.into(), tm);
+            return Err(e.into());
+        }
+
+        // Rename data file
+        let old_tbl = old_dir.join(FileKey::data(prev_name).file_name());
+        let new_tbl = new_dir.join(FileKey::data(new_name).file_name());
+        if let Err(e) = fs::rename(old_tbl, new_tbl) {
+            let _ = fs::rename(&new_idx, &old_idx);
+            let _ = fs::remove_dir(new_dir);
+            self.tables.insert(prev_name.into(), tm);
+            return Err(e.into());
+        }
+
+        // We don't care if it fails
+        let _ = fs::remove_dir(old_dir);
+
+        tm.name = new_name.into();
+
+        self.tables.insert(new_name.into(), tm);
+        self.sync_to_disk()?;
         Ok(())
     }
 
@@ -1834,6 +1877,160 @@ mod tests {
         assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
             assert_eq!(tables[0].columns.len(), 3);
         });
+    }
+
+    #[test]
+    fn catalog_rename_table_renames_existing_table() {
+        // given catalog with table "users"
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+
+        // create table directory and files on disk
+        let old_table_dir = fixture.db_path().parent().unwrap().join("users");
+        fs::create_dir(&old_table_dir).unwrap();
+        fs::write(old_table_dir.join("users.idx"), b"index data").unwrap();
+        fs::write(old_table_dir.join("users.tbl"), b"table data").unwrap();
+
+        // when renaming table
+        let result = fixture.catalog_mut().rename_table("users", "accounts");
+
+        // then operation succeeds
+        assert!(result.is_ok());
+
+        // old table name no longer exists
+        assert!(fixture.catalog().table("users").is_err());
+
+        // new table name exists with correct metadata
+        let renamed_table = fixture.catalog().table("accounts").unwrap();
+        assert_eq!(renamed_table.name, "accounts");
+        assert_eq!(renamed_table.columns.len(), 2);
+        assert_eq!(renamed_table.primary_key_column_name(), "id");
+
+        // old directory removed, new directory exists
+        assert!(!old_table_dir.exists());
+        let new_table_dir = fixture.db_path().parent().unwrap().join("accounts");
+        assert!(new_table_dir.exists());
+
+        // files renamed correctly
+        assert!(new_table_dir.join("accounts.idx").exists());
+        assert!(new_table_dir.join("accounts.tbl").exists());
+
+        // metadata file updated
+        assert_catalog_on_disk(fixture.db_path(), 1, |tables| {
+            assert_eq!(tables[0].name, "accounts");
+        });
+    }
+
+    #[test]
+    fn catalog_rename_table_returns_error_when_table_does_not_exist() {
+        // given empty catalog
+        let mut fixture = CatalogTestFixture::new();
+
+        // when renaming non-existent table
+        let result = fixture.catalog_mut().rename_table("missing", "new_name");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::TableNotFound("missing".into()),
+        );
+    }
+
+    #[test]
+    fn catalog_rename_table_rolls_back_on_idx_file_error() {
+        // given catalog with table "users"
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+
+        // create table directory without idx file
+        let old_table_dir = fixture.db_path().parent().unwrap().join("users");
+        fs::create_dir(&old_table_dir).unwrap();
+        fs::write(old_table_dir.join("users.tbl"), b"table data").unwrap();
+
+        // when renaming table (will fail on idx file)
+        let result = fixture.catalog_mut().rename_table("users", "accounts");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::IoError(io::Error::new(io::ErrorKind::NotFound, "")),
+        );
+
+        // original table still exists in catalog
+        assert!(fixture.catalog().table("users").is_ok());
+        assert!(fixture.catalog().table("accounts").is_err());
+
+        // new directory cleaned up
+        let new_table_dir = fixture.db_path().parent().unwrap().join("accounts");
+        assert!(!new_table_dir.exists());
+
+        // old directory still exists
+        assert!(old_table_dir.exists());
+    }
+
+    #[test]
+    fn catalog_rename_table_rolls_back_on_tbl_file_error() {
+        // given catalog with table "users"
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+
+        // create table directory with idx file but no tbl file
+        let old_table_dir = fixture.db_path().parent().unwrap().join("users");
+        fs::create_dir(&old_table_dir).unwrap();
+        fs::write(old_table_dir.join("users.idx"), b"index data").unwrap();
+
+        // when renaming table (will fail on tbl file)
+        let result = fixture.catalog_mut().rename_table("users", "accounts");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_catalog_error_variant(
+            &result.unwrap_err(),
+            &CatalogError::IoError(io::Error::new(io::ErrorKind::NotFound, "")),
+        );
+
+        // original table still exists in catalog
+        assert!(fixture.catalog().table("users").is_ok());
+        assert!(fixture.catalog().table("accounts").is_err());
+
+        // new directory cleaned up
+        let new_table_dir = fixture.db_path().parent().unwrap().join("accounts");
+        assert!(!new_table_dir.exists());
+
+        // idx file rolled back to old location
+        assert!(old_table_dir.join("users.idx").exists());
+    }
+
+    #[test]
+    fn catalog_rename_table_preserves_column_metadata() {
+        // given catalog with table containing multiple columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("name", Type::String, 1),
+            dummy_column("email", Type::String, 2),
+            dummy_column("age", Type::I32, 3),
+        ];
+        let table = dummy_table("users", columns.clone(), "id");
+        let mut fixture = CatalogTestFixture::with_table(table);
+
+        // create table directory and files
+        let old_table_dir = fixture.db_path().parent().unwrap().join("users");
+        fs::create_dir(&old_table_dir).unwrap();
+        fs::write(old_table_dir.join("users.idx"), b"index data").unwrap();
+        fs::write(old_table_dir.join("users.tbl"), b"table data").unwrap();
+
+        // when renaming table
+        fixture
+            .catalog_mut()
+            .rename_table("users", "people")
+            .unwrap();
+
+        // then all column metadata preserved
+        let renamed_table = fixture.catalog().table("people").unwrap();
+        assert_eq!(renamed_table.columns().count(), 4);
+
+        for (expected, actual) in columns.iter().zip(renamed_table.columns()) {
+            assert_column(expected, &actual);
+        }
     }
 
     // Helper to check if error variant is as expected

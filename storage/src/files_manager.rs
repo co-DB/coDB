@@ -50,7 +50,7 @@ impl FileKey {
     }
 
     /// Returns a full name of the file. Refer to `docs/files_structure.md`.
-    fn file_name(&self) -> String {
+    pub fn file_name(&self) -> String {
         format!("{}.{}", self.table_name, self.extension())
     }
 }
