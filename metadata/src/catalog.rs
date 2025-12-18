@@ -202,6 +202,22 @@ impl Catalog {
         Ok(cr)
     }
 
+    /// Renames column from `prev_name` to `new_name` in `table_name`.
+    /// It works by delegating this to [`TableMetadata::rename_column`].
+    ///
+    /// The purpose of this function is to have only one struct that can modify metadata - [`Catalog`].
+    pub fn rename_column(
+        &mut self,
+        table_name: impl AsRef<str>,
+        prev_name: impl AsRef<str>,
+        new_name: impl AsRef<str>,
+    ) -> Result<(), CatalogError> {
+        let table = self.table_mut(table_name.as_ref())?;
+        table.rename_column(prev_name.as_ref(), new_name.as_ref())?;
+        self.sync_to_disk()?;
+        Ok(())
+    }
+
     /// Commits the most recent tmp file by atomically renaming it to the main file.
     /// Removes all other tmp files.
     pub fn commit_staged(&self) -> Result<(), CatalogError> {
@@ -524,6 +540,20 @@ impl TableMetadata {
             }
             None => Err(TableMetadataError::ColumnNotFound(column_name.into())),
         }
+    }
+
+    /// Renames column from `prev_name` to `new_name`
+    fn rename_column(&mut self, prev_name: &str, new_name: &str) -> Result<(), TableMetadataError> {
+        let idx = self
+            .columns_by_name
+            .remove(prev_name)
+            .ok_or(TableMetadataError::ColumnNotFound(prev_name.into()))?;
+        self.columns[idx].name = new_name.into();
+        self.columns_by_name.insert(new_name.into(), idx);
+        if self.primary_key_column_name() == prev_name {
+            self.primary_key_column_name = new_name.into();
+        }
+        Ok(())
     }
 
     /// Returns name of the table's primary key column
@@ -2507,6 +2537,124 @@ mod tests {
         // column no longer exists
         assert!(table.column("age").is_err());
         assert_eq!(table.columns.len(), 3);
+    }
+
+    #[test]
+    fn table_metadata_rename_column_renames_existing_column() {
+        // given table with columns "id" and "name"
+        let mut table = users_table();
+
+        // when renaming column "name" to "full_name"
+        let result = table.rename_column("name", "full_name");
+
+        // then rename succeeds
+        assert!(result.is_ok());
+
+        // old column name no longer exists
+        assert!(table.column("name").is_err());
+
+        // new column name exists with same metadata
+        let renamed_col = table.column("full_name").unwrap();
+        assert_eq!(renamed_col.name(), "full_name");
+        assert_eq!(renamed_col.ty(), Type::String);
+        assert_eq!(renamed_col.pos(), 1);
+    }
+
+    #[test]
+    fn table_metadata_rename_column_returns_error_for_nonexistent_column() {
+        // given table with columns
+        let mut table = users_table();
+
+        // when trying to rename non-existent column
+        let result = table.rename_column("missing", "new_name");
+
+        // then error is returned
+        assert!(result.is_err());
+        assert_table_metadata_error_variant(
+            &result.unwrap_err(),
+            &TableMetadataError::ColumnNotFound(String::new()),
+        );
+    }
+
+    #[test]
+    fn table_metadata_rename_column_updates_primary_key_name() {
+        // given table with primary key column "id"
+        let mut table = users_table();
+
+        // when renaming primary key column
+        let result = table.rename_column("id", "user_id");
+
+        // then rename succeeds
+        assert!(result.is_ok());
+
+        // primary key name is updated
+        assert_eq!(table.primary_key_column_name(), "user_id");
+
+        // column can be accessed by new name
+        let pk_col = table.column("user_id").unwrap();
+        assert_eq!(pk_col.name(), "user_id");
+        assert_eq!(pk_col.ty(), Type::I32);
+    }
+
+    #[test]
+    fn table_metadata_rename_column_handles_fixed_size_column() {
+        // given table with fixed-size column
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            dummy_column("age", Type::I32, 1),
+            ColumnMetadata::new("name".to_string(), Type::String, 2, 8, 2).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when renaming fixed-size column
+        let result = table.rename_column("age", "years_old");
+
+        // then rename succeeds and metadata preserved
+        assert!(result.is_ok());
+
+        let renamed_col = table.column("years_old").unwrap();
+        assert_eq!(renamed_col.pos(), 1);
+        assert_eq!(renamed_col.base_offset(), 4);
+        assert_eq!(renamed_col.ty(), Type::I32);
+    }
+
+    #[test]
+    fn table_metadata_rename_column_handles_variable_size_column() {
+        // given table with variable-size columns
+        let columns = vec![
+            dummy_column("id", Type::I32, 0),
+            ColumnMetadata::new("name".to_string(), Type::String, 1, 4, 1).unwrap(),
+            ColumnMetadata::new("email".to_string(), Type::String, 2, 4, 1).unwrap(),
+        ];
+        let mut table = TableMetadata::new("users", columns, "id").unwrap();
+
+        // when renaming variable-size column
+        let result = table.rename_column("email", "email_address");
+
+        // then rename succeeds and metadata preserved
+        assert!(result.is_ok());
+
+        let renamed_col = table.column("email_address").unwrap();
+        assert_eq!(renamed_col.pos(), 2);
+        assert_eq!(renamed_col.base_offset(), 4);
+        assert_eq!(renamed_col.base_offset_pos(), 1);
+        assert_eq!(renamed_col.ty(), Type::String);
+    }
+
+    #[test]
+    fn table_metadata_rename_column_to_same_name() {
+        // given table with column "name"
+        let mut table = users_table();
+
+        // when renaming column to same name
+        let result = table.rename_column("name", "name");
+
+        // then rename succeeds (noop)
+        assert!(result.is_ok());
+
+        // column still accessible
+        let col = table.column("name").unwrap();
+        assert_eq!(col.name(), "name");
     }
 
     #[test]

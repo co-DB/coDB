@@ -6,7 +6,7 @@ use engine::{
 use itertools::Itertools;
 use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
-use planner::query_plan::RenameTable;
+use planner::query_plan::{RenameColumn, RenameTable};
 use planner::{
     query_plan::{
         AddColumn, ClearTable, CreateTable, Delete, Filter, Insert, Limit, Projection,
@@ -100,6 +100,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             StatementPlanItem::RenameTable(rename_table) => self.rename_table(rename_table),
             StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
             StatementPlanItem::RemoveColumn(remove_column) => self.remove_column(remove_column),
+            StatementPlanItem::RenameColumn(rename_column) => self.rename_column(rename_column),
             _ => error_factory::runtime_error(format!(
                 "Invalid root operation ({:?}) for mutation statement",
                 item
@@ -782,6 +783,27 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 hf.remove_column_migration(position, prev_column_min_offset, new_columns)
             })??;
         Ok(())
+    }
+
+    /// Handler for [`RenameColumn`] statement.
+    fn rename_column(&self, rename_column: &RenameColumn) -> StatementResult {
+        let mut catalog = self.executor.catalog.write();
+
+        // We need to remove heap file to assert that it will load new column metadata
+        self.executor.remove_heap_file(&rename_column.table_name);
+
+        if let Err(e) = catalog.rename_column(
+            &rename_column.table_name,
+            &rename_column.prev_column_name,
+            &rename_column.new_column_name,
+        ) {
+            return error_factory::runtime_error(format!("failed to rename column: {e:?}"));
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Alter,
+        }
     }
 
     /// Creates iterator that maps `expressions` into [`ProjectColumn`]s.
