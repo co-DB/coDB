@@ -381,7 +381,7 @@ impl Cache {
         Ok(())
     }
 
-    /// Returns [`Arc<PageFrame>`] and pines the underlying [`PageFrame`].
+    /// Returns [`Arc<PageFrame>`] and pins the underlying [`PageFrame`].
     /// It first looks for frame in [`Cache::frames`]. If it's found there then its key in [`Cache::lru`] is updated (making it MRU).
     /// Otherwise [`PageFrame`] is loaded from disk using [`FilesManager`] and frame's key is inserted into [`Cache::lru`].
     fn get_pinned_frame(&self, id: &FilePageRef) -> Result<Arc<PageFrame>, CacheError> {

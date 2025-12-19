@@ -126,6 +126,10 @@ impl Catalog {
 
     /// Renames table from `prev_name` to `new_name`.
     pub fn rename_table(&mut self, prev_name: &str, new_name: &str) -> Result<(), CatalogError> {
+        if self.tables.contains_key(new_name) {
+            return Err(CatalogError::TableAlreadyExists(new_name.into()));
+        }
+
         // Removes table from in memory catalog
         let mut tm = self
             .tables
@@ -149,7 +153,7 @@ impl Catalog {
         // Rename data file
         let old_tbl = old_dir.join(FileKey::data(prev_name).file_name());
         let new_tbl = new_dir.join(FileKey::data(new_name).file_name());
-        if let Err(e) = fs::rename(old_tbl, new_tbl) {
+        if let Err(e) = fs::rename(&old_tbl, &new_tbl) {
             let _ = fs::rename(&new_idx, &old_idx);
             let _ = fs::remove_dir(new_dir);
             self.tables.insert(prev_name.into(), tm);
@@ -157,12 +161,26 @@ impl Catalog {
         }
 
         // We don't care if it fails
-        let _ = fs::remove_dir(old_dir);
+        let _ = fs::remove_dir(&old_dir);
 
         tm.name = new_name.into();
 
         self.tables.insert(new_name.into(), tm);
-        self.sync_to_disk()?;
+
+        if let Err(e) = self.sync_to_disk() {
+            // Roll back in-memory state
+            if let Some(mut tm_rollback) = self.tables.remove(new_name) {
+                tm_rollback.name = prev_name.into();
+                self.tables.insert(prev_name.into(), tm_rollback);
+            }
+
+            // Best-effort rollback of filesystem changes
+            let _ = fs::create_dir(&old_dir);
+            let _ = fs::rename(&new_idx, &old_idx);
+            let _ = fs::rename(&new_tbl, &old_tbl);
+            let _ = fs::remove_dir(&new_dir);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -544,6 +562,9 @@ impl TableMetadata {
 
     /// Renames column from `prev_name` to `new_name`
     fn rename_column(&mut self, prev_name: &str, new_name: &str) -> Result<(), TableMetadataError> {
+        if self.columns_by_name.contains_key(new_name) {
+            return Err(TableMetadataError::ColumnAlreadyExists(new_name.into()));
+        }
         let idx = self
             .columns_by_name
             .remove(prev_name)
@@ -2063,6 +2084,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn catalog_rename_table_to_same_name() {
+        // given catalog with table "users"
+        let mut fixture = CatalogTestFixture::with_table(users_table());
+
+        // when renaming table to the same name
+        let result = fixture.catalog_mut().rename_table("users", "users");
+
+        // error is returned
+        assert!(result.is_err());
+
+        // and table is still accessible
+        let result = fixture.catalog().table("users");
+        assert!(result.is_ok());
+    }
+
     // Helper to check if error variant is as expected
     fn assert_table_metadata_error_variant(
         actual: &TableMetadataError,
@@ -2649,8 +2686,8 @@ mod tests {
         // when renaming column to same name
         let result = table.rename_column("name", "name");
 
-        // then rename succeeds (noop)
-        assert!(result.is_ok());
+        // then rename fails
+        assert!(result.is_err());
 
         // column still accessible
         let col = table.column("name").unwrap();

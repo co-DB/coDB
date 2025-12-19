@@ -3144,7 +3144,7 @@ mod tests {
             "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
         );
 
-        // Rename column to same name
+        // Rename table to same name
         let result = execute_single(&executor, "ALTER TABLE users RENAME TABLE TO users;");
 
         assert_parse_error_contains(result, "table 'users' already exists");
