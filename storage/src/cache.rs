@@ -94,16 +94,17 @@ impl PageFrame {
 
 /// Wrapper around frame and its guard - shared or exclusive lock.
 pub struct PinnedPage<G> {
-    /// This field should not be exposed. It's here because [`PinnedPage::guard`] cannot outlive it.
-    frame: Arc<PageFrame>,
     /// The content of the [`Page`] wrapped in a guard.
     guard: G,
+    /// This field should not be exposed. It's here because [`PinnedPage::guard`] cannot outlive it.
+    frame: Arc<PageFrame>,
 }
 
 impl<G> Drop for PinnedPage<G> {
     fn drop(&mut self) {
-        // SAFETY: `guard` cannot outlive `frame`. This is why it must be declared later in the struct,
-        // as the order of dropping is the reverse order of declaration in struct.
+        // SAFETY: `guard` cannot outlive `frame`. This is why it must be declared before it in the struct,
+        // as the order of dropping is the order of declaration in struct.
+        // (https://doc.rust-lang.org/reference/destructors.html)
         // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedPage`].
         self.frame.unpin();
     }
@@ -303,14 +304,18 @@ impl Cache {
     /// First, it removes all pages of this file from cache.
     /// Then it removes it from list of open files in [`FilesManager`].
     pub fn remove_file(&self, file_key: &FileKey) -> Result<(), CacheError> {
-        self.remove_all_pages_from_file(file_key)?;
+        self.remove_all_pages_from_file(file_key, true)?;
         self.files.close_file(file_key);
         Ok(())
     }
 
     /// Removes all pages from file with `file_key`.
-    /// Each frame is flushed to the disk before being dropped.
-    fn remove_all_pages_from_file(&self, file_key: &FileKey) -> Result<(), CacheError> {
+    /// If `flush_to_disk` is set to true then each frame is flushed to the disk before being dropped.
+    fn remove_all_pages_from_file(
+        &self,
+        file_key: &FileKey,
+        flush_to_disk: bool,
+    ) -> Result<(), CacheError> {
         let pf = self.files.get_or_open_new_file(file_key)?;
         // Acquire lock on the file to prevent other threads from creating new frames for this file
         let mut pf_lock = pf.lock();
@@ -324,13 +329,15 @@ impl Cache {
 
         for page_ref in pages_to_remove {
             if let Some((_, frame)) = self.frames.remove(&page_ref) {
-                // We wait until we got write lock on this frame to be sure that we capture any changes
-                // and flush it to disk.
-                let page = frame.write();
+                if flush_to_disk {
+                    // We wait until we got write lock on this frame to be sure that we capture any changes
+                    // and flush it to disk.
+                    let page = frame.write();
 
-                // We flush only if frame is dirty
-                if frame.dirty.load(Ordering::Acquire) {
-                    pf_lock.write_page(frame.file_page_ref.page_id, *page)?;
+                    // We flush only if frame is dirty
+                    if frame.dirty.load(Ordering::Acquire) {
+                        pf_lock.write_page(frame.file_page_ref.page_id, *page)?;
+                    }
                 }
 
                 // Remove from LRU as well
@@ -345,39 +352,8 @@ impl Cache {
     /// First, it removes all pages of this file from cache (without flushing).
     /// Then it removes it from list of open files in [`FilesManager`].
     pub fn remove_file_without_flushing(&self, file_key: &FileKey) -> Result<(), CacheError> {
-        self.remove_all_pages_from_file_without_flushing(file_key)?;
+        self.remove_all_pages_from_file(file_key, false)?;
         self.files.close_file(file_key);
-        Ok(())
-    }
-
-    /// Removes all pages from file with `file_key`.
-    /// Each frame is just dropped, no flushing to disk happens.
-    fn remove_all_pages_from_file_without_flushing(
-        &self,
-        file_key: &FileKey,
-    ) -> Result<(), CacheError> {
-        let pf = self.files.get_or_open_new_file(file_key)?;
-        // Acquire lock on the file to prevent other threads from creating new frames for this file
-        let _pf_lock = pf.lock();
-
-        let pages_to_remove: Vec<_> = self
-            .frames
-            .iter()
-            .filter(|entry| entry.key().file_key() == file_key)
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for page_ref in pages_to_remove {
-            if self.frames.remove(&page_ref).is_some() {
-                // If some other thread at this moment is using this frame we don't care
-                // It will drop it eventually and it won't be persisted to disk anyway,
-                // because the persistence is done by cache, which won't know it after this func.
-
-                // Remove from LRU as well
-                self.lru.write().pop_entry(&page_ref);
-            }
-        }
-
         Ok(())
     }
 
@@ -1487,7 +1463,7 @@ mod tests {
 
         // Remove all pages from this file
         cache
-            .remove_all_pages_from_file_without_flushing(&file_key)
+            .remove_all_pages_from_file(&file_key, false)
             .expect("remove_all_pages failed");
 
         // Verify all frames for this file are removed
@@ -1533,7 +1509,7 @@ mod tests {
 
         // Remove only pages from file_key1
         cache
-            .remove_all_pages_from_file_without_flushing(&file_key1)
+            .remove_all_pages_from_file(&file_key1, false)
             .expect("remove_all_pages failed");
 
         // id1 should be gone, id2 should remain
@@ -1569,7 +1545,7 @@ mod tests {
 
         // Remove without flushing
         cache
-            .remove_all_pages_from_file_without_flushing(&file_key)
+            .remove_all_pages_from_file(&file_key, false)
             .expect("remove_all_pages failed");
 
         // Frame should be gone
@@ -1592,7 +1568,7 @@ mod tests {
 
         // Try to remove pages from a file that has no cached pages
         cache
-            .remove_all_pages_from_file_without_flushing(&file_key)
+            .remove_all_pages_from_file(&file_key, false)
             .expect("remove_all_pages should succeed on empty");
 
         assert_eq!(cache.frames.len(), 0);
@@ -1617,7 +1593,7 @@ mod tests {
 
         // While still holding the write lock, remove all pages from this file
         cache
-            .remove_all_pages_from_file_without_flushing(&file_key)
+            .remove_all_pages_from_file(&file_key, false)
             .expect("remove_all_pages failed");
 
         // Frame should be removed from cache even though we still hold the lock
