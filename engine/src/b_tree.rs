@@ -29,6 +29,8 @@ pub enum BTreeError {
     KeyForDeleteNotFound,
     #[error("deserialization error occurred: {0}")]
     DeserializationError(#[from] DbSerializationError),
+    #[error("invalid range specified for scan")]
+    InvalidRange,
     #[error("metadata of the b-tree was corrupted: {reason}")]
     CorruptMetadata { reason: String },
 }
@@ -193,16 +195,42 @@ impl RangeBound {
 }
 
 pub struct Range {
-    pub start_key: RangeBound,
-    pub end_key: RangeBound,
+    start_key: Option<RangeBound>,
+    end_key: Option<RangeBound>,
+}
+
+impl Range {
+    pub fn new(start: Option<RangeBound>, end: Option<RangeBound>) -> Result<Self, BTreeError> {
+        if start.is_none() && end.is_none() {
+            return Err(BTreeError::InvalidRange);
+        }
+
+        Ok(Self {
+            start_key: start,
+            end_key: end,
+        })
+    }
+
+    fn excludes_as_start(&self, key: &[u8]) -> bool {
+        match &self.start_key {
+            Some(bound) => bound.excludes_as_start(key),
+            None => false,
+        }
+    }
+
+    fn excludes_as_end(&self, key: &[u8]) -> bool {
+        match &self.end_key {
+            Some(bound) => bound.excludes_as_end(key),
+            None => false,
+        }
+    }
 }
 
 pub struct RangedScanIterator<'b> {
     btree: &'b BTree,
     record_ptrs: Vec<RecordPtr>,
     next_leaf_page_id: Option<PageId>,
-    start_bound: RangeBound,
-    end_bound: RangeBound,
+    range: Range,
     is_first_leaf: bool,
 }
 
@@ -212,8 +240,7 @@ impl<'b> RangedScanIterator<'b> {
             btree,
             record_ptrs: vec![],
             next_leaf_page_id: Some(start_leaf_page_id),
-            start_bound: range.start_key,
-            end_bound: range.end_key,
+            range,
             is_first_leaf: true,
         }
     }
@@ -239,11 +266,11 @@ impl<'b> Iterator for RangedScanIterator<'b> {
             };
 
             for (key, record_ptr) in records_with_keys {
-                if self.is_first_leaf && self.start_bound.excludes_as_start(key.as_slice()) {
+                if self.is_first_leaf && self.range.excludes_as_start(key.as_slice()) {
                     continue;
                 }
 
-                if self.end_bound.excludes_as_end(key.as_slice()) {
+                if self.range.excludes_as_end(key.as_slice()) {
                     self.next_leaf_page_id = None;
                     break;
                 }
@@ -366,7 +393,10 @@ impl BTree {
 
     /// Performs a ranged scan over the B-tree, returning an iterator over record pointers.
     pub fn ranged_scan(&self, range: Range) -> Result<RangedScanIterator<'_>, BTreeError> {
-        let start_leaf_id = self.traverse(range.start_key.key.as_bytes())?;
+        let start_leaf_id = match &range.start_key {
+            Some(start_bound) => self.traverse(start_bound.key.as_bytes())?,
+            None => self.traverse_leftmost()?,
+        };
         Ok(RangedScanIterator::new(self, start_leaf_id, range))
     }
 
@@ -383,6 +413,27 @@ impl BTree {
                 NodeType::Internal => {
                     let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
                     current_page_id = node.search(key)?.child_ptr();
+                }
+                NodeType::Leaf => {
+                    return Ok(current_page_id);
+                }
+            }
+        }
+    }
+
+    /// Traversal to find the leftmost leaf node in the B-tree.
+    fn traverse_leftmost(&self) -> Result<PageId, BTreeError> {
+        let mut current_page_id = self.read_root_page_id()?;
+
+        loop {
+            let page = self
+                .cache
+                .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
+
+            match get_node_type(&page)? {
+                NodeType::Internal => {
+                    let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
+                    current_page_id = node.get_child_ptr_at(ChildPosition::Leftmost)?;
                 }
                 NodeType::Leaf => {
                     return Ok(current_page_id);
@@ -2571,14 +2622,14 @@ mod test {
 
     fn make_range(start: i32, start_inclusive: bool, end: i32, end_inclusive: bool) -> Range {
         Range {
-            start_key: RangeBound {
+            start_key: Some(RangeBound {
                 key: key_i32(start),
                 inclusive: start_inclusive,
-            },
-            end_key: RangeBound {
+            }),
+            end_key: Some(RangeBound {
                 key: key_i32(end),
                 inclusive: end_inclusive,
-            },
+            }),
         }
     }
 
