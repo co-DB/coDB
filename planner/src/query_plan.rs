@@ -224,11 +224,11 @@ pub struct TableScan {
 }
 
 /// Uses index (currently index = primary key) to load only relevant records from the table.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IndexScan {
     pub table_name: String,
-    pub start: Option<ResolvedNodeId>,
-    pub end: Option<ResolvedNodeId>,
+    pub start: Option<(ResolvedNodeId, bool)>,
+    pub end: Option<(ResolvedNodeId, bool)>,
 }
 
 /// Applies filter defined in `predicate` to `data_source`.
