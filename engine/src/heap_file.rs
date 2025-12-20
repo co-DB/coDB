@@ -1051,6 +1051,39 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         AllRecordsIterator::new(self, first_page_id)
     }
 
+    /// Reads all [`Record`]s with the given record pointers.
+    /// Chunks records by page id to minimize page reads/locks.
+    pub fn records_from_ptrs(
+        &self,
+        mut record_ptrs: Vec<RecordPtr>,
+    ) -> Result<Vec<RecordHandle>, HeapFileError> {
+        // Sort record pointers by page id to allow for chunking consecutive records from the same
+        // page.
+        record_ptrs.sort_unstable_by_key(|rp| rp.page_id);
+
+        let mut records = vec![];
+
+        // Process each chunk of records from the same page together.
+        for chunk in record_ptrs.chunk_by(|r1, r2| r1.page_id == r2.page_id) {
+            let page_id = chunk[0].page_id;
+            let mut page = self.read_record_page(page_id)?;
+            for record_ptr in chunk {
+                // Create PageLockChain that reuses the already locked record page.
+                let page_chain =
+                    PageLockChainWithLockedRecordPage::<BUCKETS_COUNT, PinnedReadPage>::with_record(
+                        self, &mut page,
+                    )?;
+
+                // Read record bytes and deserialize.
+                let record_bytes = self.record_bytes(record_ptr, page_chain)?;
+                let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
+                records.push(RecordHandle::new(record, *record_ptr));
+            }
+        }
+
+        Ok(records)
+    }
+
     /// Inserts `record` into heap file and returns its [`RecordPtr`].
     pub fn insert(&self, record: Record) -> Result<RecordPtr, HeapFileError> {
         let serialized = record.serialize();
