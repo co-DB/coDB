@@ -2902,4 +2902,510 @@ mod tests {
         assert_eq!(*david.fields[1].deref(), Value::String("David".into()));
         assert_eq!(*david.fields[2].deref(), Value::Int32(40));
     }
+
+    #[test]
+    fn test_rename_table_preserves_existing_data() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        );
+
+        // Rename table
+        let result = execute_single(&executor, "ALTER TABLE users RENAME TABLE TO people;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Old table name should not work
+        let result = execute_single(&executor, "SELECT * FROM users;");
+        assert_parse_error_contains(result, "table 'users' was not found in database");
+
+        // New table name should work and contain all data
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM people;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(rows.len(), 3);
+
+        // Verify all records are present
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[1].deref(), Value::String("Alice".into()));
+        assert_eq!(*alice.fields[2].deref(), Value::Int32(25));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*bob.fields[1].deref(), Value::String("Bob".into()));
+        assert_eq!(*bob.fields[2].deref(), Value::Int32(30));
+
+        let charlie = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(3))
+            .unwrap();
+        assert_eq!(*charlie.fields[1].deref(), Value::String("Charlie".into()));
+        assert_eq!(*charlie.fields[2].deref(), Value::Int32(35));
+    }
+
+    #[test]
+    fn test_rename_table_can_insert_after_rename() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+
+        // Rename table
+        execute_single(&executor, "ALTER TABLE users RENAME TABLE TO people;");
+
+        // Insert into renamed table
+        let result = execute_single(
+            &executor,
+            "INSERT INTO people (id, name) VALUES (2, 'Bob');",
+        );
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        // Verify both records exist
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM people;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(1)));
+        assert!(rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(2)));
+    }
+
+    #[test]
+    fn test_rename_table_can_update_after_rename() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Rename table
+        execute_single(&executor, "ALTER TABLE users RENAME TABLE TO people;");
+
+        // Update records in renamed table
+        let result = execute_single(&executor, "UPDATE people SET age = 26 WHERE id = 1;");
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify update worked
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM people WHERE id = 1;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].fields[2].deref(), Value::Int32(26));
+    }
+
+    #[test]
+    fn test_rename_table_can_delete_after_rename() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+        execute_single(&executor, "INSERT INTO users (id, name) VALUES (2, 'Bob');");
+
+        // Rename table
+        execute_single(&executor, "ALTER TABLE users RENAME TABLE TO people;");
+
+        // Delete from renamed table
+        let result = execute_single(&executor, "DELETE FROM people WHERE id = 1;");
+        assert_operation_successful(result, 1, StatementType::Delete);
+
+        // Verify deletion worked
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM people;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].fields[0].deref(), Value::Int32(2));
+    }
+
+    #[test]
+    fn test_rename_table_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create empty table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+
+        // Rename table
+        let result = execute_single(&executor, "ALTER TABLE users RENAME TABLE TO people;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Old table name should not work
+        let result = execute_single(&executor, "SELECT * FROM users;");
+        assert_parse_error_contains(result, "table 'users' was not found in database");
+
+        // New table name should work and be empty
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM people;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_rename_table_twice() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+
+        // First rename
+        execute_single(&executor, "ALTER TABLE users RENAME TABLE TO people;");
+
+        // Second rename
+        let result = execute_single(&executor, "ALTER TABLE people RENAME TABLE TO persons;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Old names should not work
+        let result = execute_single(&executor, "SELECT * FROM users;");
+        assert_parse_error_contains(result, "table 'users' was not found in database");
+
+        let result = execute_single(&executor, "SELECT * FROM people;");
+        assert_parse_error_contains(result, "table 'people' was not found in database");
+
+        // Final name should work
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM persons;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].fields[0].deref(), Value::Int32(1));
+    }
+
+    #[test]
+    fn test_rename_table_to_same_name() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+
+        // Rename table to same name
+        let result = execute_single(&executor, "ALTER TABLE users RENAME TABLE TO users;");
+
+        assert_parse_error_contains(result, "table 'users' already exists");
+    }
+
+    #[test]
+    fn test_rename_column_preserves_data() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Rename column
+        let result = execute_single(
+            &executor,
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+        );
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify data is preserved and accessible with new name
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, full_name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[1].name, "full_name");
+        assert_eq!(rows.len(), 2);
+
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[1].deref(), Value::String("Alice".into()));
+
+        let bob = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(2))
+            .unwrap();
+        assert_eq!(*bob.fields[1].deref(), Value::String("Bob".into()));
+    }
+
+    #[test]
+    fn test_rename_column_old_name_no_longer_works() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+
+        // Rename column
+        execute_single(
+            &executor,
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+        );
+
+        // Try to select using old column name
+        let result = execute_single(&executor, "SELECT id, name FROM users;");
+        assert_parse_error_contains(result, "column 'name'");
+    }
+
+    #[test]
+    fn test_rename_column_can_insert_after_rename() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+
+        // Rename column
+        execute_single(
+            &executor,
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+        );
+
+        // Insert using new column name
+        let result = execute_single(
+            &executor,
+            "INSERT INTO users (id, full_name, age) VALUES (2, 'Bob', 30);",
+        );
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        // Verify both records exist
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, full_name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_rename_column_can_update_after_rename() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+
+        // Rename column
+        execute_single(
+            &executor,
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+        );
+
+        // Update using new column name
+        let result = execute_single(
+            &executor,
+            "UPDATE users SET full_name = 'Alicia' WHERE id = 1;",
+        );
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify update worked
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, full_name FROM users WHERE id = 1;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].fields[1].deref(), Value::String("Alicia".into()));
+    }
+
+    #[test]
+    fn test_rename_primary_key_column() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+
+        // Rename primary key column
+        let result = execute_single(&executor, "ALTER TABLE users RENAME COLUMN id TO user_id;");
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify primary key column renamed
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT user_id, name FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns[0].name, "user_id");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].fields[0].deref(), Value::Int32(1));
+    }
+
+    #[test]
+    fn test_rename_column_multiple_times() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name) VALUES (1, 'Alice');",
+        );
+
+        // First rename
+        execute_single(
+            &executor,
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+        );
+
+        // Second rename
+        let result = execute_single(
+            &executor,
+            "ALTER TABLE users RENAME COLUMN full_name TO person_name;",
+        );
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify final name works
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, person_name FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns[1].name, "person_name");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].fields[1].deref(), Value::String("Alice".into()));
+
+        // Old names should not work
+        let result = execute_single(&executor, "SELECT name FROM users;");
+        assert_parse_error_contains(result, "column 'name'");
+
+        let result = execute_single(&executor, "SELECT full_name FROM users;");
+        assert_parse_error_contains(result, "column 'full_name'");
+    }
+
+    #[test]
+    fn test_rename_column_empty_table() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create empty table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+
+        // Rename column
+        let result = execute_single(
+            &executor,
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+        );
+        assert_operation_successful(result, 0, StatementType::Alter);
+
+        // Verify column renamed
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, full_name FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns[1].name, "full_name");
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_rename_column_to_same_name() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+        );
+
+        // Rename column to same name
+        let result = execute_single(&executor, "ALTER TABLE users RENAME COLUMN name TO name;");
+
+        assert_parse_error_contains(result, "column 'name' already exists");
+    }
 }

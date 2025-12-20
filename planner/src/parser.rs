@@ -804,7 +804,10 @@ impl Parser {
                 self.read_token()?;
                 let previous_name = self.parse_column_name()?;
                 self.expect_token(TokenType::To)?;
-                let new_name = self.parse_column_name()?;
+                // Here we don't use `Self::parse_column_name` because in rename column statement
+                // column with new name does not exist yet.
+                let new_ident = self.expect_ident()?;
+                let new_name = self.add_identifier_node(new_ident);
                 Ok(AlterAction::RenameColumn(RenameColumnAlterAction {
                     previous_name,
                     new_name,
@@ -813,7 +816,10 @@ impl Parser {
             TokenType::Table => {
                 self.read_token()?;
                 self.expect_token(TokenType::To)?;
-                let new_name = self.parse_table_name()?;
+                // Here we don't use `Self::parse_table_name` because in rename table statement
+                // table with new name does not exist yet.
+                let new_ident = self.expect_ident()?;
+                let new_name = self.add_identifier_node(new_ident);
                 Ok(AlterAction::RenameTable(RenameTableAlterAction {
                     new_name,
                 }))
@@ -1420,7 +1426,7 @@ mod tests {
         match &alter_stmt.action {
             AlterAction::RenameColumn(rename) => {
                 assert_column_identifier_node(&ast, rename.previous_name, "old_name", None);
-                assert_column_identifier_node(&ast, rename.new_name, "new_name", None);
+                assert_identifier_node(&ast, rename.new_name, "new_name");
             }
             other => panic!("Expected Rename action, got {:#?}", other),
         }
@@ -1440,7 +1446,7 @@ mod tests {
 
         match &alter_stmt.action {
             AlterAction::RenameTable(rename) => {
-                assert_table_identifier_node(&ast, rename.new_name, "new_users", None);
+                assert_identifier_node(&ast, rename.new_name, "new_users");
             }
             other => panic!("Expected Rename action, got {:#?}", other),
         }

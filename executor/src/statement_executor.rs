@@ -6,6 +6,7 @@ use engine::{
 use itertools::Itertools;
 use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
+use planner::query_plan::{RenameColumn, RenameTable};
 use planner::{
     query_plan::{
         AddColumn, ClearTable, CreateTable, Delete, Filter, Insert, Limit, Projection,
@@ -96,8 +97,10 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             StatementPlanItem::CreateTable(create_table) => self.create_table(create_table),
             StatementPlanItem::RemoveTable(remove_table) => self.remove_table(remove_table),
             StatementPlanItem::ClearTable(clear_table) => self.clear_table(clear_table),
+            StatementPlanItem::RenameTable(rename_table) => self.rename_table(rename_table),
             StatementPlanItem::AddColumn(add_column) => self.add_column(add_column),
             StatementPlanItem::RemoveColumn(remove_column) => self.remove_column(remove_column),
+            StatementPlanItem::RenameColumn(rename_column) => self.rename_column(rename_column),
             _ => error_factory::runtime_error(format!(
                 "Invalid root operation ({:?}) for mutation statement",
                 item
@@ -528,7 +531,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         self.executor.remove_b_tree(&remove_table.name);
 
         // Remove all pages from cache
-        if let Err(e) = self.remove_table_content_from_cache(&remove_table.name) {
+        if let Err(e) = self.remove_table_content_from_cache_without_flushing(&remove_table.name) {
             return StatementResult::from(&e);
         }
 
@@ -543,17 +546,17 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         }
     }
 
-    /// Removes pages for both index file and data file from cache
-    fn remove_table_content_from_cache(
+    /// Removes pages for both index file and data file from cache (without flushing to disk)
+    fn remove_table_content_from_cache_without_flushing(
         &self,
         table_name: impl Into<String> + Clone,
     ) -> Result<(), InternalExecutorError> {
         self.executor
             .cache
-            .remove_file(&FileKey::data(table_name.clone().into()))?;
+            .remove_file_without_flushing(&FileKey::data(table_name.clone().into()))?;
         self.executor
             .cache
-            .remove_file(&FileKey::index(table_name.clone().into()))?;
+            .remove_file_without_flushing(&FileKey::index(table_name.clone().into()))?;
         Ok(())
     }
 
@@ -568,7 +571,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         self.executor.remove_b_tree(&clear_table.name);
 
         // Remove all pages from cache
-        if let Err(e) = self.remove_table_content_from_cache(&clear_table.name) {
+        if let Err(e) = self.remove_table_content_from_cache_without_flushing(&clear_table.name) {
             return StatementResult::from(&e);
         }
 
@@ -581,6 +584,46 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             rows_affected: 0,
             ty: StatementType::Truncate,
         }
+    }
+
+    /// Handler for [`RenameTable`] statement.
+    fn rename_table(&self, rename_table: &RenameTable) -> StatementResult {
+        let mut catalog = self.executor.catalog.write();
+
+        // Remove heap file and btree from executor with flushing
+        // We are holding write lock on catalog, so we are sure no other thread can create them back
+        // during this statement.
+        self.executor.remove_heap_file(&rename_table.prev_name);
+        self.executor.remove_b_tree(&rename_table.prev_name);
+
+        // Remove all pages from cache and flush their content to disk
+        if let Err(e) = self.remove_table_content_from_cache(&rename_table.prev_name) {
+            return StatementResult::from(&e);
+        }
+
+        // Rename table name on disk and in metadata via catalog
+        if let Err(e) = catalog.rename_table(&rename_table.prev_name, &rename_table.new_name) {
+            return error_factory::runtime_error(format!("failed to rename table: {e:?}"));
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Alter,
+        }
+    }
+
+    /// Removes pages for both index file and data file from cache (but flushes it to disk)
+    fn remove_table_content_from_cache(
+        &self,
+        table_name: impl Into<String> + Clone,
+    ) -> Result<(), InternalExecutorError> {
+        self.executor
+            .cache
+            .remove_file(&FileKey::data(table_name.clone().into()))?;
+        self.executor
+            .cache
+            .remove_file(&FileKey::index(table_name.clone().into()))?;
+        Ok(())
     }
 
     /// Handler for [`AddColumn`] statement.
@@ -740,6 +783,27 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 hf.remove_column_migration(position, prev_column_min_offset, new_columns)
             })??;
         Ok(())
+    }
+
+    /// Handler for [`RenameColumn`] statement.
+    fn rename_column(&self, rename_column: &RenameColumn) -> StatementResult {
+        let mut catalog = self.executor.catalog.write();
+
+        // We need to remove heap file to assert that it will load new column metadata
+        self.executor.remove_heap_file(&rename_column.table_name);
+
+        if let Err(e) = catalog.rename_column(
+            &rename_column.table_name,
+            &rename_column.prev_column_name,
+            &rename_column.new_column_name,
+        ) {
+            return error_factory::runtime_error(format!("failed to rename column: {e:?}"));
+        }
+
+        StatementResult::OperationSuccessful {
+            rows_affected: 0,
+            ty: StatementType::Alter,
+        }
     }
 
     /// Creates iterator that maps `expressions` into [`ProjectColumn`]s.
