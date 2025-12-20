@@ -262,6 +262,85 @@ mod tests {
         }
     }
 
+    // Helper to check if a plan uses index scan
+    fn assert_uses_index_scan(plan: &StatementPlan) {
+        use planner::query_plan::StatementPlanItem;
+
+        // Walk through the plan starting from root to find IndexScan
+        let current_item = plan.root();
+        let mut found_index_scan = matches!(current_item, StatementPlanItem::IndexScan(_));
+
+        // If root is not IndexScan, check if it references a data source that is
+        if !found_index_scan && let Some(data_source_id) = get_data_source(current_item) {
+            let data_source = plan.item(data_source_id);
+            found_index_scan = matches!(data_source, StatementPlanItem::IndexScan(_));
+
+            // Check one more level deep if needed (for chained operators)
+            if !found_index_scan && let Some(nested_id) = get_data_source(data_source) {
+                let nested = plan.item(nested_id);
+                found_index_scan = matches!(nested, StatementPlanItem::IndexScan(_));
+            }
+        }
+
+        assert!(
+            found_index_scan,
+            "Expected plan to use IndexScan, but it doesn't. Root: {:?}",
+            match current_item {
+                StatementPlanItem::TableScan(_) => "TableScan",
+                StatementPlanItem::IndexScan(_) => "IndexScan",
+                StatementPlanItem::Filter(_) => "Filter",
+                StatementPlanItem::Projection(_) => "Projection",
+                StatementPlanItem::Delete(_) => "Delete",
+                StatementPlanItem::Update(_) => "Update",
+                _ => "Other",
+            }
+        );
+    }
+
+    // Helper to check if a plan uses table scan (not index scan)
+    fn assert_uses_table_scan(plan: &StatementPlan) {
+        use planner::query_plan::StatementPlanItem;
+
+        // Walk through the plan starting from root to find TableScan
+        let current_item = plan.root();
+        let mut found_table_scan = matches!(current_item, StatementPlanItem::TableScan(_));
+
+        // If root is not TableScan, check if it references a data source that is
+        if !found_table_scan && let Some(data_source_id) = get_data_source(current_item) {
+            let data_source = plan.item(data_source_id);
+            found_table_scan = matches!(data_source, StatementPlanItem::TableScan(_));
+
+            // Check one more level deep if needed
+            if !found_table_scan && let Some(nested_id) = get_data_source(data_source) {
+                let nested = plan.item(nested_id);
+                found_table_scan = matches!(nested, StatementPlanItem::TableScan(_));
+            }
+        }
+
+        assert!(
+            found_table_scan,
+            "Expected plan to use TableScan, but it doesn't"
+        );
+    }
+
+    // Helper to extract data_source from plan items that have one
+    fn get_data_source(
+        item: &planner::query_plan::StatementPlanItem,
+    ) -> Option<planner::query_plan::StatementPlanItemId> {
+        use planner::query_plan::StatementPlanItem;
+
+        match item {
+            StatementPlanItem::Filter(f) => Some(f.data_source),
+            StatementPlanItem::Sort(s) => Some(s.data_source),
+            StatementPlanItem::Limit(l) => Some(l.data_source),
+            StatementPlanItem::Skip(s) => Some(s.data_source),
+            StatementPlanItem::Projection(p) => Some(p.data_source),
+            StatementPlanItem::Delete(d) => Some(d.data_source),
+            StatementPlanItem::Update(u) => Some(u.data_source),
+            _ => None,
+        }
+    }
+
     fn assert_operation_successful(
         result: StatementResult,
         expected_rows: usize,
@@ -3407,5 +3486,699 @@ mod tests {
         let result = execute_single(&executor, "ALTER TABLE users RENAME COLUMN name TO name;");
 
         assert_parse_error_contains(result, "column 'name' already exists");
+    }
+
+    #[test]
+    fn test_select_index_scan_equal_primary_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // SELECT with equality on primary key should use index scan
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, name, price FROM products WHERE id = 5;",
+            &executor,
+        );
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&select_plan);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].fields[0].deref(), Value::Int32(5));
+        assert!(matches!(&rows[0].fields[1].deref(), Value::String(s) if s == "Product 5"));
+        assert_eq!(*rows[0].fields[2].deref(), Value::Int32(50));
+    }
+
+    #[test]
+    fn test_select_index_scan_greater_than_primary_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // SELECT with > on primary key should use index scan
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM products WHERE id > 7;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&select_plan);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| {
+            if let Value::Int32(id) = *r.fields[0].deref() {
+                id > 7
+            } else {
+                false
+            }
+        }));
+    }
+
+    #[test]
+    fn test_select_index_scan_less_than_primary_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // SELECT with < on primary key should use index scan
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM products WHERE id < 4;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&select_plan);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| {
+            if let Value::Int32(id) = *r.fields[0].deref() {
+                id < 4
+            } else {
+                false
+            }
+        }));
+    }
+
+    #[test]
+    fn test_select_index_scan_range_inclusive() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // SELECT with range on primary key should use index scan
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, name FROM products WHERE id >= 3 AND id <= 7;",
+            &executor,
+        );
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&select_plan);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|r| {
+            if let Value::Int32(id) = *r.fields[0].deref() {
+                (3..=7).contains(&id)
+            } else {
+                false
+            }
+        }));
+    }
+
+    #[test]
+    fn test_select_index_scan_range_exclusive() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // SELECT with exclusive range on primary key should use index scan
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id FROM products WHERE id > 3 AND id < 7;",
+            &executor,
+        );
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&select_plan);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| {
+            if let Value::Int32(id) = *r.fields[0].deref() {
+                id > 3 && id < 7
+            } else {
+                false
+            }
+        }));
+    }
+
+    #[test]
+    fn test_select_index_scan_no_results() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // SELECT with primary key condition that doesn't match any records
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM products WHERE id = 999;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&select_plan);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_delete_index_scan_equal_primary_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // DELETE with equality on primary key should use index scan
+        let (delete_plan, delete_ast) =
+            create_single_statement("DELETE FROM products WHERE id = 5;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&delete_plan);
+
+        let result = executor.execute_statement(&delete_plan, &delete_ast);
+        assert_operation_successful(result, 1, StatementType::Delete);
+
+        // Verify correct record was deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 9);
+        assert!(!rows.iter().any(|r| *r.fields[0].deref() == Value::Int32(5)));
+    }
+
+    #[test]
+    fn test_delete_index_scan_greater_than_primary_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // DELETE with > on primary key should use index scan
+        let (delete_plan, delete_ast) =
+            create_single_statement("DELETE FROM products WHERE id > 7;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&delete_plan);
+
+        let result = executor.execute_statement(&delete_plan, &delete_ast);
+        assert_operation_successful(result, 3, StatementType::Delete);
+
+        // Verify correct records were deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 7);
+        assert!(rows.iter().all(|r| {
+            if let Value::Int32(id) = *r.fields[0].deref() {
+                id <= 7
+            } else {
+                false
+            }
+        }));
+    }
+
+    #[test]
+    fn test_delete_index_scan_range() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // DELETE with range on primary key should use index scan
+        let (delete_plan, delete_ast) =
+            create_single_statement("DELETE FROM products WHERE id >= 3 AND id <= 7;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&delete_plan);
+
+        let result = executor.execute_statement(&delete_plan, &delete_ast);
+        assert_operation_successful(result, 5, StatementType::Delete);
+
+        // Verify correct records were deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|r| {
+            if let Value::Int32(id) = *r.fields[0].deref() {
+                !(3..=7).contains(&id)
+            } else {
+                false
+            }
+        }));
+    }
+
+    #[test]
+    fn test_delete_index_scan_no_matches() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // DELETE with primary key condition that doesn't match any records
+        let (delete_plan, delete_ast) =
+            create_single_statement("DELETE FROM products WHERE id = 999;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&delete_plan);
+
+        let result = executor.execute_statement(&delete_plan, &delete_ast);
+        assert_operation_successful(result, 0, StatementType::Delete);
+
+        // Verify no records were deleted
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id FROM products;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 10);
+    }
+
+    #[test]
+    fn test_update_index_scan_equal_primary_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // UPDATE with equality on primary key should use index scan
+        let (update_plan, update_ast) =
+            create_single_statement("UPDATE products SET price = 999 WHERE id = 5;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&update_plan);
+
+        let result = executor.execute_statement(&update_plan, &update_ast);
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify correct record was updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, price FROM products WHERE id = 5;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].fields[1].deref(), Value::Int32(999));
+
+        // Verify other records unchanged
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id FROM products WHERE price = 999;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_update_index_scan_greater_than_primary_key() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // UPDATE with > on primary key should use index scan
+        let (update_plan, update_ast) =
+            create_single_statement("UPDATE products SET price = 999 WHERE id > 7;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&update_plan);
+
+        let result = executor.execute_statement(&update_plan, &update_ast);
+        assert_operation_successful(result, 3, StatementType::Update);
+
+        // Verify correct records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, price FROM products WHERE id > 7;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|r| *r.fields[1].deref() == Value::Int32(999))
+        );
+    }
+
+    #[test]
+    fn test_update_index_scan_range() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // UPDATE with range on primary key should use index scan
+        let (update_plan, update_ast) = create_single_statement(
+            "UPDATE products SET price = 888 WHERE id >= 3 AND id <= 7;",
+            &executor,
+        );
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&update_plan);
+
+        let result = executor.execute_statement(&update_plan, &update_ast);
+        assert_operation_successful(result, 5, StatementType::Update);
+
+        // Verify correct records were updated
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, price FROM products WHERE id >= 3 AND id <= 7;",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 5);
+        assert!(
+            rows.iter()
+                .all(|r| *r.fields[1].deref() == Value::Int32(888))
+        );
+
+        // Verify other records unchanged
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, price FROM products WHERE id < 3 OR id > 7;",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 5);
+        assert!(
+            rows.iter()
+                .all(|r| *r.fields[1].deref() != Value::Int32(888))
+        );
+    }
+
+    #[test]
+    fn test_update_index_scan_no_matches() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // UPDATE with primary key condition that doesn't match any records
+        let (update_plan, update_ast) =
+            create_single_statement("UPDATE products SET price = 999 WHERE id = 999;", &executor);
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&update_plan);
+
+        let result = executor.execute_statement(&update_plan, &update_ast);
+        assert_operation_successful(result, 0, StatementType::Update);
+
+        // Verify no records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT price FROM products WHERE price = 999;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_update_index_scan_multiple_columns() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=10 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // UPDATE multiple columns with primary key condition
+        let (update_plan, update_ast) = create_single_statement(
+            "UPDATE products SET name = 'Updated', price = 999 WHERE id >= 5 AND id <= 7;",
+            &executor,
+        );
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&update_plan);
+
+        let result = executor.execute_statement(&update_plan, &update_ast);
+        assert_operation_successful(result, 3, StatementType::Update);
+
+        // Verify correct records were updated
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, name, price FROM products WHERE id >= 5 AND id <= 7;",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| {
+            matches!(&r.fields[1].deref(), Value::String(s) if s == "Updated")
+                && *r.fields[2].deref() == Value::Int32(999)
+        }));
+    }
+
+    // Test to verify TableScan is used when condition is NOT on primary key
+    #[test]
+    fn test_select_uses_table_scan_for_non_primary_key_condition() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+        for i in 1..=5 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // SELECT with condition on non-primary key should use TableScan
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name FROM products WHERE price > 20;", &executor);
+
+        // Verify TableScan is used (not IndexScan)
+        assert_uses_table_scan(&select_plan);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3); // Products 3, 4, 5 have price > 20
     }
 }
