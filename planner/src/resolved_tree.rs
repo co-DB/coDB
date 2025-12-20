@@ -95,12 +95,14 @@ pub(crate) struct ResolvedUpdateStatement {
     pub(crate) columns: Vec<ResolvedNodeId>,
     pub(crate) values: Vec<ResolvedNodeId>,
     pub(crate) where_clause: Option<ResolvedNodeId>,
+    pub(crate) index_bounds: Option<IndexBounds>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ResolvedDeleteStatement {
     pub(crate) table: ResolvedNodeId,
     pub(crate) where_clause: Option<ResolvedNodeId>,
+    pub(crate) index_bounds: Option<IndexBounds>,
 }
 
 #[derive(Debug)]

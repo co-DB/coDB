@@ -343,6 +343,14 @@ impl<'a> Analyzer<'a> {
     /// If successful [`ResolvedUpdateStatement`] is added to [`Analyzer::resolved_tree`].
     fn analyze_update_statement(&mut self, update: &UpdateStatement) -> Result<(), AnalyzerError> {
         let resolved_table = self.resolve_expression(update.table_name)?;
+        let table = self.get_table_name(resolved_table)?;
+        let primary_key = self
+            .statement_context
+            .tables_metadata
+            .get(&table)
+            .ok_or(AnalyzerError::TableNotFound { table })?
+            .primary_key_column_name()
+            .to_string();
         let resolved_column_setters = update
             .column_setters
             .iter()
@@ -359,11 +367,13 @@ impl<'a> Analyzer<'a> {
             .where_clause
             .map(|node_id| self.resolve_expression(node_id))
             .transpose()?;
+        let index_bounds = self.extract_index_bounds(resolved_where_clause, &primary_key);
         let update_statement = ResolvedUpdateStatement {
             table: resolved_table,
             columns: resolved_columns,
             values: resolved_values,
             where_clause: resolved_where_clause,
+            index_bounds,
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Update(update_statement));
@@ -374,13 +384,23 @@ impl<'a> Analyzer<'a> {
     /// If successful [`ResolvedDeleteStatement`] is added to [`Analyzer::resolved_tree`].
     fn analyze_delete_statement(&mut self, delete: &DeleteStatement) -> Result<(), AnalyzerError> {
         let resolved_table = self.resolve_expression(delete.table_name)?;
+        let table = self.get_table_name(resolved_table)?;
+        let primary_key = self
+            .statement_context
+            .tables_metadata
+            .get(&table)
+            .ok_or(AnalyzerError::TableNotFound { table })?
+            .primary_key_column_name()
+            .to_string();
         let resolved_where_clause = delete
             .where_clause
             .map(|node_id| self.resolve_expression(node_id))
             .transpose()?;
+        let index_bounds = self.extract_index_bounds(resolved_where_clause, &primary_key);
         let delete_statement = ResolvedDeleteStatement {
             table: resolved_table,
             where_clause: resolved_where_clause,
+            index_bounds,
         };
         self.resolved_tree
             .add_statement(ResolvedStatement::Delete(delete_statement));

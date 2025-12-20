@@ -92,6 +92,18 @@ impl StatementPlanItem {
         StatementPlanItem::TableScan(TableScan { table_name })
     }
 
+    pub(crate) fn index_scan(
+        table_name: String,
+        start: Option<(ResolvedNodeId, bool)>,
+        end: Option<(ResolvedNodeId, bool)>,
+    ) -> Self {
+        StatementPlanItem::IndexScan(IndexScan {
+            table_name,
+            start,
+            end,
+        })
+    }
+
     pub(crate) fn filter(data_source: StatementPlanItemId, predicate: ResolvedNodeId) -> Self {
         StatementPlanItem::Filter(Filter {
             data_source,
