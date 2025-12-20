@@ -1,3 +1,4 @@
+use std::cmp;
 use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_key::Key;
@@ -175,18 +176,18 @@ impl RangeBound {
     /// Returns true if this bound, treated as a start bound, excludes the given key.
     fn excludes_as_start(&self, key: &[u8]) -> bool {
         match key.cmp(self.key.as_bytes()) {
-            std::cmp::Ordering::Less => true,
-            std::cmp::Ordering::Equal => !self.inclusive,
-            std::cmp::Ordering::Greater => false,
+            cmp::Ordering::Less => true,
+            cmp::Ordering::Equal => !self.inclusive,
+            cmp::Ordering::Greater => false,
         }
     }
 
     /// Returns true if this bound, treated as an end bound, excludes the given key.
     fn excludes_as_end(&self, key: &[u8]) -> bool {
         match key.cmp(self.key.as_bytes()) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Equal => !self.inclusive,
-            std::cmp::Ordering::Less => false,
+            cmp::Ordering::Greater => true,
+            cmp::Ordering::Equal => !self.inclusive,
+            cmp::Ordering::Less => false,
         }
     }
 }

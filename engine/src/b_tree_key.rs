@@ -32,19 +32,6 @@ impl TryFrom<Value> for Key {
     }
 }
 
-impl Key {
-    pub fn decode(bytes: &[u8], ty: &Type) -> Result<Value, BTreeKeyError> {
-        match ty {
-            Type::String => Ok(Value::String(String::decode_key(bytes)?)),
-            Type::I32 => Ok(Value::Int32(i32::decode_key(bytes)?)),
-            Type::I64 => Ok(Value::Int64(i64::decode_key(bytes)?)),
-            Type::Date => Ok(Value::Date(DbDate::decode_key(bytes)?)),
-            Type::DateTime => Ok(Value::DateTime(DbDateTime::decode_key(bytes)?)),
-            _ => Err(BTreeKeyError::UnsupportedKeyType { ty: *ty }),
-        }
-    }
-}
-
 impl AsRef<[u8]> for Key {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
