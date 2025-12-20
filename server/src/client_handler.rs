@@ -1,4 +1,5 @@
-﻿use crate::protocol_mappings::IntoProtocol;
+﻿use crate::protocol_handler::{ProtocolHandler, ReadResult};
+use crate::protocol_mappings::IntoProtocol;
 use dashmap::{DashMap, Entry};
 use engine::record::Record as EngineRecord;
 use executor::response::StatementResult;
@@ -10,23 +11,16 @@ use parking_lot::RwLock;
 use protocol::{ErrorType, Record as ProtocolRecord, Request, Response, StatementType};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
-pub(crate) struct TextClientHandler {
-    reader: BufReader<OwnedReadHalf>,
-    writer: BufWriter<OwnedWriteHalf>,
+pub(crate) struct ClientHandler<P>
+where
+    P: ProtocolHandler,
+{
     current_database: Option<String>,
     executors: Arc<DashMap<String, Arc<Executor>>>,
     catalog_manager: Arc<RwLock<CatalogManager>>,
-}
-
-enum ReadResult {
-    Request(Request),
-    Disconnected,
-    Empty,
+    protocol_handler: P,
 }
 
 #[derive(Error, Debug)]
@@ -63,20 +57,21 @@ impl ClientError {
     }
 }
 
-impl TextClientHandler {
+impl<P> ClientHandler<P>
+where
+    P: ProtocolHandler,
+{
     const CHANNEL_BUFFER_CAPACITY: usize = 16;
 
     const ROWS_CHUNK_SIZE: usize = 10000;
 
     pub(crate) fn new(
-        socket: TcpStream,
         executors: Arc<DashMap<String, Arc<Executor>>>,
         catalog_manager: Arc<RwLock<CatalogManager>>,
+        protocol_handler: P,
     ) -> Self {
-        let (read, write) = socket.into_split();
         Self {
-            reader: BufReader::new(read),
-            writer: BufWriter::new(write),
+            protocol_handler,
             current_database: None,
             executors,
             catalog_manager,
@@ -107,21 +102,7 @@ impl TextClientHandler {
     }
 
     async fn read_request(&mut self) -> Result<ReadResult, ClientError> {
-        let mut buffer = String::new();
-
-        match self.reader.read_line(&mut buffer).await {
-            Ok(0) => Ok(ReadResult::Disconnected),
-            Ok(_) => {
-                let trimmed = buffer.trim();
-                if trimmed.is_empty() {
-                    Ok(ReadResult::Empty)
-                } else {
-                    let request = serde_json::from_str(trimmed)?;
-                    Ok(ReadResult::Request(request))
-                }
-            }
-            Err(e) => Err(ClientError::IoError(e)),
-        }
+        self.protocol_handler.read_request().await
     }
 
     async fn handle_request(&mut self, request: Request) -> Result<(), ClientError> {
@@ -304,11 +285,7 @@ impl TextClientHandler {
         Ok(())
     }
     async fn send_response(&mut self, response: Response) -> Result<(), ClientError> {
-        let json = serde_json::to_string(&response)?;
-        self.writer.write_all(json.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
-        self.writer.flush().await?;
-        Ok(())
+        self.protocol_handler.send_response(response).await
     }
 
     async fn send_error(
@@ -325,8 +302,9 @@ impl TextClientHandler {
 }
 
 #[cfg(test)]
-mod text_client_handler_tests {
-    use crate::text_client_handler::{ClientError, TextClientHandler};
+mod client_handler_tests {
+    use crate::client_handler::{ClientError, ClientHandler};
+    use crate::protocol_handler::TextProtocolHandler;
     use dashmap::DashMap;
     use executor::Executor;
     use metadata::catalog_manager::CatalogManager;
@@ -337,12 +315,12 @@ mod text_client_handler_tests {
     use tokio::net::{TcpListener, TcpStream};
 
     /// Helper struct to manage split TCP socket for testing
-    struct TestClient {
+    struct TestTextClient {
         reader: BufReader<ReadHalf<TcpStream>>,
         writer: WriteHalf<TcpStream>,
     }
 
-    impl TestClient {
+    impl TestTextClient {
         /// Create a new test client from a TCP stream
         fn new(socket: TcpStream) -> Self {
             let (read_half, write_half) = tokio::io::split(socket);
@@ -404,8 +382,8 @@ mod text_client_handler_tests {
         (executors, catalog_manager)
     }
 
-    /// Helper to spawn a test server and return the address and handles
-    async fn spawn_test_handler() -> (String, tokio::task::JoinHandle<()>) {
+    /// Helper to spawn a test server and return the address and text handler
+    async fn spawn_test_text_handler() -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Failed to bind");
@@ -416,8 +394,12 @@ mod text_client_handler_tests {
         let handle = tokio::spawn(async move {
             loop {
                 if let Ok((socket, _)) = listener.accept().await {
-                    let handler =
-                        TextClientHandler::new(socket, executors.clone(), catalog_manager.clone());
+                    let text_handler = TextProtocolHandler::from(socket);
+                    let handler = ClientHandler::new(
+                        executors.clone(),
+                        catalog_manager.clone(),
+                        text_handler,
+                    );
                     tokio::spawn(async move {
                         handler.run().await;
                     });
@@ -430,9 +412,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_create_database() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -454,9 +436,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_list_databases() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -485,9 +467,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_connect_to_database() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -515,9 +497,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_connect_to_nonexistent_database() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -538,9 +520,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_delete_database() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -568,9 +550,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_query_without_database() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -608,9 +590,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_query_with_connected_database() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -645,7 +627,7 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_multiple_clients() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
         // Use unique names based on current time to avoid conflicts
         let timestamp = std::time::SystemTime::now()
@@ -660,7 +642,7 @@ mod text_client_handler_tests {
             let addr = addr.clone();
             let db_name = db1_name.clone();
             async move {
-                let mut client = TestClient::connect(&addr).await.unwrap();
+                let mut client = TestTextClient::connect(&addr).await.unwrap();
                 let request = Request::CreateDatabase {
                     database_name: db_name,
                 };
@@ -672,7 +654,7 @@ mod text_client_handler_tests {
             let addr = addr.clone();
             let db_name = db2_name.clone();
             async move {
-                let mut client = TestClient::connect(&addr).await.unwrap();
+                let mut client = TestTextClient::connect(&addr).await.unwrap();
                 let request = Request::CreateDatabase {
                     database_name: db_name,
                 };
@@ -702,7 +684,7 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_client_disconnect() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
         let socket = TcpStream::connect(&addr)
             .await
@@ -715,7 +697,7 @@ mod text_client_handler_tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Server should still be running and accept new connections
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect after first client disconnected");
 
@@ -734,7 +716,7 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_empty_line_handling() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
         let socket = TcpStream::connect(&addr)
             .await
@@ -770,7 +752,7 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_invalid_json_request() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
         let socket = TcpStream::connect(&addr)
             .await
@@ -799,9 +781,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_create_table_query() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -849,9 +831,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_insert_query() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -910,9 +892,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_select_empty_table() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -979,9 +961,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_select_with_data() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -1072,9 +1054,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_delete_query() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -1141,9 +1123,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_query_parse_error() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 
@@ -1189,9 +1171,9 @@ mod text_client_handler_tests {
 
     #[tokio::test]
     async fn test_multiple_statements_in_query() {
-        let (addr, handle) = spawn_test_handler().await;
+        let (addr, handle) = spawn_test_text_handler().await;
 
-        let mut client = TestClient::connect(&addr)
+        let mut client = TestTextClient::connect(&addr)
             .await
             .expect("Failed to connect to server");
 

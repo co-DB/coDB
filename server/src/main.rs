@@ -1,6 +1,7 @@
+mod client_handler;
+mod protocol_handler;
 mod protocol_mappings;
 mod server;
-mod text_client_handler;
 
 use crate::server::{Server, ServerError};
 
