@@ -166,6 +166,106 @@ struct MergeContext {
     metadata_page: Option<PinnedWritePage>,
 }
 
+pub struct RangeBound {
+    pub key: Key,
+    pub inclusive: bool,
+}
+
+impl RangeBound {
+    /// Returns true if this bound, treated as a start bound, excludes the given key.
+    fn excludes_as_start(&self, key: &[u8]) -> bool {
+        match key.cmp(self.key.as_bytes()) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Equal => !self.inclusive,
+            std::cmp::Ordering::Greater => false,
+        }
+    }
+
+    /// Returns true if this bound, treated as an end bound, excludes the given key.
+    fn excludes_as_end(&self, key: &[u8]) -> bool {
+        match key.cmp(self.key.as_bytes()) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => !self.inclusive,
+            std::cmp::Ordering::Less => false,
+        }
+    }
+}
+
+pub struct Range {
+    pub start_key: RangeBound,
+    pub end_key: RangeBound,
+}
+
+pub struct RangedScanIterator<'b> {
+    btree: &'b BTree,
+    record_ptrs: Vec<RecordPtr>,
+    next_leaf_page_id: Option<PageId>,
+    start_bound: RangeBound,
+    end_bound: RangeBound,
+    is_first_leaf: bool,
+}
+
+impl<'b> RangedScanIterator<'b> {
+    fn new(btree: &'b BTree, start_leaf_page_id: PageId, range: Range) -> Self {
+        RangedScanIterator {
+            btree,
+            record_ptrs: vec![],
+            next_leaf_page_id: Some(start_leaf_page_id),
+            start_bound: range.start_key,
+            end_bound: range.end_key,
+            is_first_leaf: true,
+        }
+    }
+}
+
+impl<'b> Iterator for RangedScanIterator<'b> {
+    type Item = Result<RecordPtr, BTreeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.record_ptrs.is_empty() {
+            return Some(Ok(self.record_ptrs.remove(0)));
+        }
+
+        if let Some(leaf_page_id) = self.next_leaf_page_id {
+            let leaf_node = match self.btree.pin_leaf_for_read(leaf_page_id) {
+                Ok(leaf_node) => leaf_node,
+                Err(err) => return Some(Err(err)),
+            };
+
+            let records_with_keys = match leaf_node.read_all_records() {
+                Ok(records) => records,
+                Err(err) => return Some(Err(err.into())),
+            };
+
+            for (key, record_ptr) in records_with_keys {
+                if self.is_first_leaf && self.start_bound.excludes_as_start(key.as_slice()) {
+                    continue;
+                }
+
+                if self.end_bound.excludes_as_end(key.as_slice()) {
+                    self.next_leaf_page_id = None;
+                    break;
+                }
+
+                self.record_ptrs.push(record_ptr);
+            }
+
+            self.is_first_leaf = false;
+
+            if self.next_leaf_page_id.is_some() {
+                self.next_leaf_page_id = match leaf_node.next_leaf_id() {
+                    Ok(leaf_id) => leaf_id,
+                    Err(err) => return Some(Err(err.into())),
+                };
+            }
+
+            self.next()
+        } else {
+            None
+        }
+    }
+}
+
 /// Structure responsible for managing on-disk index files.
 ///
 /// Each [`BTree`] instance corresponds to a single physical file on disk.
@@ -213,6 +313,14 @@ impl BTree {
         Ok(self.cache.pin_read(&self.page_ref(page_id))?)
     }
 
+    fn pin_leaf_for_read(
+        &self,
+        leaf_page_id: PageId,
+    ) -> Result<BTreeLeafNode<PinnedReadPage>, BTreeError> {
+        let page = self.pin_read(leaf_page_id)?;
+        Ok(BTreeLeafNode::<PinnedReadPage>::new(page)?)
+    }
+
     fn pin_leaf_for_write(
         &self,
         leaf_page_id: PageId,
@@ -250,6 +358,33 @@ impl BTree {
                         LeafNodeSearchResult::Found { record_ptr, .. } => Ok(Some(record_ptr)),
                         LeafNodeSearchResult::NotFoundLeaf { .. } => Ok(None),
                     };
+                }
+            }
+        }
+    }
+
+    /// Performs a ranged scan over the B-tree, returning an iterator over record pointers.
+    pub fn ranged_scan(&self, range: Range) -> Result<RangedScanIterator<'_>, BTreeError> {
+        let start_leaf_id = self.traverse(range.start_key.key.as_bytes())?;
+        Ok(RangedScanIterator::new(self, start_leaf_id, range))
+    }
+
+    /// Traversal to find the leaf node containing the given key.
+    fn traverse(&self, key: &[u8]) -> Result<PageId, BTreeError> {
+        let mut current_page_id = self.read_root_page_id()?;
+
+        loop {
+            let page = self
+                .cache
+                .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
+
+            match get_node_type(&page)? {
+                NodeType::Internal => {
+                    let node = BTreeInternalNode::<PinnedReadPage>::new(page)?;
+                    current_page_id = node.search(key)?.child_ptr();
+                }
+                NodeType::Leaf => {
+                    return Ok(current_page_id);
                 }
             }
         }
@@ -395,11 +530,11 @@ impl BTree {
                     latch_stack.push(latch_handle);
                 }
                 NodeType::Leaf => {
-                    return Ok(PessimisticPath {
+                    return Ok(PessimisticPath::new(
                         latch_stack,
-                        leaf_page_id: current_page_id,
+                        current_page_id,
                         metadata_page,
-                    });
+                    ));
                 }
             }
         }
@@ -1346,11 +1481,11 @@ mod test {
     }
 
     fn key_i32(value: i32) -> Key {
-        Key::try_from(types::data::Value::Int32(value)).unwrap()
+        Key::from(value)
     }
 
     fn key_string(value: &str) -> Key {
-        Key::try_from(types::data::Value::String(value.to_string())).unwrap()
+        Key::from(value)
     }
 
     fn random_string(len: usize) -> String {
@@ -2431,5 +2566,234 @@ mod test {
                 i
             );
         }
+    }
+
+    fn make_range(start: i32, start_inclusive: bool, end: i32, end_inclusive: bool) -> Range {
+        Range {
+            start_key: RangeBound {
+                key: key_i32(start),
+                inclusive: start_inclusive,
+            },
+            end_key: RangeBound {
+                key: key_i32(end),
+                inclusive: end_inclusive,
+            },
+        }
+    }
+
+    #[test]
+    fn test_ranged_scan_empty_btree() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        let range = make_range(10, true, 20, true);
+        let results: Vec<_> = btree.ranged_scan(range).unwrap().collect();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_ranged_scan_inclusive_bounds() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data: Vec<_> = (0..10)
+            .map(|i| (key_i32(i * 10), record_ptr(i as u32, 0)))
+            .collect();
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        // Range [20, 60] should include keys 20, 30, 40, 50, 60
+        let range = make_range(20, true, 60, true);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0], record_ptr(2, 0)); // key 20
+        assert_eq!(results[1], record_ptr(3, 0)); // key 30
+        assert_eq!(results[2], record_ptr(4, 0)); // key 40
+        assert_eq!(results[3], record_ptr(5, 0)); // key 50
+        assert_eq!(results[4], record_ptr(6, 0)); // key 60
+    }
+
+    #[test]
+    fn test_ranged_scan_exclusive_start() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data: Vec<_> = (0..10)
+            .map(|i| (key_i32(i * 10), record_ptr(i as u32, 0)))
+            .collect();
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        // Range (20, 60] should include keys 30, 40, 50, 60 (not 20)
+        let range = make_range(20, false, 60, true);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0], record_ptr(3, 0)); // key 30
+        assert_eq!(results[1], record_ptr(4, 0)); // key 40
+        assert_eq!(results[2], record_ptr(5, 0)); // key 50
+        assert_eq!(results[3], record_ptr(6, 0)); // key 60
+    }
+
+    #[test]
+    fn test_ranged_scan_exclusive_end() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data: Vec<_> = (0..10)
+            .map(|i| (key_i32(i * 10), record_ptr(i as u32, 0)))
+            .collect();
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        // Range [20, 60) should include keys 20, 30, 40, 50 (not 60)
+        let range = make_range(20, true, 60, false);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0], record_ptr(2, 0)); // key 20
+        assert_eq!(results[1], record_ptr(3, 0)); // key 30
+        assert_eq!(results[2], record_ptr(4, 0)); // key 40
+        assert_eq!(results[3], record_ptr(5, 0)); // key 50
+    }
+
+    #[test]
+    fn test_ranged_scan_exclusive_both() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data: Vec<_> = (0..10)
+            .map(|i| (key_i32(i * 10), record_ptr(i as u32, 0)))
+            .collect();
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        // Range (20, 60) should include keys 30, 40, 50 (not 20 or 60)
+        let range = make_range(20, false, 60, false);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], record_ptr(3, 0)); // key 30
+        assert_eq!(results[1], record_ptr(4, 0)); // key 40
+        assert_eq!(results[2], record_ptr(5, 0)); // key 50
+    }
+
+    #[test]
+    fn test_ranged_scan_single_key() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data: Vec<_> = (0..10)
+            .map(|i| (key_i32(i * 10), record_ptr(i as u32, 0)))
+            .collect();
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        // Range [50, 50] should include only key 50
+        let range = make_range(50, true, 50, true);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], record_ptr(5, 0)); // key 50
+    }
+
+    #[test]
+    fn test_ranged_scan_no_matching_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data: Vec<_> = (0..10)
+            .map(|i| (key_i32(i * 10), record_ptr(i as u32, 0)))
+            .collect();
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        // Range [15, 25] has no keys (keys are 10, 20, 30...)
+        let range = make_range(21, true, 29, true);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_ranged_scan_all_keys() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data: Vec<_> = (0..10)
+            .map(|i| (key_i32(i * 10), record_ptr(i as u32, 0)))
+            .collect();
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        // Range [0, 90] should include all keys
+        let range = make_range(0, true, 90, true);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn test_ranged_scan_beyond_bounds() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+
+        let data: Vec<_> = (0..10)
+            .map(|i| (key_i32(i * 10), record_ptr(i as u32, 0)))
+            .collect();
+
+        let btree = create_btree_with_data(cache, file_key, data).unwrap();
+
+        // Range [-100, 200] extends beyond actual data
+        let range = make_range(-100, true, 200, true);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn test_ranged_scan_across_multiple_leaves() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Insert enough keys to force multiple leaf pages
+        for i in 0..500 {
+            btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
+        }
+
+        // Scan a range that spans multiple leaves
+        let range = make_range(100, true, 400, true);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 301);
     }
 }

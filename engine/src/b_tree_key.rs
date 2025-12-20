@@ -77,3 +77,24 @@ impl Ord for Key {
         self.bytes.cmp(&other.bytes)
     }
 }
+
+#[cfg(test)]
+mod test_helpers {
+    use super::*;
+
+    impl From<i32> for Key {
+        fn from(value: i32) -> Self {
+            Key {
+                bytes: value.encode_key(),
+            }
+        }
+    }
+
+    impl From<&str> for Key {
+        fn from(value: &str) -> Self {
+            Key {
+                bytes: value.to_string().encode_key(),
+            }
+        }
+    }
+}
