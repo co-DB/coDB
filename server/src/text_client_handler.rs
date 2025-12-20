@@ -1,4 +1,4 @@
-﻿use crate::text_protocol_mappings::IntoTextProtocol;
+﻿use crate::protocol_mappings::IntoProtocol;
 use dashmap::{DashMap, Entry};
 use engine::record::Record as EngineRecord;
 use executor::response::StatementResult;
@@ -7,9 +7,7 @@ use itertools::Itertools;
 use log::error;
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use parking_lot::RwLock;
-use protocol::text_protocol::{
-    ErrorType, Record as ProtocolRecord, Request, Response, StatementType,
-};
+use protocol::{ErrorType, Record as ProtocolRecord, Request, Response, StatementType};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -249,17 +247,14 @@ impl TextClientHandler {
             StatementResult::OperationSuccessful { rows_affected, ty } => {
                 self.send_response(Response::StatementCompleted {
                     rows_affected,
-                    statement_type: ty.into_text_protocol(),
+                    statement_type: ty.into_protocol(),
                 })
                 .await?;
             }
 
             StatementResult::SelectSuccessful { rows, columns } => {
                 self.send_response(Response::ColumnInfo {
-                    column_metadata: columns
-                        .into_iter()
-                        .map(|cm| cm.into_text_protocol())
-                        .collect(),
+                    column_metadata: columns.into_iter().map(|cm| cm.into_protocol()).collect(),
                 })
                 .await?;
 
@@ -298,7 +293,7 @@ impl TextClientHandler {
             let count = batch.len();
             let mapped_records: Vec<ProtocolRecord> = batch
                 .into_iter()
-                .map(|record| record.into_text_protocol())
+                .map(|record| record.into_protocol())
                 .collect();
             self.send_response(Response::Rows {
                 records: mapped_records,
@@ -336,7 +331,7 @@ mod text_client_handler_tests {
     use executor::Executor;
     use metadata::catalog_manager::CatalogManager;
     use parking_lot::RwLock;
-    use protocol::text_protocol::{Request, Response, StatementType};
+    use protocol::{Request, Response, StatementType};
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
     use tokio::net::{TcpListener, TcpStream};
@@ -794,10 +789,7 @@ mod text_client_handler_tests {
 
         match response {
             Response::Error { error_type, .. } => {
-                assert!(matches!(
-                    error_type,
-                    protocol::text_protocol::ErrorType::InvalidRequest
-                ));
+                assert!(matches!(error_type, protocol::ErrorType::InvalidRequest));
             }
             _ => panic!("Expected Error response for invalid JSON"),
         }
@@ -1180,10 +1172,7 @@ mod text_client_handler_tests {
         let response2 = client.receive_response().await.unwrap();
         match response2 {
             Response::Error { error_type, .. } => {
-                assert!(matches!(
-                    error_type,
-                    protocol::text_protocol::ErrorType::Query
-                ));
+                assert!(matches!(error_type, protocol::ErrorType::Query));
             }
             _ => panic!(
                 "Expected Error response for parse error, got: {:?}",

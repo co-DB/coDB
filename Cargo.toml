@@ -1,6 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["client", "engine", "executor", "metadata", "planner", "protocol", "server", "storage", "types"]
+members = [
+    "client",
+    "engine",
+    "executor",
+    "metadata",
+    "planner",
+    "protocol",
+    "server",
+    "storage",
+    "types",
+]
 
 [workspace.package]
 rust-version = "1.90.0"
@@ -17,3 +27,4 @@ time = "0.3.41"
 bytemuck = { version = "1.23.2", features = ["derive"] }
 dashmap = "6.1.0"
 itertools = "0.14.0"
+rkyv = "0.8.12"

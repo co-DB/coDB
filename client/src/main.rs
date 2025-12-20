@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::{error, info};
-use protocol::text_protocol::{ErrorType, Request, Response};
+use protocol::{ErrorType, Request, Response};
 use std::io;
 use std::io::{BufRead, Write};
 use thiserror::Error;
