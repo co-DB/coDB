@@ -11,7 +11,7 @@ use thiserror::Error;
 use types::serialization::{DbSerializable, DbSerializationError};
 
 #[derive(Error, Debug)]
-pub(crate) enum BTreeNodeError {
+pub enum BTreeNodeError {
     #[error("internal error from slotted page occurred: {0}")]
     SlottedPageInternalError(#[from] SlottedPageError),
     #[error("error occurred while deserializing: {0}")]
@@ -648,20 +648,12 @@ where
     /// Gets the key stored in the given slot.
     fn get_key(&self, slot_id: SlotId) -> Result<&[u8], BTreeNodeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
-        // RecordPtr is serialized as PageId + SlotId (no padding)
-        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
-        let key_bytes_end = record_bytes.len() - serialized_record_ptr_size;
-        let key_bytes = &record_bytes[..key_bytes_end];
-        Ok(key_bytes)
+        Self::extract_key_from_record(record_bytes)
     }
 
     fn get_record_ptr(&self, slot_id: SlotId) -> Result<RecordPtr, BTreeNodeError> {
         let record_bytes = self.slotted_page.read_record(slot_id)?;
-        // RecordPtr is serialized as PageId + SlotId (no padding)
-        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
-        let key_bytes_end = record_bytes.len() - serialized_record_ptr_size;
-        let (record_ptr, _) = RecordPtr::deserialize(&record_bytes[key_bytes_end..])?;
-        Ok(record_ptr)
+        Self::extract_record_ptr_from_record(record_bytes)
     }
 
     /// Search either finds record or insert slot.
@@ -730,13 +722,36 @@ where
     /// Returns the first (smallest) key in this leaf node without removing it.
     pub fn get_first_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
         let (_, record) = self.slotted_page.read_first_non_deleted_record()?;
-        let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
-        let key_bytes_end = record.len() - serialized_record_ptr_size;
-        Ok(record[..key_bytes_end].to_vec())
+        Ok(Self::extract_key_from_record(record)?.to_vec())
     }
 
     pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
         Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
+    }
+
+    pub(crate) fn read_all_records(&self) -> Result<Vec<(Vec<u8>, RecordPtr)>, BTreeNodeError> {
+        let records_iter = self.slotted_page.read_all_records()?;
+        records_iter
+            .map(|record| {
+                let key = Self::extract_key_from_record(record)?.to_vec();
+                let record_ptr = Self::extract_record_ptr_from_record(record)?;
+                Ok((key, record_ptr))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// RecordPtr is serialized as PageId + SlotId (no padding)
+    const SERIALIZED_RECORD_PTR_SIZE: usize = size_of::<PageId>() + size_of::<SlotId>();
+
+    fn extract_record_ptr_from_record(record: &[u8]) -> Result<RecordPtr, BTreeNodeError> {
+        let key_bytes_end = record.len() - Self::SERIALIZED_RECORD_PTR_SIZE;
+        let (record_ptr, _) = RecordPtr::deserialize(&record[key_bytes_end..])?;
+        Ok(record_ptr)
+    }
+
+    fn extract_key_from_record(record: &[u8]) -> Result<&[u8], BTreeNodeError> {
+        let key_bytes_end = record.len() - Self::SERIALIZED_RECORD_PTR_SIZE;
+        Ok(&record[..key_bytes_end])
     }
 }
 
