@@ -1,4 +1,7 @@
-﻿use crate::text_client_handler::TextClientHandler;
+﻿use crate::{
+    client_handler::ClientHandler,
+    protocol_handler::{BinaryProtocolHandler, TextProtocolHandler},
+};
 use dashmap::DashMap;
 use executor::Executor;
 use log::{error, info};
@@ -41,7 +44,8 @@ impl Server {
             self.catalog_manager.clone(),
             |socket, executors, manager| {
                 tokio::spawn(async move {
-                    let handler = TextClientHandler::new(socket, executors, manager);
+                    let text_handler = TextProtocolHandler::from(socket);
+                    let handler = ClientHandler::new(executors, manager, text_handler);
                     handler.run().await;
                 });
             },
@@ -54,7 +58,9 @@ impl Server {
             self.catalog_manager.clone(),
             |socket, executors, manager| {
                 tokio::spawn(async move {
-                    let _ = Self::handle_binary_client(socket, executors, manager).await;
+                    let binary_handler = BinaryProtocolHandler::from(socket);
+                    let handler = ClientHandler::new(executors, manager, binary_handler);
+                    handler.run().await;
                 });
             },
         )
@@ -104,13 +110,5 @@ impl Server {
         });
 
         Ok(())
-    }
-
-    async fn handle_binary_client(
-        _socket: TcpStream,
-        _executors: Arc<DashMap<String, Arc<Executor>>>,
-        _catalog_manager: Arc<RwLock<CatalogManager>>,
-    ) {
-        // ...
     }
 }

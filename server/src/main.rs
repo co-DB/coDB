@@ -1,6 +1,11 @@
+mod client_handler;
+mod protocol_handler;
+mod protocol_mappings;
 mod server;
-mod text_client_handler;
-mod text_protocol_mappings;
+
+use std::net::{IpAddr, SocketAddr};
+
+use protocol::{BINARY_PROTOCOL_PORT, TEXT_PROTOCOL_PORT};
 
 use crate::server::{Server, ServerError};
 
@@ -8,9 +13,11 @@ use crate::server::{Server, ServerError};
 async fn main() -> Result<(), ServerError> {
     env_logger::init();
 
+    let ip: IpAddr = "0.0.0.0".parse().unwrap();
+
     let server = Server::new(
-        "0.0.0.0:5433".parse().unwrap(),
-        "0.0.0.0:5434".parse().unwrap(),
+        SocketAddr::new(ip, BINARY_PROTOCOL_PORT),
+        SocketAddr::new(ip, TEXT_PROTOCOL_PORT),
     )?;
 
     server.run_loop().await?;
