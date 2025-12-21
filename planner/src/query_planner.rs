@@ -290,7 +290,7 @@ impl QueryPlanner {
         table_name: &str,
         index_bounds: &Option<IndexBounds>,
     ) -> StatementPlanItemId {
-        match index_bounds {
+        match index_bounds.clone() {
             Some(bounds) => plan.add_item(StatementPlanItem::index_scan(
                 table_name.to_string(),
                 bounds.lower_bound,

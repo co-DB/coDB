@@ -1061,12 +1061,13 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // page.
         record_ptrs.sort_unstable_by_key(|rp| rp.page_id);
 
-        let mut records = vec![];
+        let mut records = Vec::with_capacity(record_ptrs.len());
 
         // Process each chunk of records from the same page together.
         for chunk in record_ptrs.chunk_by(|r1, r2| r1.page_id == r2.page_id) {
             let page_id = chunk[0].page_id;
             let mut page = self.read_record_page(page_id)?;
+
             for record_ptr in chunk {
                 // Create PageLockChain that reuses the already locked record page.
                 let page_chain =

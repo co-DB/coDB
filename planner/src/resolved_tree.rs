@@ -188,8 +188,20 @@ pub struct ResolvedOrderByDetails {
 /// Used to describe index scan bounds. The bool indicates whether the bound is inclusive.
 #[derive(Debug, Clone)]
 pub struct IndexBounds {
-    pub lower_bound: Option<(ResolvedNodeId, bool)>,
-    pub upper_bound: Option<(ResolvedNodeId, bool)>,
+    pub lower_bound: Option<Bound>,
+    pub upper_bound: Option<Bound>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bound {
+    pub value: ResolvedNodeId,
+    pub inclusive: bool,
+}
+
+impl Bound {
+    pub fn new(value: ResolvedNodeId, inclusive: bool) -> Self {
+        Bound { value, inclusive }
+    }
 }
 
 #[derive(Debug)]

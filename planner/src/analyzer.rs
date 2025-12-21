@@ -9,6 +9,7 @@ use std::{
 use thiserror::Error;
 use types::schema::Type;
 
+use crate::resolved_tree::Bound;
 use crate::{
     ast::{
         AddAlterAction, AlterAction, AlterStatement, Ast, AstError, BinaryExpressionNode,
@@ -501,24 +502,24 @@ impl<'a> Analyzer<'a> {
 
         match op {
             BinaryOperator::Equal => Some(IndexBounds {
-                lower_bound: Some((expr_node, true)),
-                upper_bound: Some((expr_node, true)),
+                lower_bound: Some(Bound::new(expr_node, true)),
+                upper_bound: Some(Bound::new(expr_node, true)),
             }),
             BinaryOperator::Greater => Some(IndexBounds {
-                lower_bound: Some((expr_node, false)),
+                lower_bound: Some(Bound::new(expr_node, false)),
                 upper_bound: None,
             }),
             BinaryOperator::GreaterEqual => Some(IndexBounds {
-                lower_bound: Some((expr_node, true)),
+                lower_bound: Some(Bound::new(expr_node, true)),
                 upper_bound: None,
             }),
             BinaryOperator::Less => Some(IndexBounds {
                 lower_bound: None,
-                upper_bound: Some((expr_node, false)),
+                upper_bound: Some(Bound::new(expr_node, false)),
             }),
             BinaryOperator::LessEqual => Some(IndexBounds {
                 lower_bound: None,
-                upper_bound: Some((expr_node, true)),
+                upper_bound: Some(Bound::new(expr_node, true)),
             }),
             _ => None,
         }
@@ -4027,17 +4028,17 @@ mod tests {
         let select_stmt = expect_select(&rt, 0);
         assert!(select_stmt.index_bounds.is_some());
 
-        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        let bounds = select_stmt.index_bounds.as_ref().unwrap().clone();
         assert!(bounds.lower_bound.is_some());
         assert!(bounds.upper_bound.is_some());
 
-        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
-        let (upper_node, upper_inclusive) = bounds.upper_bound.unwrap();
+        let lower_bound = bounds.lower_bound.unwrap();
+        let upper_bound = bounds.upper_bound.unwrap();
 
-        assert!(lower_inclusive);
-        assert!(upper_inclusive);
-        assert_eq!(expect_literal_i32(&rt, lower_node), 5);
-        assert_eq!(expect_literal_i32(&rt, upper_node), 5);
+        assert!(lower_bound.inclusive);
+        assert!(upper_bound.inclusive);
+        assert_eq!(expect_literal_i32(&rt, lower_bound.value), 5);
+        assert_eq!(expect_literal_i32(&rt, upper_bound.value), 5);
     }
 
     #[test]
@@ -4089,13 +4090,13 @@ mod tests {
         let select_stmt = expect_select(&rt, 0);
         assert!(select_stmt.index_bounds.is_some());
 
-        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        let bounds = select_stmt.index_bounds.as_ref().unwrap().clone();
         assert!(bounds.lower_bound.is_some());
         assert!(bounds.upper_bound.is_none());
 
-        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
-        assert!(!lower_inclusive); // Greater than is not inclusive
-        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
+        let lower_bound = bounds.lower_bound.unwrap();
+        assert!(!lower_bound.inclusive); // Greater than is not inclusive
+        assert_eq!(expect_literal_i32(&rt, lower_bound.value), 10);
     }
 
     #[test]
@@ -4146,13 +4147,13 @@ mod tests {
         let select_stmt = expect_select(&rt, 0);
         assert!(select_stmt.index_bounds.is_some());
 
-        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        let bounds = select_stmt.index_bounds.as_ref().unwrap().clone();
         assert!(bounds.lower_bound.is_some());
         assert!(bounds.upper_bound.is_none());
 
-        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
-        assert!(lower_inclusive); // Greater or equal is inclusive
-        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
+        let lower_bound = bounds.lower_bound.unwrap();
+        assert!(lower_bound.inclusive); // Greater or equal is inclusive
+        assert_eq!(expect_literal_i32(&rt, lower_bound.value), 10);
     }
 
     #[test]
@@ -4227,17 +4228,17 @@ mod tests {
         let select_stmt = expect_select(&rt, 0);
         assert!(select_stmt.index_bounds.is_some());
 
-        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        let bounds = select_stmt.index_bounds.as_ref().unwrap().clone();
         assert!(bounds.lower_bound.is_some());
         assert!(bounds.upper_bound.is_some());
 
-        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
-        let (upper_node, upper_inclusive) = bounds.upper_bound.unwrap();
+        let lower_bound = bounds.lower_bound.unwrap();
+        let upper_bound = bounds.upper_bound.unwrap();
 
-        assert!(lower_inclusive);
-        assert!(upper_inclusive);
-        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
-        assert_eq!(expect_literal_i32(&rt, upper_node), 20);
+        assert!(lower_bound.inclusive);
+        assert!(upper_bound.inclusive);
+        assert_eq!(expect_literal_i32(&rt, lower_bound.value), 10);
+        assert_eq!(expect_literal_i32(&rt, upper_bound.value), 20);
     }
 
     #[test]
@@ -4312,17 +4313,17 @@ mod tests {
         let select_stmt = expect_select(&rt, 0);
         assert!(select_stmt.index_bounds.is_some());
 
-        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        let bounds = select_stmt.index_bounds.as_ref().unwrap().clone();
         assert!(bounds.lower_bound.is_some());
         assert!(bounds.upper_bound.is_some());
 
-        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
-        let (upper_node, upper_inclusive) = bounds.upper_bound.unwrap();
+        let lower_bound = bounds.lower_bound.unwrap();
+        let upper_bound = bounds.upper_bound.unwrap();
 
-        assert!(!lower_inclusive);
-        assert!(!upper_inclusive);
-        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
-        assert_eq!(expect_literal_i32(&rt, upper_node), 20);
+        assert!(!lower_bound.inclusive);
+        assert!(!upper_bound.inclusive);
+        assert_eq!(expect_literal_i32(&rt, lower_bound.value), 10);
+        assert_eq!(expect_literal_i32(&rt, upper_bound.value), 20);
     }
 
     #[test]
@@ -4373,13 +4374,13 @@ mod tests {
         let select_stmt = expect_select(&rt, 0);
         assert!(select_stmt.index_bounds.is_some());
 
-        let bounds = select_stmt.index_bounds.as_ref().unwrap();
+        let bounds = select_stmt.index_bounds.as_ref().unwrap().clone();
         assert!(bounds.lower_bound.is_some());
         assert!(bounds.upper_bound.is_none());
 
-        let (lower_node, lower_inclusive) = bounds.lower_bound.unwrap();
-        assert!(!lower_inclusive); // Should be > not >=
-        assert_eq!(expect_literal_i32(&rt, lower_node), 10);
+        let lower_bound = bounds.lower_bound.unwrap();
+        assert!(!lower_bound.inclusive); // Should be > not >=
+        assert_eq!(expect_literal_i32(&rt, lower_bound.value), 10);
     }
 
     #[test]

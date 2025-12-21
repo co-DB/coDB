@@ -9,6 +9,7 @@ use itertools::Itertools;
 use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
 use planner::query_plan::{IndexScan, RenameColumn, RenameTable};
+use planner::resolved_tree::Bound;
 use planner::{
     query_plan::{
         AddColumn, ClearTable, CreateTable, Delete, Filter, Insert, Limit, Projection,
@@ -174,16 +175,16 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
     fn create_range_bound(
         &self,
-        bound: &Option<(ResolvedNodeId, bool)>,
+        bound: &Option<Bound>,
     ) -> Result<Option<RangeBound>, InternalExecutorError> {
         Ok(match bound {
-            Some((expr_id, inclusive)) => {
+            Some(bound) => {
                 let e = ExpressionExecutor::empty(self.ast);
-                let value = e.execute_expression(*expr_id)?;
+                let value = e.execute_expression(bound.value)?;
                 Some(RangeBound {
                     key: Key::try_from(value.into_owned())
                         .map_err(|_| InternalExecutorError::InvalidRecord)?,
-                    inclusive: *inclusive,
+                    inclusive: bound.inclusive,
                 })
             }
             None => None,

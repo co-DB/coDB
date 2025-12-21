@@ -1,6 +1,6 @@
 use types::schema::Type;
 
-use crate::resolved_tree::{ResolvedCreateColumnDescriptor, ResolvedNodeId, ResolvedTree};
+use crate::resolved_tree::{Bound, ResolvedCreateColumnDescriptor, ResolvedNodeId, ResolvedTree};
 
 /// [`QueryPlan`] represents the logical steps that should be executed to perform the query.
 ///
@@ -92,11 +92,7 @@ impl StatementPlanItem {
         StatementPlanItem::TableScan(TableScan { table_name })
     }
 
-    pub(crate) fn index_scan(
-        table_name: String,
-        start: Option<(ResolvedNodeId, bool)>,
-        end: Option<(ResolvedNodeId, bool)>,
-    ) -> Self {
+    pub(crate) fn index_scan(table_name: String, start: Option<Bound>, end: Option<Bound>) -> Self {
         StatementPlanItem::IndexScan(IndexScan {
             table_name,
             start,
@@ -239,8 +235,8 @@ pub struct TableScan {
 #[derive(Debug, Clone)]
 pub struct IndexScan {
     pub table_name: String,
-    pub start: Option<(ResolvedNodeId, bool)>,
-    pub end: Option<(ResolvedNodeId, bool)>,
+    pub start: Option<Bound>,
+    pub end: Option<Bound>,
 }
 
 /// Applies filter defined in `predicate` to `data_source`.
