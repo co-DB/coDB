@@ -95,12 +95,14 @@ pub(crate) struct ResolvedUpdateStatement {
     pub(crate) columns: Vec<ResolvedNodeId>,
     pub(crate) values: Vec<ResolvedNodeId>,
     pub(crate) where_clause: Option<ResolvedNodeId>,
+    pub(crate) index_bounds: Option<IndexBounds>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ResolvedDeleteStatement {
     pub(crate) table: ResolvedNodeId,
     pub(crate) where_clause: Option<ResolvedNodeId>,
+    pub(crate) index_bounds: Option<IndexBounds>,
 }
 
 #[derive(Debug)]
@@ -184,10 +186,22 @@ pub struct ResolvedOrderByDetails {
 }
 
 /// Used to describe index scan bounds. The bool indicates whether the bound is inclusive.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IndexBounds {
-    pub lower_bound: Option<(ResolvedNodeId, bool)>,
-    pub upper_bound: Option<(ResolvedNodeId, bool)>,
+    pub lower_bound: Option<Bound>,
+    pub upper_bound: Option<Bound>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bound {
+    pub value: ResolvedNodeId,
+    pub inclusive: bool,
+}
+
+impl Bound {
+    pub fn new(value: ResolvedNodeId, inclusive: bool) -> Self {
+        Bound { value, inclusive }
+    }
 }
 
 #[derive(Debug)]

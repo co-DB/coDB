@@ -1,4 +1,5 @@
-use crate::resolved_tree::{ResolvedDeleteStatement, ResolvedUpdateStatement};
+use crate::query_plan::StatementPlanItemId;
+use crate::resolved_tree::{IndexBounds, ResolvedDeleteStatement, ResolvedUpdateStatement};
 use crate::{
     ast::OrderDirection,
     query_plan::{QueryPlan, SortOrder, StatementPlan, StatementPlanItem},
@@ -70,8 +71,7 @@ impl QueryPlanner {
 
         let table = self.get_resolved_table(select.table);
 
-        // TODO: Use index bounds from select.index_bounds
-        let mut root = plan.add_item(StatementPlanItem::table_scan(table.name.clone()));
+        let mut root = self.choose_data_source(&mut plan, &table.name, &select.index_bounds);
 
         // Handle where
         if let Some(where_node) = select.where_clause {
@@ -121,8 +121,7 @@ impl QueryPlanner {
 
         let table = self.get_resolved_table(delete.table);
 
-        // TODO: Use index bounds from select.index_bounds
-        let mut root = plan.add_item(StatementPlanItem::table_scan(table.name.clone()));
+        let mut root = self.choose_data_source(&mut plan, &table.name, &delete.index_bounds);
 
         if let Some(where_node) = delete.where_clause {
             root = plan.add_item(StatementPlanItem::filter(root, where_node));
@@ -138,8 +137,7 @@ impl QueryPlanner {
 
         let table = self.get_resolved_table(update.table);
 
-        // TODO: Use index bounds from select.index_bounds
-        let mut root = plan.add_item(StatementPlanItem::table_scan(table.name.clone()));
+        let mut root = self.choose_data_source(&mut plan, &table.name, &update.index_bounds);
 
         if let Some(where_node) = update.where_clause {
             root = plan.add_item(StatementPlanItem::filter(root, where_node));
@@ -283,6 +281,22 @@ impl QueryPlanner {
         match order {
             OrderDirection::Ascending => SortOrder::Ascending,
             OrderDirection::Descending => SortOrder::Descending,
+        }
+    }
+
+    fn choose_data_source(
+        &self,
+        plan: &mut StatementPlan,
+        table_name: &str,
+        index_bounds: &Option<IndexBounds>,
+    ) -> StatementPlanItemId {
+        match index_bounds.clone() {
+            Some(bounds) => plan.add_item(StatementPlanItem::index_scan(
+                table_name.to_string(),
+                bounds.lower_bound,
+                bounds.upper_bound,
+            )),
+            None => plan.add_item(StatementPlanItem::table_scan(table_name.to_string())),
         }
     }
 }

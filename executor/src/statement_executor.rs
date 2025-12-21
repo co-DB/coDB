@@ -1,3 +1,4 @@
+use engine::b_tree::{Range, RangeBound};
 use engine::heap_file::FieldUpdateDescriptor;
 use engine::{
     b_tree_key::Key,
@@ -7,7 +8,8 @@ use engine::{
 use itertools::Itertools;
 use log::warn;
 use metadata::catalog::{ColumnMetadata, NewColumnRequest, TableMetadataFactory};
-use planner::query_plan::{RenameColumn, RenameTable};
+use planner::query_plan::{IndexScan, RenameColumn, RenameTable};
+use planner::resolved_tree::Bound;
 use planner::{
     query_plan::{
         AddColumn, ClearTable, CreateTable, Delete, Filter, Insert, Limit, Projection,
@@ -119,6 +121,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                 let records = self.table_scan(table_scan)?;
                 Ok(records)
             }
+            StatementPlanItem::IndexScan(index_scan) => self.index_scan(index_scan),
             StatementPlanItem::Filter(filter) => self.filter(filter),
             StatementPlanItem::Sort(sort) => self.sort(sort),
             StatementPlanItem::Skip(skip) => self.skip(skip),
@@ -142,6 +145,50 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                     .collect::<Result<Vec<RecordHandle>, HeapFileError>>()
             })??;
         Ok(records)
+    }
+
+    /// Handler for [`IndexScan`] statement.
+    fn index_scan(
+        &self,
+        index_scan: &IndexScan,
+    ) -> Result<Vec<RecordHandle>, InternalExecutorError> {
+        let start_bound = self.create_range_bound(&index_scan.start)?;
+
+        let end_bound = self.create_range_bound(&index_scan.end)?;
+
+        let range = Range::new(start_bound, end_bound)?;
+
+        let record_ptrs = self
+            .executor
+            .with_b_tree(&index_scan.table_name, |btree| {
+                btree.ranged_scan(range)?.collect::<Result<Vec<_>, _>>()
+            })??;
+
+        let records = self
+            .executor
+            .with_heap_file(&index_scan.table_name, |hf| {
+                hf.records_from_ptrs(record_ptrs)
+            })??;
+
+        Ok(records)
+    }
+
+    fn create_range_bound(
+        &self,
+        bound: &Option<Bound>,
+    ) -> Result<Option<RangeBound>, InternalExecutorError> {
+        Ok(match bound {
+            Some(bound) => {
+                let e = ExpressionExecutor::empty(self.ast);
+                let value = e.execute_expression(bound.value)?;
+                Some(RangeBound {
+                    key: Key::try_from(value.into_owned())
+                        .map_err(|_| InternalExecutorError::InvalidRecord)?,
+                    inclusive: bound.inclusive,
+                })
+            }
+            None => None,
+        })
     }
 
     /// Handler for [`Filter`] statement.
