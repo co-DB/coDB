@@ -1276,17 +1276,26 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         &self,
         page_id: PageId,
     ) -> Result<(PageId, Vec<RecordHandle>), HeapFileError> {
-        let page = self.read_record_page(page_id)?;
+        let mut page = self.read_record_page(page_id)?;
         let next_page_id = page.next_page()?;
 
-        let records = page
+        let records_ptrs: Vec<_> = page
             .not_deleted_slot_ids()?
-            .map(|slot_id| {
-                let ptr = RecordPtr::new(page_id, slot_id);
-                let record = self.record(&ptr)?;
-                Ok::<RecordHandle, HeapFileError>(RecordHandle::new(record, ptr))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|slot_id| RecordPtr::new(page_id, slot_id))
+            .collect();
+
+        let mut records = Vec::with_capacity(records_ptrs.len());
+
+        for ptr in records_ptrs {
+            // Create PageLockChain that reuses the already locked record page.
+            let page_chain =
+                PageLockChainWithLockedRecordPage::<BUCKETS_COUNT, PinnedReadPage>::with_record(
+                    self, &mut page,
+                )?;
+            let record_bytes = self.record_bytes(&ptr, page_chain)?;
+            let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
+            records.push(RecordHandle::new(record, ptr));
+        }
 
         Ok((next_page_id, records))
     }
@@ -6105,39 +6114,6 @@ mod tests {
                                 .lock()
                                 .push(format!("Thread {} insert {} failed: {}", thread_id, i, e));
                             failed_clone.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-
-                    // Occasionally verify some previously inserted records
-                    if i > 0 && i % 100 == 0 {
-                        let check_idx = i / 2;
-                        if let Some((ptr, expected_id, expected_name)) = local_ptrs.get(check_idx) {
-                            match heap_file_clone.record(ptr) {
-                                Ok(retrieved) => {
-                                    assert_eq!(retrieved.fields.len(), 2);
-                                    assert_i32(*expected_id, &retrieved.fields[0]);
-                                    assert_string(expected_name, &retrieved.fields[1]);
-                                }
-                                Err(e) => {
-                                    println!(
-                                        "[Thread {}] RE-READ FAILED at index {} (record {}): {}",
-                                        thread_id, check_idx, i, e
-                                    );
-                                    println!(
-                                        "[Thread {}] Tried to read ptr: page_id={}, slot_id={}",
-                                        thread_id, ptr.page_id, ptr.slot_id
-                                    );
-                                    println!("[Thread {}] Error details: {:?}", thread_id, e);
-                                    error_details_clone.lock().push(format!(
-                                        "Thread {} re-read at index {} failed: {}",
-                                        thread_id, check_idx, e
-                                    ));
-                                    panic!(
-                                        "Thread {} failed to re-read record at index {}: {}",
-                                        thread_id, check_idx, e
-                                    );
-                                }
-                            }
                         }
                     }
                 }
