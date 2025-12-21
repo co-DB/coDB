@@ -346,13 +346,38 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
         let key =
             Key::try_from(primary_key_value).map_err(|_| InternalExecutorError::InvalidRecord)?;
 
-        let ptr = self.executor.with_heap_file(&insert.table_name, |hf| {
-            let ptr = hf.insert(record)?;
-            Ok::<RecordPtr, HeapFileError>(ptr)
-        })??;
-
+        // Insert placeholder into B-Tree to check for duplicate primary key and prevent others from
+        // inserting it concurrently.
         self.executor
-            .with_b_tree(&insert.table_name, |btree| btree.insert(&key, ptr))??;
+            .with_b_tree(&insert.table_name, |btree| btree.insert_placeholder(&key))??;
+
+        let ptr = match self
+            .executor
+            .with_heap_file(&insert.table_name, |hf| hf.insert(record))
+        {
+            Ok(ptr) => ptr?,
+            Err(e) => {
+                // Rollback placeholder
+                let _ = self
+                    .executor
+                    .with_b_tree(&insert.table_name, |btree| btree.delete(&key));
+                return Err(e);
+            }
+        };
+
+        // Update placeholder with actual pointer to the record in heap file.
+        if let Err(e) = self.executor.with_b_tree(&insert.table_name, |btree| {
+            btree.update_placeholder(&key, ptr)
+        }) {
+            // Rollback everything
+            let _ = self
+                .executor
+                .with_heap_file(&insert.table_name, |hf| hf.delete(&ptr));
+            let _ = self
+                .executor
+                .with_b_tree(&insert.table_name, |btree| btree.delete(&key));
+            return Err(e);
+        }
 
         Ok(())
     }

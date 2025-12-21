@@ -84,6 +84,13 @@ impl TryFrom<&Page> for BTreeMetadata {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum SearchResult {
+    Found { record_ptr: RecordPtr },
+    NotFound,
+    Pending,
+}
+
 /// Result of an optimistic operation (insert/delete) attempt
 #[derive(Debug)]
 enum OptimisticOperationResult {
@@ -266,6 +273,10 @@ impl<'b> Iterator for RangedScanIterator<'b> {
             };
 
             for (key, record_ptr) in records_with_keys {
+                if record_ptr == RecordPtr::PLACEHOLDER {
+                    continue;
+                }
+
                 if self.is_first_leaf && self.range.excludes_as_start(key.as_slice()) {
                     continue;
                 }
@@ -367,7 +378,7 @@ impl BTree {
 
     /// Searches for a key in the B-tree and returns the corresponding record pointer (to heap
     /// file record) if the key was found.
-    pub fn search(&self, key: &Key) -> Result<Option<RecordPtr>, BTreeError> {
+    pub fn search(&self, key: &Key) -> Result<SearchResult, BTreeError> {
         let mut current_page_id = self.read_root_page_id()?;
 
         loop {
@@ -383,8 +394,14 @@ impl BTree {
                 NodeType::Leaf => {
                     let node = BTreeLeafNode::<PinnedReadPage>::new(page)?;
                     return match node.search(key.as_bytes())? {
-                        LeafNodeSearchResult::Found { record_ptr, .. } => Ok(Some(record_ptr)),
-                        LeafNodeSearchResult::NotFoundLeaf { .. } => Ok(None),
+                        LeafNodeSearchResult::Found { record_ptr, .. } => {
+                            if record_ptr == RecordPtr::PLACEHOLDER {
+                                Ok(SearchResult::Pending)
+                            } else {
+                                Ok(SearchResult::Found { record_ptr })
+                            }
+                        }
+                        LeafNodeSearchResult::NotFoundLeaf { .. } => Ok(SearchResult::NotFound),
                     };
                 }
             }
@@ -474,6 +491,20 @@ impl BTree {
                 self.insert_pessimistic(key.as_bytes(), record_pointer)
             }
         }
+    }
+
+    /// Inserts a placeholder for the given key, reserving it for later insertion.
+    pub fn insert_placeholder(&self, key: &Key) -> Result<(), BTreeError> {
+        self.insert(key, RecordPtr::PLACEHOLDER)
+    }
+
+    /// Updates a placeholder with the actual RecordPtr.
+    pub fn update_placeholder(&self, key: &Key, record_ptr: RecordPtr) -> Result<(), BTreeError> {
+        let leaf_page_id = self.traverse(key.as_bytes())?;
+
+        let mut leaf = self.pin_leaf_for_write(leaf_page_id)?;
+        leaf.update_record_ptr(key.as_bytes(), record_ptr)?;
+        Ok(())
     }
 
     /// Traverses the tree to the leaf while recording page versions for optimistic concurrency checks.
@@ -1549,6 +1580,15 @@ mod test {
             .collect()
     }
 
+    // Helper to convert SearchResult to Option<RecordPtr> for easier testing
+    fn search_to_option(btree: &BTree, key: &Key) -> Option<RecordPtr> {
+        match btree.search(key).unwrap() {
+            SearchResult::Found { record_ptr } => Some(record_ptr),
+            SearchResult::NotFound => None,
+            SearchResult::Pending => None, // Treat pending as not found in tests
+        }
+    }
+
     #[test]
     fn test_create_empty_btree() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
@@ -1561,7 +1601,7 @@ mod test {
         let (cache, file_key, _temp_dir) = setup_test_cache();
         let btree = create_empty_btree(cache, file_key).unwrap();
 
-        assert_eq!(btree.search(&key_i32(42)).unwrap(), None);
+        assert!(matches!(search_to_option(&btree, &key_i32(42)), None));
     }
 
     #[test]
@@ -1573,7 +1613,7 @@ mod test {
         let key = key_i32(42);
 
         btree.insert(&key, ptr).unwrap();
-        assert_eq!(btree.search(&key).unwrap(), Some(ptr));
+        assert_eq!(search_to_option(&btree, &key).unwrap(), ptr);
     }
 
     #[test]
@@ -1590,11 +1630,26 @@ mod test {
 
         let btree = create_btree_with_data(cache, file_key, data).unwrap();
 
-        assert_eq!(btree.search(&key_i32(10)).unwrap(), Some(record_ptr(1, 0)));
-        assert_eq!(btree.search(&key_i32(20)).unwrap(), Some(record_ptr(1, 1)));
-        assert_eq!(btree.search(&key_i32(30)).unwrap(), Some(record_ptr(1, 2)));
-        assert_eq!(btree.search(&key_i32(40)).unwrap(), Some(record_ptr(2, 0)));
-        assert_eq!(btree.search(&key_i32(50)).unwrap(), Some(record_ptr(2, 1)));
+        assert_eq!(
+            search_to_option(&btree, &key_i32(10)),
+            Some(record_ptr(1, 0))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(20)),
+            Some(record_ptr(1, 1))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(30)),
+            Some(record_ptr(1, 2))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(40)),
+            Some(record_ptr(2, 0))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(50)),
+            Some(record_ptr(2, 1))
+        );
     }
 
     #[test]
@@ -1613,13 +1668,34 @@ mod test {
 
         let btree = create_btree_with_data(cache, file_key, data).unwrap();
 
-        assert_eq!(btree.search(&key_i32(50)).unwrap(), Some(record_ptr(5, 0)));
-        assert_eq!(btree.search(&key_i32(30)).unwrap(), Some(record_ptr(3, 0)));
-        assert_eq!(btree.search(&key_i32(70)).unwrap(), Some(record_ptr(7, 0)));
-        assert_eq!(btree.search(&key_i32(20)).unwrap(), Some(record_ptr(2, 0)));
-        assert_eq!(btree.search(&key_i32(40)).unwrap(), Some(record_ptr(4, 0)));
-        assert_eq!(btree.search(&key_i32(60)).unwrap(), Some(record_ptr(6, 0)));
-        assert_eq!(btree.search(&key_i32(80)).unwrap(), Some(record_ptr(8, 0)));
+        assert_eq!(
+            search_to_option(&btree, &key_i32(50)),
+            Some(record_ptr(5, 0))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(30)),
+            Some(record_ptr(3, 0))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(70)),
+            Some(record_ptr(7, 0))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(20)),
+            Some(record_ptr(2, 0))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(40)),
+            Some(record_ptr(4, 0))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(60)),
+            Some(record_ptr(6, 0))
+        );
+        assert_eq!(
+            search_to_option(&btree, &key_i32(80)),
+            Some(record_ptr(8, 0))
+        );
     }
 
     #[test]
@@ -1632,7 +1708,7 @@ mod test {
         }
 
         for i in 0..20 {
-            assert!(btree.search(&key_i32(i)).unwrap().is_some());
+            assert!(search_to_option(&btree, &key_i32(i)).is_some());
         }
     }
 
@@ -1660,10 +1736,10 @@ mod test {
 
         let btree = create_btree_with_data(cache, file_key, data).unwrap();
 
-        assert_eq!(btree.search(&key_i32(5)).unwrap(), None);
-        assert_eq!(btree.search(&key_i32(15)).unwrap(), None);
-        assert_eq!(btree.search(&key_i32(25)).unwrap(), None);
-        assert_eq!(btree.search(&key_i32(100)).unwrap(), None);
+        assert_eq!(search_to_option(&btree, &key_i32(5)), None);
+        assert_eq!(search_to_option(&btree, &key_i32(15)), None);
+        assert_eq!(search_to_option(&btree, &key_i32(25)), None);
+        assert_eq!(search_to_option(&btree, &key_i32(100)), None);
     }
 
     #[test]
@@ -1677,11 +1753,11 @@ mod test {
         }
 
         for &k in &keys {
-            assert!(btree.search(&key_i32(k)).unwrap().is_some());
+            assert!(search_to_option(&btree, &key_i32(k)).is_some());
         }
 
-        assert_eq!(btree.search(&key_i32(0)).unwrap(), None);
-        assert_eq!(btree.search(&key_i32(21)).unwrap(), None);
+        assert_eq!(search_to_option(&btree, &key_i32(0)), None);
+        assert_eq!(search_to_option(&btree, &key_i32(21)), None);
     }
 
     #[test]
@@ -1698,7 +1774,7 @@ mod test {
 
         for i in 0..num_keys {
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} not found after splits",
                 i
             );
@@ -1722,7 +1798,7 @@ mod test {
         }
 
         for &key in &keys {
-            assert!(btree.search(&key_i32(key)).unwrap().is_some());
+            assert!(search_to_option(&btree, &key_i32(key)).is_some());
         }
     }
 
@@ -1743,7 +1819,7 @@ mod test {
 
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(
-                btree.search(&key_string(key)).unwrap(),
+                search_to_option(&btree, &key_string(key)),
                 Some(record_ptr(i as u32, 0))
             );
         }
@@ -1766,8 +1842,8 @@ mod test {
         }
 
         // Verify we can find some of them
-        assert!(btree.search(&key_i32(1)).unwrap().is_some());
-        assert!(btree.search(&key_i32(2)).unwrap().is_some());
+        assert!(search_to_option(&btree, &key_i32(1)).is_some());
+        assert!(search_to_option(&btree, &key_i32(2)).is_some());
     }
 
     #[test]
@@ -1786,7 +1862,7 @@ mod test {
 
         // Verify everything
         for i in 0..1000 {
-            assert!(btree.search(&key_i32(i)).unwrap().is_some());
+            assert!(search_to_option(&btree, &key_i32(i)).is_some());
         }
     }
 
@@ -1819,7 +1895,7 @@ mod test {
 
         let mut missing = vec![];
         for i in 0..total_keys {
-            if btree.search(&key_i32(i)).unwrap().is_none() {
+            if search_to_option(&btree, &key_i32(i)).is_none() {
                 missing.push(i);
             }
         }
@@ -1844,9 +1920,9 @@ mod test {
         let reader = {
             let btree = btree.clone();
             thread::spawn(move || {
-                for _ in 0..200 {
+                for i in 0..200 {
                     let key_val = rand::random::<u16>() as i32 / 2;
-                    let _ = btree.search(&key_i32(key_val)).unwrap();
+                    search_to_option(&btree, &key_i32(key_val));
                 }
             })
         };
@@ -1871,7 +1947,7 @@ mod test {
                 let btree = btree.clone();
                 thread::spawn(move || {
                     for i in 0..100 {
-                        let result = btree.search(&key_i32(i)).unwrap();
+                        let result = search_to_option(&btree, &key_i32(i));
                         assert!(result.is_some());
                     }
                 })
@@ -1893,7 +1969,7 @@ mod test {
         let ptr = record_ptr(1, 0);
 
         btree.insert(&key, ptr).unwrap();
-        assert_eq!(btree.search(&key).unwrap(), Some(ptr));
+        assert_eq!(search_to_option(&btree, &key), Some(ptr));
     }
 
     #[test]
@@ -1907,7 +1983,7 @@ mod test {
         }
 
         for i in 0i32..100 {
-            assert!(btree.search(&key_i32(i)).unwrap().is_some());
+            assert!(search_to_option(&btree, &key_i32(i)).is_some());
         }
     }
 
@@ -1928,7 +2004,12 @@ mod test {
         }
 
         for (i, key) in keys.iter().enumerate() {
-            assert_eq!(btree.search(key).unwrap(), Some(record_ptr(i as u32, 0)));
+            assert_eq!(
+                btree.search(key).unwrap(),
+                SearchResult::Found {
+                    record_ptr: record_ptr(i as u32, 0)
+                }
+            );
         }
     }
 
@@ -1941,12 +2022,12 @@ mod test {
             btree.insert(&key_i32(i), record_ptr(i as u32, 0)).unwrap();
 
             assert_eq!(
-                btree.search(&key_i32(i)).unwrap(),
+                search_to_option(&btree, &key_i32(i)),
                 Some(record_ptr(i as u32, 0))
             );
 
             if i > 0 {
-                assert!(btree.search(&key_i32(i - 1)).unwrap().is_some());
+                assert!(search_to_option(&btree, &key_i32(i - 1)).is_some());
             }
         }
     }
@@ -2039,18 +2120,18 @@ mod test {
 
         // Verify all keys exist
         for i in 0..100 {
-            assert!(btree.search(&key_i32(i)).unwrap().is_some());
+            assert!(search_to_option(&btree, &key_i32(i)).is_some());
         }
 
         // Now delete a single key
         btree.delete(&key_i32(50)).unwrap();
-        assert_eq!(btree.search(&key_i32(50)).unwrap(), None);
+        assert_eq!(search_to_option(&btree, &key_i32(50)), None);
 
         // Verify other keys still exist
         for i in 0..100 {
             if i != 50 {
                 assert!(
-                    btree.search(&key_i32(i)).unwrap().is_some(),
+                    search_to_option(&btree, &key_i32(i)).is_some(),
                     "Key {} should still exist after deleting 50",
                     i
                 );
@@ -2075,16 +2156,16 @@ mod test {
         btree.delete(&key_i32(150)).unwrap();
 
         // Verify deleted keys are gone
-        assert_eq!(btree.search(&key_i32(20)).unwrap(), None);
-        assert_eq!(btree.search(&key_i32(40)).unwrap(), None);
-        assert_eq!(btree.search(&key_i32(100)).unwrap(), None);
-        assert_eq!(btree.search(&key_i32(150)).unwrap(), None);
+        assert_eq!(search_to_option(&btree, &key_i32(20)), None);
+        assert_eq!(search_to_option(&btree, &key_i32(40)), None);
+        assert_eq!(search_to_option(&btree, &key_i32(100)), None);
+        assert_eq!(search_to_option(&btree, &key_i32(150)), None);
 
         // Verify remaining keys still exist
-        assert!(btree.search(&key_i32(10)).unwrap().is_some());
-        assert!(btree.search(&key_i32(30)).unwrap().is_some());
-        assert!(btree.search(&key_i32(50)).unwrap().is_some());
-        assert!(btree.search(&key_i32(199)).unwrap().is_some());
+        assert!(search_to_option(&btree, &key_i32(10)).is_some());
+        assert!(search_to_option(&btree, &key_i32(30)).is_some());
+        assert!(search_to_option(&btree, &key_i32(50)).is_some());
+        assert!(search_to_option(&btree, &key_i32(199)).is_some());
     }
 
     #[test]
@@ -2108,7 +2189,7 @@ mod test {
         // Verify deleted keys are gone
         for &k in &keys[..100] {
             assert_eq!(
-                btree.search(&key_i32(k)).unwrap(),
+                search_to_option(&btree, &key_i32(k)),
                 None,
                 "Key {} should be deleted",
                 k
@@ -2118,7 +2199,7 @@ mod test {
         // Verify remaining keys exist
         for &k in &keys[100..] {
             assert!(
-                btree.search(&key_i32(k)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(k)).is_some(),
                 "Key {} should still exist",
                 k
             );
@@ -2140,13 +2221,13 @@ mod test {
             btree
                 .delete(&key_i32(i))
                 .unwrap_or_else(|e| panic!("Failed to delete key {} {e}", i));
-            assert_eq!(btree.search(&key_i32(i)).unwrap(), None);
+            assert_eq!(search_to_option(&btree, &key_i32(i)), None);
         }
 
         // Verify remaining keys still exist
         for i in 0..200 {
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} should still exist",
                 i
             );
@@ -2168,13 +2249,13 @@ mod test {
             btree
                 .delete(&key_i32(i))
                 .unwrap_or_else(|e| panic!("Failed to delete key {} {e}", i));
-            assert_eq!(btree.search(&key_i32(i)).unwrap(), None);
+            assert_eq!(search_to_option(&btree, &key_i32(i)), None);
         }
 
         // Verify remaining keys still exist
         for i in 300..500 {
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} should still exist",
                 i
             );
@@ -2201,13 +2282,13 @@ mod test {
             btree
                 .delete(&key_i32(k))
                 .unwrap_or_else(|_| panic!("Failed to delete key {}", k));
-            assert_eq!(btree.search(&key_i32(k)).unwrap(), None);
+            assert_eq!(search_to_option(&btree, &key_i32(k)), None);
         }
 
         // Verify remaining keys still exist
         for k in 250..500 {
             assert!(
-                btree.search(&key_i32(k)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(k)).is_some(),
                 "Key {} should still exist",
                 k
             );
@@ -2228,15 +2309,15 @@ mod test {
         let ptr2 = record_ptr(20, 10);
 
         // Verify key exists
-        assert!(btree.search(&key).unwrap().is_some());
+        assert!(search_to_option(&btree, &key).is_some());
 
         // Delete and verify
         btree.delete(&key).unwrap();
-        assert_eq!(btree.search(&key).unwrap(), None);
+        assert_eq!(search_to_option(&btree, &key), None);
 
         // Reinsert with different pointer
         btree.insert(&key, ptr2).unwrap();
-        assert_eq!(btree.search(&key).unwrap(), Some(ptr2));
+        assert_eq!(search_to_option(&btree, &key), Some(ptr2));
     }
 
     #[test]
@@ -2261,14 +2342,14 @@ mod test {
         for i in 0..num_keys {
             if i % 3 == 0 {
                 assert_eq!(
-                    btree.search(&key_i32(i)).unwrap(),
+                    search_to_option(&btree, &key_i32(i)),
                     None,
                     "Key {} should be deleted",
                     i
                 );
             } else {
                 assert!(
-                    btree.search(&key_i32(i)).unwrap().is_some(),
+                    search_to_option(&btree, &key_i32(i)).is_some(),
                     "Key {} should still exist",
                     i
                 );
@@ -2298,7 +2379,7 @@ mod test {
         // Verify remaining keys still work
         for i in 500..num_keys {
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} should still exist after merges",
                 i
             );
@@ -2326,9 +2407,9 @@ mod test {
         }
 
         // Verify we can search for keys that weren't deleted
-        assert!(btree.search(&key_i32(0)).unwrap().is_some());
-        assert!(btree.search(&key_i32(100)).unwrap().is_some());
-        assert!(btree.search(&key_i32(299)).unwrap().is_some());
+        assert!(search_to_option(&btree, &key_i32(0)).is_some());
+        assert!(search_to_option(&btree, &key_i32(100)).is_some());
+        assert!(search_to_option(&btree, &key_i32(299)).is_some());
     }
 
     #[test]
@@ -2359,9 +2440,9 @@ mod test {
         // Verify large keys
         for (i, _) in large_keys.iter().enumerate().take(20) {
             if i % 2 == 0 {
-                assert_eq!(btree.search(&key_string(&large_keys[i])).unwrap(), None);
+                assert_eq!(search_to_option(&btree, &key_string(&large_keys[i])), None);
             } else {
-                assert!(btree.search(&key_string(&large_keys[i])).unwrap().is_some());
+                assert!(search_to_option(&btree, &key_string(&large_keys[i])).is_some());
             }
         }
     }
@@ -2388,13 +2469,13 @@ mod test {
         btree.delete(&key_i32(i32::MIN)).unwrap();
         btree.delete(&key_i32(i32::MAX)).unwrap();
 
-        assert_eq!(btree.search(&key_i32(i32::MIN)).unwrap(), None);
-        assert_eq!(btree.search(&key_i32(i32::MAX)).unwrap(), None);
+        assert_eq!(search_to_option(&btree, &key_i32(i32::MIN)), None);
+        assert_eq!(search_to_option(&btree, &key_i32(i32::MAX)), None);
 
         // Regular keys should still exist
-        assert!(btree.search(&key_i32(0)).unwrap().is_some());
-        assert!(btree.search(&key_i32(100)).unwrap().is_some());
-        assert!(btree.search(&key_i32(199)).unwrap().is_some());
+        assert!(search_to_option(&btree, &key_i32(0)).is_some());
+        assert!(search_to_option(&btree, &key_i32(100)).is_some());
+        assert!(search_to_option(&btree, &key_i32(199)).is_some());
     }
 
     #[test]
@@ -2441,7 +2522,7 @@ mod test {
         // Verify deleted keys are gone
         for i in 0..delete_range {
             assert_eq!(
-                btree.search(&key_i32(i)).unwrap(),
+                search_to_option(&btree, &key_i32(i)),
                 None,
                 "Key {} should be deleted",
                 i
@@ -2451,7 +2532,7 @@ mod test {
         // Verify remaining keys still exist
         for i in delete_range..num_keys {
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} should still exist",
                 i
             );
@@ -2495,7 +2576,7 @@ mod test {
         // Verify: keys 0-249 should be deleted, 250-999 should exist
         for i in 0..250 {
             assert_eq!(
-                btree.search(&key_i32(i)).unwrap(),
+                search_to_option(&btree, &key_i32(i)),
                 None,
                 "Key {} should be deleted",
                 i
@@ -2503,7 +2584,7 @@ mod test {
         }
         for i in 250..1000 {
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} should exist",
                 i
             );
@@ -2554,7 +2635,7 @@ mod test {
             let offset = 500 + cycle * 100;
             for i in 0..30 {
                 assert_eq!(
-                    btree.search(&key_i32(offset + i)).unwrap(),
+                    search_to_option(&btree, &key_i32(offset + i)),
                     None,
                     "Key {} should be deleted",
                     offset + i
@@ -2562,7 +2643,7 @@ mod test {
             }
             for i in 30..100 {
                 assert!(
-                    btree.search(&key_i32(offset + i)).unwrap().is_some(),
+                    search_to_option(&btree, &key_i32(offset + i)).is_some(),
                     "Key {} should exist",
                     offset + i
                 );
@@ -2584,7 +2665,7 @@ mod test {
         for i in 100..200 {
             // Search before delete
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} should exist before delete",
                 i
             );
@@ -2595,9 +2676,8 @@ mod test {
                 .unwrap_or_else(|_| panic!("Failed to delete key {}", i));
 
             // Search after delete
-            assert_eq!(
-                btree.search(&key_i32(i)).unwrap(),
-                None,
+            assert!(
+                search_to_option(&btree, &key_i32(i)).is_none(),
                 "Key {} should not exist after delete",
                 i
             );
@@ -2606,14 +2686,14 @@ mod test {
         // Verify keys outside the deleted range still exist
         for i in 0..100 {
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} should still exist",
                 i
             );
         }
         for i in 200..300 {
             assert!(
-                btree.search(&key_i32(i)).unwrap().is_some(),
+                search_to_option(&btree, &key_i32(i)).is_some(),
                 "Key {} should still exist",
                 i
             );
