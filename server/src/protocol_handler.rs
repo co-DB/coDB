@@ -73,6 +73,7 @@ impl ProtocolHandler for BinaryProtocolHandler {
             rkyv::to_bytes::<Error>(&response).map_err(ClientError::BinarySerializationError)?;
         self.writer.write_u32(bytes.len() as u32).await?;
         self.writer.write_all(&bytes).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 }
