@@ -73,7 +73,7 @@ where
             match self.db_client.read_response().await? {
                 ReadResult::Disconnected => break,
                 ReadResult::Response(resp) => {
-                    ConsoleHandler::<P>::display_response(&resp);
+                    display_response(&resp);
 
                     if resp.is_final_message() {
                         break;
@@ -184,82 +184,82 @@ where
             sql: without_prefix.to_string(),
         })
     }
+}
 
-    fn display_response(response: &Response) {
-        match response {
-            Response::Connected { database_name } => {
-                println!("Connected to database: {}", database_name);
+pub fn display_response(response: &Response) {
+    match response {
+        Response::Connected { database_name } => {
+            println!("Connected to database: {}", database_name);
+        }
+
+        Response::Acknowledge => {
+            println!("✔ Query acknowledged by server, executing...");
+        }
+
+        Response::ColumnInfo { column_metadata } => {
+            println!("Columns:");
+            for col in column_metadata {
+                println!("  - {} ({:?})", col.name, col.ty);
             }
+        }
 
-            Response::Acknowledge => {
-                println!("✔ Query acknowledged by server, executing...");
-            }
-
-            Response::ColumnInfo { column_metadata } => {
-                println!("Columns:");
-                for col in column_metadata {
-                    println!("  - {} ({:?})", col.name, col.ty);
+        Response::Rows {
+            records,
+            count: _count,
+        } => {
+            print!("Row: ");
+            for (i, v) in records.iter().enumerate() {
+                if i > 0 {
+                    print!(", ");
                 }
+                print!("{:?}", v);
             }
+            println!();
+        }
 
-            Response::Rows {
-                records,
-                count: _count,
-            } => {
-                print!("Row: ");
-                for (i, v) in records.iter().enumerate() {
-                    if i > 0 {
-                        print!(", ");
-                    }
-                    print!("{:?}", v);
-                }
-                println!();
-            }
+        Response::StatementCompleted {
+            rows_affected,
+            statement_type,
+        } => {
+            println!(
+                "Statement completed: {:?}, affected rows: {}",
+                statement_type, rows_affected
+            );
+        }
 
-            Response::StatementCompleted {
-                rows_affected,
-                statement_type,
-            } => {
-                println!(
-                    "Statement completed: {:?}, affected rows: {}",
-                    statement_type, rows_affected
-                );
-            }
+        Response::QueryCompleted => {
+            println!("✔ Query completed.");
+        }
 
-            Response::QueryCompleted => {
-                println!("✔ Query completed.");
-            }
+        Response::Error {
+            message,
+            error_type: _error_type,
+        } => {
+            eprintln!("❌ ERROR: {}", message);
+        }
 
-            Response::Error {
-                message,
-                error_type: _error_type,
-            } => {
-                eprintln!("❌ ERROR: {}", message);
-            }
+        Response::DatabaseCreated { database_name } => {
+            println!("Database created: {}", database_name);
+        }
 
-            Response::DatabaseCreated { database_name } => {
-                println!("Database created: {}", database_name);
-            }
+        Response::DatabaseDeleted { database_name } => {
+            println!("Database deleted: {}", database_name);
+        }
 
-            Response::DatabaseDeleted { database_name } => {
-                println!("Database deleted: {}", database_name);
-            }
-
-            Response::DatabasesListed { database_names } => {
-                if database_names.is_empty() {
-                    println!("No databases found.");
-                } else {
-                    println!("Databases:");
-                    for name in database_names {
-                        println!("  - {}", name);
-                    }
+        Response::DatabasesListed { database_names } => {
+            if database_names.is_empty() {
+                println!("No databases found.");
+            } else {
+                println!("Databases:");
+                for name in database_names {
+                    println!("  - {}", name);
                 }
             }
         }
     }
 }
 
-trait IsFinalMessage {
+pub trait IsFinalMessage {
     fn is_final_message(&self) -> bool;
 }
 
