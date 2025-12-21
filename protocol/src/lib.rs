@@ -185,3 +185,6 @@ pub struct DateTime {
     pub days_since_epoch: i32,
     pub milliseconds_since_midnight: u32,
 }
+
+pub const BINARY_PROTOCOL_PORT: u16 = 5433;
+pub const TEXT_PROTOCOL_PORT: u16 = 5434;

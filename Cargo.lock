@@ -191,6 +191,7 @@ dependencies = [
  "env_logger",
  "log",
  "protocol",
+ "rkyv",
  "serde",
  "serde_json",
  "thiserror",
