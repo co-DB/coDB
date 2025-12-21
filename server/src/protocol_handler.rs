@@ -1,5 +1,8 @@
-use protocol::{Request, Response};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use std::io::ErrorKind;
+
+use protocol::{ArchivedRequest, Request, Response};
+use rkyv::rancor::Error;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -33,11 +36,44 @@ impl From<TcpStream> for BinaryProtocolHandler {
 
 impl ProtocolHandler for BinaryProtocolHandler {
     async fn read_request(&mut self) -> Result<ReadResult, ClientError> {
-        todo!()
+        let length = match self.reader.read_u32().await {
+            Ok(len) => len,
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                return Ok(ReadResult::Disconnected);
+            }
+            Err(e) => {
+                return Err(ClientError::IoError(e));
+            }
+        };
+
+        if length == 0 {
+            return Ok(ReadResult::Empty);
+        }
+
+        let mut buffer = vec![0u8; length as _];
+        match self.reader.read_exact(&mut buffer).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                return Ok(ReadResult::Disconnected);
+            }
+            Err(e) => {
+                return Err(ClientError::IoError(e));
+            }
+        }
+        let archived_request = rkyv::access::<ArchivedRequest, Error>(&buffer[..])
+            .map_err(ClientError::BinaryDeserializationError)?;
+        let request = rkyv::deserialize::<Request, Error>(archived_request)
+            .map_err(ClientError::BinaryDeserializationError)?;
+
+        Ok(ReadResult::Request(request))
     }
 
     async fn send_response(&mut self, response: Response) -> Result<(), ClientError> {
-        todo!()
+        let bytes =
+            rkyv::to_bytes::<Error>(&response).map_err(ClientError::BinarySerializationError)?;
+        self.writer.write_u32(bytes.len() as u32).await?;
+        self.writer.write_all(&bytes).await?;
+        Ok(())
     }
 }
 

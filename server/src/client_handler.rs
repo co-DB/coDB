@@ -9,6 +9,7 @@ use log::error;
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use parking_lot::RwLock;
 use protocol::{ErrorType, Record as ProtocolRecord, Request, Response, StatementType};
+use rkyv::rancor;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -42,6 +43,12 @@ pub(crate) enum ClientError {
 
     #[error("executor error: {0}")]
     ExecutorError(#[from] ExecutorError),
+
+    #[error("failed to serialize binary message: {0}")]
+    BinarySerializationError(rancor::Error),
+
+    #[error("failed to deserialize binary message: {0}")]
+    BinaryDeserializationError(rancor::Error),
 }
 
 impl ClientError {
@@ -53,6 +60,8 @@ impl ClientError {
             ClientError::IoError(_) => ErrorType::Network,
             ClientError::CatalogError(_) => ErrorType::Catalog,
             ClientError::ExecutorError(_) => ErrorType::Execution,
+            ClientError::BinarySerializationError(_) => ErrorType::Execution,
+            ClientError::BinaryDeserializationError(_) => ErrorType::InvalidRequest,
         }
     }
 }

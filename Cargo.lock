@@ -983,6 +983,7 @@ dependencies = [
  "metadata",
  "parking_lot",
  "protocol",
+ "rkyv",
  "serde",
  "serde_json",
  "thiserror",
