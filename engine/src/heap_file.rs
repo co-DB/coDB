@@ -215,6 +215,12 @@ pub struct RecordPtr {
 }
 
 impl RecordPtr {
+    /// Placeholder used to reserve a key in the B-tree before inserting actual data.
+    pub const PLACEHOLDER: RecordPtr = RecordPtr {
+        page_id: PageId::MAX,
+        slot_id: SlotId::MAX,
+    };
+
     pub(crate) fn new(page_id: PageId, slot_id: SlotId) -> Self {
         Self { page_id, slot_id }
     }

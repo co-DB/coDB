@@ -1,7 +1,7 @@
 ﻿use crate::heap_file::RecordPtr;
 use crate::slotted_page::{
     InsertResult, PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
-    SlottedPageHeader, get_base_header,
+    SlottedPageHeader, UpdateResult, get_base_header,
 };
 use bytemuck::{Pod, Zeroable};
 use std::cmp::Ordering;
@@ -892,6 +892,33 @@ where
         };
         self.slotted_page.insert_at(record, position)?;
         Ok(NodeInsertResult::Success)
+    }
+
+    pub(crate) fn update_record_ptr(
+        &mut self,
+        key: &[u8],
+        record_ptr: RecordPtr,
+    ) -> Result<(), BTreeNodeError> {
+        match self.search(key)? {
+            LeafNodeSearchResult::Found { position, .. } => {
+                let mut buffer = Vec::new();
+                buffer.extend_from_slice(key);
+                record_ptr.serialize(&mut buffer);
+
+                match self.slotted_page.update(position, &buffer)? {
+                    UpdateResult::Success => Ok(()),
+                    UpdateResult::NeedsDefragmentation | UpdateResult::PageFull => {
+                        Err(BTreeNodeError::CorruptNode {
+                            reason: "Updating record ptr of the same size should not fail"
+                                .to_string(),
+                        })
+                    }
+                }
+            }
+            LeafNodeSearchResult::NotFoundLeaf { .. } => Err(BTreeNodeError::CorruptNode {
+                reason: "Should work".to_string(),
+            }),
+        }
     }
 }
 #[cfg(test)]
