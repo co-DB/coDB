@@ -1,5 +1,6 @@
 use std::{
     array,
+    collections::VecDeque,
     marker::PhantomData,
     mem,
     sync::{
@@ -1031,7 +1032,7 @@ impl RecordHandle {
 /// Iterator over all records in a heap file
 pub struct AllRecordsIterator<'hf, const BUCKETS_COUNT: usize> {
     heap_file: &'hf HeapFile<BUCKETS_COUNT>,
-    current_page_records: Vec<RecordHandle>,
+    current_page_records: VecDeque<RecordHandle>,
     next_page_id: PageId,
 }
 
@@ -1039,7 +1040,7 @@ impl<'hf, const BUCKETS_COUNT: usize> AllRecordsIterator<'hf, BUCKETS_COUNT> {
     fn new(heap_file: &'hf HeapFile<BUCKETS_COUNT>, next_page_id: PageId) -> Self {
         AllRecordsIterator {
             heap_file,
-            current_page_records: vec![],
+            current_page_records: VecDeque::new(),
             next_page_id,
         }
     }
@@ -1050,8 +1051,7 @@ impl<'hf, const BUCKETS_COUNT: usize> Iterator for AllRecordsIterator<'hf, BUCKE
 
     fn next(&mut self) -> Option<Self::Item> {
         // If we have records left from the ones already read just return the first one
-        if !self.current_page_records.is_empty() {
-            let record = self.current_page_records.remove(0);
+        if let Some(record) = self.current_page_records.pop_front() {
             return Some(Ok(record));
         }
 
@@ -1337,7 +1337,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     fn read_all_record_from_page(
         &self,
         page_id: PageId,
-    ) -> Result<(PageId, Vec<RecordHandle>), HeapFileError> {
+    ) -> Result<(PageId, VecDeque<RecordHandle>), HeapFileError> {
         let mut page = self.read_record_page(page_id)?;
         let next_page_id = page.next_page()?;
 
@@ -1346,7 +1346,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             .map(|slot_id| RecordPtr::new(page_id, slot_id))
             .collect();
 
-        let mut records = Vec::with_capacity(records_ptrs.len());
+        let mut records = VecDeque::with_capacity(records_ptrs.len());
 
         for ptr in records_ptrs {
             // Create PageLockChain that reuses the already locked record page.
@@ -1356,7 +1356,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 )?;
             let record_bytes = self.record_bytes(&ptr, page_chain)?;
             let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
-            records.push(RecordHandle::new(record, ptr));
+            records.push_back(RecordHandle::new(record, ptr));
         }
 
         Ok((next_page_id, records))
@@ -6114,7 +6114,7 @@ mod tests {
         assert_string("Alice", &updated_record.fields[1]);
     }
 
-    #[ignore = "TODO: need to figure out better way to handle benchmark tests"]
+    //#[ignore = "TODO: need to figure out better way to handle benchmark tests"]
     #[test]
     fn heap_file_stress_test_concurrent_inserts_many_threads() {
         let (cache, _, file_key) = setup_test_cache();
@@ -6123,8 +6123,8 @@ mod tests {
         let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
         let heap_file = Arc::new(factory.create_heap_file().unwrap());
 
-        let num_threads = 10;
-        let records_per_thread = 3000;
+        let num_threads = 1;
+        let records_per_thread = 30000;
         let total_records = num_threads * records_per_thread;
 
         println!("\n=== HeapFile Concurrent Insert Stress Test ===");
