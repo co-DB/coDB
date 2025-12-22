@@ -1794,20 +1794,6 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         self.write_heap_page(page_id)
     }
 
-    /// Generic helper for allocating any type of heap page
-    fn allocate_heap_page<H>(
-        &self,
-        header: H,
-    ) -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>
-    where
-        H: BaseHeapPageHeader,
-    {
-        let (page, page_id) = self.cache.allocate_page(&self.file_key)?;
-        let slotted_page = SlottedPage::initialize_with_header(page, header)?;
-        let heap_page = HeapPage::new(slotted_page);
-        Ok((page_id, heap_page))
-    }
-
     /// Generic helper for allocating a page and updating metadata
     fn allocate_page_with_metadata<H, F>(
         &self,
@@ -1818,12 +1804,21 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         H: BaseHeapPageHeader,
         F: FnOnce(PageId) -> H,
     {
-        let mut metadata_page_lock = metadata_lock.lock();
-        let header = header_fn(*metadata_page_lock);
-        let (page_id, page) = self.allocate_heap_page(header)?;
-        *metadata_page_lock = page_id;
-        self.metadata.dirty.store(true, Ordering::Release);
-        Ok((page_id, page))
+        let (page, page_id) = self.cache.allocate_page(&self.file_key)?;
+
+        let old_first_page = {
+            let mut metadata_page_lock = metadata_lock.lock();
+            let old = *metadata_page_lock;
+            *metadata_page_lock = page_id;
+            self.metadata.dirty.store(true, Ordering::Release);
+            old
+        };
+
+        let header = header_fn(old_first_page);
+        let slotted_page = SlottedPage::initialize_with_header(page, header)?;
+        let heap_page = HeapPage::new(slotted_page);
+
+        Ok((page_id, heap_page))
     }
 
     fn allocate_record_page(
@@ -6123,8 +6118,8 @@ mod tests {
         let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
         let heap_file = Arc::new(factory.create_heap_file().unwrap());
 
-        let num_threads = 1;
-        let records_per_thread = 30000;
+        let num_threads = 16;
+        let records_per_thread = 3000;
         let total_records = num_threads * records_per_thread;
 
         println!("\n=== HeapFile Concurrent Insert Stress Test ===");
