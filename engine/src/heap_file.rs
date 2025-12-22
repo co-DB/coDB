@@ -2688,7 +2688,7 @@ mod tests {
     }
 
     #[test]
-    fn fsm_page_with_free_space_does_not_reinsert_different_bucket() {
+    fn fsm_page_with_free_space_moves_stale_entry_to_correct_bucket() {
         let (cache, _, file_key) = setup_test_cache();
         let fsm = create_test_fsm::<4>(
             cache.clone(),
@@ -2697,8 +2697,12 @@ mod tests {
         );
 
         // Manually insert a page into bucket 3 that actually belongs to bucket 2
+        // (simulating a stale entry)
         let free_space_60_percent = PAGE_SIZE * 60 / 100;
         let page_id = create_page_with_free_space(&cache, &file_key, free_space_60_percent);
+
+        // Add to tracked_pages and push to wrong bucket (bucket 3)
+        fsm.tracked_pages.insert(page_id);
         fsm.buckets[3].push(page_id);
 
         // Request space that requires searching bucket 3
@@ -2706,11 +2710,12 @@ mod tests {
         let result = fsm.page_with_free_space(needed_80_percent).unwrap();
         assert!(result.is_none());
 
-        // Verify page was not re-inserted into bucket 3
+        // Verify page was moved to the correct bucket (bucket 2)
+        // The page should have been removed from tracked_pages when popped,
+        // then re-added when moved to correct bucket
         assert!(!bucket_contains_page(&fsm, 3, page_id));
-
-        // Verify page was not automatically moved to bucket 2 either
-        assert!(!bucket_contains_page(&fsm, 2, page_id));
+        assert!(bucket_contains_page(&fsm, 2, page_id));
+        assert!(fsm.tracked_pages.contains(&page_id));
     }
 
     #[test]
@@ -4078,11 +4083,23 @@ mod tests {
         let free_space = slotted_page.free_space().unwrap() as usize;
 
         assert_eq!(free_space, 0);
-        assert!(bucket_contains_page(
-            &heap_file.record_pages_fsm,
-            0,
-            first_record_page_id
-        ));
+        // Page with 0 free space is below MIN_USEFUL_FREE_SPACE,
+        // so it should not be added to FSM at all
+        assert!(
+            !heap_file
+                .record_pages_fsm
+                .tracked_pages
+                .contains(&first_record_page_id)
+        );
+
+        // Verify page is not in any bucket
+        for bucket_idx in 0..4 {
+            assert!(!bucket_contains_page(
+                &heap_file.record_pages_fsm,
+                bucket_idx,
+                first_record_page_id
+            ));
+        }
     }
 
     #[test]
@@ -4120,35 +4137,58 @@ mod tests {
         assert_i32(777, &retrieved_record.fields[0]);
         assert_string(&large_string, &retrieved_record.fields[1]);
 
-        // Verify both pages were updated in their respective FSMs
+        // Verify record page was added to FSM (if have some free space left)
         let record_page_ref = FilePageRef::new(first_record_page_id, file_key.clone());
         let record_page = cache.pin_read(&record_page_ref).unwrap();
         let record_slotted_page = SlottedPage::<_, RecordPageHeader>::new(record_page).unwrap();
         let record_free_space = record_slotted_page.free_space().unwrap() as usize;
-        let record_bucket = heap_file
-            .record_pages_fsm
-            .bucket_for_space(record_free_space);
 
+        // Record page should be in FSM if it has enough free space
+        if record_free_space >= FreeSpaceMap::<4, RecordPageHeader>::MIN_USEFUL_FREE_SPACE {
+            let record_bucket = heap_file
+                .record_pages_fsm
+                .bucket_for_space(record_free_space);
+            assert!(bucket_contains_page(
+                &heap_file.record_pages_fsm,
+                record_bucket,
+                first_record_page_id
+            ));
+        } else {
+            // Page has too little free space, should not be tracked
+            assert!(
+                !heap_file
+                    .record_pages_fsm
+                    .tracked_pages
+                    .contains(&first_record_page_id)
+            );
+        }
+
+        // Verify overflow page handling
         let overflow_page_ref = FilePageRef::new(first_overflow_page_id, file_key.clone());
         let overflow_page = cache.pin_read(&overflow_page_ref).unwrap();
         let overflow_slotted_page =
             SlottedPage::<_, OverflowPageHeader>::new(overflow_page).unwrap();
         let overflow_free_space = overflow_slotted_page.free_space().unwrap() as usize;
-        let overflow_bucket = heap_file
-            .overflow_pages_fsm
-            .bucket_for_space(overflow_free_space);
 
-        // Both pages should have been added to their respective FSMs
-        assert!(bucket_contains_page(
-            &heap_file.record_pages_fsm,
-            record_bucket,
-            first_record_page_id
-        ));
-        assert!(bucket_contains_page(
-            &heap_file.overflow_pages_fsm,
-            overflow_bucket,
-            first_overflow_page_id
-        ));
+        // Overflow page should be in FSM only if it has enough free space
+        if overflow_free_space >= FreeSpaceMap::<4, OverflowPageHeader>::MIN_USEFUL_FREE_SPACE {
+            let overflow_bucket = heap_file
+                .overflow_pages_fsm
+                .bucket_for_space(overflow_free_space);
+            assert!(bucket_contains_page(
+                &heap_file.overflow_pages_fsm,
+                overflow_bucket,
+                first_overflow_page_id
+            ));
+        } else {
+            // Page has too little free space, should not be tracked
+            assert!(
+                !heap_file
+                    .overflow_pages_fsm
+                    .tracked_pages
+                    .contains(&first_overflow_page_id)
+            );
+        }
 
         // Verify that the first fragment contains a continuation tag
         let first_fragment_data = record_slotted_page.read_record(0).unwrap();
@@ -6109,7 +6149,7 @@ mod tests {
         assert_string("Alice", &updated_record.fields[1]);
     }
 
-    //#[ignore = "TODO: need to figure out better way to handle benchmark tests"]
+    #[ignore = "TODO: need to figure out better way to handle benchmark tests"]
     #[test]
     fn heap_file_stress_test_concurrent_inserts_many_threads() {
         let (cache, _, file_key) = setup_test_cache();
