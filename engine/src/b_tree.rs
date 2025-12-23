@@ -319,18 +319,6 @@ pub struct BTree {
 impl BTree {
     const METADATA_PAGE_ID: PageId = 1;
 
-    /// Reads the root page ID from the metadata page.
-    fn read_root_page_id(&self) -> Result<PageId, BTreeError> {
-        let metadata_page = self.cache.pin_read(&FilePageRef::new(
-            BTree::METADATA_PAGE_ID,
-            self.file_key.clone(),
-        ))?;
-
-        let metadata = BTreeMetadata::try_from(metadata_page.page())?;
-
-        Ok(metadata.root_page_id)
-    }
-
     fn new(cache: Arc<Cache>, file_key: FileKey) -> Result<Self, BTreeError> {
         Ok(Self {
             cache,
@@ -378,8 +366,13 @@ impl BTree {
     /// Searches for a key in the B-tree and returns the corresponding record pointer (to heap
     /// file record) if the key was found.
     pub fn search(&self, key: &Key) -> Result<SearchResult, BTreeError> {
-        let root_page_id = self.read_root_page_id()?;
+        let metadata_page = self.cache.pin_read(&FilePageRef::new(
+            BTree::METADATA_PAGE_ID,
+            self.file_key.clone(),
+        ))?;
+        let root_page_id = BTreeMetadata::try_from(metadata_page.page())?.root_page_id;
         let mut current_page = self.pin_read(root_page_id)?;
+        drop(metadata_page);
 
         loop {
             let node_type = get_node_type(&current_page)?;
@@ -419,10 +412,15 @@ impl BTree {
 
     /// Traversal to find the leaf node containing the given key.
     fn traverse(&self, key: &[u8]) -> Result<PageId, BTreeError> {
-        let mut current_page_id = self.read_root_page_id()?;
+        let metadata_page = self.cache.pin_read(&FilePageRef::new(
+            BTree::METADATA_PAGE_ID,
+            self.file_key.clone(),
+        ))?;
+        let mut current_page_id = BTreeMetadata::try_from(metadata_page.page())?.root_page_id;
         let mut current_page = self
             .cache
             .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
+        drop(metadata_page);
 
         loop {
             match get_node_type(&current_page)? {
@@ -449,10 +447,15 @@ impl BTree {
 
     /// Traversal to find the leftmost leaf node in the B-tree.
     fn traverse_leftmost(&self) -> Result<PageId, BTreeError> {
-        let mut current_page_id = self.read_root_page_id()?;
+        let metadata_page = self.cache.pin_read(&FilePageRef::new(
+            BTree::METADATA_PAGE_ID,
+            self.file_key.clone(),
+        ))?;
+        let mut current_page_id = BTreeMetadata::try_from(metadata_page.page())?.root_page_id;
         let mut current_page = self
             .cache
             .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
+        drop(metadata_page);
 
         loop {
             match get_node_type(&current_page)? {
@@ -526,20 +529,25 @@ impl BTree {
 
     /// Traverses the tree to the leaf while recording page versions for optimistic concurrency checks.
     fn traverse_with_versions(&self, key: &[u8]) -> Result<(PageId, Vec<PageVersion>), BTreeError> {
-        let mut current_page_id = self.read_root_page_id()?;
         let mut path_versions = Vec::new();
+
+        let metadata_page = self.cache.pin_read(&FilePageRef::new(
+            BTree::METADATA_PAGE_ID,
+            self.file_key.clone(),
+        ))?;
+        let mut current_page_id = BTreeMetadata::try_from(metadata_page.page())?.root_page_id;
 
         let version = self
             .structural_version_numbers
             .entry(current_page_id)
             .or_insert_with(|| AtomicU16::new(0))
             .load(Ordering::Acquire);
-
         path_versions.push(PageVersion::new(current_page_id, version));
 
         let mut current_page = self
             .cache
             .pin_read(&FilePageRef::new(current_page_id, self.file_key.clone()))?;
+        drop(metadata_page);
 
         loop {
             // Record page version before descending (necessary here before page read, because if a
@@ -2499,7 +2507,6 @@ mod test {
         assert!(search_to_option(&btree, &key_i32(199)).is_some());
     }
 
-    #[ignore = "lol"]
     #[test]
     fn test_concurrent_deletes() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
@@ -2561,7 +2568,6 @@ mod test {
         }
     }
 
-    //#[ignore = "TODO: fix me bro"]
     #[test]
     fn test_concurrent_inserts_and_deletes() {
         let (cache, file_key, _temp_dir) = setup_test_cache();
