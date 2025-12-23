@@ -112,7 +112,7 @@ impl Drop for PinnedReadPage {
         // SAFETY: `guard` cannot outlive `frame`. This is why it must be declared before it in the struct,
         // as the order of dropping is the order of declaration in struct.
         // (https://doc.rust-lang.org/reference/destructors.html)
-        // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedPage`].
+        // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedReadPage`].
         self.frame.unpin();
     }
 }
@@ -162,7 +162,7 @@ impl Drop for PinnedWritePage {
         // SAFETY: `guard` cannot outlive `frame`. This is why it must be declared before it in the struct,
         // as the order of dropping is the order of declaration in struct.
         // (https://doc.rust-lang.org/reference/destructors.html)
-        // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedPage`].
+        // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedWritePage`].
         self.frame.unpin();
     }
 }
