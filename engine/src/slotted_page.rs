@@ -100,10 +100,6 @@ impl SlottedPageBaseHeader {
         self.first_free_slot != Self::NO_FREE_SLOTS
     }
 
-    pub fn has_free_block(&self) -> bool {
-        self.first_free_block_offset != Self::NO_FREE_SLOTS
-    }
-
     pub fn new(header_size: u16, page_type: PageType) -> Self {
         assert!(
             header_size as usize >= size_of::<SlottedPageBaseHeader>(),
@@ -618,6 +614,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
             let updated_slot = self.get_slot_mut(slot_id)?;
             updated_slot.len = new_len;
+            self.mark_slot_diff(slot_id)?;
 
             let leftover = old_len - new_len;
             self.add_freeblock(old_offset + new_len, leftover)?;
@@ -652,6 +649,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         let updated_slot = self.get_slot_mut(slot_id)?;
         updated_slot.offset = offset;
         updated_slot.len = new_len;
+        self.mark_slot_diff(slot_id)?;
 
         Ok(UpdateResult::Success)
     }
@@ -672,6 +670,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         let old_record_len = slot.len;
         slot.mark_deleted();
+        self.mark_slot_diff(slot_id)?;
 
         let header = self.get_base_header_mut()?;
         header.total_free_space += old_record_len;
@@ -690,6 +689,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         slot.offset = offset;
         slot.len = updated_record.len() as u16;
         slot.flags = 0;
+        self.mark_slot_diff(slot_id)?;
 
         Ok(UpdateResult::Success)
     }
@@ -706,6 +706,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         slot.mark_deleted();
         slot.set_next_free_slot(next_free_slot);
+        self.mark_slot_diff(slot_id)?;
 
         // copy slot to handle borrow checker complaints
         let copied_slot = *self.get_slot(slot_id)?;
@@ -740,8 +741,6 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         let next_block_offset = self.get_base_header()?.first_free_block_offset;
 
-        let page = self.page.data_mut();
-
         let new_freeblock = FreeBlock {
             len,
             next_block_offset,
@@ -749,9 +748,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         };
 
         let aligned_offset = Self::calculate_free_block_aligned_offset(offset);
-        let start = aligned_offset as usize;
-        let end = start + FreeBlock::SIZE;
-        page[start..end].copy_from_slice(bytemuck::bytes_of(&new_freeblock));
+        self.page
+            .write_at(aligned_offset, bytemuck::bytes_of(&new_freeblock).to_vec());
 
         self.get_base_header_mut()?.first_free_block_offset = aligned_offset;
 
@@ -815,13 +813,9 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     /// Writes a slot to the slot directory at a given position.
     fn write_slot_at(&mut self, position: SlotId, slot: Slot) -> Result<(), SlottedPageError> {
         let header_size = self.get_base_header()?.header_size as usize;
-        let page = self.page.data_mut();
-
-        let start = header_size + position as usize * Slot::SIZE;
-        let end = start + Slot::SIZE;
-
-        page[start..end].copy_from_slice(bytemuck::bytes_of(&slot));
-
+        let start = (header_size + position as usize * Slot::SIZE) as u16;
+        self.page
+            .write_at(start, bytemuck::bytes_of(&slot).to_vec());
         Ok(())
     }
 
@@ -837,10 +831,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         }
         let start = header.header_size as usize + position as usize * Slot::SIZE;
         let end = start + shifted_slots_num as usize * Slot::SIZE;
-
-        let page = self.page.data_mut();
-
-        page.copy_within(start..end, start + Slot::SIZE);
+        let data = self.page.data()[start..end].to_vec();
+        self.page.write_at((start + Slot::SIZE) as u16, data);
 
         Ok(())
     }
@@ -866,10 +858,12 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
                 } else {
                     self.get_slot_mut(prev)?
                         .set_next_free_slot(next_free_slot_id);
+                    self.mark_slot_diff(prev)?;
                 }
 
                 let removed_slot = self.get_slot_mut(slot_id)?;
                 removed_slot.set_next_free_slot(Slot::NO_FREE_SLOTS);
+                self.mark_slot_diff(slot_id)?;
 
                 return Ok(());
             }
@@ -949,9 +943,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
     /// Writes record bytes into the page at the given offset.
     fn write_record_at(&mut self, record: &[u8], offset: u16) {
-        let start = offset as usize;
-        let end = start + record.len();
-        self.page.data_mut()[start..end].copy_from_slice(record)
+        self.page.write_at(offset, record.to_vec());
     }
 
     /// Allocates space for a record of length `record_len`.
@@ -1017,9 +1009,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
                 actual_offset: new_freeblock_actual_offset,
             };
 
-            let start = aligned_offset as usize;
-            let end = start + FreeBlock::SIZE;
-            self.page.data_mut()[start..end].copy_from_slice(bytemuck::bytes_of(&new_freeblock));
+            self.page
+                .write_at(aligned_offset, bytemuck::bytes_of(&new_freeblock).to_vec());
 
             // we store the aligned offset in the free block linked list so we can read the free block
             // without calculating aligned version of it every time.
@@ -1047,6 +1038,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
                     [prev_offset as usize..prev_offset as usize + FreeBlock::SIZE],
             )?;
             prev.next_block_offset = new_next;
+            self.page
+                .mark_diff(prev_offset, prev_offset + FreeBlock::SIZE as u16);
         }
         Ok(())
     }
@@ -1077,17 +1070,9 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(None)
     }
 
-    /// Returns a mutable slice of all slots.
-    fn get_slots_mut(&mut self) -> Result<&mut [Slot], SlottedPageError> {
-        let header = self.get_base_header()?;
-        let start = header.header_size as usize;
-        let end = start + (header.num_slots as usize * Slot::SIZE);
-        Ok(bytemuck::try_cast_slice_mut(
-            &mut self.page.data_mut()[start..end],
-        )?)
-    }
-
     /// Returns a mutable reference to a specific slot.
+    ///
+    /// IMPORTANT: After modifying a slot remember to call [`SlottedPage::mark_slot_diff`] or [`SlottedPage::mark_all_slots_diff`].
     fn get_slot_mut(&mut self, slot_id: SlotId) -> Result<&mut Slot, SlottedPageError> {
         let header = self.get_base_header()?;
         let start = header.header_size as usize + slot_id as usize * Slot::SIZE;
@@ -1095,6 +1080,28 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(bytemuck::try_from_bytes_mut(
             &mut self.page.data_mut()[start..end],
         )?)
+    }
+
+    /// Marks slot as new diff.
+    ///
+    /// Should be used after using [`SlottedPage::get_slot_mut`].
+    fn mark_slot_diff(&mut self, slot_id: SlotId) -> Result<(), SlottedPageError> {
+        let header = self.get_base_header()?;
+        let start = header.header_size + slot_id * Slot::SIZE as u16;
+        let end = start + Slot::SIZE as u16;
+        self.page.mark_diff(start, end);
+        Ok(())
+    }
+
+    /// Marks all slots as new diff.
+    ///
+    /// Should be used after using [`SlottedPage::get_slot_mut`] on many slots.
+    fn mark_all_slots_diff(&mut self) -> Result<(), SlottedPageError> {
+        let header = self.get_base_header()?;
+        let start = header.header_size;
+        let end = start + header.num_slots * Slot::SIZE as u16;
+        self.page.mark_diff(start, end);
+        Ok(())
     }
 
     /// Compacts the slot directory by removing deleted slots and shifting
@@ -1128,15 +1135,14 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         let deleted_count = slots.len() - filled_count;
         let freed_space = deleted_count * Slot::SIZE;
 
-        let page = self.page.data_mut();
-
         // Compact slots by moving filled ones toward the start.
         for (dst_i, src_i) in filled_slots.into_iter().enumerate() {
             let copy_location = header_size + dst_i * Slot::SIZE;
             let src_start = header_size + src_i * Slot::SIZE;
             let src_end = src_start + Slot::SIZE;
 
-            page.copy_within(src_start..src_end, copy_location);
+            let data = self.page.data()[src_start..src_end].to_vec();
+            self.page.write_at(copy_location as u16, data);
         }
 
         let header = self.get_base_header_mut()?;
@@ -1175,11 +1181,14 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             }
 
             let record_range = slot.offset as usize..slot.offset as usize + slot.len as usize;
+            let record = self.page.data()[record_range].to_vec();
 
             // Move record into new compacted position and update its corresponding slot to new offset
-            self.page.data_mut().copy_within(record_range, write_pos);
+            self.page.write_at(write_pos as u16, record);
             self.get_slot_mut(idx as u16)?.offset = write_pos as u16;
         }
+        self.mark_all_slots_diff()?;
+
         let header = self.get_base_header_mut()?;
         header.record_area_offset = write_pos as u16;
         header.contiguous_free_space = write_pos as u16 - header.free_space_start();
