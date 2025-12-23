@@ -19,6 +19,30 @@ pub const PAGE_SIZE: usize = 4096; // 4 kB
 /// Type representing page, should be used instead of bare array of bytes.
 pub type Page = [u8; PAGE_SIZE];
 
+/// Type representing Log Sequence Number for WAL.
+pub type Lsn = u64;
+
+/// Size of LSN stored at the end of each page.
+pub const PAGE_LSN_SIZE: usize = size_of::<Lsn>();
+
+/// Offset where LSN is stored (last 8 bytes of the page).
+pub const PAGE_LSN_OFFSET: usize = PAGE_SIZE - PAGE_LSN_SIZE;
+
+/// Usable page size excluding the LSN at the end.
+/// This is the maximum space available for data structures (headers, slots, records, etc.)
+pub const USABLE_PAGE_SIZE: usize = PAGE_SIZE - PAGE_LSN_SIZE;
+
+/// Reads the LSN from the end of the page.
+pub fn get_page_lsn(page: &Page) -> Lsn {
+    let lsn_bytes = &page[PAGE_LSN_OFFSET..PAGE_SIZE];
+    u64::from_le_bytes(lsn_bytes.try_into().expect("LSN slice should be 8 bytes"))
+}
+
+/// Writes the LSN to the end of the page.
+pub fn set_page_lsn(page: &mut Page, lsn: Lsn) {
+    page[PAGE_LSN_OFFSET..PAGE_SIZE].copy_from_slice(&lsn.to_le_bytes());
+}
+
 /// Responsible for managing a single on-disk file.
 /// Only this structure should be responsible for directly communicating with disk.
 ///

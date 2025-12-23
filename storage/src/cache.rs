@@ -19,7 +19,7 @@ use crate::{
     background_worker::{BackgroundWorker, BackgroundWorkerHandle},
     files_manager::{FileKey, FilesManager, FilesManagerError},
     page_diff::PageDiff,
-    paged_file::{Page, PageId, PagedFile, PagedFileError},
+    paged_file::{Lsn, Page, PageId, PagedFile, PagedFileError, get_page_lsn, set_page_lsn},
 };
 
 /// Structure for referring to single page in the file.

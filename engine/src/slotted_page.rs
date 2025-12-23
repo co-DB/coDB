@@ -3,7 +3,7 @@ use bitflags::bitflags;
 use bytemuck::{Pod, PodCastError, Zeroable};
 use std::marker::PhantomData;
 use storage::cache::{PageRead, PageWrite};
-use storage::paged_file::PAGE_SIZE;
+use storage::paged_file::USABLE_PAGE_SIZE;
 use thiserror::Error;
 
 /// Helper trait meant for structs implementing SlottedPageHeader trait. Making implementing it
@@ -108,9 +108,9 @@ impl SlottedPageBaseHeader {
         );
         Self {
             co_db_magic_number: CO_DB_MAGIC_NUMBER,
-            total_free_space: PAGE_SIZE as u16 - header_size,
-            contiguous_free_space: PAGE_SIZE as u16 - header_size,
-            record_area_offset: PAGE_SIZE as u16,
+            total_free_space: USABLE_PAGE_SIZE as u16 - header_size,
+            contiguous_free_space: USABLE_PAGE_SIZE as u16 - header_size,
+            record_area_offset: USABLE_PAGE_SIZE as u16,
             header_size,
             first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
             first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
@@ -318,7 +318,7 @@ pub(crate) struct SlottedPage<P, H: SlottedPageHeader> {
 
 impl<P, H: SlottedPageHeader> SlottedPage<P, H> {
     /// Maximum free space available in the slotted page (when no slot is used).
-    pub const MAX_FREE_SPACE: u16 = (PAGE_SIZE - size_of::<H>()) as _;
+    pub const MAX_FREE_SPACE: u16 = (USABLE_PAGE_SIZE - size_of::<H>()) as _;
 
     pub(crate) fn into_page(self) -> P {
         self.page
@@ -1309,11 +1309,18 @@ mod tests {
     fn create_test_page(size: usize) -> SlottedPage<TestPage, SlottedPageBaseHeader> {
         let mut page = TestPage::new(size);
 
+        // Use USABLE_PAGE_SIZE for calculations since LSN takes last 8 bytes
+        let usable_size = if size == PAGE_SIZE {
+            USABLE_PAGE_SIZE
+        } else {
+            size
+        };
+
         let header = SlottedPageBaseHeader {
             co_db_magic_number: CO_DB_MAGIC_NUMBER,
-            total_free_space: (size - size_of::<SlottedPageBaseHeader>()) as u16,
-            contiguous_free_space: (size - size_of::<SlottedPageBaseHeader>()) as u16,
-            record_area_offset: size as u16,
+            total_free_space: (usable_size - size_of::<SlottedPageBaseHeader>()) as u16,
+            contiguous_free_space: (usable_size - size_of::<SlottedPageBaseHeader>()) as u16,
+            record_area_offset: usable_size as u16,
             header_size: size_of::<SlottedPageBaseHeader>() as u16,
             first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
             first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
@@ -1547,9 +1554,10 @@ mod tests {
                 Self {
                     base: SlottedPageBaseHeader {
                         co_db_magic_number: CO_DB_MAGIC_NUMBER,
-                        total_free_space: (PAGE_SIZE - size_of::<CustomHeader>()) as u16,
-                        contiguous_free_space: (PAGE_SIZE - size_of::<CustomHeader>()) as u16,
-                        record_area_offset: PAGE_SIZE as u16,
+                        total_free_space: (USABLE_PAGE_SIZE - size_of::<CustomHeader>()) as u16,
+                        contiguous_free_space: (USABLE_PAGE_SIZE - size_of::<CustomHeader>())
+                            as u16,
+                        record_area_offset: USABLE_PAGE_SIZE as u16,
                         header_size: size_of::<CustomHeader>() as u16,
                         first_free_block_offset: SlottedPageBaseHeader::NO_FREE_BLOCKS,
                         first_free_slot: SlottedPageBaseHeader::NO_FREE_SLOTS,
@@ -1705,7 +1713,7 @@ mod tests {
         assert!(slot.is_deleted());
 
         let header = page.get_base_header().unwrap();
-        let expected_free_space = PAGE_SIZE as u16
+        let expected_free_space = USABLE_PAGE_SIZE as u16
             - header.header_size
             - header.num_slots * Slot::SIZE as u16
             - b"first".len() as u16
