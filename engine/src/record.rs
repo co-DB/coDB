@@ -2,7 +2,6 @@
 
 use metadata::catalog::ColumnMetadata;
 use thiserror::Error;
-use types::lexicographic_serialization::DecodeError;
 use types::{data::Value, schema::Type, serialization::DbSerializationError};
 
 /// Error for record related operations
