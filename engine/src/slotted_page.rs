@@ -9,6 +9,9 @@ use thiserror::Error;
 /// Helper trait meant for structs implementing SlottedPageHeader trait. Making implementing it
 /// compulsory should help remind to use #[repr(C)] for those structs (there is no way to ensure
 /// that it is used otherwise)
+///
+/// # Safety
+/// User must guarantee that the struct actually has #[repr(C)].
 pub(crate) unsafe trait ReprC {}
 
 /// Magic number for assuring the page is initialized
@@ -419,7 +422,7 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     ) -> Result<impl Iterator<Item = SlotId>, SlottedPageError> {
         Ok(self
             .get_slots()?
-            .into_iter()
+            .iter()
             .enumerate()
             .filter_map(|(id, slot)| match slot.is_deleted() {
                 true => None,
@@ -535,7 +538,7 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     pub fn initialize_with_header(page: P, header: H) -> Result<Self, SlottedPageError> {
         let mut page = page;
-        page.data_mut()[0..size_of::<H>()].copy_from_slice(bytemuck::bytes_of(&header));
+        page.write_at(0, bytemuck::bytes_of(&header).to_vec());
 
         let ty = header.base().page_type()?;
         let allow_slot_compaction = ty.allow_slot_compaction();
@@ -557,6 +560,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     /// Generic method to cast page header to any type implementing SlottedPageHeader
     ///
     /// Caller must ensure T matches the actual header type stored in the page
+    ///
+    /// IMPORTANT: After header is modified remember to call [`SlottedPage::mark_header_diff`].
     fn get_generic_header_mut<T>(&mut self) -> Result<&mut T, SlottedPageError>
     where
         T: SlottedPageHeader,
@@ -566,13 +571,25 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         )?)
     }
 
+    /// Gets a mutable reference to header.
+    ///
+    /// IMPORTANT: After header is modified remember to call [`SlottedPage::mark_header_diff`].
     pub fn get_header_mut(&mut self) -> Result<&mut H, SlottedPageError> {
         self.get_generic_header_mut::<H>()
     }
 
     /// Gets a mutable reference to base header (common to all slotted pages).
+    ///
+    /// IMPORTANT: After header is modified remember to call [`SlottedPage::mark_header_diff`].
     pub fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
         self.get_generic_header_mut::<SlottedPageBaseHeader>()
+    }
+
+    /// Marks whole header as new diff.
+    ///
+    /// Should be used after modifying header using [`PageWrite::data_mut`].
+    pub fn mark_header_diff(&mut self) {
+        self.page.mark_diff(0, size_of::<H>() as u16);
     }
 
     /// Updates the record at given position.
@@ -607,6 +624,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
             let header = self.get_base_header_mut()?;
             header.total_free_space += leftover;
+            self.mark_header_diff();
 
             return Ok(UpdateResult::Success);
         }
@@ -629,6 +647,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         self.add_freeblock(old_offset, old_len)?;
         let header = self.get_base_header_mut()?;
         header.total_free_space += old_len;
+        self.mark_header_diff();
 
         let updated_slot = self.get_slot_mut(slot_id)?;
         updated_slot.offset = offset;
@@ -656,6 +675,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         let header = self.get_base_header_mut()?;
         header.total_free_space += old_record_len;
+        // Note: we don't call `mark_header_diff` here, because it's called inside `compact_records`.
 
         self.compact_records()?;
 
@@ -701,6 +721,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         } else {
             self.add_freeblock(copied_slot.offset, copied_slot.len)?;
         }
+        self.mark_header_diff();
 
         Ok(())
     }
@@ -785,6 +806,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             header_mut.total_free_space -= Slot::SIZE as u16;
             header_mut.contiguous_free_space -= Slot::SIZE as u16;
         }
+
+        self.mark_header_diff();
 
         Ok(InsertResult::Success(position))
     }
@@ -887,6 +910,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         // Increment valid slot count after successful insert
         self.get_base_header_mut()?.num_used_slots += 1;
+        self.mark_header_diff();
 
         Ok(InsertResult::Success(slot_id))
     }
@@ -1121,6 +1145,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         header.total_free_space += freed_space as u16;
         header.contiguous_free_space += freed_space as u16;
         header.first_free_slot = SlottedPageBaseHeader::NO_FREE_SLOTS;
+        self.mark_header_diff();
         Ok(())
     }
 
@@ -1159,6 +1184,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         header.record_area_offset = write_pos as u16;
         header.contiguous_free_space = write_pos as u16 - header.free_space_start();
         header.first_free_block_offset = SlottedPageBaseHeader::NO_FREE_BLOCKS;
+        self.mark_header_diff();
         Ok(())
     }
 }
@@ -1191,6 +1217,13 @@ mod tests {
     impl PageWrite for TestPage {
         fn data_mut(&mut self) -> &mut [u8] {
             &mut self.data
+        }
+
+        fn mark_diff(&mut self, _: u16, _: u16) {}
+
+        fn write_at(&mut self, offset: u16, data: Vec<u8>) {
+            let end = offset as usize + data.len();
+            self.data[offset as usize..end].copy_from_slice(&data);
         }
     }
 

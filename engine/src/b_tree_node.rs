@@ -262,8 +262,13 @@ where
     Page: PageRead + PageWrite,
     Header: SlottedPageHeader,
 {
+    /// IMPORTANT: After header is modified remember to call [`BTreeNode::mark_btree_header_diff`].
     fn get_btree_header_mut(&mut self) -> Result<&mut Header, BTreeNodeError> {
         Ok(self.slotted_page.get_header_mut()?)
+    }
+
+    fn mark_btree_header_diff(&mut self) {
+        self.slotted_page.mark_header_diff();
     }
 
     pub fn batch_insert(&mut self, insert_values: Vec<Vec<u8>>) -> Result<(), BTreeNodeError> {
@@ -520,6 +525,7 @@ where
     pub fn set_leftmost_child_id(&mut self, child_id: PageId) -> Result<(), BTreeNodeError> {
         let header = self.get_btree_header_mut()?;
         header.leftmost_child_pointer = child_id;
+        self.mark_btree_header_diff();
         Ok(())
     }
 
@@ -604,6 +610,7 @@ where
 
         self.slotted_page.delete(slot_id)?;
         self.get_btree_header_mut()?.leftmost_child_pointer = new_leftmost;
+        self.mark_btree_header_diff();
 
         Ok((key, old_leftmost))
     }
@@ -630,6 +637,7 @@ where
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let old_leftmost = self.get_btree_header()?.leftmost_child_pointer;
         self.get_btree_header_mut()?.leftmost_child_pointer = new_leftmost;
+        self.mark_btree_header_diff();
 
         // Insert the key with old_leftmost as its child pointer
         // Since this key should be smaller than all existing keys, it goes at position 0
@@ -813,6 +821,7 @@ where
             Some(next_leaf) => header.next_leaf_pointer = next_leaf,
             None => header.next_leaf_pointer = BTreeLeafHeader::NO_NEXT_LEAF,
         };
+        self.mark_btree_header_diff();
         Ok(())
     }
 
@@ -949,6 +958,13 @@ mod test {
     impl PageWrite for TestPage {
         fn data_mut(&mut self) -> &mut [u8] {
             &mut self.data
+        }
+
+        fn mark_diff(&mut self, _: u16, _: u16) {}
+
+        fn write_at(&mut self, offset: u16, data: Vec<u8>) {
+            let end = offset as usize + data.len();
+            self.data[offset as usize..end].copy_from_slice(&data);
         }
     }
 
