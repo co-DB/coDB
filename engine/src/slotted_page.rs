@@ -1201,19 +1201,63 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     const PAGE_SIZE: usize = 4096;
 
     // Simple page for testing with configurable size
     struct TestPage {
         data: Vec<u8>,
+        /// Track all diffs marked on this page for testing purposes
+        diffs: BTreeMap<u16, u16>,
     }
 
     impl TestPage {
         fn new(size: usize) -> Self {
             Self {
                 data: vec![0; size],
+                diffs: BTreeMap::new(),
             }
+        }
+
+        /// Check if a diff was marked for the given range (from..to)
+        fn has_diff(&self, from: u16, to: u16) -> bool {
+            // Check if there's any diff that covers [from, to)
+            for (&diff_start, &diff_end) in &self.diffs {
+                if diff_start <= from && to <= diff_end {
+                    return true;
+                }
+            }
+            false
+        }
+
+        /// Check if a diff was marked that covers the header
+        fn has_header_diff(&self) -> bool {
+            self.has_diff(0, size_of::<SlottedPageBaseHeader>() as u16)
+        }
+
+        /// Check if a diff was marked for the given slot
+        fn has_slot_diff(&self, slot_id: SlotId) -> bool {
+            let header_size = size_of::<SlottedPageBaseHeader>() as u16;
+            let slot_start = header_size + slot_id * Slot::SIZE as u16;
+            let slot_end = slot_start + Slot::SIZE as u16;
+            self.has_diff(slot_start, slot_end)
+        }
+
+        /// Check if diffs were marked for all slots
+        fn has_all_slots_diff(&self, num_slots: u16) -> bool {
+            if num_slots == 0 {
+                return true;
+            }
+            let header_size = size_of::<SlottedPageBaseHeader>() as u16;
+            let slots_start = header_size;
+            let slots_end = header_size + num_slots * Slot::SIZE as u16;
+            self.has_diff(slots_start, slots_end)
+        }
+
+        /// Clear all tracked diffs
+        fn clear_diffs(&mut self) {
+            self.diffs.clear();
         }
     }
 
@@ -1228,11 +1272,32 @@ mod tests {
             &mut self.data
         }
 
-        fn mark_diff(&mut self, _: u16, _: u16) {}
+        fn mark_diff(&mut self, from: u16, to: u16) {
+            // Merge overlapping/adjacent diffs
+            let mut new_start = from;
+            let mut new_end = to;
+            let mut to_remove = vec![];
+
+            for (&diff_start, &diff_end) in &self.diffs {
+                // Check if ranges overlap or are adjacent
+                if diff_end >= new_start && diff_start <= new_end {
+                    new_start = new_start.min(diff_start);
+                    new_end = new_end.max(diff_end);
+                    to_remove.push(diff_start);
+                }
+            }
+
+            for key in to_remove {
+                self.diffs.remove(&key);
+            }
+
+            self.diffs.insert(new_start, new_end);
+        }
 
         fn write_at(&mut self, offset: u16, data: Vec<u8>) {
             let end = offset as usize + data.len();
             self.data[offset as usize..end].copy_from_slice(&data);
+            self.mark_diff(offset, offset + data.len() as u16);
         }
     }
 
@@ -2238,5 +2303,257 @@ mod tests {
         page.compact_slots().unwrap();
         assert_eq!(page.num_used_slots().unwrap(), 8);
         assert_eq!(page.num_slots().unwrap(), 8);
+    }
+
+    #[test]
+    fn test_insert_marks_header_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.page.clear_diffs();
+
+        page.insert(b"test_data").unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "insert() should mark header as modified"
+        );
+    }
+
+    #[test]
+    fn test_insert_at_marks_only_shifted_slots() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        // Insert some records to have slots before the insertion point
+        page.insert(b"slot0").unwrap();
+        page.insert(b"slot1").unwrap();
+        page.insert(b"slot2").unwrap();
+        page.insert(b"slot3").unwrap();
+        page.insert(b"slot4").unwrap();
+
+        page.page.clear_diffs();
+
+        // Insert at position 2 - this should shift slots 2, 3, 4 to positions 3, 4, 5
+        page.insert_at(b"new_slot", 2).unwrap();
+
+        // Header should be marked
+        assert!(
+            page.page.has_header_diff(),
+            "insert_at() should mark header as modified"
+        );
+
+        // Slots 0 and 1 should NOT be marked (they weren't touched)
+        assert!(
+            !page.page.has_slot_diff(0),
+            "slot 0 should NOT be marked (not shifted)"
+        );
+        assert!(
+            !page.page.has_slot_diff(1),
+            "slot 1 should NOT be marked (not shifted)"
+        );
+
+        // The newly written slot and all shifted slots (2, 3, 4, 5) should be marked
+        // Since shift_slots_right writes slots 2,3,4 to positions 3,4,5
+        // and then we write the new slot at position 2
+        // We need to check if positions 2-5 were marked
+        let num_slots = page.num_slots().unwrap();
+        assert_eq!(num_slots, 6, "should have 6 slots after insertion");
+
+        // Check that slots from insertion point onwards are marked
+        for slot_id in 2..num_slots {
+            assert!(
+                page.page.has_slot_diff(slot_id),
+                "slot {} should be marked (shifted or newly written)",
+                slot_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_marks_header_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"original").unwrap();
+
+        page.page.clear_diffs();
+
+        // Update with smaller record
+        page.update(0, b"new").unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "update() should mark header as modified"
+        );
+    }
+
+    #[test]
+    fn test_update_with_same_size_marks_slot_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"12345").unwrap();
+
+        page.page.clear_diffs();
+
+        // Update with same size
+        page.update(0, b"abcde").unwrap();
+
+        assert!(
+            page.page.has_slot_diff(0),
+            "update() should mark slot as modified when updating in place"
+        );
+    }
+
+    #[test]
+    fn test_defragment_and_update_marks_header_and_slots() {
+        let mut page = create_test_page(200);
+        page.insert(&[1u8; 50]).unwrap();
+        page.insert(&[2u8; 50]).unwrap();
+        page.delete(0).unwrap();
+
+        page.page.clear_diffs();
+
+        page.defragment_and_update(1, &[3u8; 80]).unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "defragment_and_update() should mark header as modified"
+        );
+
+        // Should mark slots because compaction updates slot offsets
+        let num_slots = page.num_slots().unwrap();
+        assert!(
+            page.page.has_all_slots_diff(num_slots),
+            "defragment_and_update() should mark all slots due to compaction"
+        );
+    }
+
+    #[test]
+    fn test_delete_marks_header_and_slot_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"to_delete").unwrap();
+
+        page.page.clear_diffs();
+
+        page.delete(0).unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "delete() should mark header as modified"
+        );
+
+        assert!(
+            page.page.has_slot_diff(0),
+            "delete() should mark the deleted slot as modified"
+        );
+    }
+
+    #[test]
+    fn test_compact_slots_marks_header_and_all_slots_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"keep1").unwrap();
+        page.insert(b"delete").unwrap();
+        page.insert(b"keep2").unwrap();
+        page.delete(1).unwrap();
+
+        let num_slots_before = page.num_slots().unwrap();
+        page.page.clear_diffs();
+
+        page.compact_slots().unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "compact_slots() should mark header as modified"
+        );
+
+        // Should mark all remaining slots
+        let num_slots_after = page.num_slots().unwrap();
+        assert!(
+            page.page.has_all_slots_diff(num_slots_after),
+            "compact_slots() should mark all slots as modified"
+        );
+
+        assert!(
+            num_slots_after < num_slots_before,
+            "compact_slots() should reduce number of slots"
+        );
+    }
+
+    #[test]
+    fn test_compact_records_marks_header_and_slots_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(&[1u8; 50]).unwrap();
+        page.insert(&[2u8; 50]).unwrap();
+        page.insert(&[3u8; 50]).unwrap();
+        page.delete(1).unwrap();
+
+        page.page.clear_diffs();
+
+        page.compact_records().unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "compact_records() should mark header as modified"
+        );
+
+        let num_slots = page.num_slots().unwrap();
+        assert!(
+            page.page.has_all_slots_diff(num_slots),
+            "compact_records() should mark all slots as modified (offsets change)"
+        );
+    }
+
+    #[test]
+    fn test_multiple_operations_track_diffs_correctly() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        // Insert and verify diff
+        page.page.clear_diffs();
+        page.insert(b"first").unwrap();
+        assert!(page.page.has_header_diff());
+
+        // Insert again and verify diff
+        page.page.clear_diffs();
+        page.insert(b"second").unwrap();
+        assert!(page.page.has_header_diff());
+
+        // Delete and verify diffs
+        page.page.clear_diffs();
+        page.delete(0).unwrap();
+        assert!(page.page.has_header_diff());
+        assert!(page.page.has_slot_diff(0));
+
+        // Update and verify diff
+        page.page.clear_diffs();
+        page.update(1, b"updated").unwrap();
+        assert!(page.page.has_header_diff());
+    }
+
+    #[test]
+    fn test_insert_at_beginning_marks_all_slots() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"second").unwrap();
+        page.insert(b"third").unwrap();
+
+        page.page.clear_diffs();
+
+        page.insert_at(b"first", 0).unwrap();
+
+        let num_slots = page.num_slots().unwrap();
+        assert!(
+            page.page.has_all_slots_diff(num_slots),
+            "insert_at(0) should mark all slots as they all shift"
+        );
+    }
+
+    #[test]
+    fn test_insert_at_end_marks_header() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"first").unwrap();
+
+        page.page.clear_diffs();
+
+        let pos = page.num_slots().unwrap();
+        page.insert_at(b"second", pos).unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "insert_at(end) should mark header"
+        );
     }
 }
