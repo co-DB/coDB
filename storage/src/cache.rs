@@ -105,6 +105,11 @@ impl PinnedReadPage {
     pub fn page(&self) -> &Page {
         &self.guard
     }
+
+    /// Gets the LSN of the page.
+    pub fn lsn(&self) -> Lsn {
+        get_page_lsn(self.page())
+    }
 }
 
 impl Drop for PinnedReadPage {
@@ -154,6 +159,15 @@ impl PinnedWritePage {
         let end = offset as usize + data.len();
         self.guard[offset as usize..end].copy_from_slice(&data);
         self.diffs.write_at(offset, data);
+    }
+
+    /// Gets the LSN of the page.
+    pub fn lsn(&self) -> Lsn {
+        get_page_lsn(self.page())
+    }
+
+    pub fn set_lsn(&mut self, lsn: Lsn) {
+        set_page_lsn(self.page_mut(), lsn);
     }
 }
 
