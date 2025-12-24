@@ -18,6 +18,7 @@ use thiserror::Error;
 use crate::{
     background_worker::{BackgroundWorker, BackgroundWorkerHandle},
     files_manager::{FileKey, FilesManager, FilesManagerError},
+    page_diff::PageDiff,
     paged_file::{Page, PageId, PagedFile, PagedFileError},
 };
 
@@ -92,26 +93,13 @@ impl PageFrame {
     }
 }
 
-/// Wrapper around frame and its guard - shared or exclusive lock.
-pub struct PinnedPage<G> {
+/// Wrapper around frame and its guard (shared lock).
+pub struct PinnedReadPage {
     /// The content of the [`Page`] wrapped in a guard.
-    guard: G,
-    /// This field should not be exposed. It's here because [`PinnedPage::guard`] cannot outlive it.
+    guard: RwLockReadGuard<'static, Page>,
+    /// This field should not be exposed. It's here because `guard` cannot outlive it.
     frame: Arc<PageFrame>,
 }
-
-impl<G> Drop for PinnedPage<G> {
-    fn drop(&mut self) {
-        // SAFETY: `guard` cannot outlive `frame`. This is why it must be declared before it in the struct,
-        // as the order of dropping is the order of declaration in struct.
-        // (https://doc.rust-lang.org/reference/destructors.html)
-        // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedPage`].
-        self.frame.unpin();
-    }
-}
-
-/// [`Page`] wrapped in shared lock.
-pub type PinnedReadPage = PinnedPage<RwLockReadGuard<'static, Page>>;
 
 impl PinnedReadPage {
     pub fn page(&self) -> &Page {
@@ -119,16 +107,63 @@ impl PinnedReadPage {
     }
 }
 
-/// [`Page`] wrapped in exclusive lock.
-pub type PinnedWritePage = PinnedPage<RwLockWriteGuard<'static, Page>>;
+impl Drop for PinnedReadPage {
+    fn drop(&mut self) {
+        // SAFETY: `guard` cannot outlive `frame`. This is why it must be declared before it in the struct,
+        // as the order of dropping is the order of declaration in struct.
+        // (https://doc.rust-lang.org/reference/destructors.html)
+        // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedReadPage`].
+        self.frame.unpin();
+    }
+}
+
+/// Wrapper around frame and its guard (exclusive lock).
+pub struct PinnedWritePage {
+    /// Diffs of changes made to page.
+    diffs: PageDiff,
+    /// The content of the [`Page`] wrapped in a guard.
+    guard: RwLockWriteGuard<'static, Page>,
+    /// This field should not be exposed. It's here because `guard` cannot outlive it.
+    frame: Arc<PageFrame>,
+}
 
 impl PinnedWritePage {
     pub fn page(&self) -> &Page {
         &self.guard
     }
 
+    /// Returns mutable reference to the whole page.
+    ///
+    /// If used, then should be followed by call to [`PinnedWritePage::mark_diff`].
     pub fn page_mut(&mut self) -> &mut Page {
         &mut self.guard
+    }
+
+    /// Manually adds diff to [`PageDiff`].
+    ///
+    /// Should be used if page was modified using [`PinnedWritePage::page_mut`].
+    pub fn mark_diff(&mut self, from: u16, to: u16) {
+        let data = self.page()[from as usize..to as usize].to_vec();
+        self.diffs.write_at(from, data);
+    }
+
+    /// Inserts `data` to page at `offset`.
+    ///
+    /// Preferred way of modifying page, as this automatically updates [`PageDiff`].
+    pub fn write_at(&mut self, offset: u16, data: Vec<u8>) {
+        let end = offset as usize + data.len();
+        self.guard[offset as usize..end].copy_from_slice(&data);
+        self.diffs.write_at(offset, data);
+    }
+}
+
+impl Drop for PinnedWritePage {
+    fn drop(&mut self) {
+        // SAFETY: `guard` cannot outlive `frame`. This is why it must be declared before it in the struct,
+        // as the order of dropping is the order of declaration in struct.
+        // (https://doc.rust-lang.org/reference/destructors.html)
+        // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedWritePage`].
+        self.frame.unpin();
     }
 }
 
@@ -138,6 +173,8 @@ pub trait PageRead {
 
 pub trait PageWrite {
     fn data_mut(&mut self) -> &mut [u8];
+    fn mark_diff(&mut self, from: u16, to: u16);
+    fn write_at(&mut self, offset: u16, data: Vec<u8>);
 }
 
 impl PageRead for PinnedReadPage {
@@ -161,11 +198,27 @@ impl<T: PageWrite> PageWrite for &mut T {
     fn data_mut(&mut self) -> &mut [u8] {
         (*self).data_mut()
     }
+
+    fn mark_diff(&mut self, from: u16, to: u16) {
+        (*self).mark_diff(from, to);
+    }
+
+    fn write_at(&mut self, offset: u16, data: Vec<u8>) {
+        (*self).write_at(offset, data);
+    }
 }
 
 impl PageWrite for PinnedWritePage {
     fn data_mut(&mut self) -> &mut [u8] {
         self.page_mut()
+    }
+
+    fn mark_diff(&mut self, from: u16, to: u16) {
+        self.mark_diff(from, to);
+    }
+
+    fn write_at(&mut self, offset: u16, data: Vec<u8>) {
+        self.write_at(offset, data);
     }
 }
 
@@ -259,6 +312,7 @@ impl Cache {
             )
         };
         Ok(PinnedWritePage {
+            diffs: PageDiff::default(),
             frame,
             guard: guard_static,
         })
@@ -984,7 +1038,7 @@ mod tests {
 
         {
             let mut w = cache.pin_write(&id.clone()).expect("pin_write");
-            w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+            w.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
             // drop -> dirty = true, unpinned
         }
 
@@ -1014,7 +1068,7 @@ mod tests {
 
         // Allocate page via cache
         let (mut w, pid) = cache.allocate_page(&file_key).expect("allocate_page");
-        w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+        w.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
         let id = FilePageRef {
             page_id: pid,
             file_key: file_key.clone(),
@@ -1057,7 +1111,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 s.wait();
                 let mut w = c.pin_write(&idc).expect("pin_write");
-                w.page_mut()[0..8].copy_from_slice(&(1000 + i as u64).to_be_bytes());
+                w.write_at(0, (1000 + i as u64).to_be_bytes().to_vec());
                 // hold write briefly to increase chance of overlap
                 thread::sleep(std::time::Duration::from_millis(10));
             }));
@@ -1098,7 +1152,7 @@ mod tests {
             .allocate_page(&file_key)
             .expect("allocate_page failed");
 
-        pinned.page_mut()[0..8].copy_from_slice(&0xFEEDu64.to_be_bytes());
+        pinned.write_at(0, 0xFEEDu64.to_be_bytes().to_vec());
 
         let allocated_ref = pinned.frame.file_page_ref.clone();
 
@@ -1193,7 +1247,7 @@ mod tests {
 
         // pin for write and hold it
         let mut pinned_w = cache.pin_write(&id).expect("pin_write failed (holder)");
-        pinned_w.page_mut()[0..8].copy_from_slice(&0xDEADu64.to_be_bytes());
+        pinned_w.write_at(0, 0xDEADu64.to_be_bytes().to_vec());
 
         // spawn free_page which should block until we drop `pinned_w`
         let cache_cl = cache.clone();
@@ -1411,7 +1465,7 @@ mod tests {
 
         {
             let mut w = cache.pin_write(&id).expect("pin_write failed");
-            w.page_mut()[0..8].copy_from_slice(&0xDEADu64.to_be_bytes());
+            w.write_at(0, 0xDEADu64.to_be_bytes().to_vec());
         }
 
         drop(cache);
@@ -1534,7 +1588,7 @@ mod tests {
         // Write to page (make it dirty)
         {
             let mut w = cache.pin_write(&id).expect("pin_write");
-            w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+            w.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
         }
 
         // Verify it's dirty and cached
@@ -1589,7 +1643,7 @@ mod tests {
 
         // Pin the page for write and make it dirty
         let mut w = cache.pin_write(&id).expect("pin_write");
-        w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+        w.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
 
         // While still holding the write lock, remove all pages from this file
         cache
@@ -1601,7 +1655,7 @@ mod tests {
         assert!(!cache.lru.read().contains(&id));
 
         // Continue modifying the page while holding the frame
-        w.page_mut()[8..16].copy_from_slice(&0xDEADu64.to_be_bytes());
+        w.write_at(8, 0xDEADu64.to_be_bytes().to_vec());
 
         // Drop the write lock
         drop(w);
@@ -1648,11 +1702,11 @@ mod tests {
         // Load pages and modify them
         {
             let mut w1 = cache.pin_write(&id1).expect("pin_write id1");
-            w1.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+            w1.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
         }
         {
             let mut w2 = cache.pin_write(&id2).expect("pin_write id2");
-            w2.page_mut()[0..8].copy_from_slice(&0xDEADu64.to_be_bytes());
+            w2.write_at(0, 0xDEADu64.to_be_bytes().to_vec());
         }
 
         // Remove file (should flush)
@@ -1699,11 +1753,11 @@ mod tests {
         // Modify both pages
         {
             let mut w1 = cache.pin_write(&id1).expect("pin_write id1");
-            w1.page_mut()[0..8].copy_from_slice(&0xAAAAu64.to_be_bytes());
+            w1.write_at(0, 0xAAAAu64.to_be_bytes().to_vec());
         }
         {
             let mut w2 = cache.pin_write(&id2).expect("pin_write id2");
-            w2.page_mut()[0..8].copy_from_slice(&0xBBBBu64.to_be_bytes());
+            w2.write_at(0, 0xBBBBu64.to_be_bytes().to_vec());
         }
 
         // Remove file1 WITH flushing
@@ -1750,7 +1804,7 @@ mod tests {
 
         // Pin the page for write and modify it
         let mut w = cache.pin_write(&id).expect("pin_write");
-        w.page_mut()[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes());
+        w.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
 
         // Spawn thread to remove file (should block until we release the write lock)
         let cache_cl = cache.clone();

@@ -218,14 +218,6 @@ where
         Ok(self.slotted_page.get_header()?)
     }
 
-    fn get_base_header(&self) -> Result<&SlottedPageBaseHeader, BTreeNodeError> {
-        Ok(self.get_btree_header()?.base())
-    }
-
-    fn has_deleted_slots(&self) -> Result<bool, BTreeNodeError> {
-        Ok(self.get_base_header()?.base().has_free_slot())
-    }
-
     /// Finds a new mid for binary search in the case where the slot in the base mid (left + right / 2)
     /// is deleted. Can return None if every node is deleted.
     fn find_new_mid(&self, mid: u16, left: u16, right: u16) -> Result<Option<u16>, BTreeNodeError> {
@@ -262,8 +254,13 @@ where
     Page: PageRead + PageWrite,
     Header: SlottedPageHeader,
 {
+    /// IMPORTANT: After header is modified remember to call [`BTreeNode::mark_btree_header_diff`].
     fn get_btree_header_mut(&mut self) -> Result<&mut Header, BTreeNodeError> {
         Ok(self.slotted_page.get_header_mut()?)
+    }
+
+    fn mark_btree_header_diff(&mut self) {
+        self.slotted_page.mark_header_diff();
     }
 
     pub fn batch_insert(&mut self, insert_values: Vec<Vec<u8>>) -> Result<(), BTreeNodeError> {
@@ -448,29 +445,6 @@ where
     pub(crate) fn will_not_underflow_after_delete(&self) -> Result<bool, BTreeNodeError> {
         Ok(self.slotted_page.fraction_filled()? > Self::UNDERFLOW_BOUNDARY + 0.05)
     }
-
-    /// Returns the first (smallest) key in this internal node without removing it.
-    pub(crate) fn get_first_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
-        let (_, record) = self.slotted_page.read_first_non_deleted_record()?;
-        let key_bytes_end = record.len() - size_of::<PageId>();
-        Ok(record[..key_bytes_end].to_vec())
-    }
-
-    /// Returns the last (largest) key in this internal node without removing it.
-    pub(crate) fn get_last_key(&self) -> Result<Vec<u8>, BTreeNodeError> {
-        let (_, record) = self.slotted_page.read_last_non_deleted_record()?;
-        let key_bytes_end = record.len() - size_of::<PageId>();
-        Ok(record[..key_bytes_end].to_vec())
-    }
-
-    /// Returns the last (largest) key and its child pointer without removing.
-    pub(crate) fn get_last_key_and_child(&self) -> Result<(Vec<u8>, PageId), BTreeNodeError> {
-        let (_, record) = self.slotted_page.read_last_non_deleted_record()?;
-        let key_bytes_end = record.len() - size_of::<PageId>();
-        let key = record[..key_bytes_end].to_vec();
-        let (child_ptr, _) = PageId::deserialize(&record[key_bytes_end..])?;
-        Ok((key, child_ptr))
-    }
 }
 
 impl<Page> BTreeNode<Page, BTreeInternalHeader>
@@ -515,12 +489,6 @@ where
         new_child_id.serialize(&mut buffer);
         let insert_result = self.slotted_page.insert_at(&buffer, position)?;
         self.handle_insert_result(insert_result, &buffer, position)
-    }
-
-    pub fn set_leftmost_child_id(&mut self, child_id: PageId) -> Result<(), BTreeNodeError> {
-        let header = self.get_btree_header_mut()?;
-        header.leftmost_child_pointer = child_id;
-        Ok(())
     }
 
     /// Updates the separator key at the given slot index while preserving the child pointer.
@@ -604,6 +572,7 @@ where
 
         self.slotted_page.delete(slot_id)?;
         self.get_btree_header_mut()?.leftmost_child_pointer = new_leftmost;
+        self.mark_btree_header_diff();
 
         Ok((key, old_leftmost))
     }
@@ -630,6 +599,7 @@ where
     ) -> Result<NodeInsertResult, BTreeNodeError> {
         let old_leftmost = self.get_btree_header()?.leftmost_child_pointer;
         self.get_btree_header_mut()?.leftmost_child_pointer = new_leftmost;
+        self.mark_btree_header_diff();
 
         // Insert the key with old_leftmost as its child pointer
         // Since this key should be smaller than all existing keys, it goes at position 0
@@ -813,6 +783,7 @@ where
             Some(next_leaf) => header.next_leaf_pointer = next_leaf,
             None => header.next_leaf_pointer = BTreeLeafHeader::NO_NEXT_LEAF,
         };
+        self.mark_btree_header_diff();
         Ok(())
     }
 
@@ -949,6 +920,13 @@ mod test {
     impl PageWrite for TestPage {
         fn data_mut(&mut self) -> &mut [u8] {
             &mut self.data
+        }
+
+        fn mark_diff(&mut self, _: u16, _: u16) {}
+
+        fn write_at(&mut self, offset: u16, data: Vec<u8>) {
+            let end = offset as usize + data.len();
+            self.data[offset as usize..end].copy_from_slice(&data);
         }
     }
 
@@ -1379,19 +1357,6 @@ mod test {
 
         node.set_next_leaf_id(None).unwrap();
         assert_eq!(node.next_leaf_id().unwrap(), None);
-    }
-
-    #[test]
-    fn test_internal_leftmost_child() {
-        let page = TestPage::new(PAGE_SIZE);
-        let mut node = InternalNode::initialize(page, 100).unwrap();
-
-        let header = node.get_btree_header().unwrap();
-        assert_eq!(header.leftmost_child_pointer, 100);
-
-        node.set_leftmost_child_id(200).unwrap();
-        let header = node.get_btree_header().unwrap();
-        assert_eq!(header.leftmost_child_pointer, 200);
     }
 
     #[test]

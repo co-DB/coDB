@@ -58,9 +58,8 @@ impl BTreeMetadata {
     }
 
     fn save_to_page(&self, page: &mut impl PageWrite) {
-        let metadata = BTreeMetadata::new(self.root_page_id);
-        let metadata_bytes = bytemuck::bytes_of(&metadata);
-        page.data_mut()[0..metadata_bytes.len()].copy_from_slice(metadata_bytes);
+        let metadata_bytes = bytemuck::bytes_of(self);
+        page.write_at(0, metadata_bytes.to_vec());
     }
 }
 
@@ -831,15 +830,8 @@ impl BTree {
         new_root.insert(separator_key.as_slice(), right_child_id)?;
 
         // Update the metadata to point to the new root
-        let metadata_bytes = &mut metadata_page.page_mut()[0..size_of::<BTreeMetadata>()];
-        let metadata =
-            bytemuck::try_from_bytes_mut::<BTreeMetadata>(metadata_bytes).map_err(|e| {
-                BTreeError::CorruptMetadata {
-                    reason: e.to_string(),
-                }
-            })?;
-
-        metadata.root_page_id = new_root_id;
+        let metadata = BTreeMetadata::new(new_root_id);
+        metadata.save_to_page(&mut metadata_page);
 
         Ok(())
     }
@@ -1406,15 +1398,9 @@ impl BTree {
 
             self.update_structural_version(child_id);
 
-            let metadata_bytes = &mut metadata_page.page_mut()[0..size_of::<BTreeMetadata>()];
-            let metadata =
-                bytemuck::try_from_bytes_mut::<BTreeMetadata>(metadata_bytes).map_err(|e| {
-                    BTreeError::CorruptMetadata {
-                        reason: e.to_string(),
-                    }
-                })?;
+            let metadata = BTreeMetadata::new(child_id);
+            metadata.save_to_page(&mut metadata_page);
 
-            metadata.root_page_id = child_id;
             self.free_page(root_latch.page_id)?;
         }
 
@@ -1601,7 +1587,7 @@ mod test {
         let (cache, file_key, _temp_dir) = setup_test_cache();
         let btree = create_empty_btree(cache, file_key).unwrap();
 
-        assert!(matches!(search_to_option(&btree, &key_i32(42)), None));
+        assert!(search_to_option(&btree, &key_i32(42)).is_none());
     }
 
     #[test]
@@ -1920,7 +1906,7 @@ mod test {
         let reader = {
             let btree = btree.clone();
             thread::spawn(move || {
-                for i in 0..200 {
+                for _ in 0..200 {
                     let key_val = rand::random::<u16>() as i32 / 2;
                     search_to_option(&btree, &key_i32(key_val));
                 }

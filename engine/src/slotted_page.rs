@@ -9,6 +9,9 @@ use thiserror::Error;
 /// Helper trait meant for structs implementing SlottedPageHeader trait. Making implementing it
 /// compulsory should help remind to use #[repr(C)] for those structs (there is no way to ensure
 /// that it is used otherwise)
+///
+/// # Safety
+/// User must guarantee that the struct actually has #[repr(C)].
 pub(crate) unsafe trait ReprC {}
 
 /// Magic number for assuring the page is initialized
@@ -95,10 +98,6 @@ impl SlottedPageBaseHeader {
 
     pub fn has_free_slot(&self) -> bool {
         self.first_free_slot != Self::NO_FREE_SLOTS
-    }
-
-    pub fn has_free_block(&self) -> bool {
-        self.first_free_block_offset != Self::NO_FREE_SLOTS
     }
 
     pub fn new(header_size: u16, page_type: PageType) -> Self {
@@ -419,7 +418,7 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     ) -> Result<impl Iterator<Item = SlotId>, SlottedPageError> {
         Ok(self
             .get_slots()?
-            .into_iter()
+            .iter()
             .enumerate()
             .filter_map(|(id, slot)| match slot.is_deleted() {
                 true => None,
@@ -535,7 +534,7 @@ impl<P: PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     pub fn initialize_with_header(page: P, header: H) -> Result<Self, SlottedPageError> {
         let mut page = page;
-        page.data_mut()[0..size_of::<H>()].copy_from_slice(bytemuck::bytes_of(&header));
+        page.write_at(0, bytemuck::bytes_of(&header).to_vec());
 
         let ty = header.base().page_type()?;
         let allow_slot_compaction = ty.allow_slot_compaction();
@@ -557,6 +556,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
     /// Generic method to cast page header to any type implementing SlottedPageHeader
     ///
     /// Caller must ensure T matches the actual header type stored in the page
+    ///
+    /// IMPORTANT: After header is modified remember to call [`SlottedPage::mark_header_diff`].
     fn get_generic_header_mut<T>(&mut self) -> Result<&mut T, SlottedPageError>
     where
         T: SlottedPageHeader,
@@ -566,13 +567,25 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         )?)
     }
 
+    /// Gets a mutable reference to header.
+    ///
+    /// IMPORTANT: After header is modified remember to call [`SlottedPage::mark_header_diff`].
     pub fn get_header_mut(&mut self) -> Result<&mut H, SlottedPageError> {
         self.get_generic_header_mut::<H>()
     }
 
     /// Gets a mutable reference to base header (common to all slotted pages).
+    ///
+    /// IMPORTANT: After header is modified remember to call [`SlottedPage::mark_header_diff`].
     pub fn get_base_header_mut(&mut self) -> Result<&mut SlottedPageBaseHeader, SlottedPageError> {
         self.get_generic_header_mut::<SlottedPageBaseHeader>()
+    }
+
+    /// Marks whole header as new diff.
+    ///
+    /// Should be used after modifying header using [`PageWrite::data_mut`].
+    pub fn mark_header_diff(&mut self) {
+        self.page.mark_diff(0, size_of::<H>() as u16);
     }
 
     /// Updates the record at given position.
@@ -601,12 +614,14 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
             let updated_slot = self.get_slot_mut(slot_id)?;
             updated_slot.len = new_len;
+            self.mark_slot_diff(slot_id)?;
 
             let leftover = old_len - new_len;
             self.add_freeblock(old_offset + new_len, leftover)?;
 
             let header = self.get_base_header_mut()?;
             header.total_free_space += leftover;
+            self.mark_header_diff();
 
             return Ok(UpdateResult::Success);
         }
@@ -629,10 +644,12 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         self.add_freeblock(old_offset, old_len)?;
         let header = self.get_base_header_mut()?;
         header.total_free_space += old_len;
+        self.mark_header_diff();
 
         let updated_slot = self.get_slot_mut(slot_id)?;
         updated_slot.offset = offset;
         updated_slot.len = new_len;
+        self.mark_slot_diff(slot_id)?;
 
         Ok(UpdateResult::Success)
     }
@@ -653,9 +670,11 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         let old_record_len = slot.len;
         slot.mark_deleted();
+        self.mark_slot_diff(slot_id)?;
 
         let header = self.get_base_header_mut()?;
         header.total_free_space += old_record_len;
+        // Note: we don't call `mark_header_diff` here, because it's called inside `compact_records`.
 
         self.compact_records()?;
 
@@ -670,6 +689,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         slot.offset = offset;
         slot.len = updated_record.len() as u16;
         slot.flags = 0;
+        self.mark_slot_diff(slot_id)?;
 
         Ok(UpdateResult::Success)
     }
@@ -686,6 +706,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         slot.mark_deleted();
         slot.set_next_free_slot(next_free_slot);
+        self.mark_slot_diff(slot_id)?;
 
         // copy slot to handle borrow checker complaints
         let copied_slot = *self.get_slot(slot_id)?;
@@ -701,6 +722,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         } else {
             self.add_freeblock(copied_slot.offset, copied_slot.len)?;
         }
+        self.mark_header_diff();
 
         Ok(())
     }
@@ -719,8 +741,6 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         let next_block_offset = self.get_base_header()?.first_free_block_offset;
 
-        let page = self.page.data_mut();
-
         let new_freeblock = FreeBlock {
             len,
             next_block_offset,
@@ -728,9 +748,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         };
 
         let aligned_offset = Self::calculate_free_block_aligned_offset(offset);
-        let start = aligned_offset as usize;
-        let end = start + FreeBlock::SIZE;
-        page[start..end].copy_from_slice(bytemuck::bytes_of(&new_freeblock));
+        self.page
+            .write_at(aligned_offset, bytemuck::bytes_of(&new_freeblock).to_vec());
 
         self.get_base_header_mut()?.first_free_block_offset = aligned_offset;
 
@@ -786,19 +805,17 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             header_mut.contiguous_free_space -= Slot::SIZE as u16;
         }
 
+        self.mark_header_diff();
+
         Ok(InsertResult::Success(position))
     }
 
     /// Writes a slot to the slot directory at a given position.
     fn write_slot_at(&mut self, position: SlotId, slot: Slot) -> Result<(), SlottedPageError> {
         let header_size = self.get_base_header()?.header_size as usize;
-        let page = self.page.data_mut();
-
-        let start = header_size + position as usize * Slot::SIZE;
-        let end = start + Slot::SIZE;
-
-        page[start..end].copy_from_slice(bytemuck::bytes_of(&slot));
-
+        let start = (header_size + position as usize * Slot::SIZE) as u16;
+        self.page
+            .write_at(start, bytemuck::bytes_of(&slot).to_vec());
         Ok(())
     }
 
@@ -814,10 +831,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         }
         let start = header.header_size as usize + position as usize * Slot::SIZE;
         let end = start + shifted_slots_num as usize * Slot::SIZE;
-
-        let page = self.page.data_mut();
-
-        page.copy_within(start..end, start + Slot::SIZE);
+        let data = self.page.data()[start..end].to_vec();
+        self.page.write_at((start + Slot::SIZE) as u16, data);
 
         Ok(())
     }
@@ -843,10 +858,12 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
                 } else {
                     self.get_slot_mut(prev)?
                         .set_next_free_slot(next_free_slot_id);
+                    self.mark_slot_diff(prev)?;
                 }
 
                 let removed_slot = self.get_slot_mut(slot_id)?;
                 removed_slot.set_next_free_slot(Slot::NO_FREE_SLOTS);
+                self.mark_slot_diff(slot_id)?;
 
                 return Ok(());
             }
@@ -887,6 +904,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
         // Increment valid slot count after successful insert
         self.get_base_header_mut()?.num_used_slots += 1;
+        self.mark_header_diff();
 
         Ok(InsertResult::Success(slot_id))
     }
@@ -925,9 +943,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 
     /// Writes record bytes into the page at the given offset.
     fn write_record_at(&mut self, record: &[u8], offset: u16) {
-        let start = offset as usize;
-        let end = start + record.len();
-        self.page.data_mut()[start..end].copy_from_slice(record)
+        self.page.write_at(offset, record.to_vec());
     }
 
     /// Allocates space for a record of length `record_len`.
@@ -993,9 +1009,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
                 actual_offset: new_freeblock_actual_offset,
             };
 
-            let start = aligned_offset as usize;
-            let end = start + FreeBlock::SIZE;
-            self.page.data_mut()[start..end].copy_from_slice(bytemuck::bytes_of(&new_freeblock));
+            self.page
+                .write_at(aligned_offset, bytemuck::bytes_of(&new_freeblock).to_vec());
 
             // we store the aligned offset in the free block linked list so we can read the free block
             // without calculating aligned version of it every time.
@@ -1023,6 +1038,8 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
                     [prev_offset as usize..prev_offset as usize + FreeBlock::SIZE],
             )?;
             prev.next_block_offset = new_next;
+            self.page
+                .mark_diff(prev_offset, prev_offset + FreeBlock::SIZE as u16);
         }
         Ok(())
     }
@@ -1053,17 +1070,9 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(None)
     }
 
-    /// Returns a mutable slice of all slots.
-    fn get_slots_mut(&mut self) -> Result<&mut [Slot], SlottedPageError> {
-        let header = self.get_base_header()?;
-        let start = header.header_size as usize;
-        let end = start + (header.num_slots as usize * Slot::SIZE);
-        Ok(bytemuck::try_cast_slice_mut(
-            &mut self.page.data_mut()[start..end],
-        )?)
-    }
-
     /// Returns a mutable reference to a specific slot.
+    ///
+    /// IMPORTANT: After modifying a slot remember to call [`SlottedPage::mark_slot_diff`] or [`SlottedPage::mark_all_slots_diff`].
     fn get_slot_mut(&mut self, slot_id: SlotId) -> Result<&mut Slot, SlottedPageError> {
         let header = self.get_base_header()?;
         let start = header.header_size as usize + slot_id as usize * Slot::SIZE;
@@ -1071,6 +1080,28 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         Ok(bytemuck::try_from_bytes_mut(
             &mut self.page.data_mut()[start..end],
         )?)
+    }
+
+    /// Marks slot as new diff.
+    ///
+    /// Should be used after using [`SlottedPage::get_slot_mut`].
+    fn mark_slot_diff(&mut self, slot_id: SlotId) -> Result<(), SlottedPageError> {
+        let header = self.get_base_header()?;
+        let start = header.header_size + slot_id * Slot::SIZE as u16;
+        let end = start + Slot::SIZE as u16;
+        self.page.mark_diff(start, end);
+        Ok(())
+    }
+
+    /// Marks all slots as new diff.
+    ///
+    /// Should be used after using [`SlottedPage::get_slot_mut`] on many slots.
+    fn mark_all_slots_diff(&mut self) -> Result<(), SlottedPageError> {
+        let header = self.get_base_header()?;
+        let start = header.header_size;
+        let end = start + header.num_slots * Slot::SIZE as u16;
+        self.page.mark_diff(start, end);
+        Ok(())
     }
 
     /// Compacts the slot directory by removing deleted slots and shifting
@@ -1104,15 +1135,14 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         let deleted_count = slots.len() - filled_count;
         let freed_space = deleted_count * Slot::SIZE;
 
-        let page = self.page.data_mut();
-
         // Compact slots by moving filled ones toward the start.
         for (dst_i, src_i) in filled_slots.into_iter().enumerate() {
             let copy_location = header_size + dst_i * Slot::SIZE;
             let src_start = header_size + src_i * Slot::SIZE;
             let src_end = src_start + Slot::SIZE;
 
-            page.copy_within(src_start..src_end, copy_location);
+            let data = self.page.data()[src_start..src_end].to_vec();
+            self.page.write_at(copy_location as u16, data);
         }
 
         let header = self.get_base_header_mut()?;
@@ -1121,6 +1151,7 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
         header.total_free_space += freed_space as u16;
         header.contiguous_free_space += freed_space as u16;
         header.first_free_slot = SlottedPageBaseHeader::NO_FREE_SLOTS;
+        self.mark_header_diff();
         Ok(())
     }
 
@@ -1150,15 +1181,19 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
             }
 
             let record_range = slot.offset as usize..slot.offset as usize + slot.len as usize;
+            let record = self.page.data()[record_range].to_vec();
 
             // Move record into new compacted position and update its corresponding slot to new offset
-            self.page.data_mut().copy_within(record_range, write_pos);
+            self.page.write_at(write_pos as u16, record);
             self.get_slot_mut(idx as u16)?.offset = write_pos as u16;
         }
+        self.mark_all_slots_diff()?;
+
         let header = self.get_base_header_mut()?;
         header.record_area_offset = write_pos as u16;
         header.contiguous_free_space = write_pos as u16 - header.free_space_start();
         header.first_free_block_offset = SlottedPageBaseHeader::NO_FREE_BLOCKS;
+        self.mark_header_diff();
         Ok(())
     }
 }
@@ -1166,19 +1201,63 @@ impl<P: PageWrite + PageRead, H: SlottedPageHeader> SlottedPage<P, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     const PAGE_SIZE: usize = 4096;
 
     // Simple page for testing with configurable size
     struct TestPage {
         data: Vec<u8>,
+        /// Track all diffs marked on this page for testing purposes
+        diffs: BTreeMap<u16, u16>,
     }
 
     impl TestPage {
         fn new(size: usize) -> Self {
             Self {
                 data: vec![0; size],
+                diffs: BTreeMap::new(),
             }
+        }
+
+        /// Check if a diff was marked for the given range (from..to)
+        fn has_diff(&self, from: u16, to: u16) -> bool {
+            // Check if there's any diff that covers [from, to)
+            for (&diff_start, &diff_end) in &self.diffs {
+                if diff_start <= from && to <= diff_end {
+                    return true;
+                }
+            }
+            false
+        }
+
+        /// Check if a diff was marked that covers the header
+        fn has_header_diff(&self) -> bool {
+            self.has_diff(0, size_of::<SlottedPageBaseHeader>() as u16)
+        }
+
+        /// Check if a diff was marked for the given slot
+        fn has_slot_diff(&self, slot_id: SlotId) -> bool {
+            let header_size = size_of::<SlottedPageBaseHeader>() as u16;
+            let slot_start = header_size + slot_id * Slot::SIZE as u16;
+            let slot_end = slot_start + Slot::SIZE as u16;
+            self.has_diff(slot_start, slot_end)
+        }
+
+        /// Check if diffs were marked for all slots
+        fn has_all_slots_diff(&self, num_slots: u16) -> bool {
+            if num_slots == 0 {
+                return true;
+            }
+            let header_size = size_of::<SlottedPageBaseHeader>() as u16;
+            let slots_start = header_size;
+            let slots_end = header_size + num_slots * Slot::SIZE as u16;
+            self.has_diff(slots_start, slots_end)
+        }
+
+        /// Clear all tracked diffs
+        fn clear_diffs(&mut self) {
+            self.diffs.clear();
         }
     }
 
@@ -1191,6 +1270,34 @@ mod tests {
     impl PageWrite for TestPage {
         fn data_mut(&mut self) -> &mut [u8] {
             &mut self.data
+        }
+
+        fn mark_diff(&mut self, from: u16, to: u16) {
+            // Merge overlapping/adjacent diffs
+            let mut new_start = from;
+            let mut new_end = to;
+            let mut to_remove = vec![];
+
+            for (&diff_start, &diff_end) in &self.diffs {
+                // Check if ranges overlap or are adjacent
+                if diff_end >= new_start && diff_start <= new_end {
+                    new_start = new_start.min(diff_start);
+                    new_end = new_end.max(diff_end);
+                    to_remove.push(diff_start);
+                }
+            }
+
+            for key in to_remove {
+                self.diffs.remove(&key);
+            }
+
+            self.diffs.insert(new_start, new_end);
+        }
+
+        fn write_at(&mut self, offset: u16, data: Vec<u8>) {
+            let end = offset as usize + data.len();
+            self.data[offset as usize..end].copy_from_slice(&data);
+            self.mark_diff(offset, offset + data.len() as u16);
         }
     }
 
@@ -2196,5 +2303,257 @@ mod tests {
         page.compact_slots().unwrap();
         assert_eq!(page.num_used_slots().unwrap(), 8);
         assert_eq!(page.num_slots().unwrap(), 8);
+    }
+
+    #[test]
+    fn test_insert_marks_header_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.page.clear_diffs();
+
+        page.insert(b"test_data").unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "insert() should mark header as modified"
+        );
+    }
+
+    #[test]
+    fn test_insert_at_marks_only_shifted_slots() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        // Insert some records to have slots before the insertion point
+        page.insert(b"slot0").unwrap();
+        page.insert(b"slot1").unwrap();
+        page.insert(b"slot2").unwrap();
+        page.insert(b"slot3").unwrap();
+        page.insert(b"slot4").unwrap();
+
+        page.page.clear_diffs();
+
+        // Insert at position 2 - this should shift slots 2, 3, 4 to positions 3, 4, 5
+        page.insert_at(b"new_slot", 2).unwrap();
+
+        // Header should be marked
+        assert!(
+            page.page.has_header_diff(),
+            "insert_at() should mark header as modified"
+        );
+
+        // Slots 0 and 1 should NOT be marked (they weren't touched)
+        assert!(
+            !page.page.has_slot_diff(0),
+            "slot 0 should NOT be marked (not shifted)"
+        );
+        assert!(
+            !page.page.has_slot_diff(1),
+            "slot 1 should NOT be marked (not shifted)"
+        );
+
+        // The newly written slot and all shifted slots (2, 3, 4, 5) should be marked
+        // Since shift_slots_right writes slots 2,3,4 to positions 3,4,5
+        // and then we write the new slot at position 2
+        // We need to check if positions 2-5 were marked
+        let num_slots = page.num_slots().unwrap();
+        assert_eq!(num_slots, 6, "should have 6 slots after insertion");
+
+        // Check that slots from insertion point onwards are marked
+        for slot_id in 2..num_slots {
+            assert!(
+                page.page.has_slot_diff(slot_id),
+                "slot {} should be marked (shifted or newly written)",
+                slot_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_marks_header_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"original").unwrap();
+
+        page.page.clear_diffs();
+
+        // Update with smaller record
+        page.update(0, b"new").unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "update() should mark header as modified"
+        );
+    }
+
+    #[test]
+    fn test_update_with_same_size_marks_slot_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"12345").unwrap();
+
+        page.page.clear_diffs();
+
+        // Update with same size
+        page.update(0, b"abcde").unwrap();
+
+        assert!(
+            page.page.has_slot_diff(0),
+            "update() should mark slot as modified when updating in place"
+        );
+    }
+
+    #[test]
+    fn test_defragment_and_update_marks_header_and_slots() {
+        let mut page = create_test_page(200);
+        page.insert(&[1u8; 50]).unwrap();
+        page.insert(&[2u8; 50]).unwrap();
+        page.delete(0).unwrap();
+
+        page.page.clear_diffs();
+
+        page.defragment_and_update(1, &[3u8; 80]).unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "defragment_and_update() should mark header as modified"
+        );
+
+        // Should mark slots because compaction updates slot offsets
+        let num_slots = page.num_slots().unwrap();
+        assert!(
+            page.page.has_all_slots_diff(num_slots),
+            "defragment_and_update() should mark all slots due to compaction"
+        );
+    }
+
+    #[test]
+    fn test_delete_marks_header_and_slot_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"to_delete").unwrap();
+
+        page.page.clear_diffs();
+
+        page.delete(0).unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "delete() should mark header as modified"
+        );
+
+        assert!(
+            page.page.has_slot_diff(0),
+            "delete() should mark the deleted slot as modified"
+        );
+    }
+
+    #[test]
+    fn test_compact_slots_marks_header_and_all_slots_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"keep1").unwrap();
+        page.insert(b"delete").unwrap();
+        page.insert(b"keep2").unwrap();
+        page.delete(1).unwrap();
+
+        let num_slots_before = page.num_slots().unwrap();
+        page.page.clear_diffs();
+
+        page.compact_slots().unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "compact_slots() should mark header as modified"
+        );
+
+        // Should mark all remaining slots
+        let num_slots_after = page.num_slots().unwrap();
+        assert!(
+            page.page.has_all_slots_diff(num_slots_after),
+            "compact_slots() should mark all slots as modified"
+        );
+
+        assert!(
+            num_slots_after < num_slots_before,
+            "compact_slots() should reduce number of slots"
+        );
+    }
+
+    #[test]
+    fn test_compact_records_marks_header_and_slots_diff() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(&[1u8; 50]).unwrap();
+        page.insert(&[2u8; 50]).unwrap();
+        page.insert(&[3u8; 50]).unwrap();
+        page.delete(1).unwrap();
+
+        page.page.clear_diffs();
+
+        page.compact_records().unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "compact_records() should mark header as modified"
+        );
+
+        let num_slots = page.num_slots().unwrap();
+        assert!(
+            page.page.has_all_slots_diff(num_slots),
+            "compact_records() should mark all slots as modified (offsets change)"
+        );
+    }
+
+    #[test]
+    fn test_multiple_operations_track_diffs_correctly() {
+        let mut page = create_test_page(PAGE_SIZE);
+
+        // Insert and verify diff
+        page.page.clear_diffs();
+        page.insert(b"first").unwrap();
+        assert!(page.page.has_header_diff());
+
+        // Insert again and verify diff
+        page.page.clear_diffs();
+        page.insert(b"second").unwrap();
+        assert!(page.page.has_header_diff());
+
+        // Delete and verify diffs
+        page.page.clear_diffs();
+        page.delete(0).unwrap();
+        assert!(page.page.has_header_diff());
+        assert!(page.page.has_slot_diff(0));
+
+        // Update and verify diff
+        page.page.clear_diffs();
+        page.update(1, b"updated").unwrap();
+        assert!(page.page.has_header_diff());
+    }
+
+    #[test]
+    fn test_insert_at_beginning_marks_all_slots() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"second").unwrap();
+        page.insert(b"third").unwrap();
+
+        page.page.clear_diffs();
+
+        page.insert_at(b"first", 0).unwrap();
+
+        let num_slots = page.num_slots().unwrap();
+        assert!(
+            page.page.has_all_slots_diff(num_slots),
+            "insert_at(0) should mark all slots as they all shift"
+        );
+    }
+
+    #[test]
+    fn test_insert_at_end_marks_header() {
+        let mut page = create_test_page(PAGE_SIZE);
+        page.insert(b"first").unwrap();
+
+        page.page.clear_diffs();
+
+        let pos = page.num_slots().unwrap();
+        page.insert_at(b"second", pos).unwrap();
+
+        assert!(
+            page.page.has_header_diff(),
+            "insert_at(end) should mark header"
+        );
     }
 }

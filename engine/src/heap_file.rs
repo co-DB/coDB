@@ -32,7 +32,7 @@ use types::{
 use storage::{
     cache::{Cache, CacheError, FilePageRef, PageRead, PageWrite, PinnedReadPage, PinnedWritePage},
     files_manager::FileKey,
-    paged_file::{PAGE_SIZE, Page, PageId, PagedFileError},
+    paged_file::{PAGE_SIZE, PageId, PagedFileError},
 };
 
 /// Free-space map for a HeapFile.
@@ -373,14 +373,20 @@ struct MetadataRepr {
 }
 
 impl MetadataRepr {
-    fn load_from_page(page: &Page) -> Result<Self, HeapFileError> {
+    fn load_from_page(page: &impl PageRead) -> Result<Self, HeapFileError> {
         let metadata_size = size_of::<MetadataRepr>();
-        let metadata = bytemuck::try_from_bytes(&page[..metadata_size]).map_err(|err| {
+        let data = page.data();
+        let metadata = bytemuck::try_from_bytes(&data[..metadata_size]).map_err(|err| {
             HeapFileError::InvalidMetadataPage {
                 error: err.to_string(),
             }
         })?;
         Ok(*metadata)
+    }
+
+    fn write_to_page(&self, page: &mut impl PageWrite) {
+        let bytes = bytemuck::bytes_of(self);
+        page.write_at(0, bytes.to_vec());
     }
 }
 
@@ -1226,8 +1232,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 let key = self.file_page_ref(Self::METADATA_PAGE_ID);
                 let mut page = self.cache.pin_write(&key)?;
                 let repr = MetadataRepr::from(&self.metadata);
-                let bytes = bytemuck::bytes_of(&repr);
-                page.page_mut()[..size_of::<MetadataRepr>()].copy_from_slice(bytes);
+                repr.write_to_page(&mut page);
                 Ok(())
             }
             Err(_) => {
@@ -2097,7 +2102,7 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
         let key = self.file_page_ref(HeapFile::<BUCKETS_COUNT>::METADATA_PAGE_ID);
         match self.cache.pin_read(&key) {
             Ok(page) => {
-                let metadata = MetadataRepr::load_from_page(page.page())?;
+                let metadata = MetadataRepr::load_from_page(&page)?;
                 Ok(metadata)
             }
             Err(e) => {
@@ -2125,9 +2130,7 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
                         first_record_page: record_page_id,
                         first_overflow_page: overflow_page_id,
                     };
-
-                    let bytes = bytemuck::bytes_of(&repr);
-                    metadata_page.page_mut()[..size_of::<MetadataRepr>()].copy_from_slice(bytes);
+                    repr.write_to_page(&mut metadata_page);
 
                     Ok(repr)
                 } else {
@@ -4440,7 +4443,7 @@ mod tests {
         // Read metadata directly from disk to verify it was written
         let metadata_page_ref = heap_file.file_page_ref(HeapFile::<4>::METADATA_PAGE_ID);
         let metadata_page = cache.pin_read(&metadata_page_ref).unwrap();
-        let disk_metadata = MetadataRepr::load_from_page(metadata_page.page()).unwrap();
+        let disk_metadata = MetadataRepr::load_from_page(&metadata_page).unwrap();
 
         assert_eq!(disk_metadata.first_record_page, first_record_page);
         assert_eq!(disk_metadata.first_overflow_page, first_overflow_page);
@@ -6432,5 +6435,101 @@ mod tests {
         }
 
         println!("\n=== Test Passed ===");
+    }
+
+    /// Mock page that tracks diffs for testing
+    struct MockPageWithDiffTracking {
+        data: Vec<u8>,
+        diffs: Vec<(u16, u16)>, // (from, to) ranges
+    }
+
+    impl MockPageWithDiffTracking {
+        fn new(size: usize) -> Self {
+            Self {
+                data: vec![0; size],
+                diffs: Vec::new(),
+            }
+        }
+
+        fn has_diff(&self, from: u16, to: u16) -> bool {
+            // Check if the expected range is covered by any marked diff
+            self.diffs
+                .iter()
+                .any(|&(diff_from, diff_to)| diff_from <= from && to <= diff_to)
+        }
+    }
+
+    impl PageRead for MockPageWithDiffTracking {
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl PageWrite for MockPageWithDiffTracking {
+        fn data_mut(&mut self) -> &mut [u8] {
+            &mut self.data
+        }
+
+        fn mark_diff(&mut self, from: u16, to: u16) {
+            self.diffs.push((from, to));
+        }
+
+        fn write_at(&mut self, offset: u16, data: Vec<u8>) {
+            let end = offset as usize + data.len();
+            self.data[offset as usize..end].copy_from_slice(&data);
+            self.mark_diff(offset, offset + data.len() as u16);
+        }
+    }
+
+    #[test]
+    fn metadata_repr_write_to_page_marks_diff() {
+        let mut page = MockPageWithDiffTracking::new(PAGE_SIZE);
+
+        let metadata = MetadataRepr {
+            first_record_page: 42,
+            first_overflow_page: 123,
+        };
+
+        // Write metadata
+        metadata.write_to_page(&mut page);
+
+        // Verify diff was marked for the metadata region
+        let metadata_size = size_of::<MetadataRepr>();
+        assert!(
+            page.has_diff(0, metadata_size as u16),
+            "write_to_page should mark diff for the entire metadata structure"
+        );
+
+        // Verify exactly one diff was marked (from write_at call)
+        assert_eq!(
+            page.diffs.len(),
+            1,
+            "write_to_page should mark exactly one diff"
+        );
+
+        // Verify the diff covers the correct range
+        let (from, to) = page.diffs[0];
+        assert_eq!(from, 0, "Diff should start at offset 0");
+        assert_eq!(to, metadata_size as u16, "Diff should end at metadata size");
+    }
+
+    #[test]
+    fn metadata_repr_write_to_page_updates_data() {
+        let mut page = MockPageWithDiffTracking::new(PAGE_SIZE);
+
+        let metadata = MetadataRepr {
+            first_record_page: 0x12345678,
+            first_overflow_page: 0xABCDEF01,
+        };
+
+        metadata.write_to_page(&mut page);
+
+        // Verify the data was actually written
+        let read_back = MetadataRepr::load_from_page(&page).unwrap();
+        assert_eq!(read_back.first_record_page, metadata.first_record_page);
+        assert_eq!(read_back.first_overflow_page, metadata.first_overflow_page);
+
+        // Verify diff was marked
+        assert!(!page.diffs.is_empty(), "Diff should be marked");
     }
 }
