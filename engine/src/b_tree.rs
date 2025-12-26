@@ -157,14 +157,39 @@ impl PessimisticPath {
     }
 }
 
+trait Latch {
+    fn page_id(&self) -> PageId;
+    fn page(self) -> PinnedWritePage;
+}
+
 struct InternalNodeLatch {
     page_id: PageId,
     node: BTreeInternalNode<PinnedWritePage>,
 }
 
+impl Latch for InternalNodeLatch {
+    fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    fn page(self) -> PinnedWritePage {
+        self.node.into_page()
+    }
+}
+
 struct LeafNodeLatch {
     page_id: PageId,
     node: BTreeLeafNode<PinnedWritePage>,
+}
+
+impl Latch for LeafNodeLatch {
+    fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    fn page(self) -> PinnedWritePage {
+        self.node.into_page()
+    }
 }
 
 struct MergeContext {
@@ -1099,8 +1124,7 @@ impl BTree {
         ctx.parent_node.delete_at(slot_id)?;
         self.update_structural_version(ctx.parent_id);
 
-        drop(right_sibling_latch.node);
-        self.free_page(right_sibling_latch.page_id)?;
+        self.free_latch(right_sibling_latch)?;
 
         if ctx.parent_node.is_underflow()? {
             self.handle_internal_underflow(ctx)?;
@@ -1134,8 +1158,7 @@ impl BTree {
         ctx.parent_node.delete_at(slot_id)?;
         self.update_structural_version(ctx.parent_id);
 
-        drop(current_node_latch.node);
-        self.free_page(current_node_latch.page_id)?;
+        self.free_latch(current_node_latch)?;
 
         if ctx.parent_node.is_underflow()? {
             self.handle_internal_underflow(ctx)?;
@@ -1144,11 +1167,11 @@ impl BTree {
         Ok(())
     }
 
-    /// Frees the page at disk level and removes it from structural version numbers map.
-    fn free_page(&self, page_id: PageId) -> Result<(), BTreeError> {
-        self.structural_version_numbers.remove(&page_id);
-        let page_ref = self.page_ref(page_id);
-        Ok(self.cache.free_page(&page_ref)?)
+    /// Frees the latch's page at disk level and removes it from structural version numbers map.
+    fn free_latch(&self, latch: impl Latch) -> Result<(), BTreeError> {
+        self.structural_version_numbers.remove(&latch.page_id());
+        let page_ref = self.page_ref(latch.page_id());
+        Ok(self.cache.free_page(&page_ref, latch.page())?)
     }
 
     /// Takes care of restructuring an internal node if it has an underflow. Works similarly to
@@ -1380,7 +1403,7 @@ impl BTree {
 
         ctx.parent_node.delete_at(separator_slot)?;
         self.update_structural_version(ctx.parent_id);
-        self.free_page(right_sibling_latch.page_id)?;
+        self.free_latch(right_sibling_latch)?;
 
         if ctx.parent_node.is_underflow()? {
             return self.handle_internal_underflow(ctx);
@@ -1420,7 +1443,7 @@ impl BTree {
 
         ctx.parent_node.delete_at(separator_slot)?;
         self.update_structural_version(ctx.parent_id);
-        self.free_page(underflow_node_latch.page_id)?;
+        self.free_latch(underflow_node_latch)?;
 
         if ctx.parent_node.is_underflow()? {
             return self.handle_internal_underflow(ctx);
@@ -1444,7 +1467,7 @@ impl BTree {
             let metadata = BTreeMetadata::new(child_id);
             metadata.save_to_page(&mut metadata_page);
 
-            self.free_page(root_latch.page_id)?;
+            self.free_latch(root_latch)?;
         }
 
         Ok(())

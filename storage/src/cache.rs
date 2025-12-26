@@ -330,21 +330,18 @@ impl Cache {
         Ok((self.pin_write(&id)?, page_id))
     }
 
-    /// Remove page from file. If there is a lock on the frame this will block
-    /// until it gets the exclusive lock on the frame. Any changes made to the page
-    /// after calling this function will not be flushed to the disk.
-    pub fn free_page(&self, id: &FilePageRef) -> Result<(), CacheError> {
+    /// Remove page from file.
+    ///
+    /// `_page` is only passed to ensure we are the only one using this page and no other thread
+    /// can get it in the meantime.
+    pub fn free_page(&self, id: &FilePageRef, _page: PinnedWritePage) -> Result<(), CacheError> {
         let pf = self.files.get_or_open_new_file(&id.file_key)?;
         pf.lock().free_page(id.page_id)?;
         match self.frames.entry(id.clone()) {
             Entry::Occupied(occupied_entry) => {
                 // We hold exclusive lock on the key and remove it from the dashmap,
                 // so no other thread can get this key.
-                // Additionally, we get exclusive lock on the page in the frame to wait until all other threads stop working with the frame.
-                let frame = occupied_entry.remove();
-                let w = frame.write();
-                // We can drop it right away as now we are sure no other thread can access it now. We do not need to flush it first, as it will be discarded anyway (the page will be freed).
-                drop(w);
+                occupied_entry.remove();
                 self.lru.write().pop_entry(id);
 
                 Ok(())
@@ -648,9 +645,13 @@ impl BackgroundCacheCleaner {
             .collect();
 
         for key in keys_in_cache {
-            self.cache.remove_from_cache_if(&key, |key, frame| {
-                !frame.is_pinned() && !self.cache.lru.read().contains(key)
-            })?;
+            // Lock LRU, and only after lock frames.
+            // This way we have same order of locking as in try_evict_frame.
+            let lru_guard = self.cache.lru.read();
+            if !lru_guard.contains(&key) {
+                self.cache
+                    .remove_from_cache_if(&key, |_, frame| !frame.is_pinned())?;
+            }
         }
 
         Ok(())
@@ -1189,81 +1190,11 @@ mod tests {
             h.join().unwrap();
         }
 
+        let page = cache.pin_write(&id).unwrap();
+
         cache
-            .free_page(&id)
+            .free_page(&id, page)
             .expect("free_page failed in normal case");
-
-        assert!(cache.frames.is_empty());
-        assert!(cache.lru.read().is_empty());
-    }
-
-    #[test]
-    fn cache_free_page_blocks_until_reader_released() {
-        let files = create_files_manager();
-        let fk = FileKey::data("table_free_reader");
-        let pid = alloc_page_with_u64(&files, &fk, 0xBB);
-        let id = FilePageRef {
-            page_id: pid,
-            file_key: fk.clone(),
-        };
-
-        let cache = Cache::new(1, files.clone());
-
-        // pin for read and hold it
-        let pinned = cache.pin_read(&id).expect("pin_read failed (holder)");
-
-        // spawn free_page which should block until we drop `pinned`
-        let cache_cl = cache.clone();
-        let id_cl = id.clone();
-        let handle = thread::spawn(move || {
-            // this call should block until the reader drops its guard
-            cache_cl
-                .free_page(&id_cl)
-                .expect("free_page blocked and failed");
-        });
-
-        // give free_page a moment to reach the blocking write-lock call
-        thread::sleep(Duration::from_millis(50));
-
-        drop(pinned);
-
-        handle.join().expect("free_page thread panicked");
-
-        assert!(cache.frames.is_empty());
-        assert!(cache.lru.read().is_empty());
-    }
-
-    #[test]
-    fn cache_free_page_blocks_until_writer_released() {
-        let files = create_files_manager();
-        let fk = FileKey::data("table_free_writer");
-        let pid = alloc_page_with_u64(&files, &fk, 0xCC);
-        let id = FilePageRef {
-            page_id: pid,
-            file_key: fk.clone(),
-        };
-
-        let cache = Cache::new(1, files.clone());
-
-        // pin for write and hold it
-        let mut pinned_w = cache.pin_write(&id).expect("pin_write failed (holder)");
-        pinned_w.write_at(0, 0xDEADu64.to_be_bytes().to_vec());
-
-        // spawn free_page which should block until we drop `pinned_w`
-        let cache_cl = cache.clone();
-        let id_cl = id.clone();
-        let handle = std::thread::spawn(move || {
-            cache_cl
-                .free_page(&id_cl)
-                .expect("free_page blocked and failed");
-        });
-
-        // let free_page attempt to block
-        thread::sleep(Duration::from_millis(50));
-
-        drop(pinned_w);
-
-        handle.join().expect("free_page thread panicked");
 
         assert!(cache.frames.is_empty());
         assert!(cache.lru.read().is_empty());

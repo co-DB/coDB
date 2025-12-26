@@ -294,6 +294,10 @@ where
     pub(crate) fn delete_at(&mut self, slot_id: SlotId) -> Result<(), BTreeNodeError> {
         Ok(self.slotted_page.delete(slot_id)?)
     }
+
+    pub(crate) fn into_page(self) -> Page {
+        self.slotted_page.into_page()
+    }
 }
 
 impl<Page> BTreeNode<Page, BTreeInternalHeader>
