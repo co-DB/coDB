@@ -332,9 +332,9 @@ impl Cache {
 
     /// Remove page from file.
     ///
-    /// `_page` is only passed to ensure we are the only one using this page and no other thread
+    /// `page` is only passed to ensure we are the only one using this page and no other thread
     /// can get it in the meantime.
-    pub fn free_page(&self, id: &FilePageRef, _page: PinnedWritePage) -> Result<(), CacheError> {
+    pub fn free_page(&self, id: &FilePageRef, page: PinnedWritePage) -> Result<(), CacheError> {
         let pf = self.files.get_or_open_new_file(&id.file_key)?;
         pf.lock().free_page(id.page_id)?;
         match self.frames.entry(id.clone()) {
@@ -343,11 +343,11 @@ impl Cache {
                 // so no other thread can get this key.
                 occupied_entry.remove();
                 self.lru.write().pop_entry(id);
-
-                Ok(())
             }
-            Entry::Vacant(_) => Ok(()),
-        }
+            Entry::Vacant(_) => {}
+        };
+        drop(page);
+        Ok(())
     }
 
     /// Removes file from cache.
