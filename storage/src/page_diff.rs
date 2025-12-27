@@ -1,6 +1,7 @@
 // TODO: move to wal.rs once its created
 
 use std::collections::BTreeMap;
+use types::serialization::DbSerializable;
 
 /// Structure containing list of diffs applied to a page.
 ///
@@ -30,7 +31,7 @@ impl PageDiff {
                 continue;
             }
 
-            // Merge left (there is at most one element that match this criteria)
+            // Merge left (there is at most one element that match this criterion)
             if diff_start < new_start {
                 let prefix_len = (new_start - diff_start) as usize;
                 let mut merged = diff_data[..prefix_len].to_vec();
@@ -39,7 +40,7 @@ impl PageDiff {
                 new_start = diff_start;
             }
 
-            // Merge right (there is at most one element that match this criteria)
+            // Merge right (there is at most one element that match this criterion)
             if diff_end > new_end {
                 let suffix_start = (new_end - diff_start) as usize;
                 new_data.extend_from_slice(&diff_data[suffix_start..]);
@@ -53,6 +54,15 @@ impl PageDiff {
         }
 
         self.diffs.insert(new_start, new_data);
+    }
+
+    pub(crate) fn serialize(&self, buffer: &mut Vec<u8>) {
+        (self.diffs.len() as u16).serialize(buffer);
+        for (offset, data) in &self.diffs {
+            offset.serialize(buffer);
+            (data.len() as u16).serialize(buffer);
+            buffer.extend_from_slice(data);
+        }
     }
 }
 

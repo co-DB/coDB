@@ -5,6 +5,7 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
+types = { path = "../types" }
 bytemuck.workspace = true
 thiserror.workspace = true
 log.workspace = true
