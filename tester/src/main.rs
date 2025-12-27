@@ -22,16 +22,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List all available test cases
-    List,
-
-    /// Run a specific test case
-    Run {
-        /// Name of the test case to run
-        test: String,
-
+    /// Insert X records by Y threads concurrently
+    ConcurrentInserts {
         /// How many times to run the test and average the time
+        #[arg(long, default_value_t = 1)]
         runs: u32,
+
+        /// Number of concurrent threads
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+
+        /// Records per thread
+        #[arg(long, default_value_t = 1000)]
+        records_per_thread: usize,
     },
 }
 
@@ -51,12 +54,13 @@ enum TesterError {
 
     #[error("server returned error: {message}")]
     ServerError { message: String },
-
-    #[error("unknown test: {0}")]
-    UnknownTest(String),
 }
 
-async fn concurrent_inserts(runs: u32) -> Result<Vec<TestResult>, TesterError> {
+async fn concurrent_inserts(
+    runs: u32,
+    threads: usize,
+    records_per_thread: usize,
+) -> Result<Vec<TestResult>, TesterError> {
     let mut test_results = Vec::with_capacity(runs as _);
     let db_name = "CONCURRENT_INSERTS".to_string();
     let table_name = "CONCURRENT_INSERTS_TABLE".to_string();
@@ -69,8 +73,8 @@ async fn concurrent_inserts(runs: u32) -> Result<Vec<TestResult>, TesterError> {
     let test = concurrent_inserts::Test {
         database_name: db_name.clone(),
         table_name: table_name.clone(),
-        num_of_threads: 1,
-        records_per_thread: 600,
+        num_of_threads: threads,
+        records_per_thread,
     };
 
     let cleanup = concurrent_inserts::Cleanup {
@@ -97,18 +101,13 @@ async fn main() -> Result<(), TesterError> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::List => {
-            println!("Available tests:");
-            println!("  - concurrent_inserts: insert X records by Y threads concurrently");
-            Ok(())
-        }
-        Command::Run { test, runs } => {
-            let test_results = match test.as_str() {
-                "concurrent_inserts" => concurrent_inserts(runs).await?,
-                _ => return Err(TesterError::UnknownTest(test)),
-            };
-
-            report_stats(&test, &test_results);
+        Command::ConcurrentInserts {
+            runs,
+            threads,
+            records_per_thread,
+        } => {
+            let test_results = concurrent_inserts(runs, threads, records_per_thread).await?;
+            report_stats("concurrent-inserts", &test_results);
             Ok(())
         }
     }
