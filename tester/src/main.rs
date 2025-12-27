@@ -6,6 +6,7 @@ use rkyv::rancor::Error as RkyvError;
 use thiserror::Error;
 
 use crate::performance::concurrent_inserts::{self, ConcurrentInserts};
+use crate::performance::concurrent_reads::{self, ReadMany};
 use crate::suite::TestResult;
 
 mod client;
@@ -34,7 +35,21 @@ enum Command {
 
         /// Records per thread
         #[arg(long, default_value_t = 1000)]
-        records_per_thread: usize,
+        records: usize,
+    },
+
+    ConcurrentReads {
+        /// How many times to run the test and average the time
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+
+        /// Number of concurrent threads
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+
+        /// How many records to insert
+        #[arg(long, default_value_t = 1000)]
+        records: usize,
     },
 }
 
@@ -94,6 +109,44 @@ async fn concurrent_inserts(
     Ok(test_results)
 }
 
+async fn concurrent_reads(
+    runs: u32,
+    threads: usize,
+    records_to_insert: usize,
+) -> Result<Vec<TestResult>, TesterError> {
+    let mut test_results = Vec::with_capacity(runs as _);
+    let db_name = "CONCURRENT_READS".to_string();
+    let table_name = "CONCURRENT_READS_TABLE".to_string();
+
+    let setup = concurrent_reads::Setup {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        records_to_insert,
+    };
+
+    let test = concurrent_reads::Test {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        num_of_threads: threads,
+    };
+
+    let cleanup = concurrent_reads::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let suite = ReadMany {
+        setup,
+        test,
+        cleanup,
+    };
+
+    for _ in 0..runs {
+        let result = suite.run_suite().await?;
+        test_results.push(result);
+    }
+    Ok(test_results)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), TesterError> {
     env_logger::init();
@@ -104,10 +157,19 @@ async fn main() -> Result<(), TesterError> {
         Command::ConcurrentInserts {
             runs,
             threads,
-            records_per_thread,
+            records,
         } => {
-            let test_results = concurrent_inserts(runs, threads, records_per_thread).await?;
+            let test_results = concurrent_inserts(runs, threads, records).await?;
             report_stats("concurrent-inserts", &test_results);
+            Ok(())
+        }
+        Command::ConcurrentReads {
+            runs,
+            threads,
+            records,
+        } => {
+            let test_results = concurrent_reads(runs, threads, records).await?;
+            report_stats("concurrent-reads", &test_results);
             Ok(())
         }
     }
