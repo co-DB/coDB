@@ -319,6 +319,10 @@ pub(crate) struct SlottedPage<P, H: SlottedPageHeader> {
 impl<P, H: SlottedPageHeader> SlottedPage<P, H> {
     /// Maximum free space available in the slotted page (when no slot is used).
     pub const MAX_FREE_SPACE: u16 = (PAGE_SIZE - size_of::<H>()) as _;
+
+    pub(crate) fn into_page(self) -> P {
+        self.page
+    }
 }
 
 /// Gets a reference to the base header from the given page without creating an instance of
