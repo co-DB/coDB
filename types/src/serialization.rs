@@ -100,7 +100,7 @@ impl DbSerializable for String {
     fn serialize_into(&self, buffer: &mut [u8]) {
         let len_size = size_of::<u16>();
         buffer[0..len_size].copy_from_slice(&(self.len() as u16).to_le_bytes());
-        buffer[len_size..(len_size + self.len())].copy_from_slice(&self.as_bytes());
+        buffer[len_size..(len_size + self.len())].copy_from_slice(self.as_bytes());
     }
 
     fn deserialize(buffer: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
@@ -235,7 +235,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result,
-            Err(DbSerializationError::FailedToDeserialize { .. })
+            Err(DbSerializationError::FailedToDeserialize)
         ));
     }
 
@@ -268,7 +268,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result,
-            Err(DbSerializationError::FailedToDeserialize { .. })
+            Err(DbSerializationError::FailedToDeserialize)
         ));
     }
 

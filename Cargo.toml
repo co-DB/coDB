@@ -9,6 +9,7 @@ members = [
     "protocol",
     "server",
     "storage",
+    "tester",
     "types",
 ]
 
