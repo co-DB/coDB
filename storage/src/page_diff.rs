@@ -1,6 +1,5 @@
-// TODO: move to wal.rs once its created
-
 use std::collections::BTreeMap;
+use types::serialization::{DbSerializable, DbSerializationError};
 
 /// Structure containing list of diffs applied to a page.
 ///
@@ -30,7 +29,7 @@ impl PageDiff {
                 continue;
             }
 
-            // Merge left (there is at most one element that match this criteria)
+            // Merge left (there is at most one element that match this criterion)
             if diff_start < new_start {
                 let prefix_len = (new_start - diff_start) as usize;
                 let mut merged = diff_data[..prefix_len].to_vec();
@@ -39,7 +38,7 @@ impl PageDiff {
                 new_start = diff_start;
             }
 
-            // Merge right (there is at most one element that match this criteria)
+            // Merge right (there is at most one element that match this criterion)
             if diff_end > new_end {
                 let suffix_start = (new_end - diff_start) as usize;
                 new_data.extend_from_slice(&diff_data[suffix_start..]);
@@ -53,6 +52,42 @@ impl PageDiff {
         }
 
         self.diffs.insert(new_start, new_data);
+    }
+
+    pub(crate) fn serialize(&self, buffer: &mut Vec<u8>) {
+        (self.diffs.len() as u16).serialize(buffer);
+        for (offset, data) in &self.diffs {
+            offset.serialize(buffer);
+            (data.len() as u16).serialize(buffer);
+            buffer.extend_from_slice(data);
+        }
+    }
+
+    pub(crate) fn deserialize(data: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        let (count, mut rest) = u16::deserialize(data)?;
+        let mut diffs = BTreeMap::new();
+
+        for _ in 0..count {
+            let (diff_offset, rest_after_offset) = u16::deserialize(rest)?;
+            rest = rest_after_offset;
+            let (diff_len, rest_after_len) = u16::deserialize(rest)?;
+            rest = rest_after_len;
+
+            let diff_len = diff_len as usize;
+
+            if rest.len() < diff_len {
+                return Err(DbSerializationError::UnexpectedEnd {
+                    expected: diff_len,
+                    actual: rest.len(),
+                });
+            }
+
+            let diff_data = rest[..diff_len].to_vec();
+            rest = &rest[diff_len..];
+            diffs.insert(diff_offset, diff_data);
+        }
+
+        Ok((PageDiff { diffs }, rest))
     }
 }
 
