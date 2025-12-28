@@ -487,7 +487,6 @@ impl WalRecordData {
 
 /// Client handle for interacting with the WAL from other threads.
 /// This is the public API for WAL operations.
-#[derive(Clone)]
 pub(crate) struct WalClient {
     sender: SyncSender<WalRequest>,
     flushed_lsn: Arc<AtomicLsn>,
@@ -543,5 +542,523 @@ impl WalClient {
     /// Returns the highest LSN that has been flushed to disk.
     pub(crate) fn flushed_lsn(&self) -> Lsn {
         self.flushed_lsn.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use tempfile::tempdir;
+
+    // ==================== Serialization / Deserialization ====================
+
+    fn make_single_page_op(page_id: PageId, data: Vec<u8>) -> WalRecordData {
+        let mut diff = PageDiff::default();
+        diff.write_at(0, data);
+        WalRecordData::SinglePageOperation(SinglePageOperation { page_id, diff })
+    }
+
+    fn make_multi_page_op(ops: Vec<(PageId, Vec<u8>)>) -> WalRecordData {
+        let ops = ops
+            .into_iter()
+            .map(|(page_id, data)| {
+                let mut diff = PageDiff::default();
+                diff.write_at(0, data);
+                SinglePageOperation { page_id, diff }
+            })
+            .collect();
+        WalRecordData::MultiPageOperation(ops)
+    }
+
+    fn roundtrip_record(record: WalRecordData, lsn: Lsn) -> WalRecordData {
+        let serialized = record.serialize(lsn);
+        // Skip LSN (8 bytes) and length (4 bytes) to get to the record data
+        let data = &serialized[size_of::<Lsn>() + size_of::<u32>()..];
+        WalRecordData::deserialize(data, lsn).expect("deserialize should succeed")
+    }
+
+    #[test]
+    fn serialize_deserialize_single_page_operation() {
+        let record = make_single_page_op(42, vec![1, 2, 3, 4]);
+        let result = roundtrip_record(record, 100);
+
+        match result {
+            WalRecordData::SinglePageOperation(op) => {
+                assert_eq!(op.page_id, 42);
+            }
+            _ => panic!("expected SinglePageOperation"),
+        }
+    }
+
+    #[test]
+    fn serialize_deserialize_multi_page_operation() {
+        let record = make_multi_page_op(vec![(1, vec![10, 20]), (2, vec![30, 40]), (3, vec![50])]);
+        let result = roundtrip_record(record, 200);
+
+        match result {
+            WalRecordData::MultiPageOperation(ops) => {
+                assert_eq!(ops.len(), 3);
+                assert_eq!(ops[0].page_id, 1);
+                assert_eq!(ops[1].page_id, 2);
+                assert_eq!(ops[2].page_id, 3);
+            }
+            _ => panic!("expected MultiPageOperation"),
+        }
+    }
+
+    #[test]
+    fn serialize_deserialize_checkpoint() {
+        let record = WalRecordData::Checkpoint {
+            checkpoint_lsn: 999,
+        };
+        let result = roundtrip_record(record, 1000);
+
+        match result {
+            WalRecordData::Checkpoint { checkpoint_lsn } => {
+                assert_eq!(checkpoint_lsn, 999);
+            }
+            _ => panic!("expected Checkpoint"),
+        }
+    }
+
+    #[test]
+    fn serialized_record_contains_correct_lsn_and_length() {
+        let record = make_single_page_op(1, vec![1, 2, 3]);
+        let serialized = record.serialize(42);
+
+        let lsn = Lsn::from_le_bytes(serialized[0..8].try_into().unwrap());
+        let len = u32::from_le_bytes(serialized[8..12].try_into().unwrap());
+
+        assert_eq!(lsn, 42);
+        assert_eq!(len as usize, serialized.len() - 12); // total - lsn - len
+    }
+
+    // ==================== Recovery from Log ====================
+
+    fn write_record_to_file(file: &mut File, record: WalRecordData, lsn: Lsn) {
+        let serialized = record.serialize(lsn);
+        file.write_all(&serialized).unwrap();
+    }
+
+    #[test]
+    fn recover_from_empty_file() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        File::create(&log_path).unwrap();
+
+        let result = WalManager::recover_from_log(&log_path).unwrap();
+
+        assert!(result.redo_records.is_empty());
+        assert_eq!(result.last_lsn, 0);
+    }
+
+    #[test]
+    fn recover_from_nonexistent_file() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("nonexistent.log");
+
+        let result = WalManager::recover_from_log(&log_path).unwrap();
+
+        assert!(result.redo_records.is_empty());
+        assert_eq!(result.last_lsn, 0);
+    }
+
+    #[test]
+    fn recover_single_record() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let mut file = File::create(&log_path).unwrap();
+
+        write_record_to_file(&mut file, make_single_page_op(1, vec![1, 2, 3]), 1);
+        drop(file);
+
+        let result = WalManager::recover_from_log(&log_path).unwrap();
+
+        assert_eq!(result.redo_records.len(), 1);
+        assert_eq!(result.redo_records[0].0, 1);
+        assert_eq!(result.last_lsn, 1);
+    }
+
+    #[test]
+    fn recover_multiple_records() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let mut file = File::create(&log_path).unwrap();
+
+        write_record_to_file(&mut file, make_single_page_op(1, vec![1]), 1);
+        write_record_to_file(&mut file, make_single_page_op(2, vec![2]), 2);
+        write_record_to_file(&mut file, make_single_page_op(3, vec![3]), 3);
+        drop(file);
+
+        let result = WalManager::recover_from_log(&log_path).unwrap();
+
+        assert_eq!(result.redo_records.len(), 3);
+        assert_eq!(result.last_lsn, 3);
+    }
+
+    #[test]
+    fn recover_clears_records_on_checkpoint() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let mut file = File::create(&log_path).unwrap();
+
+        write_record_to_file(&mut file, make_single_page_op(1, vec![1]), 1);
+        write_record_to_file(&mut file, make_single_page_op(2, vec![2]), 2);
+        write_record_to_file(
+            &mut file,
+            WalRecordData::Checkpoint { checkpoint_lsn: 2 },
+            3,
+        );
+        write_record_to_file(&mut file, make_single_page_op(3, vec![3]), 4);
+        drop(file);
+
+        let result = WalManager::recover_from_log(&log_path).unwrap();
+
+        // Only record after checkpoint should be in redo_records
+        assert_eq!(result.redo_records.len(), 1);
+        assert_eq!(result.redo_records[0].0, 4);
+        assert_eq!(result.last_lsn, 4);
+    }
+
+    #[test]
+    fn recover_with_only_checkpoint() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let mut file = File::create(&log_path).unwrap();
+
+        write_record_to_file(
+            &mut file,
+            WalRecordData::Checkpoint { checkpoint_lsn: 10 },
+            10,
+        );
+        drop(file);
+
+        let result = WalManager::recover_from_log(&log_path).unwrap();
+
+        assert!(result.redo_records.is_empty());
+        assert_eq!(result.last_lsn, 10);
+    }
+
+    // ==================== WalClient / WalManager Integration ====================
+
+    #[test]
+    fn spawn_wal_returns_valid_handle() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+
+        let handle = spawn_wal(&log_path).expect("spawn_wal should succeed");
+
+        assert!(handle.redo_records.is_empty());
+        drop(handle.wal_client);
+        handle
+            .handle
+            .join()
+            .expect("WAL thread should join cleanly");
+    }
+
+    #[test]
+    fn write_single_returns_lsn() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let handle = spawn_wal(&log_path).unwrap();
+
+        let mut diff = PageDiff::default();
+        diff.write_at(0, vec![1, 2, 3]);
+
+        let lsn = handle.wal_client.write_single(1, diff);
+
+        assert_eq!(lsn, Some(1));
+        drop(handle.wal_client);
+        handle.handle.join().unwrap();
+    }
+
+    #[test]
+    fn write_single_increments_lsn() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let handle = spawn_wal(&log_path).unwrap();
+
+        let lsn1 = handle.wal_client.write_single(1, PageDiff::default());
+        let lsn2 = handle.wal_client.write_single(2, PageDiff::default());
+        let lsn3 = handle.wal_client.write_single(3, PageDiff::default());
+
+        assert_eq!(lsn1, Some(1));
+        assert_eq!(lsn2, Some(2));
+        assert_eq!(lsn3, Some(3));
+
+        drop(handle.wal_client);
+        handle.handle.join().unwrap();
+    }
+
+    #[test]
+    fn write_multi_returns_lsn() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let handle = spawn_wal(&log_path).unwrap();
+
+        let mut diff1 = PageDiff::default();
+        diff1.write_at(0, vec![1]);
+        let mut diff2 = PageDiff::default();
+        diff2.write_at(0, vec![2]);
+
+        let lsn = handle.wal_client.write_multi(vec![(1, diff1), (2, diff2)]);
+
+        assert_eq!(lsn, Some(1));
+        drop(handle.wal_client);
+        handle.handle.join().unwrap();
+    }
+
+    #[test]
+    fn flush_updates_flushed_lsn() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let handle = spawn_wal(&log_path).unwrap();
+
+        assert_eq!(handle.wal_client.flushed_lsn(), 0);
+
+        handle.wal_client.write_single(1, PageDiff::default());
+        handle.wal_client.write_single(2, PageDiff::default());
+
+        let success = handle.wal_client.flush();
+        assert!(success);
+        assert_eq!(handle.wal_client.flushed_lsn(), 2);
+
+        drop(handle.wal_client);
+        handle.handle.join().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_returns_lsn() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let handle = spawn_wal(&log_path).unwrap();
+
+        handle.wal_client.write_single(1, PageDiff::default());
+        handle.wal_client.write_single(2, PageDiff::default());
+
+        let checkpoint_lsn = handle.wal_client.checkpoint();
+
+        assert_eq!(checkpoint_lsn, Some(3));
+
+        drop(handle.wal_client);
+        handle.handle.join().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_truncates_wal_file() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let handle = spawn_wal(&log_path).unwrap();
+
+        // Write several records
+        for _ in 0..10 {
+            handle.wal_client.write_single(1, PageDiff::default());
+        }
+        handle.wal_client.flush();
+
+        let size_before = std::fs::metadata(&log_path).unwrap().len();
+
+        handle.wal_client.checkpoint();
+
+        let size_after = std::fs::metadata(&log_path).unwrap().len();
+
+        // After checkpoint, file should be smaller (contains only checkpoint record)
+        assert!(size_after < size_before);
+
+        drop(handle.wal_client);
+        handle.handle.join().unwrap();
+    }
+
+    #[test]
+    fn recovery_after_checkpoint_only_contains_post_checkpoint_records() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+
+        // First session: write records and checkpoint
+        {
+            let handle = spawn_wal(&log_path).unwrap();
+            handle.wal_client.write_single(1, PageDiff::default());
+            handle.wal_client.write_single(2, PageDiff::default());
+            handle.wal_client.checkpoint();
+            handle.wal_client.write_single(3, PageDiff::default());
+            handle.wal_client.write_single(4, PageDiff::default());
+            handle.wal_client.flush();
+            drop(handle.wal_client);
+            handle.handle.join().unwrap();
+        }
+
+        // Second session: recover
+        {
+            let handle = spawn_wal(&log_path).unwrap();
+
+            // Should only have records after checkpoint (LSN 4 and 5)
+            assert_eq!(handle.redo_records.len(), 2);
+            assert_eq!(handle.redo_records[0].0, 4);
+            assert_eq!(handle.redo_records[1].0, 5);
+
+            drop(handle.wal_client);
+            handle.handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn flushed_lsn_persists_across_recovery() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+
+        // First session
+        {
+            let handle = spawn_wal(&log_path).unwrap();
+            handle.wal_client.write_single(1, PageDiff::default());
+            handle.wal_client.write_single(2, PageDiff::default());
+            handle.wal_client.write_single(3, PageDiff::default());
+            handle.wal_client.flush();
+            drop(handle.wal_client);
+            handle.handle.join().unwrap();
+        }
+
+        // Second session
+        {
+            let handle = spawn_wal(&log_path).unwrap();
+
+            // flushed_lsn should be set to last_lsn from recovery
+            assert_eq!(handle.wal_client.flushed_lsn(), 3);
+
+            drop(handle.wal_client);
+            handle.handle.join().unwrap();
+        }
+    }
+
+    // ==================== Concurrent Access ====================
+
+    /// Wrapper to simulate how Cache would hold WalClient behind Arc.
+    struct SharedWalClient(Arc<WalClient>);
+
+    impl SharedWalClient {
+        fn new(client: WalClient) -> Self {
+            Self(Arc::new(client))
+        }
+
+        fn clone_arc(&self) -> Arc<WalClient> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn multiple_writers_concurrent() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let handle = spawn_wal(&log_path).unwrap();
+
+        // Simulate how Cache would share WalClient via Arc
+        let shared = SharedWalClient::new(handle.wal_client);
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let client = shared.clone_arc();
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        let lsn = client.write_single(i, PageDiff::default());
+                        assert!(lsn.is_some());
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        shared.0.flush();
+        assert_eq!(shared.0.flushed_lsn(), 100);
+
+        drop(shared);
+        handle.handle.join().unwrap();
+    }
+
+    #[test]
+    fn arc_shared_client_sees_same_flushed_lsn() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("wal.log");
+        let handle = spawn_wal(&log_path).unwrap();
+
+        let shared = SharedWalClient::new(handle.wal_client);
+        let client1 = shared.clone_arc();
+        let client2 = shared.clone_arc();
+
+        client1.write_single(1, PageDiff::default());
+        client1.write_single(2, PageDiff::default());
+        client1.flush();
+
+        // Both Arc references should see the same flushed_lsn
+        assert_eq!(client1.flushed_lsn(), 2);
+        assert_eq!(client2.flushed_lsn(), 2);
+
+        drop(client1);
+        drop(client2);
+        drop(shared);
+        handle.handle.join().unwrap();
+    }
+
+    // ==================== Error Cases ====================
+
+    #[test]
+    fn deserialize_invalid_record_type_returns_error() {
+        let data = [255u8]; // Invalid record type
+
+        let result = WalRecordData::deserialize(&data, 1);
+
+        assert!(result.is_err());
+        match result {
+            Err(WalError::CorruptedRecord { lsn, reason }) => {
+                assert_eq!(lsn, 1);
+                assert!(reason.contains("Unknown record type"));
+            }
+            _ => panic!("expected CorruptedRecord error"),
+        }
+    }
+
+    #[test]
+    fn deserialize_truncated_data_returns_error() {
+        // Valid record type but no data for single page op
+        let data = [1u8]; // Single page op type
+
+        let result = WalRecordData::deserialize(&data, 1);
+
+        assert!(result.is_err());
+    }
+
+    // ==================== TempFileGuard ====================
+
+    #[test]
+    fn temp_file_guard_deletes_on_drop() {
+        let dir = tempdir().unwrap();
+        let temp_path = dir.path().join("temp.file");
+
+        File::create(&temp_path).unwrap();
+        assert!(temp_path.exists());
+
+        {
+            let _guard = TempFileGuard::new(temp_path.clone());
+            // Guard drops here
+        }
+
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn temp_file_guard_keeps_on_commit() {
+        let dir = tempdir().unwrap();
+        let temp_path = dir.path().join("temp.file");
+
+        File::create(&temp_path).unwrap();
+
+        {
+            let guard = TempFileGuard::new(temp_path.clone());
+            guard.commit();
+        }
+
+        assert!(temp_path.exists());
     }
 }
