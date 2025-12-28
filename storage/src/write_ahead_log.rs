@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, mpsc};
-use std::{io, time};
+use std::thread::JoinHandle;
+use std::{io, thread, time};
 use thiserror::Error;
 use types::serialization::DbSerializable;
 
@@ -32,7 +33,27 @@ pub struct RecoveryResult {
     pub last_checkpoint_lsn: Lsn,
 }
 
-pub struct WalManager {
+struct StartHandle {
+    handle: JoinHandle<()>,
+    wal_client: WalClient,
+    redo_records: Vec<(Lsn, WalRecordData)>,
+}
+
+impl StartHandle {
+    fn new(
+        handle: JoinHandle<()>,
+        wal_client: WalClient,
+        redo_records: Vec<(Lsn, WalRecordData)>,
+    ) -> Self {
+        Self {
+            handle,
+            wal_client,
+            redo_records,
+        }
+    }
+}
+
+struct WalManager {
     /// The highest LSN assigned so far.
     current_lsn: Lsn,
     /// The highest LSN for which all records have been flushed to disk both from cache and WAL.
@@ -50,34 +71,51 @@ pub struct WalManager {
 }
 
 impl WalManager {
-    const FLUSH_THRESHOLD: usize = 1024;
+    pub fn spawn(log_path: impl AsRef<Path>) -> Result<StartHandle, WalError> {
+        let (sender, recv) = mpsc::sync_channel(1024);
+
+        let (mut manager, recovery, flushed_lsn) = WalManager::with_recovery(recv, log_path)?;
+
+        let handle = thread::spawn(move || {
+            manager.run();
+        });
+
+        let client = WalClient {
+            sender,
+            flushed_lsn,
+        };
+
+        let handle = StartHandle::new(handle, client.clone(), recovery.records_to_replay);
+        Ok(handle)
+    }
 
     /// Creates WalManager after recovering from existing log file.
-    /// Returns the manager and recovery result for replay.
-    pub fn with_recovery(
+    /// Returns the manager, recovery result, and shared flushed_lsn.
+    fn with_recovery(
         recv: mpsc::Receiver<WalRequest>,
-        flushed_lsn: Arc<AtomicLsn>,
         log_path: impl AsRef<Path>,
-    ) -> Result<(Self, RecoveryResult), WalError> {
+    ) -> Result<(Self, RecoveryResult, Arc<AtomicLsn>), WalError> {
         let path = log_path.as_ref();
         let recovery = Self::recover_from_log(path)?;
+
+        let flushed_lsn = Arc::new(AtomicLsn::new(recovery.last_lsn));
 
         let log_file = File::options().create(true).append(true).open(path)?;
 
         let manager = WalManager {
             current_lsn: recovery.last_lsn,
             checkpoint_lsn: recovery.last_checkpoint_lsn,
-            flushed_lsn,
+            flushed_lsn: flushed_lsn.clone(),
             recv,
             log_path: path.to_path_buf(),
             log_file: BufWriter::new(log_file),
             records_since_checkpoint: recovery.records_to_replay.len(),
         };
 
-        Ok((manager, recovery))
+        Ok((manager, recovery, flushed_lsn))
     }
 
-    pub fn run(&mut self) {
+    fn run(&mut self) {
         while let Ok(req) = self.recv.recv() {
             if let Err(err) = self.handle_request(req) {
                 // Figure out what to do on error.
@@ -98,12 +136,10 @@ impl WalManager {
         match self.append_record(record.data) {
             Ok(lsn) => {
                 self.records_since_checkpoint += 1;
-                // Ignore send error - client may have disconnected
                 let _ = record.send.send(Some(lsn));
                 Ok(())
             }
             Err(err) => {
-                // Notify client of failure (None = failed)
                 let _ = record.send.send(None);
                 Err(err)
             }
@@ -144,12 +180,10 @@ impl WalManager {
     ///
     /// The caller must ensure all dirty pages have been flushed to disk before calling this.
     fn perform_checkpoint(&mut self) -> Result<Lsn, WalError> {
-        // Write checkpoint record
         let checkpoint_lsn = self.current_lsn;
         let checkpoint_record = WalRecordData::Checkpoint { checkpoint_lsn };
         let new_lsn = self.append_record(checkpoint_record)?;
 
-        // Flush the checkpoint record
         self.log_file.flush()?;
 
         // Truncate WAL - everything before checkpoint is no longer needed
@@ -342,13 +376,13 @@ impl WalManager {
 
 type AtomicLsn = AtomicU64;
 
-pub enum WalRequest {
+enum WalRequest {
     Write(WalRecord),
     ForceFlush { sender: SyncSender<bool> },
     Checkpoint { sender: SyncSender<Option<Lsn>> },
 }
 
-pub struct WalRecord {
+struct WalRecord {
     data: WalRecordData,
     send: SyncSender<Option<Lsn>>,
 }
@@ -360,14 +394,8 @@ pub enum WalRecordData {
 }
 
 pub struct SinglePageOperation {
-    page_id: PageId,
-    diff: PageDiff,
-}
-
-impl SinglePageOperation {
-    pub fn new(page_id: PageId, diff: PageDiff) -> Self {
-        Self { page_id, diff }
-    }
+    pub page_id: PageId,
+    pub diff: PageDiff,
 }
 
 /// Wal record is serialized as:
@@ -424,5 +452,66 @@ impl WalRecordData {
             .copy_from_slice(&total_length.to_le_bytes());
 
         buffer
+    }
+}
+
+/// Client handle for interacting with the WAL from other threads.
+/// This is the public API for WAL operations.
+#[derive(Clone)]
+pub struct WalClient {
+    sender: SyncSender<WalRequest>,
+    flushed_lsn: Arc<AtomicLsn>,
+}
+
+impl WalClient {
+    /// Writes a single page operation to WAL and returns the assigned LSN.
+    /// Returns None if the write failed.
+    pub fn write_single(&self, page_id: PageId, diff: PageDiff) -> Option<Lsn> {
+        let (send, recv) = mpsc::sync_channel(1);
+        let record = WalRecord {
+            data: WalRecordData::SinglePageOperation(SinglePageOperation { page_id, diff }),
+            send,
+        };
+        self.sender.send(WalRequest::Write(record)).ok()?;
+        recv.recv().ok()?
+    }
+
+    /// Writes multiple page operations atomically to WAL.
+    /// Returns None if the write failed.
+    pub fn write_multi(&self, ops: Vec<(PageId, PageDiff)>) -> Option<Lsn> {
+        let (send, recv) = mpsc::sync_channel(1);
+        let ops = ops
+            .into_iter()
+            .map(|(page_id, diff)| SinglePageOperation { page_id, diff })
+            .collect();
+        let record = WalRecord {
+            data: WalRecordData::MultiPageOperation(ops),
+            send,
+        };
+        self.sender.send(WalRequest::Write(record)).ok()?;
+        recv.recv().ok()?
+    }
+
+    /// Forces a flush of all pending WAL records to disk.
+    /// Returns true if flush succeeded.
+    pub fn flush(&self) -> bool {
+        let (sender, recv) = mpsc::sync_channel(1);
+        if self.sender.send(WalRequest::ForceFlush { sender }).is_err() {
+            return false;
+        }
+        recv.recv().unwrap_or(false)
+    }
+
+    /// Requests a checkpoint. Caller must ensure all dirty pages have been flushed first.
+    /// Returns the checkpoint LSN on success.
+    pub fn checkpoint(&self) -> Option<Lsn> {
+        let (sender, recv) = mpsc::sync_channel(1);
+        self.sender.send(WalRequest::Checkpoint { sender }).ok()?;
+        recv.recv().ok()?
+    }
+
+    /// Returns the highest LSN that has been flushed to disk.
+    pub fn flushed_lsn(&self) -> Lsn {
+        self.flushed_lsn.load(Ordering::SeqCst)
     }
 }

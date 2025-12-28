@@ -13,7 +13,6 @@ parking_lot.workspace = true
 dashmap.workspace = true
 
 lru = "0.16.0"
-directories = "6.0.0"
 
 [dev-dependencies]
 tempfile = "3.20.0"
