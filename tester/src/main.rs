@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::performance::concurrent_inserts::{self, ConcurrentInserts};
 use crate::performance::concurrent_reads::{self, ReadMany};
 use crate::performance::concurrent_reads_and_inserts::{self, ConcurrentReadsAndInserts};
+use crate::performance::concurrent_reads_with_index::{self, ReadByIndex};
 use crate::suite::TestResult;
 
 mod client;
@@ -52,6 +53,24 @@ enum Command {
         /// How many records to insert
         #[arg(long, default_value_t = 1000)]
         records: usize,
+    },
+
+    ConcurrentReadsIndex {
+        /// How many times to run the test and average the time
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+
+        /// Number of concurrent threads
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+
+        /// How many records to insert
+        #[arg(long, default_value_t = 1000)]
+        records: usize,
+
+        /// Size of the id range used for filtering (upper - lower)
+        #[arg(long, default_value_t = 10)]
+        bound_size: usize,
     },
 
     ConcurrentReadsAndInserts {
@@ -207,6 +226,46 @@ async fn concurrent_reads_and_inserts(
     Ok(test_results)
 }
 
+async fn concurrent_reads_index(
+    runs: u32,
+    threads: usize,
+    records_to_insert: usize,
+    bound_size: usize,
+) -> Result<Vec<TestResult>, TesterError> {
+    let mut test_results = Vec::with_capacity(runs as _);
+    let db_name = "CONCURRENT_READS_INDEX".to_string();
+    let table_name = "CONCURRENT_READS_INDEX_TABLE".to_string();
+
+    let setup = concurrent_reads_with_index::Setup {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        records_to_insert,
+    };
+
+    let test = concurrent_reads_with_index::Test {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        num_of_threads: threads,
+        bound_size,
+    };
+
+    let cleanup = concurrent_reads_with_index::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let suite = ReadByIndex {
+        setup,
+        test,
+        cleanup,
+    };
+
+    for _ in 0..runs {
+        let result = suite.run_suite().await?;
+        test_results.push(result);
+    }
+    Ok(test_results)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), TesterError> {
     env_logger::init();
@@ -230,6 +289,16 @@ async fn main() -> Result<(), TesterError> {
         } => {
             let test_results = concurrent_reads(runs, threads, records).await?;
             report_stats("concurrent-reads", &test_results);
+            Ok(())
+        }
+        Command::ConcurrentReadsIndex {
+            runs,
+            threads,
+            records,
+            bound_size,
+        } => {
+            let test_results = concurrent_reads_index(runs, threads, records, bound_size).await?;
+            report_stats("concurrent-reads-index", &test_results);
             Ok(())
         }
         Command::ConcurrentReadsAndInserts {
