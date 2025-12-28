@@ -3,7 +3,7 @@ use crate::paged_file::{AtomicLsn, Lsn, PageId};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -33,8 +33,8 @@ struct RecoveryResult {
 
 pub struct StartHandle {
     handle: JoinHandle<()>,
-    pub wal_client: WalClient,
-    pub redo_records: Vec<(Lsn, WalRecordData)>,
+    pub(crate) wal_client: WalClient,
+    pub(crate) redo_records: Vec<(Lsn, WalRecordData)>,
 }
 
 impl StartHandle {
@@ -202,6 +202,9 @@ impl WalManager {
             .as_millis();
         let temp_path = self.log_path.with_extension(format!("tmp-{}", epoch));
 
+        // Guard to ensure temp file is deleted if something goes wrong.
+        let guard = TempFileGuard::new(temp_path.clone());
+
         // Create new file with just the checkpoint record
         let mut new_file = File::create(&temp_path)?;
         let checkpoint_record = WalRecordData::Checkpoint {
@@ -215,6 +218,9 @@ impl WalManager {
 
         // Swap files
         std::fs::rename(&temp_path, &self.log_path)?;
+
+        // Commit the guard so it doesn't delete the temp file.
+        guard.commit();
 
         let log_file = File::options().append(true).open(&self.log_path)?;
         self.log_file = BufWriter::new(log_file);
@@ -233,7 +239,7 @@ impl WalManager {
 
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
-        let mut redo_records: Vec<(Lsn, WalRecordData)> = Vec::new();
+        let mut redo_records: Vec<(Lsn, WalRecordData)> = Vec::with_capacity(1024);
         let mut last_lsn: Lsn = 0;
 
         loop {
@@ -295,34 +301,65 @@ impl WalManager {
     }
 }
 
+/// Represents a request to the WAL manager.
 enum WalRequest {
     Write(WalRecord),
     ForceFlush { sender: SyncSender<bool> },
     Checkpoint { sender: SyncSender<Option<Lsn>> },
 }
 
+/// Represents a WAL record write request along with a channel to send back the assigned LSN.
 struct WalRecord {
     data: WalRecordData,
     send: SyncSender<Option<Lsn>>,
 }
 
-pub enum WalRecordData {
+/// Represents the data contained in a WAL record. Can be single-page if only one page is modified,
+/// or multipage for operations like split in B-Tree or an insert with overflow in heap file.
+/// Checkpoint is for recording when all pages up to a certain LSN have been flushed from both
+/// WAL and cache.
+pub(crate) enum WalRecordData {
     SinglePageOperation(SinglePageOperation),
     MultiPageOperation(Vec<SinglePageOperation>),
     Checkpoint { checkpoint_lsn: Lsn },
 }
 
-pub struct SinglePageOperation {
-    pub page_id: PageId,
-    pub diff: PageDiff,
+/// Represents a single page operation in WAL.
+pub(crate) struct SinglePageOperation {
+    page_id: PageId,
+    diff: PageDiff,
+}
+
+/// Guard for temporary files that ensures deletion on drop unless committed.
+struct TempFileGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn commit(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Wal record is serialized as:
 /// 1. LSN (u64)
 /// 2. Total length (u32)
-/// 2. Record type (u8)
-/// 3. Number of page operations (if multipage)
-/// 4. For each page operation:
+/// 3. Record type (u8)
+/// 4. Number of page operations (if multipage)
+/// 5. For each page operation:
 ///    a. Page ID (u32)
 ///    b. Number of diffs (u16)
 ///    c. For each diff:
@@ -451,7 +488,7 @@ impl WalRecordData {
 /// Client handle for interacting with the WAL from other threads.
 /// This is the public API for WAL operations.
 #[derive(Clone)]
-pub struct WalClient {
+pub(crate) struct WalClient {
     sender: SyncSender<WalRequest>,
     flushed_lsn: Arc<AtomicLsn>,
 }
@@ -459,7 +496,7 @@ pub struct WalClient {
 impl WalClient {
     /// Writes a single page operation to WAL and returns the assigned LSN.
     /// Returns None if the write operation failed.
-    pub fn write_single(&self, page_id: PageId, diff: PageDiff) -> Option<Lsn> {
+    pub(crate) fn write_single(&self, page_id: PageId, diff: PageDiff) -> Option<Lsn> {
         let (send, recv) = mpsc::sync_channel(1);
         let record = WalRecord {
             data: WalRecordData::SinglePageOperation(SinglePageOperation { page_id, diff }),
@@ -471,7 +508,7 @@ impl WalClient {
 
     /// Writes multiple page operations as single record to WAL and returns the assigned LSN.
     /// Returns None if the write operation failed.
-    pub fn write_multi(&self, ops: Vec<(PageId, PageDiff)>) -> Option<Lsn> {
+    pub(crate) fn write_multi(&self, ops: Vec<(PageId, PageDiff)>) -> Option<Lsn> {
         let (send, recv) = mpsc::sync_channel(1);
         let ops = ops
             .into_iter()
@@ -487,7 +524,7 @@ impl WalClient {
 
     /// Forces a flush of all pending WAL records to disk.
     /// Returns true if flush succeeded.
-    pub fn flush(&self) -> bool {
+    pub(crate) fn flush(&self) -> bool {
         let (sender, recv) = mpsc::sync_channel(1);
         if self.sender.send(WalRequest::ForceFlush { sender }).is_err() {
             return false;
@@ -497,14 +534,14 @@ impl WalClient {
 
     /// Requests a checkpoint. Caller must ensure all dirty pages have been flushed first.
     /// Returns the checkpoint LSN on success.
-    pub fn checkpoint(&self) -> Option<Lsn> {
+    pub(crate) fn checkpoint(&self) -> Option<Lsn> {
         let (sender, recv) = mpsc::sync_channel(1);
         self.sender.send(WalRequest::Checkpoint { sender }).ok()?;
         recv.recv().ok()?
     }
 
     /// Returns the highest LSN that has been flushed to disk.
-    pub fn flushed_lsn(&self) -> Lsn {
+    pub(crate) fn flushed_lsn(&self) -> Lsn {
         self.flushed_lsn.load(Ordering::SeqCst)
     }
 }

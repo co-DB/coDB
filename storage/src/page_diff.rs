@@ -75,7 +75,17 @@ impl PageDiff {
             let (diff_len, rest_after_len) = u16::deserialize(rest)?;
             rest = rest_after_len;
 
-            let diff_data = rest[..diff_len as usize].to_vec();
+            let diff_len = diff_len as usize;
+
+            if rest.len() < diff_len {
+                return Err(DbSerializationError::UnexpectedEnd {
+                    expected: diff_len,
+                    actual: rest.len(),
+                });
+            }
+
+            let diff_data = rest[..diff_len].to_vec();
+            rest = &rest[diff_len..];
             diffs.insert(diff_offset, diff_data);
         }
 
