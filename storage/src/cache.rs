@@ -166,6 +166,7 @@ impl PinnedWritePage {
         get_page_lsn(self.page())
     }
 
+    /// Sets the LSN of the page.
     pub fn set_lsn(&mut self, lsn: Lsn) {
         set_page_lsn(self.page_mut(), lsn);
     }

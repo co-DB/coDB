@@ -1,5 +1,5 @@
 ﻿use crate::page_diff::PageDiff;
-use crate::paged_file::{Lsn, PageId};
+use crate::paged_file::{AtomicLsn, Lsn, PageId};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -294,8 +294,6 @@ impl WalManager {
         Ok(Some((lsn, record)))
     }
 }
-
-pub(crate) type AtomicLsn = AtomicU64;
 
 enum WalRequest {
     Write(WalRecord),

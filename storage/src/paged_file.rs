@@ -1,13 +1,13 @@
 //! PagedFile module — abstraction layer for managing on-disk paged-files and page operations.
 
+use bytemuck::{Pod, Zeroable};
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::HashSet,
     fs,
     io::{self, ErrorKind, Read, Seek, Write},
     path::Path,
 };
-
-use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
 /// Type representing page id, should be used instead of bare `u32`.
@@ -21,6 +21,9 @@ pub type Page = [u8; PAGE_SIZE];
 
 /// Type representing Log Sequence Number for WAL.
 pub type Lsn = u64;
+
+/// Atomic version of LSN.
+pub(crate) type AtomicLsn = AtomicU64;
 
 /// Size of LSN stored at the end of each page.
 pub const PAGE_LSN_SIZE: usize = size_of::<Lsn>();
