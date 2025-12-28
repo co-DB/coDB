@@ -61,16 +61,16 @@ impl Suite for ReadMany {
 
         // Insert records on a single thread
         for i in 0..args.records_to_insert {
-            let mut c = default_client().await?;
             let sql = format!(
                 "INSERT INTO {} (id, value) VALUES ({}, {});",
                 args.table_name, i as i32, i as i32
             );
-            c.execute_and_wait(Request::Query {
-                database_name: Some(args.database_name.clone()),
-                sql,
-            })
-            .await?;
+            client
+                .execute_and_wait(Request::Query {
+                    database_name: Some(args.database_name.clone()),
+                    sql,
+                })
+                .await?;
         }
 
         Ok(())
