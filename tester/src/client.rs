@@ -25,6 +25,7 @@ pub struct BinaryClient {
 impl BinaryClient {
     pub async fn connect(addr: SocketAddr) -> Result<Self, TesterError> {
         let stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
         let (reader, writer) = stream.into_split();
         Ok(Self {
             reader: BufReader::new(reader),
