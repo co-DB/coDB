@@ -4,7 +4,7 @@ use protocol::Request;
 
 use crate::{
     TesterError,
-    suite::{Suite, TestResult, default_client},
+    suite::{PerformanceTestResult, Suite, default_client},
 };
 
 pub struct ReadMany {
@@ -14,7 +14,7 @@ pub struct ReadMany {
 }
 
 impl ReadMany {
-    pub async fn run_suite(&self) -> Result<TestResult, TesterError> {
+    pub async fn run_suite(&self) -> Result<PerformanceTestResult, TesterError> {
         self.setup(&self.setup).await?;
         let result = self.run(&self.test).await?;
         self.cleanup(&self.cleanup).await?;
@@ -38,7 +38,7 @@ pub struct Cleanup {
     pub database_name: String,
 }
 
-impl Suite for ReadMany {
+impl Suite<PerformanceTestResult> for ReadMany {
     type SetupArgs = Setup;
 
     async fn setup(&self, args: &Self::SetupArgs) -> Result<(), TesterError> {
@@ -78,7 +78,7 @@ impl Suite for ReadMany {
 
     type TestArgs = Test;
 
-    async fn run(&self, args: &Self::TestArgs) -> Result<TestResult, TesterError> {
+    async fn run(&self, args: &Self::TestArgs) -> Result<PerformanceTestResult, TesterError> {
         let start = Instant::now();
 
         let mut handles = Vec::with_capacity(args.num_of_threads);
@@ -108,7 +108,7 @@ impl Suite for ReadMany {
         }
 
         let elapsed = start.elapsed();
-        Ok(TestResult { duration: elapsed })
+        Ok(PerformanceTestResult { duration: elapsed })
     }
 
     type CleanupArgs = Cleanup;

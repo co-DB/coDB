@@ -10,7 +10,7 @@ use crate::performance::concurrent_reads::{self, ReadMany};
 use crate::performance::concurrent_reads_and_inserts::{self, ConcurrentReadsAndInserts};
 use crate::performance::concurrent_reads_non_index::{self, ReadByNonIndex};
 use crate::performance::concurrent_reads_with_index::{self, ReadByIndex};
-use crate::suite::TestResult;
+use crate::suite::PerformanceTestResult;
 
 mod client;
 mod performance;
@@ -137,7 +137,7 @@ async fn concurrent_inserts(
     runs: u32,
     threads: usize,
     records_per_thread: usize,
-) -> Result<Vec<TestResult>, TesterError> {
+) -> Result<Vec<PerformanceTestResult>, TesterError> {
     let mut test_results = Vec::with_capacity(runs as _);
     let db_name = "CONCURRENT_INSERTS".to_string();
     let table_name = "CONCURRENT_INSERTS_TABLE".to_string();
@@ -175,7 +175,7 @@ async fn concurrent_reads(
     runs: u32,
     threads: usize,
     records_to_insert: usize,
-) -> Result<Vec<TestResult>, TesterError> {
+) -> Result<Vec<PerformanceTestResult>, TesterError> {
     let mut test_results = Vec::with_capacity(runs as _);
     let db_name = "CONCURRENT_READS".to_string();
     let table_name = "CONCURRENT_READS_TABLE".to_string();
@@ -214,7 +214,7 @@ async fn concurrent_reads_and_inserts(
     readers: usize,
     writers: usize,
     records_per_writer: usize,
-) -> Result<Vec<TestResult>, TesterError> {
+) -> Result<Vec<PerformanceTestResult>, TesterError> {
     let mut test_results = Vec::with_capacity(runs as _);
     let db_name = "CONCURRENT_RW".to_string();
     let table_name = "CONCURRENT_RW_TABLE".to_string();
@@ -254,7 +254,7 @@ async fn concurrent_reads_index(
     threads: usize,
     records_to_insert: usize,
     bound_size: usize,
-) -> Result<Vec<TestResult>, TesterError> {
+) -> Result<Vec<PerformanceTestResult>, TesterError> {
     let mut test_results = Vec::with_capacity(runs as _);
     let db_name = "CONCURRENT_READS_INDEX".to_string();
     let table_name = "CONCURRENT_READS_INDEX_TABLE".to_string();
@@ -294,7 +294,7 @@ async fn concurrent_reads_non_index(
     threads: usize,
     records_to_insert: usize,
     bound_size: usize,
-) -> Result<Vec<TestResult>, TesterError> {
+) -> Result<Vec<PerformanceTestResult>, TesterError> {
     let mut test_results = Vec::with_capacity(runs as _);
     let db_name = "CONCURRENT_READS_NON_INDEX".to_string();
     let table_name = "CONCURRENT_READS_NON_INDEX_TABLE".to_string();
@@ -389,7 +389,7 @@ async fn main() -> Result<(), TesterError> {
     }
 }
 
-fn report_stats(test_name: &str, results: &[TestResult]) {
+fn report_stats(test_name: &str, results: &[PerformanceTestResult]) {
     if results.is_empty() {
         println!("No runs executed for test '{}'.", test_name);
         return;

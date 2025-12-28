@@ -4,7 +4,7 @@ use protocol::Request;
 
 use crate::{
     TesterError,
-    suite::{Suite, TestResult, default_client},
+    suite::{PerformanceTestResult, Suite, default_client},
 };
 
 pub struct ConcurrentInserts {
@@ -14,7 +14,7 @@ pub struct ConcurrentInserts {
 }
 
 impl ConcurrentInserts {
-    pub async fn run_suite(&self) -> Result<TestResult, TesterError> {
+    pub async fn run_suite(&self) -> Result<PerformanceTestResult, TesterError> {
         self.setup(&self.setup).await?;
         let result = self.run(&self.test).await?;
         self.cleanup(&self.cleanup).await?;
@@ -38,7 +38,7 @@ pub struct Cleanup {
     pub database_name: String,
 }
 
-impl Suite for ConcurrentInserts {
+impl Suite<PerformanceTestResult> for ConcurrentInserts {
     type SetupArgs = Setup;
 
     async fn setup(&self, args: &Self::SetupArgs) -> Result<(), TesterError> {
@@ -62,7 +62,7 @@ impl Suite for ConcurrentInserts {
 
     type TestArgs = Test;
 
-    async fn run(&self, args: &Self::TestArgs) -> Result<TestResult, TesterError> {
+    async fn run(&self, args: &Self::TestArgs) -> Result<PerformanceTestResult, TesterError> {
         let start = Instant::now();
         let mut handles = Vec::with_capacity(args.num_of_threads);
         for worker_id in 0..args.num_of_threads {
@@ -97,7 +97,7 @@ impl Suite for ConcurrentInserts {
 
         let elapsed = start.elapsed();
 
-        let test_result = TestResult { duration: elapsed };
+        let test_result = PerformanceTestResult { duration: elapsed };
         Ok(test_result)
     }
 

@@ -6,7 +6,7 @@ use protocol::Request;
 
 use crate::{
     TesterError,
-    suite::{Suite, TestResult, default_client},
+    suite::{PerformanceTestResult, Suite, default_client},
 };
 
 pub struct ConcurrentReadsAndInserts {
@@ -16,7 +16,7 @@ pub struct ConcurrentReadsAndInserts {
 }
 
 impl ConcurrentReadsAndInserts {
-    pub async fn run_suite(&self) -> Result<TestResult, TesterError> {
+    pub async fn run_suite(&self) -> Result<PerformanceTestResult, TesterError> {
         self.setup(&self.setup).await?;
         let result = self.run(&self.test).await?;
         self.cleanup(&self.cleanup).await?;
@@ -41,7 +41,7 @@ pub struct Cleanup {
     pub database_name: String,
 }
 
-impl Suite for ConcurrentReadsAndInserts {
+impl Suite<PerformanceTestResult> for ConcurrentReadsAndInserts {
     type SetupArgs = Setup;
 
     async fn setup(&self, args: &Self::SetupArgs) -> Result<(), TesterError> {
@@ -68,7 +68,7 @@ impl Suite for ConcurrentReadsAndInserts {
 
     type TestArgs = Test;
 
-    async fn run(&self, args: &Self::TestArgs) -> Result<TestResult, TesterError> {
+    async fn run(&self, args: &Self::TestArgs) -> Result<PerformanceTestResult, TesterError> {
         let writers_remaining = Arc::new(AtomicUsize::new(args.num_of_writers));
 
         let start = Instant::now();
@@ -139,7 +139,7 @@ impl Suite for ConcurrentReadsAndInserts {
         }
 
         let elapsed = start.elapsed();
-        Ok(TestResult { duration: elapsed })
+        Ok(PerformanceTestResult { duration: elapsed })
     }
 
     type CleanupArgs = Cleanup;

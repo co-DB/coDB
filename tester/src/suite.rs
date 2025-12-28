@@ -7,18 +7,18 @@ use protocol::BINARY_PROTOCOL_PORT;
 
 use crate::{TesterError, client::BinaryClient};
 
-pub trait Suite {
+pub trait Suite<R> {
     type SetupArgs;
     async fn setup(&self, args: &Self::SetupArgs) -> Result<(), TesterError>;
 
     type TestArgs;
-    async fn run(&self, args: &Self::TestArgs) -> Result<TestResult, TesterError>;
+    async fn run(&self, args: &Self::TestArgs) -> Result<R, TesterError>;
 
     type CleanupArgs;
     async fn cleanup(&self, args: &Self::CleanupArgs) -> Result<(), TesterError>;
 }
 
-pub struct TestResult {
+pub struct PerformanceTestResult {
     pub duration: Duration,
 }
 
