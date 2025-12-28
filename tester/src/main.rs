@@ -13,6 +13,7 @@ use crate::performance::concurrent_reads_with_index::{self, ReadByIndex};
 use crate::suite::PerformanceTestResult;
 
 mod client;
+mod e2e;
 mod performance;
 mod suite;
 
@@ -94,6 +95,9 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         bound_size: usize,
     },
+
+    /// Run quick e2e correctness tests
+    E2e,
 
     /// Concurrently read all records until all writers finish adding records
     ConcurrentReadsAndInserts {
@@ -373,6 +377,11 @@ async fn main() -> Result<(), TesterError> {
             let test_results =
                 concurrent_reads_non_index(runs, threads, records, bound_size).await?;
             report_stats("concurrent-reads-non-index", &test_results);
+            Ok(())
+        }
+        Command::E2e => {
+            e2e::run_all().await?;
+            println!("All e2e tests passed");
             Ok(())
         }
         Command::ConcurrentReadsAndInserts {

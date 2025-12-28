@@ -22,6 +22,10 @@ pub struct PerformanceTestResult {
     pub duration: Duration,
 }
 
+pub struct E2eTestResult {
+    pub error: Option<String>,
+}
+
 const TEST_HOST: &str = "127.0.0.1";
 const TEST_PORT: u16 = BINARY_PROTOCOL_PORT;
 
