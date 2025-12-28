@@ -41,6 +41,7 @@ enum Command {
         records: usize,
     },
 
+    /// Read all records by X threads concurrently
     ConcurrentReads {
         /// How many times to run the test and average the time
         #[arg(long, default_value_t = 1)]
@@ -55,6 +56,7 @@ enum Command {
         records: usize,
     },
 
+    /// Read part of the records with filter that uses only index (primary key)
     ConcurrentReadsIndex {
         /// How many times to run the test and average the time
         #[arg(long, default_value_t = 1)]
@@ -73,6 +75,7 @@ enum Command {
         bound_size: usize,
     },
 
+    /// Concurrently read all records until all writers finish adding records
     ConcurrentReadsAndInserts {
         /// How many times to run the test and average the time
         #[arg(long, default_value_t = 1)]
