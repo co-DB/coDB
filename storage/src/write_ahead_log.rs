@@ -1,5 +1,6 @@
 ﻿use crate::page_diff::PageDiff;
 use crate::paged_file::{AtomicLsn, Lsn, PageId};
+use log::error;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -118,8 +119,7 @@ impl WalManager {
     fn run(&mut self) {
         while let Ok(req) = self.recv.recv() {
             if let Err(err) = self.handle_request(req) {
-                // Figure out what to do on error.
-                eprintln!("WAL error: {}", err);
+                error!("WAL error occurred: {}", err);
             }
         }
     }

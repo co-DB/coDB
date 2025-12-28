@@ -1,5 +1,3 @@
-// TODO: move to wal.rs once its created
-
 use std::collections::BTreeMap;
 use types::serialization::{DbSerializable, DbSerializationError};
 
