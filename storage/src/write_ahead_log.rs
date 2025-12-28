@@ -24,9 +24,9 @@ pub enum WalError {
 }
 
 /// Result of WAL recovery process.
-pub struct RecoveryResult {
-    /// Records that need to be replayed (after last checkpoint).
-    pub records_to_replay: Vec<(Lsn, WalRecordData)>,
+struct RecoveryResult {
+    /// Records that need to be redone (after last checkpoint).
+    pub redo_records: Vec<(Lsn, WalRecordData)>,
     /// The LSN to continue from.
     pub last_lsn: Lsn,
 }
@@ -50,8 +50,8 @@ impl StartHandle {
         }
     }
 
-    /// Waits for the WAL thread to finish.
-    /// This will block until the WalClient is dropped and the thread exits.
+    /// Waits for the WAL thread to finish (when either WalClient is dropped or an error occurs)
+    /// and joins it.
     pub fn join(self) -> thread::Result<()> {
         self.handle.join()
     }
@@ -86,7 +86,7 @@ pub fn spawn_wal(log_path: impl AsRef<Path>) -> Result<StartHandle, WalError> {
         flushed_lsn,
     };
 
-    let handle = StartHandle::new(handle, client, recovery.records_to_replay);
+    let handle = StartHandle::new(handle, client, recovery.redo_records);
     Ok(handle)
 }
 
@@ -226,14 +226,14 @@ impl WalManager {
     fn recover_from_log(path: &Path) -> Result<RecoveryResult, WalError> {
         if !path.exists() {
             return Ok(RecoveryResult {
-                records_to_replay: Vec::new(),
+                redo_records: Vec::new(),
                 last_lsn: 0,
             });
         }
 
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
-        let mut records_to_replay: Vec<(Lsn, WalRecordData)> = Vec::new();
+        let mut redo_records: Vec<(Lsn, WalRecordData)> = Vec::new();
         let mut last_lsn: Lsn = 0;
 
         loop {
@@ -245,10 +245,10 @@ impl WalManager {
                         WalRecordData::Checkpoint { .. } => {
                             // Clear any records before the checkpoint as they were persisted.
                             // This shouldn't happen unless the truncating after checkpoint fails.
-                            records_to_replay.clear();
+                            redo_records.clear();
                         }
                         _ => {
-                            records_to_replay.push((lsn, record));
+                            redo_records.push((lsn, record));
                         }
                     }
                 }
@@ -258,7 +258,7 @@ impl WalManager {
         }
 
         Ok(RecoveryResult {
-            records_to_replay,
+            redo_records,
             last_lsn,
         })
     }
@@ -290,81 +290,8 @@ impl WalManager {
             });
         }
 
-        let (record_type, content) =
-            u8::deserialize(&data).map_err(|e| WalError::CorruptedRecord {
-                lsn,
-                reason: format!("Failed to deserialize record type: {}", e),
-            })?;
-
-        let record = match record_type {
-            1 => Self::deserialize_single_page_op(content, lsn)?,
-            2 => Self::deserialize_multi_page_op(content, lsn)?,
-            3 => Self::deserialize_checkpoint(content, lsn)?,
-            _ => {
-                return Err(WalError::CorruptedRecord {
-                    lsn,
-                    reason: format!("Unknown record type: {}", record_type),
-                });
-            }
-        };
-
+        let record = WalRecordData::deserialize(&data, lsn)?;
         Ok(Some((lsn, record)))
-    }
-
-    fn deserialize_single_page_op(data: &[u8], lsn: Lsn) -> Result<WalRecordData, WalError> {
-        let (page_id, rest) =
-            PageId::deserialize(data).map_err(|err| WalError::CorruptedRecord {
-                lsn,
-                reason: format!("failed to deserialize PageId: {}", err),
-            })?;
-
-        let (diff, _) = PageDiff::deserialize(rest).map_err(|e| WalError::CorruptedRecord {
-            lsn,
-            reason: format!("failed to deserialize PageDiff: {}", e),
-        })?;
-
-        Ok(WalRecordData::SinglePageOperation(SinglePageOperation {
-            page_id,
-            diff,
-        }))
-    }
-
-    fn deserialize_multi_page_op(data: &[u8], lsn: Lsn) -> Result<WalRecordData, WalError> {
-        let (count, mut data) = u16::deserialize(data).map_err(|e| WalError::CorruptedRecord {
-            lsn,
-            reason: format!("Failed to deserialize multi-page op count: {}", e),
-        })?;
-
-        let mut ops = Vec::with_capacity(count as usize);
-
-        for _ in 0..count {
-            let (page_id, rest) =
-                PageId::deserialize(data).map_err(|e| WalError::CorruptedRecord {
-                    lsn,
-                    reason: format!("Failed to deserialize PageId: {}", e),
-                })?;
-            data = rest;
-
-            let (diff, rest) =
-                PageDiff::deserialize(data).map_err(|e| WalError::CorruptedRecord {
-                    lsn,
-                    reason: format!("Failed to deserialize PageDiff: {}", e),
-                })?;
-            data = rest;
-
-            ops.push(SinglePageOperation { page_id, diff });
-        }
-
-        Ok(WalRecordData::MultiPageOperation(ops))
-    }
-
-    fn deserialize_checkpoint(data: &[u8], lsn: Lsn) -> Result<WalRecordData, WalError> {
-        let (checkpoint_lsn, _) =
-            Lsn::deserialize(data).map_err(|err| WalError::CorruptedRecord {
-                lsn,
-                reason: format!("failed to deserialize checkpoint LSN: {}", err),
-            })?;
-        Ok(WalRecordData::Checkpoint { checkpoint_lsn })
     }
 }
 
@@ -447,6 +374,80 @@ impl WalRecordData {
 
         buffer
     }
+
+    fn deserialize(data: &[u8], lsn: Lsn) -> Result<WalRecordData, WalError> {
+        let (record_type, content) =
+            u8::deserialize(data).map_err(|e| WalError::CorruptedRecord {
+                lsn,
+                reason: format!("Failed to deserialize record type: {}", e),
+            })?;
+
+        match record_type {
+            1 => Self::deserialize_single_page_op(content, lsn),
+            2 => Self::deserialize_multi_page_op(content, lsn),
+            3 => Self::deserialize_checkpoint(content, lsn),
+            _ => Err(WalError::CorruptedRecord {
+                lsn,
+                reason: format!("Unknown record type: {}", record_type),
+            }),
+        }
+    }
+
+    fn deserialize_single_page_op(data: &[u8], lsn: Lsn) -> Result<WalRecordData, WalError> {
+        let (page_id, rest) =
+            PageId::deserialize(data).map_err(|err| WalError::CorruptedRecord {
+                lsn,
+                reason: format!("failed to deserialize PageId: {}", err),
+            })?;
+
+        let (diff, _) = PageDiff::deserialize(rest).map_err(|e| WalError::CorruptedRecord {
+            lsn,
+            reason: format!("failed to deserialize PageDiff: {}", e),
+        })?;
+
+        Ok(WalRecordData::SinglePageOperation(SinglePageOperation {
+            page_id,
+            diff,
+        }))
+    }
+
+    fn deserialize_multi_page_op(data: &[u8], lsn: Lsn) -> Result<WalRecordData, WalError> {
+        let (count, mut data) = u16::deserialize(data).map_err(|e| WalError::CorruptedRecord {
+            lsn,
+            reason: format!("Failed to deserialize multi-page op count: {}", e),
+        })?;
+
+        let mut ops = Vec::with_capacity(count as usize);
+
+        for _ in 0..count {
+            let (page_id, rest) =
+                PageId::deserialize(data).map_err(|e| WalError::CorruptedRecord {
+                    lsn,
+                    reason: format!("Failed to deserialize PageId: {}", e),
+                })?;
+            data = rest;
+
+            let (diff, rest) =
+                PageDiff::deserialize(data).map_err(|e| WalError::CorruptedRecord {
+                    lsn,
+                    reason: format!("Failed to deserialize PageDiff: {}", e),
+                })?;
+            data = rest;
+
+            ops.push(SinglePageOperation { page_id, diff });
+        }
+
+        Ok(WalRecordData::MultiPageOperation(ops))
+    }
+
+    fn deserialize_checkpoint(data: &[u8], lsn: Lsn) -> Result<WalRecordData, WalError> {
+        let (checkpoint_lsn, _) =
+            Lsn::deserialize(data).map_err(|err| WalError::CorruptedRecord {
+                lsn,
+                reason: format!("failed to deserialize checkpoint LSN: {}", err),
+            })?;
+        Ok(WalRecordData::Checkpoint { checkpoint_lsn })
+    }
 }
 
 /// Client handle for interacting with the WAL from other threads.
@@ -470,8 +471,8 @@ impl WalClient {
         recv.recv().ok()?
     }
 
-    /// Writes multiple page operations atomically to WAL.
-    /// Returns None if the write failed.
+    /// Writes multiple page operations as single record to WAL and returns the assigned LSN.
+    /// Returns None if the write operation failed.
     pub fn write_multi(&self, ops: Vec<(PageId, PageDiff)>) -> Option<Lsn> {
         let (send, recv) = mpsc::sync_channel(1);
         let ops = ops
