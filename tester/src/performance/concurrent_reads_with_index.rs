@@ -7,20 +7,7 @@ use crate::{
     suite::{PerformanceTestResult, Suite, default_client},
 };
 
-pub struct ReadByIndex {
-    pub setup: Setup,
-    pub test: Test,
-    pub cleanup: Cleanup,
-}
-
-impl ReadByIndex {
-    pub async fn run_suite(&self) -> Result<PerformanceTestResult, TesterError> {
-        self.setup(&self.setup).await?;
-        let result = self.run(&self.test).await?;
-        self.cleanup(&self.cleanup).await?;
-        Ok(result)
-    }
-}
+pub struct ReadByIndex;
 
 pub struct Setup {
     pub database_name: String,
@@ -42,7 +29,7 @@ pub struct Cleanup {
 impl Suite<PerformanceTestResult> for ReadByIndex {
     type SetupArgs = Setup;
 
-    async fn setup(&self, args: &Self::SetupArgs) -> Result<(), TesterError> {
+    async fn setup(args: &Self::SetupArgs) -> Result<(), TesterError> {
         let mut client = default_client().await?;
         client
             .execute_and_wait(Request::CreateDatabase {
@@ -78,7 +65,7 @@ impl Suite<PerformanceTestResult> for ReadByIndex {
 
     type TestArgs = Test;
 
-    async fn run(&self, args: &Self::TestArgs) -> Result<PerformanceTestResult, TesterError> {
+    async fn run(args: &Self::TestArgs) -> Result<PerformanceTestResult, TesterError> {
         let start = Instant::now();
 
         let mut handles = Vec::with_capacity(args.num_of_threads);
@@ -120,7 +107,7 @@ impl Suite<PerformanceTestResult> for ReadByIndex {
 
     type CleanupArgs = Cleanup;
 
-    async fn cleanup(&self, args: &Self::CleanupArgs) -> Result<(), TesterError> {
+    async fn cleanup(args: &Self::CleanupArgs) -> Result<(), TesterError> {
         let mut client = default_client().await?;
         client
             .execute_and_wait(Request::DeleteDatabase {

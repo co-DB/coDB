@@ -10,7 +10,7 @@ use crate::performance::concurrent_reads::{self, ReadMany};
 use crate::performance::concurrent_reads_and_inserts::{self, ConcurrentReadsAndInserts};
 use crate::performance::concurrent_reads_non_index::{self, ReadByNonIndex};
 use crate::performance::concurrent_reads_with_index::{self, ReadByIndex};
-use crate::suite::PerformanceTestResult;
+use crate::suite::{PerformanceTestResult, Suite};
 
 mod client;
 mod performance;
@@ -158,14 +158,8 @@ async fn concurrent_inserts(
         database_name: db_name.clone(),
     };
 
-    let suite = ConcurrentInserts {
-        setup,
-        test,
-        cleanup,
-    };
-
     for _ in 0..runs {
-        let result = suite.run_suite().await?;
+        let result = ConcurrentInserts::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
     }
     Ok(test_results)
@@ -196,14 +190,8 @@ async fn concurrent_reads(
         database_name: db_name.clone(),
     };
 
-    let suite = ReadMany {
-        setup,
-        test,
-        cleanup,
-    };
-
     for _ in 0..runs {
-        let result = suite.run_suite().await?;
+        let result = ReadMany::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
     }
     Ok(test_results)
@@ -236,14 +224,8 @@ async fn concurrent_reads_and_inserts(
         database_name: db_name.clone(),
     };
 
-    let suite = ConcurrentReadsAndInserts {
-        setup,
-        test,
-        cleanup,
-    };
-
     for _ in 0..runs {
-        let result = suite.run_suite().await?;
+        let result = ConcurrentReadsAndInserts::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
     }
     Ok(test_results)
@@ -276,14 +258,8 @@ async fn concurrent_reads_index(
         database_name: db_name.clone(),
     };
 
-    let suite = ReadByIndex {
-        setup,
-        test,
-        cleanup,
-    };
-
     for _ in 0..runs {
-        let result = suite.run_suite().await?;
+        let result = ReadByIndex::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
     }
     Ok(test_results)
@@ -316,14 +292,8 @@ async fn concurrent_reads_non_index(
         database_name: db_name.clone(),
     };
 
-    let suite = ReadByNonIndex {
-        setup,
-        test,
-        cleanup,
-    };
-
     for _ in 0..runs {
-        let result = suite.run_suite().await?;
+        let result = ReadByNonIndex::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
     }
     Ok(test_results)

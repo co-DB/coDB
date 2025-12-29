@@ -9,13 +9,24 @@ use crate::{TesterError, client::BinaryClient};
 
 pub trait Suite<R> {
     type SetupArgs;
-    async fn setup(&self, args: &Self::SetupArgs) -> Result<(), TesterError>;
+    async fn setup(args: &Self::SetupArgs) -> Result<(), TesterError>;
 
     type TestArgs;
-    async fn run(&self, args: &Self::TestArgs) -> Result<R, TesterError>;
+    async fn run(args: &Self::TestArgs) -> Result<R, TesterError>;
 
     type CleanupArgs;
-    async fn cleanup(&self, args: &Self::CleanupArgs) -> Result<(), TesterError>;
+    async fn cleanup(args: &Self::CleanupArgs) -> Result<(), TesterError>;
+
+    async fn run_suite(
+        setup_args: &Self::SetupArgs,
+        run_args: &Self::TestArgs,
+        cleanup_args: &Self::CleanupArgs,
+    ) -> Result<R, TesterError> {
+        Self::setup(setup_args).await?;
+        let result = Self::run(run_args).await?;
+        Self::cleanup(cleanup_args).await?;
+        Ok(result)
+    }
 }
 
 pub struct PerformanceTestResult {
