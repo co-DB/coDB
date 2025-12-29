@@ -357,6 +357,7 @@ mod client_handler_tests {
     impl TestClient for TestTextClient {
         async fn connect(addr: &str) -> Result<Self, ClientError> {
             let socket = TcpStream::connect(addr).await?;
+            socket.set_nodelay(true)?;
             Ok(Self::new(socket))
         }
 

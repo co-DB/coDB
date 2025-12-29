@@ -96,6 +96,9 @@ impl Server {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
                         info!("Accepted connection from {}", addr);
+                        if let Err(e) = socket.set_nodelay(true) {
+                            error!("Failed to set TCP_NODELAY on {}: {}", addr, e);
+                        }
                         let h = handler.clone();
                         let exec = executors.clone();
                         let manager = catalog_manager.clone();

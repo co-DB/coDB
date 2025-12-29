@@ -1068,6 +1068,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tester"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "log",
+ "protocol",
+ "rkyv",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

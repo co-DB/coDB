@@ -82,6 +82,7 @@ where
     P: ProtocolHandler + From<TcpStream>,
 {
     let socket = TcpStream::connect(SocketAddr::new(ip, port)).await?;
+    socket.set_nodelay(true)?;
     let protocol = P::from(socket);
     let client = DbClient::new(protocol);
     Ok(client)
