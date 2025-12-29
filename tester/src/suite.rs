@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use log::info;
 use protocol::BINARY_PROTOCOL_PORT;
 
 use crate::{TesterError, client::BinaryClient};
@@ -22,9 +23,18 @@ pub trait Suite<R> {
         run_args: &Self::TestArgs,
         cleanup_args: &Self::CleanupArgs,
     ) -> Result<R, TesterError> {
+        info!("Starting setup...");
         Self::setup(setup_args).await?;
+        info!("Setup completed.");
+
+        info!("Starting test...");
         let result = Self::run(run_args).await?;
+        info!("Test completed.");
+
+        info!("Starting cleanup...");
         Self::cleanup(cleanup_args).await?;
+        info!("Cleanup completed.");
+
         Ok(result)
     }
 }
