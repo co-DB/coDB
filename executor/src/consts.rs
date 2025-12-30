@@ -4,3 +4,5 @@ pub(crate) const HEAP_FILE_BUCKET_SIZE: usize = 16;
 
 pub(crate) const CACHE_SIZE: usize = 4096;
 pub(crate) const CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(120);
+
+pub(crate) const FILES_MANAGER_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);

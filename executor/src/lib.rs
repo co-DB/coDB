@@ -58,7 +58,11 @@ impl Executor {
         database_path: impl AsRef<Path>,
         catalog: Catalog,
     ) -> Result<(Self, Vec<BackgroundWorkerHandle>), ExecutorError> {
-        let files = Arc::new(FilesManager::new(database_path)?);
+        let (files, files_background_worker) = FilesManager::with_background_cleaner(
+            database_path,
+            consts::FILES_MANAGER_CLEANUP_INTERVAL,
+        )?;
+
         let (cache, cache_background_worker) = Cache::with_background_cleaner(
             consts::CACHE_SIZE,
             files,
@@ -71,7 +75,7 @@ impl Executor {
             cache,
             catalog,
         };
-        let workers = vec![cache_background_worker];
+        let workers = vec![cache_background_worker, files_background_worker];
         Ok((executor, workers))
     }
 
