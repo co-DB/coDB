@@ -21,6 +21,7 @@ use metadata::catalog::Catalog;
 use parking_lot::RwLock;
 use planner::{query_plan::StatementPlan, resolved_tree::ResolvedTree};
 use storage::{
+    background_worker::BackgroundWorkerHandle,
     cache::Cache,
     files_manager::{FileKey, FilesManager, FilesManagerError},
 };
@@ -51,6 +52,27 @@ impl Executor {
             cache,
             catalog,
         })
+    }
+
+    pub fn with_background_workers(
+        database_path: impl AsRef<Path>,
+        catalog: Catalog,
+    ) -> Result<(Self, Vec<BackgroundWorkerHandle>), ExecutorError> {
+        let files = Arc::new(FilesManager::new(database_path)?);
+        let (cache, cache_background_worker) = Cache::with_background_cleaner(
+            consts::CACHE_SIZE,
+            files,
+            consts::CACHE_CLEANUP_INTERVAL,
+        );
+        let catalog = Arc::new(RwLock::new(catalog));
+        let executor = Executor {
+            heap_files: DashMap::new(),
+            b_trees: DashMap::new(),
+            cache,
+            catalog,
+        };
+        let workers = vec![cache_background_worker];
+        Ok((executor, workers))
     }
 
     /// Parses `query` and returns iterator over results for each statement in the `query`.

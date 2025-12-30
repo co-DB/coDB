@@ -52,11 +52,13 @@ impl Server {
             self.executors.clone(),
             self.catalog_manager.clone(),
             self.tasks.clone(),
+            self.background_workers.clone(),
             self.shutdown.child_token(),
-            |socket, executors, manager, tasks, shutdown| {
+            |socket, executors, manager, tasks, workers, shutdown| {
                 let handle = tokio::spawn(async move {
                     let text_handler = TextProtocolHandler::from(socket);
-                    let handler = ClientHandler::new(executors, manager, text_handler, shutdown);
+                    let handler =
+                        ClientHandler::new(executors, manager, text_handler, workers, shutdown);
                     handler.run().await;
                 });
                 tasks.add(handle);
@@ -69,11 +71,13 @@ impl Server {
             self.executors.clone(),
             self.catalog_manager.clone(),
             self.tasks.clone(),
+            self.background_workers.clone(),
             self.shutdown.child_token(),
-            |socket, executors, manager, tasks, shutdown| {
+            |socket, executors, manager, tasks, workers, shutdown| {
                 let handle = tokio::spawn(async move {
                     let binary_handler = BinaryProtocolHandler::from(socket);
-                    let handler = ClientHandler::new(executors, manager, binary_handler, shutdown);
+                    let handler =
+                        ClientHandler::new(executors, manager, binary_handler, workers, shutdown);
                     handler.run().await;
                 });
                 tasks.add(handle);
@@ -96,12 +100,14 @@ impl Server {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_listener<F>(
         &self,
         addr: SocketAddr,
         executors: Arc<DashMap<String, Arc<Executor>>>,
         catalog_manager: Arc<RwLock<CatalogManager>>,
         tasks: Arc<TasksContainer>,
+        workers: Arc<WorkersContainer>,
         shutdown: CancellationToken,
         handler: F,
     ) -> Result<(), ServerError>
@@ -111,6 +117,7 @@ impl Server {
                 Arc<DashMap<String, Arc<Executor>>>,
                 Arc<RwLock<CatalogManager>>,
                 Arc<TasksContainer>,
+                Arc<WorkersContainer>,
                 CancellationToken,
             ) + Send
             + Sync
@@ -144,7 +151,7 @@ impl Server {
                         }
 
                         let child_shutdown = shutdown.child_token();
-                        handler(socket, executors.clone(), catalog_manager.clone(), tasks.clone(), child_shutdown);
+                        handler(socket, executors.clone(), catalog_manager.clone(), tasks.clone(), workers.clone(), child_shutdown);
                     }
                 }
             }

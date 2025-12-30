@@ -1,5 +1,6 @@
 ﻿use crate::protocol_handler::{ProtocolHandler, ReadResult};
 use crate::protocol_mappings::IntoProtocol;
+use crate::workers_container::WorkersContainer;
 use dashmap::{DashMap, Entry};
 use engine::record::Record as EngineRecord;
 use executor::response::StatementResult;
@@ -23,6 +24,7 @@ where
     executors: Arc<DashMap<String, Arc<Executor>>>,
     catalog_manager: Arc<RwLock<CatalogManager>>,
     protocol_handler: P,
+    workers: Arc<WorkersContainer>,
     shutdown: CancellationToken,
 }
 
@@ -80,6 +82,7 @@ where
         executors: Arc<DashMap<String, Arc<Executor>>>,
         catalog_manager: Arc<RwLock<CatalogManager>>,
         protocol_handler: P,
+        workers: Arc<WorkersContainer>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
@@ -87,6 +90,7 @@ where
             current_database: None,
             executors,
             catalog_manager,
+            workers,
             shutdown,
         }
     }
@@ -233,12 +237,15 @@ where
                 };
 
                 let db_directory_path = main_path.join(database.as_ref());
-                let executor = Arc::new(
-                    Executor::new(db_directory_path, catalog)
-                        .map_err(ClientError::ExecutorError)?,
-                );
+                let (executor, background_workers) =
+                    Executor::with_background_workers(db_directory_path, catalog)
+                        .map_err(ClientError::ExecutorError)?;
 
+                let executor = Arc::new(executor);
                 vacant_entry.insert(executor.clone());
+
+                self.workers.add_many(background_workers.into_iter());
+
                 Ok(executor)
             }
         }
@@ -329,6 +336,7 @@ where
 mod client_handler_tests {
     use crate::client_handler::{ClientError, ClientHandler};
     use crate::protocol_handler::{BinaryProtocolHandler, TextProtocolHandler};
+    use crate::workers_container::WorkersContainer;
     use dashmap::DashMap;
     use executor::Executor;
     use metadata::catalog_manager::CatalogManager;
@@ -475,6 +483,7 @@ mod client_handler_tests {
                         executors.clone(),
                         catalog_manager.clone(),
                         text_handler,
+                        Arc::new(WorkersContainer::new()),
                         CancellationToken::new(),
                     );
                     tokio::spawn(async move {
@@ -504,6 +513,7 @@ mod client_handler_tests {
                         executors.clone(),
                         catalog_manager.clone(),
                         binary_handler,
+                        Arc::new(WorkersContainer::new()),
                         CancellationToken::new(),
                     );
                     tokio::spawn(async move {

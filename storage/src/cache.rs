@@ -10,7 +10,7 @@ use std::{
 };
 
 use dashmap::{DashMap, Entry};
-use log::{error, warn};
+use log::{error, info, warn};
 use lru::LruCache;
 use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use thiserror::Error;
@@ -613,6 +613,7 @@ impl BackgroundWorker for BackgroundCacheCleaner {
     type BackgroundWorkerParams = BackgroundCacheCleanerParams;
 
     fn start(params: Self::BackgroundWorkerParams) -> BackgroundWorkerHandle {
+        info!("Starting cache background cleaner");
         let (tx, rx) = mpsc::channel();
         let cleaner = BackgroundCacheCleaner {
             cache: params.cache,
@@ -632,15 +633,18 @@ impl BackgroundCacheCleaner {
             match self.shutdown.recv_timeout(self.cleanup_interval) {
                 Ok(()) => {
                     // Got signal for shutdown.
+                    info!("Shutting down cache background cleaner");
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    info!("Cache background cleaner - syncing frames and lru");
                     if let Err(e) = self.sync_frames_and_lru() {
                         error!("failed to sync frames and lru: {e}")
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // Sender dropped - trying to shutdown anyway.
+                    info!("Shutting down cache background cleaner (cancellation channel dropped)");
                     break;
                 }
             }

@@ -17,6 +17,12 @@ impl WorkersContainer {
         self.workers.push(handle);
     }
 
+    pub fn add_many(&self, handles: impl Iterator<Item = BackgroundWorkerHandle>) {
+        for handle in handles {
+            self.add(handle);
+        }
+    }
+
     pub fn shutdown(&self) {
         let mut stopped = Vec::with_capacity(self.workers.len());
 
