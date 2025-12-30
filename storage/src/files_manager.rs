@@ -177,7 +177,7 @@ impl BackgroundFilesManagerCleaner {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     info!("Files manager background cleaner - truncating files");
                     if let Err(e) = self.truncate_files() {
-                        error!("failed to sync frames and lru: {e}")
+                        error!("failed to truncate files: {e}")
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {

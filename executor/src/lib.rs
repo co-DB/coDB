@@ -42,6 +42,7 @@ pub enum ExecutorError {
 }
 
 impl Executor {
+    /// Creates new [`Executor`] for database at `database_path`.
     pub fn new(database_path: impl AsRef<Path>, catalog: Catalog) -> Result<Self, ExecutorError> {
         let files = Arc::new(FilesManager::new(database_path)?);
         let cache = Cache::new(consts::CACHE_SIZE, files);
@@ -54,6 +55,8 @@ impl Executor {
         })
     }
 
+    /// Creates new [`Executor`] for database at `database_path` and initializes background threads used by its components.
+    /// Returns executor and handles to the background threads.
     pub fn with_background_workers(
         database_path: impl AsRef<Path>,
         catalog: Catalog,
