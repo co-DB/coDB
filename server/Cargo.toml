@@ -8,6 +8,7 @@ rust-version.workspace = true
 executor = { path = "../executor" }
 metadata = { path = "../metadata" }
 engine = { path = "../engine" }
+storage = { path = "../storage" }
 protocol = { path = "../protocol" }
 types = { path = "../types" }
 storage = { path = "../storage" }

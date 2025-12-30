@@ -38,6 +38,21 @@ pub struct StartHandle {
     pub(crate) redo_records: Vec<(Lsn, WalRecordData)>,
 }
 
+/// Handle containing WAL client and redo records for passing to Executor/Cache.
+pub struct WalHandle {
+    pub(crate) wal_client: WalClient,
+    pub(crate) redo_records: Vec<(Lsn, WalRecordData)>,
+}
+
+impl WalHandle {
+    fn new(wal_client: WalClient, redo_records: Vec<(Lsn, WalRecordData)>) -> Self {
+        Self {
+            wal_client,
+            redo_records,
+        }
+    }
+}
+
 impl StartHandle {
     fn new(
         handle: JoinHandle<()>,
@@ -49,6 +64,13 @@ impl StartHandle {
             wal_client,
             redo_records,
         }
+    }
+
+    /// Consumes StartHandle and returns WalHandle for passing to Executor/Cache.
+    /// The JoinHandle remains in StartHandle for cleanup.
+    pub fn into_wal_handle(self) -> (WalHandle, JoinHandle<()>) {
+        let wal_handle = WalHandle::new(self.wal_client, self.redo_records);
+        (wal_handle, self.handle)
     }
 
     /// Waits for the WAL thread to finish (when either WalClient is dropped or an error occurs)
