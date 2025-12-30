@@ -1361,6 +1361,27 @@ mod tests {
     }
 
     #[test]
+    fn test_with_background_workers_starts_and_stoppable() {
+        let (catalog, temp_dir) = create_catalog();
+        let db_path = temp_dir.path().join("test_db");
+
+        let (executor, mut workers) = Executor::with_background_workers(db_path, catalog)
+            .expect("with_background_workers should succeed");
+
+        // We expect two background workers (cache and files manager)
+        assert_eq!(workers.len(), 2);
+
+        // Shutdown and join all workers to ensure threads are started and can be stopped.
+        while let Some(mut handle) = workers.pop() {
+            handle.shutdown().expect("shutdown should succeed");
+            handle.join().expect("join should succeed");
+        }
+
+        // Basic sanity check that executor was created and holds structures
+        let _c = executor.catalog.read();
+    }
+
+    #[test]
     fn test_execute_insert_twice_with_the_same_key() {
         let (executor, _temp_dir) = create_test_executor();
 
