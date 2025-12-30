@@ -5,7 +5,7 @@ use engine::record::Record as EngineRecord;
 use executor::response::StatementResult;
 use executor::{Executor, ExecutorError};
 use itertools::Itertools;
-use log::error;
+use log::{error, info};
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use parking_lot::RwLock;
 use protocol::{ErrorType, Record as ProtocolRecord, Request, Response, StatementType};
@@ -13,6 +13,7 @@ use rkyv::rancor;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) struct ClientHandler<P>
 where
@@ -22,6 +23,7 @@ where
     executors: Arc<DashMap<String, Arc<Executor>>>,
     catalog_manager: Arc<RwLock<CatalogManager>>,
     protocol_handler: P,
+    shutdown: CancellationToken,
 }
 
 #[derive(Error, Debug)]
@@ -78,33 +80,46 @@ where
         executors: Arc<DashMap<String, Arc<Executor>>>,
         catalog_manager: Arc<RwLock<CatalogManager>>,
         protocol_handler: P,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             protocol_handler,
             current_database: None,
             executors,
             catalog_manager,
+            shutdown,
         }
     }
 
     pub(crate) async fn run(mut self) {
+        let shutdown = self.shutdown.clone();
+
         loop {
-            match self.read_request().await {
-                Ok(ReadResult::Request(request)) => {
-                    if let Err(e) = self.handle_request(request).await {
-                        error!("Error handling request: {}", e);
-                        let _ = self.send_error(e.to_string(), e.to_error_type()).await;
-                    }
-                }
-                Ok(ReadResult::Disconnected) => {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("Client handler received shutdown signal");
+                    let _ = self.send_error(
+                        "Server is shutting down",
+                        ErrorType::Execution,
+                    ).await;
                     break;
                 }
-                Ok(ReadResult::Empty) => {
-                    continue;
-                }
-                Err(e) => {
-                    error!("Error reading request: {}", e);
-                    let _ = self.send_error(e.to_string(), e.to_error_type()).await;
+
+                res = self.read_request() => {
+                    match res {
+                        Ok(ReadResult::Request(request)) => {
+                            if let Err(e) = self.handle_request(request).await {
+                                error!("Error handling request: {}", e);
+                                let _ = self.send_error(e.to_string(), e.to_error_type()).await;
+                            }
+                        }
+                        Ok(ReadResult::Disconnected) => break,
+                        Ok(ReadResult::Empty) => continue,
+                        Err(e) => {
+                            error!("Error reading request: {}", e);
+                            let _ = self.send_error(e.to_string(), e.to_error_type()).await;
+                        }
+                    }
                 }
             }
         }
@@ -323,6 +338,7 @@ mod client_handler_tests {
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio_util::sync::CancellationToken;
 
     /// Trait for test clients that can work with different protocols
     trait TestClient: Sized {
@@ -459,6 +475,7 @@ mod client_handler_tests {
                         executors.clone(),
                         catalog_manager.clone(),
                         text_handler,
+                        CancellationToken::new(),
                     );
                     tokio::spawn(async move {
                         handler.run().await;
@@ -487,6 +504,7 @@ mod client_handler_tests {
                         executors.clone(),
                         catalog_manager.clone(),
                         binary_handler,
+                        CancellationToken::new(),
                     );
                     tokio::spawn(async move {
                         handler.run().await;

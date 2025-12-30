@@ -23,3 +23,5 @@ log.workspace = true
 env_logger.workspace = true
 rkyv.workspace = true
 crossbeam.workspace = true
+
+tokio-util = "0.7"
