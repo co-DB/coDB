@@ -21,6 +21,7 @@ use metadata::catalog::Catalog;
 use parking_lot::RwLock;
 use planner::{query_plan::StatementPlan, resolved_tree::ResolvedTree};
 use storage::{
+    background_worker::BackgroundWorkerHandle,
     cache::Cache,
     files_manager::{FileKey, FilesManager, FilesManagerError},
 };
@@ -41,6 +42,7 @@ pub enum ExecutorError {
 }
 
 impl Executor {
+    /// Creates new [`Executor`] for database at `database_path`.
     pub fn new(database_path: impl AsRef<Path>, catalog: Catalog) -> Result<Self, ExecutorError> {
         let files = Arc::new(FilesManager::new(database_path)?);
         let cache = Cache::new(consts::CACHE_SIZE, files);
@@ -51,6 +53,33 @@ impl Executor {
             cache,
             catalog,
         })
+    }
+
+    /// Creates new [`Executor`] for database at `database_path` and initializes background threads used by its components.
+    /// Returns executor and handles to the background threads.
+    pub fn with_background_workers(
+        database_path: impl AsRef<Path>,
+        catalog: Catalog,
+    ) -> Result<(Self, Vec<BackgroundWorkerHandle>), ExecutorError> {
+        let (files, files_background_worker) = FilesManager::with_background_cleaner(
+            database_path,
+            consts::FILES_MANAGER_CLEANUP_INTERVAL,
+        )?;
+
+        let (cache, cache_background_worker) = Cache::with_background_cleaner(
+            consts::CACHE_SIZE,
+            files,
+            consts::CACHE_CLEANUP_INTERVAL,
+        );
+        let catalog = Arc::new(RwLock::new(catalog));
+        let executor = Executor {
+            heap_files: DashMap::new(),
+            b_trees: DashMap::new(),
+            cache,
+            catalog,
+        };
+        let workers = vec![cache_background_worker, files_background_worker];
+        Ok((executor, workers))
     }
 
     /// Parses `query` and returns iterator over results for each statement in the `query`.
@@ -1329,6 +1358,27 @@ mod tests {
         assert_eq!(*row.fields[0].deref(), Value::Int32(1));
         assert!(matches!(&row.fields[1].deref(), Value::String(s) if s == "Alice"));
         assert_eq!(*row.fields[2].deref(), Value::Int32(25));
+    }
+
+    #[test]
+    fn test_with_background_workers_starts_and_stoppable() {
+        let (catalog, temp_dir) = create_catalog();
+        let db_path = temp_dir.path().join("test_db");
+
+        let (executor, mut workers) = Executor::with_background_workers(db_path, catalog)
+            .expect("with_background_workers should succeed");
+
+        // We expect two background workers (cache and files manager)
+        assert_eq!(workers.len(), 2);
+
+        // Shutdown and join all workers to ensure threads are started and can be stopped.
+        while let Some(mut handle) = workers.pop() {
+            handle.shutdown().expect("shutdown should succeed");
+            handle.join().expect("join should succeed");
+        }
+
+        // Basic sanity check that executor was created and holds structures
+        let _c = executor.catalog.read();
     }
 
     #[test]

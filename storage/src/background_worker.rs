@@ -33,7 +33,7 @@ impl BackgroundWorkerHandle {
 
     /// Sends signal via [`mpsc::Channel`] to [`BackgroundWorkerHandle::handle`] to shutdown.
     /// This function can only be called once for the whole lifetime of this struct.
-    pub(crate) fn shutdown(&mut self) -> Result<(), BackgroundWorkerError> {
+    pub fn shutdown(&mut self) -> Result<(), BackgroundWorkerError> {
         let tx = mem::take(&mut self.shutdown);
         tx.ok_or(BackgroundWorkerError::AlreadyShutdown)?
             .send(())
@@ -41,7 +41,7 @@ impl BackgroundWorkerHandle {
     }
 
     /// Awaits the completion of [`BackgroundWorkerHandle::handle`].
-    pub(crate) fn join(self) -> Result<(), BackgroundWorkerError> {
+    pub fn join(self) -> Result<(), BackgroundWorkerError> {
         self.handle
             .join()
             .map_err(|_| BackgroundWorkerError::FailedToJoin)

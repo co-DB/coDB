@@ -15,8 +15,8 @@ parking_lot.workspace = true
 time.workspace = true
 bytemuck.workspace = true
 dashmap.workspace = true
+crossbeam.workspace = true
 
-crossbeam = "0.8"
 bitflags = { version = "2.9.4", features = ["bytemuck"] }
 
 [dev-dependencies]

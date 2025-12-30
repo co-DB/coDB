@@ -1,10 +1,14 @@
 ﻿//! FilesManager module — manages and distributes paged files in a single database.
 
+use crate::background_worker::{BackgroundWorker, BackgroundWorkerHandle};
 use crate::paged_file::{PagedFile, PagedFileError};
 use dashmap::DashMap;
+use log::{error, info};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Represents possible file types inside a table directory (refer to `docs/file_structure.md` for more
@@ -91,6 +95,19 @@ impl FilesManager {
         }
     }
 
+    /// Creates new [`FilesManager`] with its [`BackgroundFilesManagerCleaner`]'s handle
+    pub fn with_background_cleaner(
+        database_path: impl AsRef<Path>,
+        cleanup_interval: Duration,
+    ) -> Result<(Arc<Self>, BackgroundWorkerHandle), FilesManagerError> {
+        let files_manager = Arc::new(Self::new(database_path)?);
+        let cleaner = BackgroundFilesManagerCleaner::start(BackgroundFilesManagerCleanerParams {
+            files_manager: files_manager.clone(),
+            cleanup_interval,
+        });
+        Ok((files_manager, cleaner))
+    }
+
     /// Returns a [`Arc<Mutext<PagedFile>>`] for a specific combination of table name and file type stored in
     /// FileKey or creates and stores it if one didn't exist beforehand.
     ///
@@ -115,5 +132,73 @@ impl FilesManager {
     /// a table is deleted or renamed.
     pub(crate) fn close_file(&self, key: &FileKey) {
         self.open_files.remove(key);
+    }
+}
+
+/// Responsible for periodically scanning opened files in [`FilesManager`] and truncating them.
+pub(crate) struct BackgroundFilesManagerCleaner {
+    files_manager: Arc<FilesManager>,
+    cleanup_interval: Duration,
+    shutdown: mpsc::Receiver<()>,
+}
+
+pub(crate) struct BackgroundFilesManagerCleanerParams {
+    files_manager: Arc<FilesManager>,
+    cleanup_interval: Duration,
+}
+
+impl BackgroundWorker for BackgroundFilesManagerCleaner {
+    type BackgroundWorkerParams = BackgroundFilesManagerCleanerParams;
+
+    fn start(params: Self::BackgroundWorkerParams) -> BackgroundWorkerHandle {
+        info!("Starting files manager background cleaner");
+        let (tx, rx) = mpsc::channel();
+        let cleaner = BackgroundFilesManagerCleaner {
+            files_manager: params.files_manager,
+            cleanup_interval: params.cleanup_interval,
+            shutdown: rx,
+        };
+        let handle = thread::spawn(move || {
+            cleaner.run();
+        });
+        BackgroundWorkerHandle::new(handle, tx)
+    }
+}
+
+impl BackgroundFilesManagerCleaner {
+    fn run(self) {
+        loop {
+            match self.shutdown.recv_timeout(self.cleanup_interval) {
+                Ok(()) => {
+                    // Got signal for shutdown.
+                    info!("Shutting down files manager background cleaner");
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    info!("Files manager background cleaner - truncating files");
+                    if let Err(e) = self.truncate_files() {
+                        error!("failed to truncate files: {e}")
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Sender dropped - trying to shutdown anyway.
+                    info!(
+                        "Shutting down files manager background cleaner (cancellation channel dropped)"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Iterate over all files currently opened.
+    /// For each file, if we can instantly acquire the lock we truncate them (remove unused pages from the end of the file).
+    fn truncate_files(&self) -> Result<(), FilesManagerError> {
+        for file in &self.files_manager.open_files {
+            if let Some(mut lock) = file.try_lock() {
+                lock.truncate()?;
+            }
+        }
+        Ok(())
     }
 }

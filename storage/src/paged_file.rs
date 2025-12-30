@@ -431,7 +431,7 @@ impl TryFrom<fs::File> for PagedFile {
         Ok(PagedFile {
             handle: value,
             metadata: file_metadata,
-            free_pages: free_pages,
+            free_pages,
         })
     }
 }

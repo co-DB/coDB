@@ -29,3 +29,4 @@ bytemuck = { version = "1.23.2", features = ["derive"] }
 dashmap = "6.1.0"
 itertools = "0.14.0"
 rkyv = "0.8.12"
+crossbeam = "0.8"
