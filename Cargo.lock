@@ -975,6 +975,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "crossbeam",
  "dashmap",
  "engine",
  "env_logger",
@@ -987,6 +988,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
+ "storage",
  "thiserror",
  "tokio",
  "types",

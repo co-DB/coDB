@@ -10,6 +10,7 @@ metadata = { path = "../metadata" }
 engine = { path = "../engine" }
 protocol = { path = "../protocol" }
 types = { path = "../types" }
+storage = { path = "../storage" }
 
 tokio.workspace = true
 thiserror.workspace = true
@@ -21,3 +22,4 @@ itertools.workspace = true
 log.workspace = true
 env_logger.workspace = true
 rkyv.workspace = true
+crossbeam.workspace = true

@@ -1,6 +1,7 @@
 ﻿use crate::{
     client_handler::ClientHandler,
     protocol_handler::{BinaryProtocolHandler, TextProtocolHandler},
+    workers_container::WorkersContainer,
 };
 use dashmap::DashMap;
 use executor::Executor;
@@ -25,6 +26,7 @@ pub(crate) struct Server {
     text_addr: SocketAddr,
     catalog_manager: Arc<RwLock<CatalogManager>>,
     executors: Arc<DashMap<String, Arc<Executor>>>,
+    background_workers: Arc<WorkersContainer>,
 }
 
 impl Server {
@@ -34,6 +36,7 @@ impl Server {
             text_addr,
             catalog_manager: Arc::new(RwLock::new(CatalogManager::new()?)),
             executors: Arc::new(DashMap::new()),
+            background_workers: Arc::new(WorkersContainer::new()),
         })
     }
 

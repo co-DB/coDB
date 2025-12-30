@@ -2,6 +2,7 @@ mod client_handler;
 mod protocol_handler;
 mod protocol_mappings;
 mod server;
+mod workers_container;
 
 use std::net::{IpAddr, SocketAddr};
 
