@@ -3,12 +3,12 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
     },
     thread,
     time::Duration,
 };
 
+use crossbeam::channel;
 use dashmap::{DashMap, Entry};
 use log::{error, info, warn};
 use lru::LruCache;
@@ -601,7 +601,7 @@ impl Drop for Cache {
 struct BackgroundCacheCleaner {
     cache: Arc<Cache>,
     cleanup_interval: Duration,
-    shutdown: mpsc::Receiver<()>,
+    shutdown: channel::Receiver<()>,
 }
 
 struct BackgroundCacheCleanerParams {
@@ -614,7 +614,7 @@ impl BackgroundWorker for BackgroundCacheCleaner {
 
     fn start(params: Self::BackgroundWorkerParams) -> BackgroundWorkerHandle {
         info!("Starting cache background cleaner");
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = channel::unbounded();
         let cleaner = BackgroundCacheCleaner {
             cache: params.cache,
             cleanup_interval: params.cleanup_interval,
@@ -636,13 +636,13 @@ impl BackgroundCacheCleaner {
                     info!("Shutting down cache background cleaner");
                     break;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(channel::RecvTimeoutError::Timeout) => {
                     info!("Cache background cleaner - syncing frames and lru");
                     if let Err(e) = self.sync_frames_and_lru() {
                         error!("failed to sync frames and lru: {e}")
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(channel::RecvTimeoutError::Disconnected) => {
                     // Sender dropped - trying to shutdown anyway.
                     info!("Shutting down cache background cleaner (cancellation channel dropped)");
                     break;

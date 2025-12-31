@@ -2,11 +2,12 @@
 
 use crate::background_worker::{BackgroundWorker, BackgroundWorkerHandle};
 use crate::paged_file::{PagedFile, PagedFileError};
+use crossbeam::channel;
 use dashmap::DashMap;
 use log::{error, info};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -139,7 +140,7 @@ impl FilesManager {
 pub(crate) struct BackgroundFilesManagerCleaner {
     files_manager: Arc<FilesManager>,
     cleanup_interval: Duration,
-    shutdown: mpsc::Receiver<()>,
+    shutdown: channel::Receiver<()>,
 }
 
 pub(crate) struct BackgroundFilesManagerCleanerParams {
@@ -152,7 +153,7 @@ impl BackgroundWorker for BackgroundFilesManagerCleaner {
 
     fn start(params: Self::BackgroundWorkerParams) -> BackgroundWorkerHandle {
         info!("Starting files manager background cleaner");
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = channel::unbounded();
         let cleaner = BackgroundFilesManagerCleaner {
             files_manager: params.files_manager,
             cleanup_interval: params.cleanup_interval,
@@ -174,13 +175,13 @@ impl BackgroundFilesManagerCleaner {
                     info!("Shutting down files manager background cleaner");
                     break;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(channel::RecvTimeoutError::Timeout) => {
                     info!("Files manager background cleaner - truncating files");
                     if let Err(e) = self.truncate_files() {
                         error!("failed to truncate files: {e}")
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(channel::RecvTimeoutError::Disconnected) => {
                     // Sender dropped - trying to shutdown anyway.
                     info!(
                         "Shutting down files manager background cleaner (cancellation channel dropped)"

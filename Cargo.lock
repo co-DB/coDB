@@ -998,7 +998,6 @@ dependencies = [
  "parking_lot",
  "protocol",
  "rkyv",
- "serde",
  "serde_json",
  "storage",
  "thiserror",
@@ -1043,6 +1042,7 @@ name = "storage"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "crossbeam",
  "dashmap",
  "log",
  "lru",
