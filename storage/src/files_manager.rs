@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
+use types::serialization::DbSerializable;
 
 /// Represents possible file types inside a table directory (refer to `docs/file_structure.md` for more
 /// details)
@@ -18,6 +19,40 @@ use thiserror::Error;
 enum FileType {
     Data,
     Index,
+}
+
+impl DbSerializable for FileType {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        let type_id: u8 = match self {
+            FileType::Data => 0,
+            FileType::Index => 1,
+        };
+        type_id.serialize(buffer);
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        let type_id: u8 = match self {
+            FileType::Data => 0,
+            FileType::Index => 1,
+        };
+        type_id.serialize_into(buffer);
+    }
+
+    fn deserialize(
+        data: &[u8],
+    ) -> Result<(Self, &[u8]), types::serialization::DbSerializationError> {
+        let (type_id, rest) = u8::deserialize(data)?;
+        let file_type = match type_id {
+            0 => FileType::Data,
+            1 => FileType::Index,
+            _ => return Err(types::serialization::DbSerializationError::FailedToDeserialize),
+        };
+        Ok((file_type, rest))
+    }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<u8>()
+    }
 }
 
 /// Helper type created to make referring to files easier and cleaner.
@@ -57,6 +92,59 @@ impl FileKey {
     /// Returns a full name of the file. Refer to `docs/files_structure.md`.
     pub fn file_name(&self) -> String {
         format!("{}.{}", self.table_name, self.extension())
+    }
+}
+
+impl DbSerializable for FileKey {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        let name_bytes = self.table_name.as_bytes();
+        (name_bytes.len() as u16).serialize(buffer);
+        buffer.extend_from_slice(name_bytes);
+        self.file_type.serialize(buffer);
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        let name_bytes = self.table_name.as_bytes();
+        let name_len = name_bytes.len();
+
+        (name_len as u16).serialize_into(&mut buffer[0..size_of::<u16>()]);
+
+        buffer[size_of::<u16>()..size_of::<u16>() + name_len].copy_from_slice(name_bytes);
+
+        self.file_type.serialize_into(&mut buffer[2 + name_len..]);
+    }
+
+    fn deserialize(
+        data: &[u8],
+    ) -> Result<(Self, &[u8]), types::serialization::DbSerializationError> {
+        let (name_len, rest) = u16::deserialize(data)?;
+        let name_len = name_len as usize;
+
+        if rest.len() < name_len {
+            return Err(types::serialization::DbSerializationError::UnexpectedEnd {
+                expected: name_len,
+                actual: rest.len(),
+            });
+        }
+
+        let table_name = std::str::from_utf8(&rest[..name_len])
+            .map_err(|_| types::serialization::DbSerializationError::FailedToDeserialize)?
+            .to_string();
+
+        let rest = &rest[name_len..];
+        let (file_type, rest) = FileType::deserialize(rest)?;
+
+        Ok((
+            FileKey {
+                table_name,
+                file_type,
+            },
+            rest,
+        ))
+    }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<u16>() + self.table_name.len() + size_of::<u8>()
     }
 }
 

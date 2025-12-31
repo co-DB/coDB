@@ -21,6 +21,7 @@ use crate::{
     page_diff::PageDiff,
     paged_file::{Lsn, Page, PageId, PagedFile, PagedFileError, get_page_lsn, set_page_lsn},
 };
+use types::serialization::DbSerializable;
 
 /// Structure for referring to single page in the file.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -40,6 +41,31 @@ impl FilePageRef {
 
     pub fn file_key(&self) -> &FileKey {
         &self.file_key
+    }
+}
+
+impl DbSerializable for FilePageRef {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        self.file_key.serialize(buffer);
+        self.page_id.serialize(buffer);
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        let file_key_size = self.file_key.size_serialized();
+        self.file_key.serialize_into(&mut buffer[0..file_key_size]);
+        self.page_id.serialize_into(&mut buffer[file_key_size..]);
+    }
+
+    fn deserialize(
+        data: &[u8],
+    ) -> Result<(Self, &[u8]), types::serialization::DbSerializationError> {
+        let (file_key, rest) = FileKey::deserialize(data)?;
+        let (page_id, rest) = PageId::deserialize(rest)?;
+        Ok((FilePageRef { page_id, file_key }, rest))
+    }
+
+    fn size_serialized(&self) -> usize {
+        self.file_key.size_serialized() + self.page_id.size_serialized()
     }
 }
 

@@ -1,13 +1,16 @@
-﻿use crate::page_diff::PageDiff;
-use crate::paged_file::{AtomicLsn, Lsn, PageId};
+use crate::background_worker::BackgroundWorkerHandle;
+use crate::cache::FilePageRef;
+use crate::page_diff::PageDiff;
+use crate::paged_file::{AtomicLsn, Lsn};
+use crossbeam::channel;
+use crossbeam::select;
 use log::error;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, mpsc};
-use std::thread::JoinHandle;
+use std::time::Duration;
 use std::{io, thread, time};
 use thiserror::Error;
 use types::serialization::DbSerializable;
@@ -32,12 +35,6 @@ struct RecoveryResult {
     pub last_lsn: Lsn,
 }
 
-pub struct StartHandle {
-    handle: JoinHandle<()>,
-    pub(crate) wal_client: WalClient,
-    pub(crate) redo_records: Vec<(Lsn, WalRecordData)>,
-}
-
 /// Handle containing WAL client and redo records for passing to Executor/Cache.
 pub struct WalHandle {
     pub(crate) wal_client: WalClient,
@@ -53,72 +50,67 @@ impl WalHandle {
     }
 }
 
-impl StartHandle {
-    fn new(
-        handle: JoinHandle<()>,
-        wal_client: WalClient,
-        redo_records: Vec<(Lsn, WalRecordData)>,
-    ) -> Self {
-        Self {
-            handle,
-            wal_client,
-            redo_records,
-        }
-    }
-
-    /// Consumes StartHandle and returns WalHandle for passing to Executor/Cache.
-    /// The JoinHandle remains in StartHandle for cleanup.
-    pub fn into_wal_handle(self) -> (WalHandle, JoinHandle<()>) {
-        let wal_handle = WalHandle::new(self.wal_client, self.redo_records);
-        (wal_handle, self.handle)
-    }
-
-    /// Waits for the WAL thread to finish (when either WalClient is dropped or an error occurs)
-    /// and joins it.
-    pub fn join(self) -> thread::Result<()> {
-        self.handle.join()
-    }
-}
-
 struct WalManager {
     /// The highest LSN assigned so far.
     current_lsn: Lsn,
     /// The highest LSN that has been flushed to disk. Atomic for cross-thread access.
     flushed_lsn: Arc<AtomicLsn>,
     /// Receiver for incoming WAL requests.
-    recv: mpsc::Receiver<WalRequest>,
+    recv: channel::Receiver<WalRequest>,
     /// Path to the file where WAL records are stored.
     log_path: PathBuf,
     /// Buffered writer for the WAL file.
     log_file: BufWriter<File>,
+    /// Receiver for shutdown signal.
+    shutdown: channel::Receiver<()>,
+    /// Interval for automatic flush.
+    flush_interval: Duration,
+    /// Maximum number of unflushed records before forcing a flush.
+    max_unflushed_records: u64,
 }
 
 /// Spawns the WAL manager thread and returns a handle for interaction.
 /// This is the main entry point for using WAL.
-pub fn spawn_wal(log_path: impl AsRef<Path>) -> Result<StartHandle, WalError> {
-    let (sender, recv) = mpsc::sync_channel(1024);
+pub fn spawn_wal(
+    log_path: impl AsRef<Path>,
+    flush_interval: Duration,
+    max_unflushed_records: u64,
+) -> Result<(WalHandle, BackgroundWorkerHandle), WalError> {
+    let (record_sender, record_receiver) = channel::bounded(1024);
+    let (shutdown_sender, shutdown_receiver) = channel::unbounded();
 
-    let (mut manager, recovery, flushed_lsn) = WalManager::with_recovery(recv, log_path)?;
+    let (mut manager, recovery, flushed_lsn) = WalManager::with_recovery(
+        record_receiver,
+        shutdown_receiver,
+        log_path,
+        flush_interval,
+        max_unflushed_records,
+    )?;
 
     let handle = thread::spawn(move || {
         manager.run();
     });
 
     let client = WalClient {
-        sender,
+        sender: record_sender,
         flushed_lsn,
     };
 
-    let handle = StartHandle::new(handle, client, recovery.redo_records);
-    Ok(handle)
+    let wal_handle = WalHandle::new(client, recovery.redo_records);
+    let bg_handle = BackgroundWorkerHandle::new(handle, shutdown_sender);
+
+    Ok((wal_handle, bg_handle))
 }
 
 impl WalManager {
     /// Creates WalManager after recovering from existing log file.
     /// Returns the manager, recovery result, and shared flushed_lsn.
     fn with_recovery(
-        recv: mpsc::Receiver<WalRequest>,
+        recv: channel::Receiver<WalRequest>,
+        shutdown: channel::Receiver<()>,
         log_path: impl AsRef<Path>,
+        flush_interval: Duration,
+        max_unflushed_records: u64,
     ) -> Result<(Self, RecoveryResult, Arc<AtomicLsn>), WalError> {
         let path = log_path.as_ref();
         let recovery = Self::recover_from_log(path)?;
@@ -133,16 +125,49 @@ impl WalManager {
             recv,
             log_path: path.to_path_buf(),
             log_file: BufWriter::new(log_file),
+            shutdown,
+            max_unflushed_records,
+            flush_interval,
         };
 
         Ok((manager, recovery, flushed_lsn))
     }
 
     fn run(&mut self) {
-        while let Ok(req) = self.recv.recv() {
-            if let Err(err) = self.handle_request(req) {
-                error!("WAL error occurred: {}", err);
+        loop {
+            select! {
+                recv(self.recv) -> msg => {
+                    match msg {
+                        Ok(req) => {
+                            if let Err(err) = self.handle_request(req) {
+                                error!("WAL error occurred: {}", err);
+                            }
+                        }
+                        Err(_) => {
+                            // Channel closed, shutdown gracefully
+                            self.shutdown_gracefully();
+                            break;
+                        }
+                    }
+                }
+                recv(self.shutdown) -> _ => {
+                    self.shutdown_gracefully();
+                    break;
+                }
+                default(self.flush_interval) => {
+                    if self.current_lsn > self.flushed_lsn.load(Ordering::Acquire)
+                        && let Err(e) = self.flush_internal() {
+                            error!("Periodic WAL flush failed: {}", e);
+                        }
+                }
             }
+        }
+    }
+
+    fn shutdown_gracefully(&mut self) {
+        // Flush any remaining records before shutting down
+        if let Err(e) = self.flush_internal() {
+            error!("Failed to flush WAL during shutdown: {}", e);
         }
     }
 
@@ -158,6 +183,9 @@ impl WalManager {
         match self.append_record(record.data) {
             Ok(lsn) => {
                 let _ = record.send.send(Some(lsn));
+                if lsn - self.flushed_lsn.load(Ordering::Acquire) >= self.max_unflushed_records {
+                    self.flush_internal()?;
+                }
                 Ok(())
             }
             Err(err) => {
@@ -175,7 +203,7 @@ impl WalManager {
         Ok(record_lsn)
     }
 
-    fn handle_flush(&mut self, sender: SyncSender<bool>) -> Result<(), WalError> {
+    fn handle_flush(&mut self, sender: channel::Sender<bool>) -> Result<(), WalError> {
         let result = self.flush_internal();
         let _ = sender.send(result.is_ok());
         result
@@ -188,7 +216,7 @@ impl WalManager {
         Ok(())
     }
 
-    fn handle_checkpoint(&mut self, sender: SyncSender<Option<Lsn>>) -> Result<(), WalError> {
+    fn handle_checkpoint(&mut self, sender: channel::Sender<Option<Lsn>>) -> Result<(), WalError> {
         let result = self.perform_checkpoint();
         let lsn = match &result {
             Ok(lsn) => Some(*lsn),
@@ -326,14 +354,18 @@ impl WalManager {
 /// Represents a request to the WAL manager.
 enum WalRequest {
     Write(WalRecord),
-    ForceFlush { sender: SyncSender<bool> },
-    Checkpoint { sender: SyncSender<Option<Lsn>> },
+    ForceFlush {
+        sender: channel::Sender<bool>,
+    },
+    Checkpoint {
+        sender: channel::Sender<Option<Lsn>>,
+    },
 }
 
 /// Represents a WAL record write request along with a channel to send back the assigned LSN.
 struct WalRecord {
     data: WalRecordData,
-    send: SyncSender<Option<Lsn>>,
+    send: channel::Sender<Option<Lsn>>,
 }
 
 /// Represents the data contained in a WAL record. Can be single-page if only one page is modified,
@@ -348,8 +380,25 @@ pub(crate) enum WalRecordData {
 
 /// Represents a single page operation in WAL.
 pub(crate) struct SinglePageOperation {
-    page_id: PageId,
+    file_page_ref: FilePageRef,
     diff: PageDiff,
+}
+
+impl SinglePageOperation {
+    pub fn new(file_page_ref: FilePageRef, diff: PageDiff) -> Self {
+        Self {
+            file_page_ref,
+            diff,
+        }
+    }
+
+    pub fn file_page_ref(&self) -> &FilePageRef {
+        &self.file_page_ref
+    }
+
+    pub fn diff(&self) -> &PageDiff {
+        &self.diff
+    }
 }
 
 /// Guard for temporary files that ensures deletion on drop unless committed.
@@ -382,7 +431,7 @@ impl Drop for TempFileGuard {
 /// 3. Record type (u8)
 /// 4. Number of page operations (if multipage)
 /// 5. For each page operation:
-///    a. Page ID (u32)
+///    a. PageRef (u32 + FileKey)
 ///    b. Number of diffs (u16)
 ///    c. For each diff:
 ///    i. Offset (u16)
@@ -409,13 +458,13 @@ impl WalRecordData {
 
         match &self {
             WalRecordData::SinglePageOperation(op) => {
-                op.page_id.serialize(&mut buffer);
+                op.file_page_ref.serialize(&mut buffer);
                 op.diff.serialize(&mut buffer);
             }
             WalRecordData::MultiPageOperation(ops) => {
                 (ops.len() as u16).serialize(&mut buffer);
                 for op in ops {
-                    op.page_id.serialize(&mut buffer);
+                    op.file_page_ref.serialize(&mut buffer);
                     op.diff.serialize(&mut buffer);
                 }
             }
@@ -451,10 +500,10 @@ impl WalRecordData {
     }
 
     fn deserialize_single_page_op(data: &[u8], lsn: Lsn) -> Result<WalRecordData, WalError> {
-        let (page_id, rest) =
-            PageId::deserialize(data).map_err(|err| WalError::CorruptedRecord {
+        let (file_page_ref, rest) =
+            FilePageRef::deserialize(data).map_err(|err| WalError::CorruptedRecord {
                 lsn,
-                reason: format!("failed to deserialize PageId: {}", err),
+                reason: format!("failed to deserialize FilePageRef: {}", err),
             })?;
 
         let (diff, _) = PageDiff::deserialize(rest).map_err(|e| WalError::CorruptedRecord {
@@ -463,7 +512,7 @@ impl WalRecordData {
         })?;
 
         Ok(WalRecordData::SinglePageOperation(SinglePageOperation {
-            page_id,
+            file_page_ref,
             diff,
         }))
     }
@@ -477,10 +526,10 @@ impl WalRecordData {
         let mut ops = Vec::with_capacity(count as usize);
 
         for _ in 0..count {
-            let (page_id, rest) =
-                PageId::deserialize(data).map_err(|e| WalError::CorruptedRecord {
+            let (file_page_ref, rest) =
+                FilePageRef::deserialize(data).map_err(|e| WalError::CorruptedRecord {
                     lsn,
-                    reason: format!("Failed to deserialize PageId: {}", e),
+                    reason: format!("Failed to deserialize FilePageRef: {}", e),
                 })?;
             data = rest;
 
@@ -491,7 +540,10 @@ impl WalRecordData {
                 })?;
             data = rest;
 
-            ops.push(SinglePageOperation { page_id, diff });
+            ops.push(SinglePageOperation {
+                file_page_ref,
+                diff,
+            });
         }
 
         Ok(WalRecordData::MultiPageOperation(ops))
@@ -510,17 +562,20 @@ impl WalRecordData {
 /// Client handle for interacting with the WAL from other threads.
 /// This is the public API for WAL operations.
 pub(crate) struct WalClient {
-    sender: SyncSender<WalRequest>,
+    sender: channel::Sender<WalRequest>,
     flushed_lsn: Arc<AtomicLsn>,
 }
 
 impl WalClient {
     /// Writes a single page operation to WAL and returns the assigned LSN.
     /// Returns None if the write operation failed.
-    pub(crate) fn write_single(&self, page_id: PageId, diff: PageDiff) -> Option<Lsn> {
-        let (send, recv) = mpsc::sync_channel(1);
+    pub(crate) fn write_single(&self, file_page_ref: FilePageRef, diff: PageDiff) -> Option<Lsn> {
+        let (send, recv) = channel::bounded(1);
         let record = WalRecord {
-            data: WalRecordData::SinglePageOperation(SinglePageOperation { page_id, diff }),
+            data: WalRecordData::SinglePageOperation(SinglePageOperation {
+                file_page_ref,
+                diff,
+            }),
             send,
         };
         self.sender.send(WalRequest::Write(record)).ok()?;
@@ -529,11 +584,14 @@ impl WalClient {
 
     /// Writes multiple page operations as single record to WAL and returns the assigned LSN.
     /// Returns None if the write operation failed.
-    pub(crate) fn write_multi(&self, ops: Vec<(PageId, PageDiff)>) -> Option<Lsn> {
-        let (send, recv) = mpsc::sync_channel(1);
+    pub(crate) fn write_multi(&self, ops: Vec<(FilePageRef, PageDiff)>) -> Option<Lsn> {
+        let (send, recv) = channel::bounded(1);
         let ops = ops
             .into_iter()
-            .map(|(page_id, diff)| SinglePageOperation { page_id, diff })
+            .map(|(file_page_ref, diff)| SinglePageOperation {
+                file_page_ref,
+                diff,
+            })
             .collect();
         let record = WalRecord {
             data: WalRecordData::MultiPageOperation(ops),
@@ -546,7 +604,7 @@ impl WalClient {
     /// Forces a flush of all pending WAL records to disk.
     /// Returns true if flush succeeded.
     pub(crate) fn flush(&self) -> bool {
-        let (sender, recv) = mpsc::sync_channel(1);
+        let (sender, recv) = channel::bounded(1);
         if self.sender.send(WalRequest::ForceFlush { sender }).is_err() {
             return false;
         }
@@ -556,7 +614,7 @@ impl WalClient {
     /// Requests a checkpoint. Caller must ensure all dirty pages have been flushed first.
     /// Returns the checkpoint LSN on success.
     pub(crate) fn checkpoint(&self) -> Option<Lsn> {
-        let (sender, recv) = mpsc::sync_channel(1);
+        let (sender, recv) = channel::bounded(1);
         self.sender.send(WalRequest::Checkpoint { sender }).ok()?;
         recv.recv().ok()?
     }
@@ -570,15 +628,30 @@ impl WalClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::files_manager::FileKey;
+    use crate::paged_file::PageId;
     use std::thread;
     use tempfile::tempdir;
 
+    /// Interval for automatic WAL flush (in milliseconds).
+    const FLUSH_INTERVAL_MS: Duration = Duration::from_millis(100);
+
+    /// Maximum number of unflushed records before forcing a flush.
+    const MAX_UNFLUSHED_RECORDS: u64 = 1024;
+
     // ==================== Serialization / Deserialization ====================
+
+    fn make_test_file_page_ref(page_id: PageId) -> FilePageRef {
+        FilePageRef::new(page_id, FileKey::data("test_table"))
+    }
 
     fn make_single_page_op(page_id: PageId, data: Vec<u8>) -> WalRecordData {
         let mut diff = PageDiff::default();
         diff.write_at(0, data);
-        WalRecordData::SinglePageOperation(SinglePageOperation { page_id, diff })
+        WalRecordData::SinglePageOperation(SinglePageOperation {
+            file_page_ref: make_test_file_page_ref(page_id),
+            diff,
+        })
     }
 
     fn make_multi_page_op(ops: Vec<(PageId, Vec<u8>)>) -> WalRecordData {
@@ -587,7 +660,10 @@ mod tests {
             .map(|(page_id, data)| {
                 let mut diff = PageDiff::default();
                 diff.write_at(0, data);
-                SinglePageOperation { page_id, diff }
+                SinglePageOperation {
+                    file_page_ref: make_test_file_page_ref(page_id),
+                    diff,
+                }
             })
             .collect();
         WalRecordData::MultiPageOperation(ops)
@@ -607,7 +683,8 @@ mod tests {
 
         match result {
             WalRecordData::SinglePageOperation(op) => {
-                assert_eq!(op.page_id, 42);
+                assert_eq!(op.file_page_ref.page_id(), 42);
+                assert_eq!(op.file_page_ref.file_key().file_name(), "test_table.tbl");
             }
             _ => panic!("expected SinglePageOperation"),
         }
@@ -621,9 +698,9 @@ mod tests {
         match result {
             WalRecordData::MultiPageOperation(ops) => {
                 assert_eq!(ops.len(), 3);
-                assert_eq!(ops[0].page_id, 1);
-                assert_eq!(ops[1].page_id, 2);
-                assert_eq!(ops[2].page_id, 3);
+                assert_eq!(ops[0].file_page_ref.page_id(), 1);
+                assert_eq!(ops[1].file_page_ref.page_id(), 2);
+                assert_eq!(ops[2].file_page_ref.page_id(), 3);
             }
             _ => panic!("expected MultiPageOperation"),
         }
@@ -769,113 +846,131 @@ mod tests {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
 
-        let handle = spawn_wal(&log_path).expect("spawn_wal should succeed");
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).expect("spawn_wal should succeed");
 
         assert!(handle.redo_records.is_empty());
-        drop(handle.wal_client);
-        handle
-            .handle
-            .join()
-            .expect("WAL thread should join cleanly");
+        drop(handle);
+        let _ = bg_handle.shutdown();
     }
 
     #[test]
     fn write_single_returns_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let handle = spawn_wal(&log_path).unwrap();
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let mut diff = PageDiff::default();
         diff.write_at(0, vec![1, 2, 3]);
 
-        let lsn = handle.wal_client.write_single(1, diff);
+        let lsn = handle
+            .wal_client
+            .write_single(make_test_file_page_ref(1), diff);
 
         assert_eq!(lsn, Some(1));
-        drop(handle.wal_client);
-        handle.handle.join().unwrap();
+        drop(handle);
+        let _ = bg_handle.shutdown();
     }
 
     #[test]
     fn write_single_increments_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let handle = spawn_wal(&log_path).unwrap();
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
-        let lsn1 = handle.wal_client.write_single(1, PageDiff::default());
-        let lsn2 = handle.wal_client.write_single(2, PageDiff::default());
-        let lsn3 = handle.wal_client.write_single(3, PageDiff::default());
+        let lsn1 = handle
+            .wal_client
+            .write_single(make_test_file_page_ref(1), PageDiff::default());
+        let lsn2 = handle
+            .wal_client
+            .write_single(make_test_file_page_ref(2), PageDiff::default());
+        let lsn3 = handle
+            .wal_client
+            .write_single(make_test_file_page_ref(3), PageDiff::default());
 
         assert_eq!(lsn1, Some(1));
         assert_eq!(lsn2, Some(2));
         assert_eq!(lsn3, Some(3));
 
-        drop(handle.wal_client);
-        handle.handle.join().unwrap();
+        drop(handle);
+        let _ = bg_handle.shutdown();
     }
 
     #[test]
     fn write_multi_returns_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let handle = spawn_wal(&log_path).unwrap();
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let mut diff1 = PageDiff::default();
         diff1.write_at(0, vec![1]);
         let mut diff2 = PageDiff::default();
         diff2.write_at(0, vec![2]);
 
-        let lsn = handle.wal_client.write_multi(vec![(1, diff1), (2, diff2)]);
+        let lsn = handle.wal_client.write_multi(vec![
+            (make_test_file_page_ref(1), diff1),
+            (make_test_file_page_ref(2), diff2),
+        ]);
 
         assert_eq!(lsn, Some(1));
-        drop(handle.wal_client);
-        handle.handle.join().unwrap();
+        drop(handle);
+        let _ = bg_handle.shutdown();
     }
 
     #[test]
     fn flush_updates_flushed_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let handle = spawn_wal(&log_path).unwrap();
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         assert_eq!(handle.wal_client.flushed_lsn(), 0);
 
-        handle.wal_client.write_single(1, PageDiff::default());
-        handle.wal_client.write_single(2, PageDiff::default());
+        handle
+            .wal_client
+            .write_single(make_test_file_page_ref(1), PageDiff::default());
+        handle
+            .wal_client
+            .write_single(make_test_file_page_ref(2), PageDiff::default());
 
         let success = handle.wal_client.flush();
         assert!(success);
         assert_eq!(handle.wal_client.flushed_lsn(), 2);
 
-        drop(handle.wal_client);
-        handle.handle.join().unwrap();
+        drop(handle);
+        let _ = bg_handle.shutdown();
     }
 
     #[test]
     fn checkpoint_returns_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let handle = spawn_wal(&log_path).unwrap();
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
-        handle.wal_client.write_single(1, PageDiff::default());
-        handle.wal_client.write_single(2, PageDiff::default());
+        handle
+            .wal_client
+            .write_single(make_test_file_page_ref(1), PageDiff::default());
+        handle
+            .wal_client
+            .write_single(make_test_file_page_ref(2), PageDiff::default());
 
         let checkpoint_lsn = handle.wal_client.checkpoint();
 
         assert_eq!(checkpoint_lsn, Some(3));
 
-        drop(handle.wal_client);
-        handle.handle.join().unwrap();
+        drop(handle);
+        let _ = bg_handle.shutdown();
     }
 
     #[test]
     fn checkpoint_truncates_wal_file() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let handle = spawn_wal(&log_path).unwrap();
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         // Write several records
         for _ in 0..10 {
-            handle.wal_client.write_single(1, PageDiff::default());
+            handle
+                .wal_client
+                .write_single(make_test_file_page_ref(1), PageDiff::default());
         }
         handle.wal_client.flush();
 
@@ -888,8 +983,8 @@ mod tests {
         // After checkpoint, file should be smaller (contains only checkpoint record)
         assert!(size_after < size_before);
 
-        drop(handle.wal_client);
-        handle.handle.join().unwrap();
+        drop(handle);
+        let _ = bg_handle.shutdown();
     }
 
     #[test]
@@ -899,28 +994,36 @@ mod tests {
 
         // First session: write records and checkpoint
         {
-            let handle = spawn_wal(&log_path).unwrap();
-            handle.wal_client.write_single(1, PageDiff::default());
-            handle.wal_client.write_single(2, PageDiff::default());
+            let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            handle
+                .wal_client
+                .write_single(make_test_file_page_ref(1), PageDiff::default());
+            handle
+                .wal_client
+                .write_single(make_test_file_page_ref(2), PageDiff::default());
             handle.wal_client.checkpoint();
-            handle.wal_client.write_single(3, PageDiff::default());
-            handle.wal_client.write_single(4, PageDiff::default());
+            handle
+                .wal_client
+                .write_single(make_test_file_page_ref(3), PageDiff::default());
+            handle
+                .wal_client
+                .write_single(make_test_file_page_ref(4), PageDiff::default());
             handle.wal_client.flush();
-            drop(handle.wal_client);
-            handle.handle.join().unwrap();
+            drop(handle);
+            let _ = bg_handle.shutdown();
         }
 
         // Second session: recover
         {
-            let handle = spawn_wal(&log_path).unwrap();
+            let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
             // Should only have records after checkpoint (LSN 4 and 5)
             assert_eq!(handle.redo_records.len(), 2);
             assert_eq!(handle.redo_records[0].0, 4);
             assert_eq!(handle.redo_records[1].0, 5);
 
-            drop(handle.wal_client);
-            handle.handle.join().unwrap();
+            drop(handle);
+            let _ = bg_handle.shutdown();
         }
     }
 
@@ -931,24 +1034,30 @@ mod tests {
 
         // First session
         {
-            let handle = spawn_wal(&log_path).unwrap();
-            handle.wal_client.write_single(1, PageDiff::default());
-            handle.wal_client.write_single(2, PageDiff::default());
-            handle.wal_client.write_single(3, PageDiff::default());
+            let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            handle
+                .wal_client
+                .write_single(make_test_file_page_ref(1), PageDiff::default());
+            handle
+                .wal_client
+                .write_single(make_test_file_page_ref(2), PageDiff::default());
+            handle
+                .wal_client
+                .write_single(make_test_file_page_ref(3), PageDiff::default());
             handle.wal_client.flush();
-            drop(handle.wal_client);
-            handle.handle.join().unwrap();
+            drop(handle);
+            let _ = bg_handle.shutdown();
         }
 
         // Second session
         {
-            let handle = spawn_wal(&log_path).unwrap();
+            let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
             // flushed_lsn should be set to last_lsn from recovery
             assert_eq!(handle.wal_client.flushed_lsn(), 3);
 
-            drop(handle.wal_client);
-            handle.handle.join().unwrap();
+            drop(handle);
+            let _ = bg_handle.shutdown();
         }
     }
 
@@ -971,7 +1080,7 @@ mod tests {
     fn multiple_writers_concurrent() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let handle = spawn_wal(&log_path).unwrap();
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         // Simulate how Cache would share WalClient via Arc
         let shared = SharedWalClient::new(handle.wal_client);
@@ -981,7 +1090,8 @@ mod tests {
                 let client = shared.clone_arc();
                 thread::spawn(move || {
                     for _ in 0..10 {
-                        let lsn = client.write_single(i, PageDiff::default());
+                        let lsn =
+                            client.write_single(make_test_file_page_ref(i), PageDiff::default());
                         assert!(lsn.is_some());
                     }
                 })
@@ -996,21 +1106,21 @@ mod tests {
         assert_eq!(shared.0.flushed_lsn(), 100);
 
         drop(shared);
-        handle.handle.join().unwrap();
+        let _ = bg_handle.shutdown();
     }
 
     #[test]
     fn arc_shared_client_sees_same_flushed_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let handle = spawn_wal(&log_path).unwrap();
+        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let shared = SharedWalClient::new(handle.wal_client);
         let client1 = shared.clone_arc();
         let client2 = shared.clone_arc();
 
-        client1.write_single(1, PageDiff::default());
-        client1.write_single(2, PageDiff::default());
+        client1.write_single(make_test_file_page_ref(1), PageDiff::default());
+        client1.write_single(make_test_file_page_ref(2), PageDiff::default());
         client1.flush();
 
         // Both Arc references should see the same flushed_lsn
@@ -1020,7 +1130,7 @@ mod tests {
         drop(client1);
         drop(client2);
         drop(shared);
-        handle.handle.join().unwrap();
+        let _ = bg_handle.shutdown();
     }
 
     // ==================== Error Cases ====================
