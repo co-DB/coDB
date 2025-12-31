@@ -81,6 +81,8 @@ pub enum AnalyzerError {
     },
     #[error("value '{got}' cannot be used in {context}")]
     ValueOutOfBounds { got: i64, context: String },
+    #[error("cannot use type '{ty}' for '{addon}'")]
+    TypeNotSupportedByAddon { addon: String, ty: String },
 }
 
 /// Used as a key type for [`StatementContext::inserted_columns`].
@@ -597,6 +599,13 @@ impl<'a> Analyzer<'a> {
                 ty: col.ty,
                 addon,
             };
+
+            if !resolved.addon_supported_by_type() {
+                return Err(AnalyzerError::TypeNotSupportedByAddon {
+                    addon: resolved.addon.to_string(),
+                    ty: resolved.ty.to_string(),
+                });
+            }
 
             if addon == ResolvedCreateColumnAddon::PrimaryKey {
                 primary_key_column = Some(resolved)
@@ -3397,6 +3406,49 @@ mod tests {
                 assert_eq!(*addon, ResolvedCreateColumnAddon::PrimaryKey.to_string());
             }
             other => panic!("expected UniqueAddonUsedMoreThanOnce, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_create_primary_key_type_not_supported() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+        fs::write(&db_path, r#"{ "tables": [] }"#).unwrap();
+        let catalog = Catalog::new(tmp.path(), "db").unwrap();
+        let catalog = Arc::new(RwLock::new(catalog));
+
+        let mut ast = Ast::default();
+
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "bad_pk".into(),
+        }));
+
+        let col_a_ident =
+            ast.add_node(Expression::Identifier(IdentifierNode { value: "a".into() }));
+
+        let col_a = CreateColumnDescriptor {
+            name: col_a_ident,
+            ty: Type::F32,
+            addon: CreateColumnAddon::PrimaryKey,
+        };
+
+        let create = CreateStatement {
+            table_name: table_ident,
+            columns: vec![col_a],
+        };
+        ast.add_statement(Statement::Create(create));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            AnalyzerError::TypeNotSupportedByAddon { addon, ty } => {
+                assert_eq!(addon, &ResolvedCreateColumnAddon::PrimaryKey.to_string());
+                assert_eq!(ty, &Type::F32.to_string());
+            }
+            other => panic!("expected TypeNotSupportedByAddon, got: {:?}", other),
         }
     }
 
