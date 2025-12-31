@@ -49,7 +49,7 @@ pub fn process_query(
     query_str: &str,
     catalog: Arc<RwLock<Catalog>>,
 ) -> Result<QueryPlan, Vec<PlannerError>> {
-    let parser = Parser::new(&query_str);
+    let parser = Parser::new(query_str);
     let ast = parser.parse_program().map_errors()?;
     let analyzer = Analyzer::new(&ast, catalog);
     let resolved_ast = analyzer.analyze().map_errors()?;
