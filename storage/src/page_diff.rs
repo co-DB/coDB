@@ -98,6 +98,10 @@ impl PageDiff {
             page.data_mut()[start..end].copy_from_slice(&data);
         }
     }
+
+    pub(crate) fn empty(&self) -> bool {
+        self.diffs.is_empty()
+    }
 }
 
 #[cfg(test)]

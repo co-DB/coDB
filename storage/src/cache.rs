@@ -4,6 +4,7 @@ use log::{error, info, warn};
 use lru::LruCache;
 use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{
+    mem,
     num::NonZero,
     sync::{
         Arc,
@@ -150,6 +151,7 @@ impl Drop for PinnedReadPage {
 
 /// Wrapper around frame and its guard (exclusive lock).
 pub struct PinnedWritePage {
+    wal: Option<Arc<WalClient>>,
     /// Diffs of changes made to page.
     diffs: PageDiff,
     /// The content of the [`Page`] wrapped in a guard.
@@ -204,6 +206,23 @@ impl Drop for PinnedWritePage {
         // as the order of dropping is the order of declaration in struct.
         // (https://doc.rust-lang.org/reference/destructors.html)
         // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedWritePage`].
+
+        // If [`PinnedWritePage`] is not manually sent to wal via [`Cache::`] then
+        // here we automatically send the diff to wal as [`SinglePageOperation`].
+        if !self.diffs.empty()
+            && let Some(w) = &self.wal
+        {
+            let diffs = mem::take(&mut self.diffs);
+            let lsn = w.write_single(self.frame.file_page_ref.clone(), diffs);
+            match lsn {
+                Some(lsn) => {
+                    self.set_lsn(lsn);
+                }
+                None => error!(
+                    "failed to add SinglePageOperation to WalClient while dropping PinnedWritePage"
+                ),
+            }
+        }
         self.frame.unpin();
     }
 }
@@ -293,7 +312,7 @@ pub struct Cache {
     /// Pointer to [`FilesManager`], used for file operations when page must be loaded from/flushed to disk.
     files: Arc<FilesManager>,
     /// Client for writing to WAL.
-    wal_client: Option<WalClient>,
+    wal_client: Option<Arc<WalClient>>,
     /// Maximum capacity of the cache (number of frames).
     capacity: usize,
 }
@@ -309,7 +328,7 @@ impl Cache {
             frames: DashMap::with_capacity(capacity),
             lru: Arc::new(RwLock::new(LruCache::new(NonZero::new(capacity).unwrap()))),
             files,
-            wal_client,
+            wal_client: wal_client.map(Arc::new),
             capacity,
         })
     }
@@ -408,6 +427,7 @@ impl Cache {
             )
         };
         Ok(PinnedWritePage {
+            wal: self.wal_client.clone(),
             diffs: PageDiff::default(),
             frame,
             guard: guard_static,
@@ -454,6 +474,30 @@ impl Cache {
         self.remove_all_pages_from_file(file_key, true)?;
         self.files.close_file(file_key);
         Ok(())
+    }
+
+    /// Consumes `pages` and send all their diffs to wal as [`MultiPageOperation`].
+    pub fn drop_write_pages(&self, mut pages: Vec<PinnedWritePage>) {
+        let wal_client = match &self.wal_client {
+            Some(w) => w,
+            None => return,
+        };
+        let args: Vec<_> = pages
+            .iter_mut()
+            .map(|page| (page.frame.file_page_ref.clone(), mem::take(&mut page.diffs)))
+            .collect();
+        // Now each diff is empty, meaning in `drop` we won't send same page diff again.
+        let lsn = wal_client.write_multi(args);
+        match lsn {
+            Some(lsn) => {
+                for mut page in pages {
+                    page.set_lsn(lsn);
+                }
+            }
+            None => error!(
+                "failed to add MultiPageOperation to WalClient while manually dropping PinnedWritePages"
+            ),
+        }
     }
 
     /// Removes all pages from file with `file_key`.
