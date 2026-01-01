@@ -114,7 +114,7 @@ impl PageVersion {
 /// ancestor nodes and metadata page.
 struct PessimisticPath {
     latch_stack: Vec<LatchHandle>,
-    leaf_page_id: PageId,
+    leaf_node_latch: LeafNodeLatch,
     metadata_page: Option<PinnedWritePage>,
 }
 
@@ -146,12 +146,12 @@ impl LatchHandle {
 impl PessimisticPath {
     fn new(
         latch_stack: Vec<LatchHandle>,
-        leaf_page_id: PageId,
+        leaf_node_latch: LeafNodeLatch,
         metadata_page: Option<PinnedWritePage>,
     ) -> Self {
         Self {
             latch_stack,
-            leaf_page_id,
+            leaf_node_latch,
             metadata_page,
         }
     }
@@ -682,7 +682,10 @@ impl BTree {
                 NodeType::Leaf => {
                     return Ok(PessimisticPath::new(
                         latch_stack,
-                        current_page_id,
+                        LeafNodeLatch {
+                            page_id: current_page_id,
+                            node: BTreeLeafNode::<PinnedWritePage>::new(page)?,
+                        },
                         metadata_page,
                     ));
                 }
@@ -692,15 +695,13 @@ impl BTree {
 
     /// Performs a pessimistic insert, splitting nodes as necessary.
     fn insert_pessimistic(&self, key: &[u8], record_pointer: RecordPtr) -> Result<(), BTreeError> {
-        let path = self.traverse_pessimistic(key, |node| Ok(node.can_fit_another()?))?;
+        let mut path = self.traverse_pessimistic(key, |node| Ok(node.can_fit_another()?))?;
 
-        let mut leaf = self.pin_leaf_for_write(path.leaf_page_id)?;
-
-        match leaf.insert(key, record_pointer)? {
+        match path.leaf_node_latch.node.insert(key, record_pointer)? {
             NodeInsertResult::Success => Ok(()),
             NodeInsertResult::PageFull => self.split_and_propagate(
                 path.latch_stack,
-                (path.leaf_page_id, leaf),
+                path.leaf_node_latch,
                 key,
                 record_pointer,
                 path.metadata_page,
@@ -744,12 +745,12 @@ impl BTree {
     fn split_and_propagate(
         &self,
         internal_nodes: Vec<LatchHandle>,
-        leaf_node: (PageId, BTreeLeafNode<PinnedWritePage>),
+        leaf_node: LeafNodeLatch,
         key: &[u8],
         record_pointer: RecordPtr,
         metadata_page: Option<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
-        let (leaf_page_id, leaf_node) = leaf_node;
+        let (leaf_page_id, leaf_node) = (leaf_node.page_id, leaf_node.node);
         // Split the leaf and get separator + new leaf id
         let (separator_key, new_leaf_id) =
             self.split_leaf(leaf_page_id, leaf_node, key, record_pointer)?;
@@ -957,19 +958,14 @@ impl BTree {
     fn delete_pessimistic(&self, key: &[u8]) -> Result<(), BTreeError> {
         // Keep the full ancestor path latched during delete so we can safely perform
         // redistributions/merges that bubble up the tree (avoids losing structural context).
-        let path =
+        let mut path =
             self.traverse_pessimistic(key, |node| Ok(node.will_not_underflow_after_delete()?))?;
 
-        let mut leaf = self.pin_leaf_for_write(path.leaf_page_id)?;
-
-        match leaf.delete(key)? {
+        match path.leaf_node_latch.node.delete(key)? {
             NodeDeleteResult::Success => Ok(()),
             NodeDeleteResult::SuccessUnderflow => self.redistribute_or_merge(
                 path.latch_stack,
-                LeafNodeLatch {
-                    page_id: path.leaf_page_id,
-                    node: leaf,
-                },
+                path.leaf_node_latch,
                 path.metadata_page,
             ),
             NodeDeleteResult::KeyDoesNotExist => Err(BTreeError::KeyForDeleteNotFound),
@@ -2535,7 +2531,7 @@ mod test {
         let (cache, file_key, _temp_dir) = setup_test_cache();
         let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
 
-        let num_keys = 2000; // Use more keys to ensure multi-level tree
+        let num_keys = 5000; // Use more keys to ensure multi-level tree
 
         // Pre-populate
         for i in 0..num_keys {
