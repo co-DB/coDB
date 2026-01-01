@@ -111,7 +111,8 @@ impl DbSerializable for FileKey {
 
         buffer[size_of::<u16>()..size_of::<u16>() + name_len].copy_from_slice(name_bytes);
 
-        self.file_type.serialize_into(&mut buffer[2 + name_len..]);
+        self.file_type
+            .serialize_into(&mut buffer[size_of::<u16>() + name_len..]);
     }
 
     fn deserialize(
