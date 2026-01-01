@@ -3,7 +3,6 @@ use dashmap::{DashMap, Entry};
 use log::{error, info, warn};
 use lru::LruCache;
 use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::any::Any;
 use std::{
     num::NonZero,
     sync::{
@@ -286,7 +285,7 @@ pub struct Cache {
     /// [`Cache`] tries to keep the size of it <= [`Cache::capacity`], but it is not always true.
     /// Check [`Cache::get_pinned_frame`] and [`Cache::try_evict_frame`] for more details.
     frames: DashMap<FilePageRef, Arc<PageFrame>>,
-    /// LRU list of the [`FilePageRef`]s used for deciding which [`PageFrame`] is best candidate for eviction (it does not mean it will always be picked as the victim - check [`Cache::try_evict_frame`] for details).
+    /// LRU list of the [`FilePageRef`]s used for deciding which [`PageFrame`] is the best candidate for eviction (it does not mean it will always be picked as the victim - check [`Cache::try_evict_frame`] for details).
     /// It is guaranteed that `lru.keys()` are subset of `frames.keys()` - it means that there might be [`PageFrame`] that is
     /// stored in [`Cache::frames`] but not in [`Cache::lru`]. Such thing may happen if for some reason [`Cache::try_evict_frame`] failed.
     /// This is not a problem as there is a background thread ([`BackgroundCacheCleaner`]) that periodically cleans [`Cache`] from such frames.
@@ -358,7 +357,9 @@ impl Cache {
 
         self.flush_all_frames();
 
-        let _ = self.wal_client.as_ref().unwrap().checkpoint();
+        if let Some(wal_client) = &self.wal_client {
+            let _ = wal_client.checkpoint();
+        }
         Ok(())
     }
 
@@ -556,7 +557,7 @@ impl Cache {
 
     /// Evicts the first frame (starting from LRU) that has [`PageFrame::pin_count`] equal to 0.
     /// If frame is selected to be evicted (using LRU), but its pin count is greater than 0, it will not be evicted and instead its key is updated in [`Cache::lru`] (making it MRU). In that case the next LRU is picked and so on.
-    /// Returns `false` if could not evict any page - every page in cache is pinned or LRU is empty.
+    /// Returns `false` if it could not evict any page - every page in cache is pinned or LRU is empty.
     fn try_evict_frame(&self) -> Result<bool, CacheError> {
         let max_attempts = self.capacity;
 
@@ -723,7 +724,7 @@ impl BackgroundCacheCleaner {
                     }
                 }
                 Err(channel::RecvTimeoutError::Disconnected) => {
-                    // Sender dropped - trying to shutdown anyway.
+                    // Sender dropped - trying to shut down anyway.
                     info!("Shutting down cache background cleaner (cancellation channel dropped)");
                     break;
                 }
@@ -1213,7 +1214,7 @@ mod tests {
                 let mut w = c.pin_write(&idc).expect("pin_write");
                 w.write_at(0, (1000 + i as u64).to_be_bytes().to_vec());
                 // hold write briefly to increase chance of overlap
-                thread::sleep(std::time::Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(10));
             }));
         }
 
@@ -1922,5 +1923,263 @@ mod tests {
         assert!(!cache.frames.contains_key(&id1));
         assert_cached(&cache, &id2);
         assert_eq!(cache.frames.len(), 1);
+    }
+
+    #[test]
+    fn cache_apply_redo_single_page_operation() {
+        use crate::write_ahead_log::{SinglePageOperation, WalRecordData};
+
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_redo");
+        let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
+
+        let page_ref = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+
+        // Create a redo record that modifies the page
+        let mut diff = PageDiff::default();
+        diff.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
+
+        let op = SinglePageOperation::new(page_ref.clone(), diff);
+        let redo_records = vec![(1u64, WalRecordData::SinglePageOperation(op))];
+
+        let cache = Cache::new(5, files.clone(), None);
+        cache.apply_redo(redo_records).expect("apply_redo failed");
+
+        // Verify the change was applied and flushed to disk
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let page = pf.lock().read_page(pid).expect("read_page");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xBEEFu64);
+
+        // Verify LSN was updated
+        buf.copy_from_slice(&page[4088..4096]);
+        assert_eq!(u64::from_le_bytes(buf), 1u64);
+    }
+
+    #[test]
+    fn cache_apply_redo_multi_page_operation() {
+        use crate::write_ahead_log::{SinglePageOperation, WalRecordData};
+
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_redo_multi");
+        let pid1 = alloc_page_with_u64(&files, &file_key, 0x1111);
+        let pid2 = alloc_page_with_u64(&files, &file_key, 0x2222);
+
+        let page_ref1 = FilePageRef {
+            page_id: pid1,
+            file_key: file_key.clone(),
+        };
+        let page_ref2 = FilePageRef {
+            page_id: pid2,
+            file_key: file_key.clone(),
+        };
+
+        // Create redo records for both pages
+        let mut diff1 = PageDiff::default();
+        diff1.write_at(0, 0xAAAAu64.to_be_bytes().to_vec());
+
+        let mut diff2 = PageDiff::default();
+        diff2.write_at(0, 0xBBBBu64.to_be_bytes().to_vec());
+
+        let op1 = SinglePageOperation::new(page_ref1.clone(), diff1);
+        let op2 = SinglePageOperation::new(page_ref2.clone(), diff2);
+
+        let redo_records = vec![(2u64, WalRecordData::MultiPageOperation(vec![op1, op2]))];
+
+        let cache = Cache::new(5, files.clone(), None);
+        cache.apply_redo(redo_records).expect("apply_redo failed");
+
+        // Verify changes were applied to both pages
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let mut pf_lock = pf.lock();
+
+        let page1 = pf_lock.read_page(pid1).expect("read_page pid1");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page1[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xAAAAu64);
+        buf.copy_from_slice(&page1[4088..4096]);
+        assert_eq!(u64::from_le_bytes(buf), 2u64);
+
+        let page2 = pf_lock.read_page(pid2).expect("read_page pid2");
+        buf.copy_from_slice(&page2[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xBBBBu64);
+        buf.copy_from_slice(&page2[4088..4096]);
+        assert_eq!(u64::from_le_bytes(buf), 2u64);
+    }
+
+    #[test]
+    fn cache_apply_redo_skips_already_applied() {
+        use crate::write_ahead_log::{SinglePageOperation, WalRecordData};
+
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_redo_skip");
+        let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
+
+        let page_ref = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+
+        // First, apply a redo with LSN 5
+        let mut diff1 = PageDiff::default();
+        diff1.write_at(0, 0xAAAAu64.to_be_bytes().to_vec());
+        let op1 = SinglePageOperation::new(page_ref.clone(), diff1);
+        let redo_records1 = vec![(5u64, WalRecordData::SinglePageOperation(op1))];
+
+        let cache = Cache::new(5, files.clone(), None);
+        cache.apply_redo(redo_records1).expect("apply_redo failed");
+
+        // Now try to apply a redo with lower LSN (should be skipped)
+        let mut diff2 = PageDiff::default();
+        diff2.write_at(0, 0xBBBBu64.to_be_bytes().to_vec());
+        let op2 = SinglePageOperation::new(page_ref.clone(), diff2);
+        let redo_records2 = vec![(3u64, WalRecordData::SinglePageOperation(op2))];
+
+        cache.apply_redo(redo_records2).expect("apply_redo failed");
+
+        // Verify the page still has the first value (0xAAAA), not 0xBBBB
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let page = pf.lock().read_page(pid).expect("read_page");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xAAAAu64);
+
+        // Verify LSN is still 5
+        buf.copy_from_slice(&page[4088..4096]);
+        assert_eq!(u64::from_le_bytes(buf), 5u64);
+    }
+
+    #[test]
+    fn cache_apply_redo_multiple_records_in_sequence() {
+        use crate::write_ahead_log::{SinglePageOperation, WalRecordData};
+
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_redo_seq");
+        let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
+
+        let page_ref = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+
+        // Create multiple redo records
+        let mut diff1 = PageDiff::default();
+        diff1.write_at(0, 0xAAAAu64.to_be_bytes().to_vec());
+        let op1 = SinglePageOperation::new(page_ref.clone(), diff1);
+
+        let mut diff2 = PageDiff::default();
+        diff2.write_at(8, 0xBBBBu64.to_be_bytes().to_vec());
+        let op2 = SinglePageOperation::new(page_ref.clone(), diff2);
+
+        let mut diff3 = PageDiff::default();
+        diff3.write_at(16, 0xCCCCu64.to_be_bytes().to_vec());
+        let op3 = SinglePageOperation::new(page_ref.clone(), diff3);
+
+        let redo_records = vec![
+            (1u64, WalRecordData::SinglePageOperation(op1)),
+            (2u64, WalRecordData::SinglePageOperation(op2)),
+            (3u64, WalRecordData::SinglePageOperation(op3)),
+        ];
+
+        let cache = Cache::new(5, files.clone(), None);
+        cache.apply_redo(redo_records).expect("apply_redo failed");
+
+        // Verify all changes were applied
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let page = pf.lock().read_page(pid).expect("read_page");
+        let mut buf = [0u8; 8];
+
+        buf.copy_from_slice(&page[0..8]);
+        assert_eq!(u64::from_be_bytes(buf), 0xAAAAu64);
+
+        buf.copy_from_slice(&page[8..16]);
+        assert_eq!(u64::from_be_bytes(buf), 0xBBBBu64);
+
+        buf.copy_from_slice(&page[16..24]);
+        assert_eq!(u64::from_be_bytes(buf), 0xCCCCu64);
+
+        // Verify LSN is the last one applied (3)
+        buf.copy_from_slice(&page[4088..4096]);
+        assert_eq!(u64::from_le_bytes(buf), 3u64);
+    }
+
+    #[test]
+    fn cache_apply_redo_with_overlapping_diffs() {
+        use crate::write_ahead_log::{SinglePageOperation, WalRecordData};
+
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_redo_overlap");
+        let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
+
+        let page_ref = FilePageRef {
+            page_id: pid,
+            file_key: file_key.clone(),
+        };
+
+        // Create redo with overlapping writes
+        let mut diff = PageDiff::default();
+        diff.write_at(0, vec![0x11, 0x22, 0x33, 0x44]);
+        diff.write_at(2, vec![0xAA, 0xBB]); // Overlaps with previous write
+
+        let op = SinglePageOperation::new(page_ref.clone(), diff);
+        let redo_records = vec![(1u64, WalRecordData::SinglePageOperation(op))];
+
+        let cache = Cache::new(5, files.clone(), None);
+        cache.apply_redo(redo_records).expect("apply_redo failed");
+
+        // Verify the final state (overlapping write should merge)
+        let pf = files.get_or_open_new_file(&file_key).unwrap();
+        let page = pf.lock().read_page(pid).expect("read_page");
+
+        // PageDiff merges writes, so we should have [0x11, 0x22, 0xAA, 0xBB]
+        assert_eq!(page[0], 0x11);
+        assert_eq!(page[1], 0x22);
+        assert_eq!(page[2], 0xAA);
+        assert_eq!(page[3], 0xBB);
+    }
+
+    #[test]
+    fn cache_apply_redo_empty_list() {
+        let files = create_files_manager();
+
+        let cache = Cache::new(5, files.clone(), None);
+
+        // This should succeed without error
+        cache.apply_redo(vec![]).expect("apply_redo failed");
+
+        // Cache should still be empty
+        assert_eq!(cache.frames.len(), 0);
+    }
+
+    #[test]
+    fn cache_apply_redo_page_not_yet_allocated() {
+        use crate::write_ahead_log::{SinglePageOperation, WalRecordData};
+
+        let files = create_files_manager();
+        let file_key = FileKey::data("table_redo_new");
+
+        // Create a redo for a page that doesn't exist yet
+        // This simulates recovery where WAL contains operations on a page that was
+        // allocated but the metadata wasn't persisted
+        let page_ref = FilePageRef {
+            page_id: 0,
+            file_key: file_key.clone(),
+        };
+
+        let mut diff = PageDiff::default();
+        diff.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
+
+        let op = SinglePageOperation::new(page_ref.clone(), diff);
+        let redo_records = vec![(1u64, WalRecordData::SinglePageOperation(op))];
+
+        let cache = Cache::new(5, files.clone(), None);
+
+        // This should fail because the page doesn't exist in the file
+        let result = cache.apply_redo(redo_records);
+        assert!(result.is_err());
     }
 }
