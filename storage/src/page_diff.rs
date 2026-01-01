@@ -99,7 +99,7 @@ impl PageDiff {
         }
     }
 
-    pub(crate) fn empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.diffs.is_empty()
     }
 }

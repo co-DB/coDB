@@ -209,7 +209,7 @@ impl Drop for PinnedWritePage {
 
         // If [`PinnedWritePage`] is not manually sent to wal via [`Cache::drop_write_pages`] then
         // here we automatically send the diff to wal as [`SinglePageOperation`].
-        if !self.diffs.empty()
+        if !self.diffs.is_empty()
             && let Some(w) = &self.wal
         {
             let diffs = mem::take(&mut self.diffs);
@@ -477,15 +477,34 @@ impl Cache {
     }
 
     /// Consumes `pages` and send all their diffs to wal as [`MultiPageOperation`].
+    ///
+    /// /// This helper is intended for callers that want to explicitly flush a batch of
+    /// [`PinnedWritePage`]s at once, instead of relying on each page being dropped
+    /// independently. This could be the case if you performed one logical operation that
+    /// required changes in more than one page (e.g. merge in [`BTree`]).
     pub fn drop_write_pages(&self, mut pages: Vec<PinnedWritePage>) {
         let wal_client = match &self.wal_client {
             Some(w) => w,
             None => return,
         };
+
+        // We only send the pages that have changes
         let args: Vec<_> = pages
             .iter_mut()
-            .map(|page| (page.frame.file_page_ref.clone(), mem::take(&mut page.diffs)))
+            .filter_map(|page| {
+                if page.diffs.is_empty() {
+                    None
+                } else {
+                    Some((page.frame.file_page_ref.clone(), mem::take(&mut page.diffs)))
+                }
+            })
             .collect();
+
+        // If we have no changes we can early return
+        if args.is_empty() {
+            return;
+        }
+
         // Now each diff is empty, meaning in `drop` we won't send same page diff again.
         let lsn = wal_client.write_multi(args);
         match lsn {
