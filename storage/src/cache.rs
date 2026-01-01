@@ -207,7 +207,7 @@ impl Drop for PinnedWritePage {
         // (https://doc.rust-lang.org/reference/destructors.html)
         // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedWritePage`].
 
-        // If [`PinnedWritePage`] is not manually sent to wal via [`Cache::`] then
+        // If [`PinnedWritePage`] is not manually sent to wal via [`Cache::drop_write_pages`] then
         // here we automatically send the diff to wal as [`SinglePageOperation`].
         if !self.diffs.empty()
             && let Some(w) = &self.wal
