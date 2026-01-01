@@ -4,6 +4,7 @@ use log::{error, info, warn};
 use lru::LruCache;
 use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{
+    mem,
     num::NonZero,
     sync::{
         Arc,
@@ -150,6 +151,7 @@ impl Drop for PinnedReadPage {
 
 /// Wrapper around frame and its guard (exclusive lock).
 pub struct PinnedWritePage {
+    wal: Option<Arc<WalClient>>,
     /// Diffs of changes made to page.
     diffs: PageDiff,
     /// The content of the [`Page`] wrapped in a guard.
@@ -204,6 +206,23 @@ impl Drop for PinnedWritePage {
         // as the order of dropping is the order of declaration in struct.
         // (https://doc.rust-lang.org/reference/destructors.html)
         // We do not need to do anything manually, but remember not to change the order of the fields in [`PinnedWritePage`].
+
+        // If [`PinnedWritePage`] is not manually sent to wal via [`Cache::drop_write_pages`] then
+        // here we automatically send the diff to wal as [`SinglePageOperation`].
+        if !self.diffs.is_empty()
+            && let Some(w) = &self.wal
+        {
+            let diffs = mem::take(&mut self.diffs);
+            let lsn = w.write_single(self.frame.file_page_ref.clone(), diffs);
+            match lsn {
+                Some(lsn) => {
+                    self.set_lsn(lsn);
+                }
+                None => error!(
+                    "failed to add SinglePageOperation to WalClient while dropping PinnedWritePage"
+                ),
+            }
+        }
         self.frame.unpin();
     }
 }
@@ -293,7 +312,7 @@ pub struct Cache {
     /// Pointer to [`FilesManager`], used for file operations when page must be loaded from/flushed to disk.
     files: Arc<FilesManager>,
     /// Client for writing to WAL.
-    wal_client: Option<WalClient>,
+    wal_client: Option<Arc<WalClient>>,
     /// Maximum capacity of the cache (number of frames).
     capacity: usize,
 }
@@ -309,7 +328,7 @@ impl Cache {
             frames: DashMap::with_capacity(capacity),
             lru: Arc::new(RwLock::new(LruCache::new(NonZero::new(capacity).unwrap()))),
             files,
-            wal_client,
+            wal_client: wal_client.map(Arc::new),
             capacity,
         })
     }
@@ -408,6 +427,7 @@ impl Cache {
             )
         };
         Ok(PinnedWritePage {
+            wal: self.wal_client.clone(),
             diffs: PageDiff::default(),
             frame,
             guard: guard_static,
@@ -454,6 +474,49 @@ impl Cache {
         self.remove_all_pages_from_file(file_key, true)?;
         self.files.close_file(file_key);
         Ok(())
+    }
+
+    /// Consumes `pages` and send all their diffs to wal as [`MultiPageOperation`].
+    ///
+    /// /// This helper is intended for callers that want to explicitly flush a batch of
+    /// [`PinnedWritePage`]s at once, instead of relying on each page being dropped
+    /// independently. This could be the case if you performed one logical operation that
+    /// required changes in more than one page (e.g. merge in [`BTree`]).
+    pub fn drop_write_pages(&self, mut pages: Vec<PinnedWritePage>) {
+        let wal_client = match &self.wal_client {
+            Some(w) => w,
+            None => return,
+        };
+
+        // We only send the pages that have changes
+        let args: Vec<_> = pages
+            .iter_mut()
+            .filter_map(|page| {
+                if page.diffs.is_empty() {
+                    None
+                } else {
+                    Some((page.frame.file_page_ref.clone(), mem::take(&mut page.diffs)))
+                }
+            })
+            .collect();
+
+        // If we have no changes we can early return
+        if args.is_empty() {
+            return;
+        }
+
+        // Now each diff is empty, meaning in `drop` we won't send same page diff again.
+        let lsn = wal_client.write_multi(args);
+        match lsn {
+            Some(lsn) => {
+                for mut page in pages {
+                    page.set_lsn(lsn);
+                }
+            }
+            None => error!(
+                "failed to add MultiPageOperation to WalClient while manually dropping PinnedWritePages"
+            ),
+        }
     }
 
     /// Removes all pages from file with `file_key`.
@@ -760,6 +823,8 @@ impl BackgroundCacheCleaner {
 
 #[cfg(test)]
 mod tests {
+    use crate::write_ahead_log::spawn_wal;
+
     use super::*;
     use std::sync::Barrier;
     use std::thread;
@@ -2153,5 +2218,534 @@ mod tests {
 
         // Cache should still be empty
         assert_eq!(cache.frames.len(), 0);
+    }
+
+    /// Helper to create a cache with WAL enabled for testing.
+    fn create_cache_with_wal(
+        capacity: usize,
+    ) -> (
+        Arc<Cache>,
+        Arc<FilesManager>,
+        Arc<WalClient>,
+        BackgroundWorkerHandle,
+    ) {
+        let files = create_files_manager();
+        let temp_dir = tempdir().expect("create tempdir");
+
+        let (wal_handle, wal_bg_handle) =
+            spawn_wal(temp_dir.path(), Duration::from_millis(50), 1024).expect("spawn_wal");
+
+        let cache = Cache::new(capacity, files.clone(), Some(wal_handle.wal_client));
+
+        let wal_client = cache.wal_client.as_ref().unwrap().clone();
+
+        (cache, files, wal_client, wal_bg_handle)
+    }
+
+    #[test]
+    fn wal_auto_log_on_drop_single_write() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(5);
+
+        let file_key = FileKey::data("table_wal_drop");
+        let page_id = alloc_page_with_u64(&files, &file_key, 0xAAAA);
+
+        let page_ref = FilePageRef {
+            page_id,
+            file_key: file_key.clone(),
+        };
+
+        let initial_lsn = {
+            let page = cache.pin_read(&page_ref).expect("pin_read");
+            page.lsn()
+        };
+
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Modify page and let it drop (should auto-log to WAL)
+        {
+            let mut page = cache.pin_write(&page_ref).expect("pin_write");
+            page.write_at(0, vec![0xBB, 0xBB, 0xBB, 0xBB]);
+            // page drops here, should automatically log to WAL
+        }
+
+        // Verify LSN was updated
+        let page = cache.pin_read(&page_ref).expect("pin_read");
+        let new_lsn = page.lsn();
+        assert!(
+            new_lsn > initial_lsn,
+            "LSN should be updated after auto-logging to WAL"
+        );
+
+        // Verify WAL received exactly 1 write (LSN incremented by 1)
+        thread::sleep(Duration::from_millis(150)); // Wait for auto-flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn,
+            initial_flushed_lsn + 1,
+            "WAL should have flushed exactly 1 record"
+        );
+        assert_eq!(new_lsn, flushed_lsn, "Page LSN should match flushed LSN");
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
+    }
+
+    #[test]
+    fn wal_auto_log_on_drop_multiple_writes() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(5);
+
+        let file_key = FileKey::data("table_wal_multi");
+        let page_id = alloc_page_with_u64(&files, &file_key, 0xCCCC);
+
+        let page_ref = FilePageRef {
+            page_id,
+            file_key: file_key.clone(),
+        };
+
+        let initial_lsn = {
+            let page = cache.pin_read(&page_ref).expect("pin_read");
+            page.lsn()
+        };
+
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Multiple writes to same page
+        {
+            let mut page = cache.pin_write(&page_ref).expect("pin_write");
+            page.write_at(0, vec![0x11]);
+            page.write_at(10, vec![0x22, 0x22]);
+            page.write_at(20, vec![0x33, 0x33, 0x33]);
+            // All diffs should be merged and logged on drop as single operation
+        }
+
+        // Verify LSN was updated
+        let page = cache.pin_read(&page_ref).expect("pin_read");
+        let new_lsn = page.lsn();
+        assert!(
+            new_lsn > initial_lsn,
+            "LSN should be updated after multiple writes"
+        );
+
+        // Verify WAL received exactly 1 write (all diffs merged into one)
+        thread::sleep(Duration::from_millis(150)); // Wait for auto-flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn,
+            initial_flushed_lsn + 1,
+            "WAL should have flushed exactly 1 record (merged diffs)"
+        );
+
+        // Verify the data was actually written
+        assert_eq!(page.page()[0], 0x11);
+        assert_eq!(page.page()[10], 0x22);
+        assert_eq!(page.page()[11], 0x22);
+        assert_eq!(page.page()[20], 0x33);
+        assert_eq!(page.page()[21], 0x33);
+        assert_eq!(page.page()[22], 0x33);
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
+    }
+
+    #[test]
+    fn wal_no_log_if_no_changes() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(5);
+
+        let file_key = FileKey::data("table_wal_nochange");
+        let page_id = alloc_page_with_u64(&files, &file_key, 0xDDDD);
+
+        let page_ref = FilePageRef {
+            page_id,
+            file_key: file_key.clone(),
+        };
+
+        let initial_lsn = {
+            let page = cache.pin_read(&page_ref).expect("pin_read");
+            page.lsn()
+        };
+
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Pin for write but don't modify
+        {
+            let _page = cache.pin_write(&page_ref).expect("pin_write");
+            // no writes, should not log to WAL on drop
+        }
+
+        // LSN should not change if no writes occurred
+        let page = cache.pin_read(&page_ref).expect("pin_read");
+        let new_lsn = page.lsn();
+        assert_eq!(
+            new_lsn, initial_lsn,
+            "LSN should not change if no writes occurred"
+        );
+
+        // Verify WAL received no writes (flushed_lsn unchanged)
+        thread::sleep(Duration::from_millis(150)); // Wait for potential flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn, initial_flushed_lsn,
+            "WAL should not have any new records"
+        );
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
+    }
+
+    #[test]
+    fn wal_drop_write_pages_multi_page_operation() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(10);
+
+        let file_key = FileKey::data("table_wal_multi_page");
+
+        // Create multiple pages
+        let page_id_1 = alloc_page_with_u64(&files, &file_key, 0x1111);
+        let page_id_2 = alloc_page_with_u64(&files, &file_key, 0x2222);
+        let page_id_3 = alloc_page_with_u64(&files, &file_key, 0x3333);
+
+        let page_ref_1 = FilePageRef {
+            page_id: page_id_1,
+            file_key: file_key.clone(),
+        };
+        let page_ref_2 = FilePageRef {
+            page_id: page_id_2,
+            file_key: file_key.clone(),
+        };
+        let page_ref_3 = FilePageRef {
+            page_id: page_id_3,
+            file_key: file_key.clone(),
+        };
+
+        // Get initial LSNs
+        let initial_lsn_1 = cache.pin_read(&page_ref_1).expect("pin_read").lsn();
+        let initial_lsn_2 = cache.pin_read(&page_ref_2).expect("pin_read").lsn();
+        let initial_lsn_3 = cache.pin_read(&page_ref_3).expect("pin_read").lsn();
+
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Modify multiple pages
+        let mut page_1 = cache.pin_write(&page_ref_1).expect("pin_write");
+        let mut page_2 = cache.pin_write(&page_ref_2).expect("pin_write");
+        let mut page_3 = cache.pin_write(&page_ref_3).expect("pin_write");
+
+        page_1.write_at(0, vec![0xAA, 0xAA]);
+        page_2.write_at(0, vec![0xBB, 0xBB]);
+        page_3.write_at(0, vec![0xCC, 0xCC]);
+
+        // Use drop_write_pages to log all at once
+        cache.drop_write_pages(vec![page_1, page_2, page_3]);
+
+        // All pages should have the same LSN (from multi-page operation)
+        let lsn_1 = cache.pin_read(&page_ref_1).expect("pin_read").lsn();
+        let lsn_2 = cache.pin_read(&page_ref_2).expect("pin_read").lsn();
+        let lsn_3 = cache.pin_read(&page_ref_3).expect("pin_read").lsn();
+
+        assert_eq!(lsn_1, lsn_2, "All pages should have same LSN");
+        assert_eq!(lsn_2, lsn_3, "All pages should have same LSN");
+        assert!(lsn_1 > initial_lsn_1, "LSN should be updated");
+        assert!(lsn_2 > initial_lsn_2, "LSN should be updated");
+        assert!(lsn_3 > initial_lsn_3, "LSN should be updated");
+
+        // Verify WAL received exactly 1 write (multi-page operation)
+        thread::sleep(Duration::from_millis(150)); // Wait for auto-flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn,
+            initial_flushed_lsn + 1,
+            "WAL should have flushed exactly 1 multi-page record"
+        );
+        assert_eq!(lsn_1, flushed_lsn, "All pages should have flushed LSN");
+
+        // Verify data was written
+        let page_1 = cache.pin_read(&page_ref_1).expect("pin_read");
+        let page_2 = cache.pin_read(&page_ref_2).expect("pin_read");
+        let page_3 = cache.pin_read(&page_ref_3).expect("pin_read");
+
+        assert_eq!(page_1.page()[0], 0xAA);
+        assert_eq!(page_2.page()[0], 0xBB);
+        assert_eq!(page_3.page()[0], 0xCC);
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
+    }
+
+    #[test]
+    fn wal_drop_write_pages_no_double_logging() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(5);
+
+        let file_key = FileKey::data("table_wal_no_double");
+        let page_id = alloc_page_with_u64(&files, &file_key, 0xEEEE);
+
+        let page_ref = FilePageRef {
+            page_id,
+            file_key: file_key.clone(),
+        };
+
+        let initial_lsn = cache.pin_read(&page_ref).expect("pin_read").lsn();
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Modify page
+        let mut page = cache.pin_write(&page_ref).expect("pin_write");
+        page.write_at(0, vec![0xFF, 0xFF]);
+
+        // Manually drop via drop_write_pages (diffs are mem::take'd, so empty on actual drop)
+        cache.drop_write_pages(vec![page]);
+
+        let lsn_after_manual_drop = cache.pin_read(&page_ref).expect("pin_read").lsn();
+
+        // LSN should be updated once
+        assert!(
+            lsn_after_manual_drop > initial_lsn,
+            "LSN should be updated after manual drop"
+        );
+
+        // Verify exactly 1 WAL record was written (no double logging)
+        thread::sleep(Duration::from_millis(150)); // Wait for auto-flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn,
+            initial_flushed_lsn + 1,
+            "WAL should have exactly 1 record (no double logging)"
+        );
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
+    }
+
+    #[test]
+    fn wal_cache_without_wal_client() {
+        let files = create_files_manager();
+        let cache = Cache::new(5, files.clone(), None);
+
+        let file_key = FileKey::data("table_no_wal");
+        let page_id = alloc_page_with_u64(&files, &file_key, 0xFFFF);
+
+        let page_ref = FilePageRef {
+            page_id,
+            file_key: file_key.clone(),
+        };
+
+        let initial_lsn = cache.pin_read(&page_ref).expect("pin_read").lsn();
+
+        // Modify page (should not panic even without WAL)
+        {
+            let mut page = cache.pin_write(&page_ref).expect("pin_write");
+            page.write_at(0, vec![0x99, 0x99]);
+        }
+
+        // LSN should not change without WAL
+        let page = cache.pin_read(&page_ref).expect("pin_read");
+        assert_eq!(
+            page.lsn(),
+            initial_lsn,
+            "LSN should not change without WAL client"
+        );
+
+        // Data should still be written to page
+        assert_eq!(page.page()[0], 0x99);
+        assert_eq!(page.page()[1], 0x99);
+    }
+
+    #[test]
+    fn wal_drop_write_pages_without_wal_client() {
+        let files = create_files_manager();
+        let cache = Cache::new(5, files.clone(), None);
+
+        let file_key = FileKey::data("table_no_wal_multi");
+        let page_id_1 = alloc_page_with_u64(&files, &file_key, 0x1111);
+        let page_id_2 = alloc_page_with_u64(&files, &file_key, 0x2222);
+
+        let page_ref_1 = FilePageRef {
+            page_id: page_id_1,
+            file_key: file_key.clone(),
+        };
+        let page_ref_2 = FilePageRef {
+            page_id: page_id_2,
+            file_key: file_key.clone(),
+        };
+
+        let mut page_1 = cache.pin_write(&page_ref_1).expect("pin_write");
+        let mut page_2 = cache.pin_write(&page_ref_2).expect("pin_write");
+
+        page_1.write_at(0, vec![0xAA]);
+        page_2.write_at(0, vec![0xBB]);
+
+        // Should not panic even without WAL
+        cache.drop_write_pages(vec![page_1, page_2]);
+
+        // Verify data was written
+        let page_1 = cache.pin_read(&page_ref_1).expect("pin_read");
+        let page_2 = cache.pin_read(&page_ref_2).expect("pin_read");
+
+        assert_eq!(page_1.page()[0], 0xAA);
+        assert_eq!(page_2.page()[0], 0xBB);
+    }
+
+    #[test]
+    fn wal_mark_diff_updates_lsn() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(5);
+
+        let file_key = FileKey::data("table_mark_diff");
+        let page_id = alloc_page_with_u64(&files, &file_key, 0x5555);
+
+        let page_ref = FilePageRef {
+            page_id,
+            file_key: file_key.clone(),
+        };
+
+        let initial_lsn = cache.pin_read(&page_ref).expect("pin_read").lsn();
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Use mark_diff instead of write_at
+        {
+            let mut page = cache.pin_write(&page_ref).expect("pin_write");
+            page.page_mut()[0] = 0x88;
+            page.page_mut()[1] = 0x88;
+            page.mark_diff(0, 2);
+        }
+
+        // LSN should be updated
+        let page = cache.pin_read(&page_ref).expect("pin_read");
+        assert!(
+            page.lsn() > initial_lsn,
+            "LSN should be updated after mark_diff"
+        );
+        assert_eq!(page.page()[0], 0x88);
+        assert_eq!(page.page()[1], 0x88);
+
+        // Verify WAL received exactly 1 write
+        thread::sleep(Duration::from_millis(150)); // Wait for auto-flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn,
+            initial_flushed_lsn + 1,
+            "WAL should have flushed exactly 1 record"
+        );
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
+    }
+
+    #[test]
+    fn wal_concurrent_writes_different_pages() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(10);
+
+        let file_key = FileKey::data("table_concurrent_wal");
+
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Create multiple pages
+        let page_ids: Vec<_> = (0..5)
+            .map(|i| alloc_page_with_u64(&files, &file_key, i as u64))
+            .collect();
+
+        let start = Arc::new(Barrier::new(page_ids.len() + 1));
+        let mut handles = Vec::new();
+
+        for (idx, page_id) in page_ids.iter().enumerate() {
+            let cache_clone = cache.clone();
+            let file_key_clone = file_key.clone();
+            let page_id = *page_id;
+            let start_clone = start.clone();
+
+            handles.push(thread::spawn(move || {
+                let page_ref = FilePageRef {
+                    page_id,
+                    file_key: file_key_clone,
+                };
+
+                start_clone.wait();
+
+                let mut page = cache_clone.pin_write(&page_ref).expect("pin_write");
+                page.write_at(0, vec![idx as u8; 8]);
+                // Each page drops independently, logging to WAL
+            }));
+        }
+
+        start.wait();
+
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        // Verify all pages were updated
+        for (idx, page_id) in page_ids.iter().enumerate() {
+            let page_ref = FilePageRef {
+                page_id: *page_id,
+                file_key: file_key.clone(),
+            };
+            let page = cache.pin_read(&page_ref).expect("pin_read");
+            assert_eq!(page.page()[0], idx as u8);
+            //   assert!(page.lsn() > 0, "Page should have LSN from WAL");
+        }
+
+        // Verify WAL received exactly 5 writes (one per page)
+        thread::sleep(Duration::from_millis(150)); // Wait for auto-flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn,
+            initial_flushed_lsn + 5,
+            "WAL should have flushed exactly 5 records (one per page)"
+        );
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
+    }
+
+    #[test]
+    fn wal_drop_write_pages_all_unmodified() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(10);
+
+        let file_key = FileKey::data("table_no_modify");
+
+        // Create 3 pages
+        let page_id_1 = alloc_page_with_u64(&files, &file_key, 0x4444);
+        let page_id_2 = alloc_page_with_u64(&files, &file_key, 0x5555);
+        let page_id_3 = alloc_page_with_u64(&files, &file_key, 0x6666);
+
+        let page_ref_1 = FilePageRef {
+            page_id: page_id_1,
+            file_key: file_key.clone(),
+        };
+        let page_ref_2 = FilePageRef {
+            page_id: page_id_2,
+            file_key: file_key.clone(),
+        };
+        let page_ref_3 = FilePageRef {
+            page_id: page_id_3,
+            file_key: file_key.clone(),
+        };
+
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Pin all 3 pages for write, but don't modify any
+        let page_1 = cache.pin_write(&page_ref_1).expect("pin_write");
+        let page_2 = cache.pin_write(&page_ref_2).expect("pin_write");
+        let page_3 = cache.pin_write(&page_ref_3).expect("pin_write");
+
+        // Don't modify any pages
+
+        // Drop all 3 pages at once - none should be logged to WAL
+        cache.drop_write_pages(vec![page_1, page_2, page_3]);
+
+        // Verify no pages were modified
+        let lsn_1 = cache.pin_read(&page_ref_1).expect("pin_read").lsn();
+        let lsn_2 = cache.pin_read(&page_ref_2).expect("pin_read").lsn();
+        let lsn_3 = cache.pin_read(&page_ref_3).expect("pin_read").lsn();
+
+        assert_eq!(lsn_1, 0, "Page 1 should NOT have been updated");
+        assert_eq!(lsn_2, 0, "Page 2 should NOT have been updated");
+        assert_eq!(lsn_3, 0, "Page 3 should NOT have been updated");
+
+        // Verify WAL received no writes (flushed_lsn unchanged)
+        thread::sleep(Duration::from_millis(150)); // Wait for potential flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn, initial_flushed_lsn,
+            "WAL should not have any new records when no pages were modified"
+        );
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
     }
 }
