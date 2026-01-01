@@ -786,15 +786,16 @@ mod tests {
     #[test]
     fn recover_multiple_records() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
-        let mut file = File::create(&log_path).unwrap();
+        let log_path = dir.path();
+        let file_path = log_path.join(WAL_LOG_FILE_NAME);
+        let mut file = File::create(&file_path).unwrap();
 
         write_record_to_file(&mut file, make_single_page_op(1, vec![1]), 1);
         write_record_to_file(&mut file, make_single_page_op(2, vec![2]), 2);
         write_record_to_file(&mut file, make_single_page_op(3, vec![3]), 3);
         drop(file);
 
-        let result = WalManager::recover_from_log(&log_path).unwrap();
+        let result = WalManager::recover_from_log(&file_path).unwrap();
 
         assert_eq!(result.redo_records.len(), 3);
         assert_eq!(result.last_lsn, 3);
@@ -803,8 +804,9 @@ mod tests {
     #[test]
     fn recover_clears_records_on_checkpoint() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
-        let mut file = File::create(&log_path).unwrap();
+        let log_path = dir.path();
+        let file_path = log_path.join(WAL_LOG_FILE_NAME);
+        let mut file = File::create(&file_path).unwrap();
 
         write_record_to_file(&mut file, make_single_page_op(1, vec![1]), 1);
         write_record_to_file(&mut file, make_single_page_op(2, vec![2]), 2);
@@ -816,7 +818,7 @@ mod tests {
         write_record_to_file(&mut file, make_single_page_op(3, vec![3]), 4);
         drop(file);
 
-        let result = WalManager::recover_from_log(&log_path).unwrap();
+        let result = WalManager::recover_from_log(&file_path).unwrap();
 
         // Only record after checkpoint should be in redo_records
         assert_eq!(result.redo_records.len(), 1);
@@ -827,8 +829,10 @@ mod tests {
     #[test]
     fn recover_with_only_checkpoint() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
-        let mut file = File::create(&log_path).unwrap();
+        let log_path = dir.path();
+        let (_, _) = spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let file_path = log_path.join(WAL_LOG_FILE_NAME);
+        let mut file = File::create(&file_path).unwrap();
 
         write_record_to_file(
             &mut file,
@@ -837,7 +841,7 @@ mod tests {
         );
         drop(file);
 
-        let result = WalManager::recover_from_log(&log_path).unwrap();
+        let result = WalManager::recover_from_log(&file_path).unwrap();
 
         assert!(result.redo_records.is_empty());
         assert_eq!(result.last_lsn, 10);
@@ -848,11 +852,9 @@ mod tests {
     #[test]
     fn spawn_wal_returns_valid_handle() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
-
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS)
-                .expect("spawn_wal should succeed");
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         assert!(handle.redo_records.is_empty());
         drop(handle);
@@ -862,9 +864,9 @@ mod tests {
     #[test]
     fn write_single_returns_lsn() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let mut diff = PageDiff::default();
         diff.write_at(0, vec![1, 2, 3]);
@@ -881,9 +883,9 @@ mod tests {
     #[test]
     fn write_single_increments_lsn() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let lsn1 = handle
             .wal_client
@@ -906,9 +908,9 @@ mod tests {
     #[test]
     fn write_multi_returns_lsn() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let mut diff1 = PageDiff::default();
         diff1.write_at(0, vec![1]);
@@ -928,7 +930,7 @@ mod tests {
     #[test]
     fn flush_updates_flushed_lsn() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
             spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
@@ -952,7 +954,7 @@ mod tests {
     #[test]
     fn checkpoint_returns_lsn() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
             spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
@@ -974,9 +976,10 @@ mod tests {
     #[test]
     fn checkpoint_truncates_wal_file() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let file_path = log_path.join(WAL_LOG_FILE_NAME);
 
         // Write several records
         for _ in 0..10 {
@@ -986,11 +989,11 @@ mod tests {
         }
         handle.wal_client.flush();
 
-        let size_before = std::fs::metadata(&log_path).unwrap().len();
+        let size_before = std::fs::metadata(&file_path).unwrap().len();
 
         handle.wal_client.checkpoint();
 
-        let size_after = std::fs::metadata(&log_path).unwrap().len();
+        let size_after = std::fs::metadata(&file_path).unwrap().len();
 
         // After checkpoint, file should be smaller (contains only checkpoint record)
         assert!(size_after < size_before);
@@ -1002,7 +1005,7 @@ mod tests {
     #[test]
     fn recovery_after_checkpoint_only_contains_post_checkpoint_records() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
 
         // First session: write records and checkpoint
         {
@@ -1044,7 +1047,7 @@ mod tests {
     #[test]
     fn flushed_lsn_persists_across_recovery() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
 
         // First session
         {
@@ -1095,7 +1098,7 @@ mod tests {
     #[test]
     fn multiple_writers_concurrent() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
             spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
@@ -1129,9 +1132,9 @@ mod tests {
     #[test]
     fn arc_shared_client_sees_same_flushed_lsn() {
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("wal.log");
+        let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let shared = SharedWalClient::new(handle.wal_client);
         let client1 = shared.clone_arc();
