@@ -20,6 +20,7 @@ use engine::heap_file::{HeapFile, HeapFileFactory};
 use metadata::catalog::Catalog;
 use parking_lot::RwLock;
 use planner::{query_plan::StatementPlan, resolved_tree::ResolvedTree};
+use storage::cache::CacheError;
 use storage::write_ahead_log::{WalError, spawn_wal};
 use storage::{
     background_worker::BackgroundWorkerHandle,
@@ -42,6 +43,8 @@ pub enum ExecutorError {
     CannotOpenFilesManager(#[from] FilesManagerError),
     #[error("Cannot open write-ahead log: {0}")]
     CannotOpenWAL(#[from] WalError),
+    #[error("Error occurred while redoing WAL records in cache: {0}")]
+    CannotRedoWALRecords(#[from] CacheError),
 }
 
 impl Executor {
@@ -80,7 +83,7 @@ impl Executor {
             files,
             consts::CACHE_CLEANUP_INTERVAL,
             Some(wal_handle),
-        );
+        )?;
 
         let catalog = Arc::new(RwLock::new(catalog));
         let executor = Executor {

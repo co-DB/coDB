@@ -389,19 +389,15 @@ pub(crate) struct SinglePageOperation {
 }
 
 impl SinglePageOperation {
-    pub fn new(file_page_ref: FilePageRef, diff: PageDiff) -> Self {
+    pub(crate) fn new(file_page_ref: FilePageRef, diff: PageDiff) -> Self {
         Self {
             file_page_ref,
             diff,
         }
     }
 
-    pub fn file_page_ref(&self) -> &FilePageRef {
-        &self.file_page_ref
-    }
-
-    pub fn diff(&self) -> &PageDiff {
-        &self.diff
+    pub(crate) fn into_parts(self) -> (FilePageRef, PageDiff) {
+        (self.file_page_ref, self.diff)
     }
 }
 

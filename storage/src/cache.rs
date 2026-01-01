@@ -1,3 +1,9 @@
+use crossbeam::channel;
+use dashmap::{DashMap, Entry};
+use log::{error, info, warn};
+use lru::LruCache;
+use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::any::Any;
 use std::{
     num::NonZero,
     sync::{
@@ -7,15 +13,9 @@ use std::{
     thread,
     time::Duration,
 };
-
-use crossbeam::channel;
-use dashmap::{DashMap, Entry};
-use log::{error, info, warn};
-use lru::LruCache;
-use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use thiserror::Error;
 
-use crate::write_ahead_log::{WalClient, WalHandle};
+use crate::write_ahead_log::{SinglePageOperation, WalClient, WalHandle, WalRecordData};
 use crate::{
     background_worker::{BackgroundWorker, BackgroundWorkerHandle},
     files_manager::{FileKey, FilesManager, FilesManagerError},
@@ -321,20 +321,57 @@ impl Cache {
         files: Arc<FilesManager>,
         cleanup_interval: Duration,
         wal_handle: Option<WalHandle>,
-    ) -> (Arc<Self>, BackgroundWorkerHandle) {
+    ) -> Result<(Arc<Self>, BackgroundWorkerHandle), CacheError> {
         let (wal_client, redo_records) = match wal_handle {
             Some(handle) => (Some(handle.wal_client), Some(handle.redo_records)),
             None => (None, None),
         };
         let cache = Self::new(capacity, files, wal_client);
+
+        if let Some(redo_records) = redo_records {
+            cache.apply_redo(redo_records)?;
+        }
         let cleaner = BackgroundCacheCleaner::start(BackgroundCacheCleanerParams {
             cache: cache.clone(),
             cleanup_interval,
         });
-        if let Some(redo_records) = redo_records {
-            // TODO: Apply redo records to cache
+        Ok((cache, cleaner))
+    }
+
+    /// Applies changes to the database files using redo records from write-ahead log. Some of the
+    /// records may already be applied and will be skipped.
+    ///
+    /// Should only be called once during cache initialization.
+    fn apply_redo(&self, redo_records: Vec<(Lsn, WalRecordData)>) -> Result<(), CacheError> {
+        for (lsn, operation) in redo_records {
+            match operation {
+                WalRecordData::SinglePageOperation(op) => self.apply_operation(lsn, op)?,
+                WalRecordData::MultiPageOperation(multi_op) => {
+                    for op in multi_op {
+                        self.apply_operation(lsn, op)?;
+                    }
+                }
+                // Checkpoints are skipped over in WAL.
+                WalRecordData::Checkpoint { .. } => unreachable!(),
+            }
         }
-        (cache, cleaner)
+
+        self.flush_all_frames();
+
+        let _ = self.wal_client.as_ref().unwrap().checkpoint();
+        Ok(())
+    }
+
+    /// Applies single page operation to the page if its LSN is lower than `lsn`.
+    fn apply_operation(&self, lsn: Lsn, operation: SinglePageOperation) -> Result<(), CacheError> {
+        let (page_ref, diff) = operation.into_parts();
+        let mut page = self.pin_write(&page_ref)?;
+        if page.lsn() >= lsn {
+            return Ok(());
+        }
+        diff.apply(&mut page);
+        page.set_lsn(lsn);
+        Ok(())
     }
 
     /// Returns shared lock to the page. If page was not found in the cache it loads it from disk.
@@ -584,9 +621,9 @@ impl Cache {
         frame: Arc<PageFrame>,
         mut file_lock: MutexGuard<'_, PagedFile>,
     ) -> Result<(), CacheError> {
-        // We do not need to check if pin_count > 0 - at this point this frame was removed from dashmap and we hold the
-        // exclusive lock on the shard in which frame's key was, so it cannot be increased. At the same time we hold the lock
-        // to underlying file, meaning no other thread can create frame for the same page - we are safe to flush.
+        // We do not need to check if pin_count > 0 - at this point either this frame was removed from dashmap, and we hold the
+        // exclusive lock on the shard in which frame's key was, so it cannot be increased or there is only one thread using cache.
+        // At the same time we hold the lock to underlying file, meaning no other thread can create frame for the same page - we are safe to flush.
 
         if !frame.dirty.load(Ordering::Acquire) {
             // Other thread already flushed it.
@@ -1323,7 +1360,8 @@ mod tests {
 
         // start cache with a short cleanup interval
         let (cache, mut cleaner) =
-            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50), None);
+            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50), None)
+                .unwrap();
 
         // create a frame and insert it directly into frames map WITHOUT adding to LRU
         let page: Page = [0u8; 4096];
@@ -1360,7 +1398,8 @@ mod tests {
         };
 
         let (cache, mut cleaner) =
-            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50), None);
+            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50), None)
+                .unwrap();
 
         let page: Page = [0u8; 4096];
         let frame = Arc::new(PageFrame::new(id.clone(), page));
@@ -1406,7 +1445,8 @@ mod tests {
         };
 
         let (cache, mut cleaner) =
-            Cache::with_background_cleaner(3, files.clone(), Duration::from_millis(50), None);
+            Cache::with_background_cleaner(3, files.clone(), Duration::from_millis(50), None)
+                .unwrap();
 
         let page: Page = [0u8; 4096];
 

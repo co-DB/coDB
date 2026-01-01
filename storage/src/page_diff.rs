@@ -1,3 +1,4 @@
+use crate::cache::PageWrite;
 use std::collections::BTreeMap;
 use types::serialization::{DbSerializable, DbSerializationError};
 
@@ -88,6 +89,14 @@ impl PageDiff {
         }
 
         Ok((PageDiff { diffs }, rest))
+    }
+
+    pub(crate) fn apply(self, mut page: impl PageWrite) {
+        for (offset, data) in self.diffs {
+            let start = offset as usize;
+            let end = start + data.len();
+            page.data_mut()[start..end].copy_from_slice(&data);
+        }
     }
 }
 
