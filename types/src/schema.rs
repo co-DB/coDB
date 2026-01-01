@@ -36,6 +36,16 @@ impl Type {
             _ => None,
         }
     }
+
+    /// Returns `true` if type can be used as a primary key.
+    ///
+    /// Type that supports primary key should implement trait `SortableSerialize`.
+    pub fn supports_primary_key(&self) -> bool {
+        matches!(
+            self,
+            Type::I32 | Type::I64 | Type::DateTime | Type::Date | Type::String
+        )
+    }
 }
 
 impl fmt::Display for Type {

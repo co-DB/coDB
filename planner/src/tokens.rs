@@ -10,6 +10,7 @@ pub enum TokenType {
     LParen,
     RParen,
     Illegal(String),
+    #[allow(clippy::upper_case_acronyms)]
     EOF,
     Comma,
     NotEqual,

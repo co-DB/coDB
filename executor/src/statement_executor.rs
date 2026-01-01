@@ -2,7 +2,7 @@ use engine::b_tree::{Range, RangeBound};
 use engine::heap_file::FieldUpdateDescriptor;
 use engine::{
     b_tree_key::Key,
-    heap_file::{HeapFileError, RecordHandle, RecordPtr},
+    heap_file::{HeapFileError, RecordHandle},
     record::{Field, Record},
 };
 use itertools::Itertools;
@@ -562,6 +562,14 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
     /// Handler for [`CreateTable`] statement.
     fn create_table(&self, create_table: &CreateTable) -> StatementResult {
+        // Should never happen, just to be extra sure
+        if !create_table.primary_key_column.ty.supports_primary_key() {
+            return error_factory::runtime_error(format!(
+                "Cannot use type '{}' as primary key",
+                create_table.primary_key_column.ty
+            ));
+        }
+
         let new_columns = self.map_to_new_columns_request(
             iter::once(&create_table.primary_key_column).chain(create_table.columns.iter()),
         );

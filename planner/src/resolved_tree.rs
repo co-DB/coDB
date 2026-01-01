@@ -33,11 +33,6 @@ impl ResolvedTree {
         &self.nodes[id.0]
     }
 
-    /// Returns statement with `node_id`.
-    pub(crate) fn statement(&self, id: ResolvedNodeId) -> &ResolvedStatement {
-        &self.statements[id.0]
-    }
-
     /// Returns all statements.
     pub(crate) fn statements(&self) -> &[ResolvedStatement] {
         &self.statements
@@ -153,6 +148,18 @@ pub struct ResolvedCreateColumnDescriptor {
     pub name: String,
     pub ty: Type,
     pub addon: ResolvedCreateColumnAddon,
+}
+
+impl ResolvedCreateColumnDescriptor {
+    /// Returns `true` if [`Self::addon`] can be used with [`Self::ty`].
+    ///
+    /// In other word, if this returns `false` then the described column is invalid.
+    pub(crate) fn addon_supported_by_type(&self) -> bool {
+        match self.addon {
+            ResolvedCreateColumnAddon::PrimaryKey => self.ty.supports_primary_key(),
+            ResolvedCreateColumnAddon::None => true,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
