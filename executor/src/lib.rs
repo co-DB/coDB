@@ -1383,8 +1383,8 @@ mod tests {
         let (executor, mut workers) = Executor::with_background_workers(db_path, catalog)
             .expect("with_background_workers should succeed");
 
-        // We expect two background workers (cache and files manager)
-        assert_eq!(workers.len(), 2);
+        // We expect three background workers (cache and files manager and wal)
+        assert_eq!(workers.len(), 3);
 
         // Shutdown and join all workers to ensure threads are started and can be stopped.
         while let Some(mut handle) = workers.pop() {

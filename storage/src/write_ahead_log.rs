@@ -27,6 +27,8 @@ pub enum WalError {
     RecoveryFailed(String),
 }
 
+const WAL_LOG_FILE_NAME: &str = "wal.log";
+
 /// Result of WAL recovery process.
 struct RecoveryResult {
     /// Records that need to be redone (after last checkpoint).
@@ -72,12 +74,14 @@ struct WalManager {
 /// Spawns the WAL manager thread and returns a handle for interaction.
 /// This is the main entry point for using WAL.
 pub fn spawn_wal(
-    log_path: impl AsRef<Path>,
+    log_dir_path: impl AsRef<Path>,
     flush_interval: Duration,
     max_unflushed_records: u64,
 ) -> Result<(WalHandle, BackgroundWorkerHandle), WalError> {
     let (record_sender, record_receiver) = channel::bounded(1024);
     let (shutdown_sender, shutdown_receiver) = channel::unbounded();
+
+    let log_path = log_dir_path.as_ref().join(WAL_LOG_FILE_NAME);
 
     let (mut manager, recovery, flushed_lsn) = WalManager::with_recovery(
         record_receiver,
