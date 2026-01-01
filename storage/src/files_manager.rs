@@ -2,21 +2,50 @@
 
 use crate::background_worker::{BackgroundWorker, BackgroundWorkerHandle};
 use crate::paged_file::{PagedFile, PagedFileError};
+use crossbeam::channel;
 use dashmap::DashMap;
 use log::{error, info};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
+use types::serialization::{DbSerializable, DbSerializationError};
 
 /// Represents possible file types inside a table directory (refer to `docs/file_structure.md` for more
 /// details)
-#[derive(Eq, PartialEq, Hash, Clone, Debug)]
+#[derive(Eq, PartialEq, Hash, Clone, Debug, Copy)]
+#[repr(u8)]
 enum FileType {
     Data,
     Index,
+}
+
+impl DbSerializable for FileType {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        (*self as u8).serialize(buffer);
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        (*self as u8).serialize_into(buffer);
+    }
+
+    fn deserialize(data: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        let (value, rest) = u8::deserialize(data)?;
+
+        let file_type = match value {
+            0 => FileType::Data,
+            1 => FileType::Index,
+            _ => return Err(DbSerializationError::FailedToDeserialize),
+        };
+
+        Ok((file_type, rest))
+    }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<u8>()
+    }
 }
 
 /// Helper type created to make referring to files easier and cleaner.
@@ -56,6 +85,60 @@ impl FileKey {
     /// Returns a full name of the file. Refer to `docs/files_structure.md`.
     pub fn file_name(&self) -> String {
         format!("{}.{}", self.table_name, self.extension())
+    }
+}
+
+impl DbSerializable for FileKey {
+    fn serialize(&self, buffer: &mut Vec<u8>) {
+        let name_bytes = self.table_name.as_bytes();
+        (name_bytes.len() as u16).serialize(buffer);
+        buffer.extend_from_slice(name_bytes);
+        self.file_type.serialize(buffer);
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) {
+        let name_bytes = self.table_name.as_bytes();
+        let name_len = name_bytes.len();
+
+        (name_len as u16).serialize_into(&mut buffer[0..size_of::<u16>()]);
+
+        buffer[size_of::<u16>()..size_of::<u16>() + name_len].copy_from_slice(name_bytes);
+
+        self.file_type
+            .serialize_into(&mut buffer[size_of::<u16>() + name_len..]);
+    }
+
+    fn deserialize(
+        data: &[u8],
+    ) -> Result<(Self, &[u8]), types::serialization::DbSerializationError> {
+        let (name_len, rest) = u16::deserialize(data)?;
+        let name_len = name_len as usize;
+
+        if rest.len() < name_len {
+            return Err(types::serialization::DbSerializationError::UnexpectedEnd {
+                expected: name_len,
+                actual: rest.len(),
+            });
+        }
+
+        let table_name = std::str::from_utf8(&rest[..name_len])
+            .map_err(|_| types::serialization::DbSerializationError::FailedToDeserialize)?
+            .to_string();
+
+        let rest = &rest[name_len..];
+        let (file_type, rest) = FileType::deserialize(rest)?;
+
+        Ok((
+            FileKey {
+                table_name,
+                file_type,
+            },
+            rest,
+        ))
+    }
+
+    fn size_serialized(&self) -> usize {
+        size_of::<u16>() + self.table_name.len() + size_of::<u8>()
     }
 }
 
@@ -139,7 +222,7 @@ impl FilesManager {
 pub(crate) struct BackgroundFilesManagerCleaner {
     files_manager: Arc<FilesManager>,
     cleanup_interval: Duration,
-    shutdown: mpsc::Receiver<()>,
+    shutdown: channel::Receiver<()>,
 }
 
 pub(crate) struct BackgroundFilesManagerCleanerParams {
@@ -152,7 +235,7 @@ impl BackgroundWorker for BackgroundFilesManagerCleaner {
 
     fn start(params: Self::BackgroundWorkerParams) -> BackgroundWorkerHandle {
         info!("Starting files manager background cleaner");
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = channel::unbounded();
         let cleaner = BackgroundFilesManagerCleaner {
             files_manager: params.files_manager,
             cleanup_interval: params.cleanup_interval,
@@ -174,13 +257,13 @@ impl BackgroundFilesManagerCleaner {
                     info!("Shutting down files manager background cleaner");
                     break;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(channel::RecvTimeoutError::Timeout) => {
                     info!("Files manager background cleaner - truncating files");
                     if let Err(e) = self.truncate_files() {
                         error!("failed to truncate files: {e}")
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(channel::RecvTimeoutError::Disconnected) => {
                     // Sender dropped - trying to shutdown anyway.
                     info!(
                         "Shutting down files manager background cleaner (cancellation channel dropped)"

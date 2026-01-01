@@ -20,6 +20,7 @@ use engine::heap_file::{HeapFile, HeapFileFactory};
 use metadata::catalog::Catalog;
 use parking_lot::RwLock;
 use planner::{query_plan::StatementPlan, resolved_tree::ResolvedTree};
+use storage::write_ahead_log::{WalError, spawn_wal};
 use storage::{
     background_worker::BackgroundWorkerHandle,
     cache::Cache,
@@ -39,13 +40,15 @@ pub struct Executor {
 pub enum ExecutorError {
     #[error("Cannot open files manager: {0}")]
     CannotOpenFilesManager(#[from] FilesManagerError),
+    #[error("Cannot open write-ahead log: {0}")]
+    CannotOpenWAL(#[from] WalError),
 }
 
 impl Executor {
     /// Creates new [`Executor`] for database at `database_path`.
     pub fn new(database_path: impl AsRef<Path>, catalog: Catalog) -> Result<Self, ExecutorError> {
         let files = Arc::new(FilesManager::new(database_path)?);
-        let cache = Cache::new(consts::CACHE_SIZE, files);
+        let cache = Cache::new(consts::CACHE_SIZE, files, None);
         let catalog = Arc::new(RwLock::new(catalog));
         Ok(Executor {
             heap_files: DashMap::new(),
@@ -62,15 +65,23 @@ impl Executor {
         catalog: Catalog,
     ) -> Result<(Self, Vec<BackgroundWorkerHandle>), ExecutorError> {
         let (files, files_background_worker) = FilesManager::with_background_cleaner(
-            database_path,
+            database_path.as_ref(),
             consts::FILES_MANAGER_CLEANUP_INTERVAL,
+        )?;
+
+        let (wal_handle, wal_background_worker) = spawn_wal(
+            database_path,
+            consts::WAL_FLUSH_INTERVAL_MS,
+            consts::WAL_MAX_UNFLUSHED_RECORDS,
         )?;
 
         let (cache, cache_background_worker) = Cache::with_background_cleaner(
             consts::CACHE_SIZE,
             files,
             consts::CACHE_CLEANUP_INTERVAL,
+            Some(wal_handle),
         );
+
         let catalog = Arc::new(RwLock::new(catalog));
         let executor = Executor {
             heap_files: DashMap::new(),
@@ -78,7 +89,11 @@ impl Executor {
             cache,
             catalog,
         };
-        let workers = vec![cache_background_worker, files_background_worker];
+        let workers = vec![
+            cache_background_worker,
+            files_background_worker,
+            wal_background_worker,
+        ];
         Ok((executor, workers))
     }
 
@@ -1368,8 +1383,8 @@ mod tests {
         let (executor, mut workers) = Executor::with_background_workers(db_path, catalog)
             .expect("with_background_workers should succeed");
 
-        // We expect two background workers (cache and files manager)
-        assert_eq!(workers.len(), 2);
+        // We expect three background workers (cache and files manager and wal)
+        assert_eq!(workers.len(), 3);
 
         // Shutdown and join all workers to ensure threads are started and can be stopped.
         while let Some(mut handle) = workers.pop() {

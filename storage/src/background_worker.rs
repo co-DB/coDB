@@ -1,5 +1,6 @@
-use std::{mem, sync::mpsc, thread};
+use std::{mem, thread};
 
+use crossbeam::channel;
 use thiserror::Error;
 
 /// Error for [`BackgroundWorker`] related operations.
@@ -19,19 +20,19 @@ pub struct BackgroundWorkerHandle {
     /// Handle to the [`BackgroundWorker`]'s thread.
     handle: thread::JoinHandle<()>,
     /// Sender end of the channel used for shutting down [`BackgroundWorker`].
-    shutdown: Option<mpsc::Sender<()>>,
+    shutdown: Option<channel::Sender<()>>,
 }
 
 impl BackgroundWorkerHandle {
     /// Creates new [`BackgroundWorkerHandle`].
-    pub(crate) fn new(handle: thread::JoinHandle<()>, shutdown: mpsc::Sender<()>) -> Self {
+    pub(crate) fn new(handle: thread::JoinHandle<()>, shutdown: channel::Sender<()>) -> Self {
         BackgroundWorkerHandle {
             handle,
             shutdown: Some(shutdown),
         }
     }
 
-    /// Sends signal via [`mpsc::Channel`] to [`BackgroundWorkerHandle::handle`] to shutdown.
+    /// Sends signal via channel to [`BackgroundWorkerHandle::handle`] to shutdown.
     /// This function can only be called once for the whole lifetime of this struct.
     pub fn shutdown(&mut self) -> Result<(), BackgroundWorkerError> {
         let tx = mem::take(&mut self.shutdown);
