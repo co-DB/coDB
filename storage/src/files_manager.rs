@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
-use types::serialization::DbSerializable;
+use types::serialization::{DbSerializable, DbSerializationError};
 
 /// Represents possible file types inside a table directory (refer to `docs/file_structure.md` for more
 /// details)
-#[derive(Eq, PartialEq, Hash, Clone, Debug)]
+#[derive(Eq, PartialEq, Hash, Clone, Debug, Copy)]
+#[repr(u8)]
 enum FileType {
     Data,
     Index,
@@ -23,30 +24,22 @@ enum FileType {
 
 impl DbSerializable for FileType {
     fn serialize(&self, buffer: &mut Vec<u8>) {
-        let type_id: u8 = match self {
-            FileType::Data => 0,
-            FileType::Index => 1,
-        };
-        type_id.serialize(buffer);
+        (*self as u8).serialize(buffer);
     }
 
     fn serialize_into(&self, buffer: &mut [u8]) {
-        let type_id: u8 = match self {
-            FileType::Data => 0,
-            FileType::Index => 1,
-        };
-        type_id.serialize_into(buffer);
+        (*self as u8).serialize_into(buffer);
     }
 
-    fn deserialize(
-        data: &[u8],
-    ) -> Result<(Self, &[u8]), types::serialization::DbSerializationError> {
-        let (type_id, rest) = u8::deserialize(data)?;
-        let file_type = match type_id {
+    fn deserialize(data: &[u8]) -> Result<(Self, &[u8]), DbSerializationError> {
+        let (value, rest) = u8::deserialize(data)?;
+
+        let file_type = match value {
             0 => FileType::Data,
             1 => FileType::Index,
-            _ => return Err(types::serialization::DbSerializationError::FailedToDeserialize),
+            _ => return Err(DbSerializationError::FailedToDeserialize),
         };
+
         Ok((file_type, rest))
     }
 
