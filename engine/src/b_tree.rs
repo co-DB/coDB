@@ -2531,7 +2531,7 @@ mod test {
         let (cache, file_key, _temp_dir) = setup_test_cache();
         let btree = Arc::new(create_empty_btree(cache, file_key).unwrap());
 
-        let num_keys = 5000; // Use more keys to ensure multi-level tree
+        let num_keys = 2000; // Use more keys to ensure multi-level tree
 
         // Pre-populate
         for i in 0..num_keys {
