@@ -2691,4 +2691,61 @@ mod tests {
         let _ = bg_wal.shutdown();
         let _ = bg_wal.join();
     }
+
+    #[test]
+    fn wal_drop_write_pages_all_unmodified() {
+        let (cache, files, wal_client, mut bg_wal) = create_cache_with_wal(10);
+
+        let file_key = FileKey::data("table_no_modify");
+
+        // Create 3 pages
+        let page_id_1 = alloc_page_with_u64(&files, &file_key, 0x4444);
+        let page_id_2 = alloc_page_with_u64(&files, &file_key, 0x5555);
+        let page_id_3 = alloc_page_with_u64(&files, &file_key, 0x6666);
+
+        let page_ref_1 = FilePageRef {
+            page_id: page_id_1,
+            file_key: file_key.clone(),
+        };
+        let page_ref_2 = FilePageRef {
+            page_id: page_id_2,
+            file_key: file_key.clone(),
+        };
+        let page_ref_3 = FilePageRef {
+            page_id: page_id_3,
+            file_key: file_key.clone(),
+        };
+
+        let initial_flushed_lsn = wal_client.flushed_lsn();
+
+        // Pin all 3 pages for write, but don't modify any
+        let page_1 = cache.pin_write(&page_ref_1).expect("pin_write");
+        let page_2 = cache.pin_write(&page_ref_2).expect("pin_write");
+        let page_3 = cache.pin_write(&page_ref_3).expect("pin_write");
+
+        // Don't modify any pages
+
+        // Drop all 3 pages at once - none should be logged to WAL
+        cache.drop_write_pages(vec![page_1, page_2, page_3]);
+
+        // Verify no pages were modified
+        let lsn_1 = cache.pin_read(&page_ref_1).expect("pin_read").lsn();
+        let lsn_2 = cache.pin_read(&page_ref_2).expect("pin_read").lsn();
+        let lsn_3 = cache.pin_read(&page_ref_3).expect("pin_read").lsn();
+
+        assert_eq!(lsn_1, 0, "Page 1 should NOT have been updated");
+        assert_eq!(lsn_2, 0, "Page 2 should NOT have been updated");
+        assert_eq!(lsn_3, 0, "Page 3 should NOT have been updated");
+
+        // Verify WAL received no writes (flushed_lsn unchanged)
+        thread::sleep(Duration::from_millis(150)); // Wait for potential flush
+        let flushed_lsn = wal_client.flushed_lsn();
+        assert_eq!(
+            flushed_lsn, initial_flushed_lsn,
+            "WAL should not have any new records when no pages were modified"
+        );
+
+        let _ = bg_wal.shutdown();
+        let _ = bg_wal.join();
+    }
 }
