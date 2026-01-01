@@ -15,6 +15,7 @@ use lru::LruCache;
 use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use thiserror::Error;
 
+use crate::write_ahead_log::{WalClient, WalHandle};
 use crate::{
     background_worker::{BackgroundWorker, BackgroundWorkerHandle},
     files_manager::{FileKey, FilesManager, FilesManagerError},
@@ -292,16 +293,24 @@ pub struct Cache {
     lru: Arc<RwLock<LruCache<FilePageRef, ()>>>,
     /// Pointer to [`FilesManager`], used for file operations when page must be loaded from/flushed to disk.
     files: Arc<FilesManager>,
+    /// Client for writing to WAL.
+    wal_client: Option<WalClient>,
+    /// Maximum capacity of the cache (number of frames).
     capacity: usize,
 }
 
 impl Cache {
     /// Creates new [`Cache`] that handles frames for single database.
-    pub fn new(capacity: usize, files: Arc<FilesManager>) -> Arc<Self> {
+    pub fn new(
+        capacity: usize,
+        files: Arc<FilesManager>,
+        wal_client: Option<WalClient>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             frames: DashMap::with_capacity(capacity),
             lru: Arc::new(RwLock::new(LruCache::new(NonZero::new(capacity).unwrap()))),
             files,
+            wal_client,
             capacity,
         })
     }
@@ -311,12 +320,20 @@ impl Cache {
         capacity: usize,
         files: Arc<FilesManager>,
         cleanup_interval: Duration,
+        wal_handle: Option<WalHandle>,
     ) -> (Arc<Self>, BackgroundWorkerHandle) {
-        let cache = Self::new(capacity, files);
+        let (wal_client, redo_records) = match wal_handle {
+            Some(handle) => (Some(handle.wal_client), Some(handle.redo_records)),
+            None => (None, None),
+        };
+        let cache = Self::new(capacity, files, wal_client);
         let cleaner = BackgroundCacheCleaner::start(BackgroundCacheCleanerParams {
             cache: cache.clone(),
             cleanup_interval,
         });
+        if let Some(redo_records) = redo_records {
+            // TODO: Apply redo records to cache
+        }
         (cache, cleaner)
     }
 
@@ -787,7 +804,7 @@ mod tests {
         let file_key = FileKey::data("table1");
         let page_id = alloc_page_with_u64(&files, &file_key, 7);
 
-        let cache = Cache::new(1, files.clone());
+        let cache = Cache::new(1, files.clone(), None);
 
         let id = FilePageRef {
             page_id,
@@ -808,7 +825,7 @@ mod tests {
         let file_key = FileKey::data("table1");
         let page_id = alloc_page_with_u64(&files, &file_key, 7);
 
-        let cache = Cache::new(2, files.clone());
+        let cache = Cache::new(2, files.clone(), None);
 
         let id = FilePageRef {
             page_id,
@@ -839,7 +856,7 @@ mod tests {
         let page_id2 = alloc_page_with_u64(&files, &file_key, 2);
         let page_id3 = alloc_page_with_u64(&files, &file_key, 3);
 
-        let cache = Cache::new(3, files.clone());
+        let cache = Cache::new(3, files.clone(), None);
 
         let id1 = FilePageRef {
             page_id: page_id1,
@@ -883,7 +900,7 @@ mod tests {
         let page_id2 = alloc_page_with_u64(&files, &file_key, 2);
         let page_id3 = alloc_page_with_u64(&files, &file_key, 3);
 
-        let cache = Cache::new(3, files.clone());
+        let cache = Cache::new(3, files.clone(), None);
 
         let id1 = FilePageRef {
             page_id: page_id1,
@@ -922,7 +939,7 @@ mod tests {
         let file_key = FileKey::data("table1");
         let page_id = alloc_page_with_u64(&files, &file_key, 0xdeadbeefu64);
 
-        let cache = Cache::new(2, files.clone());
+        let cache = Cache::new(2, files.clone(), None);
 
         let id = FilePageRef {
             page_id,
@@ -982,7 +999,7 @@ mod tests {
         let id2 = alloc_page_with_u64(&files, &file_key, 102);
         let id3 = alloc_page_with_u64(&files, &file_key, 103);
 
-        let cache = Cache::new(1, files.clone());
+        let cache = Cache::new(1, files.clone(), None);
 
         let fp1 = FilePageRef {
             page_id: id1,
@@ -1076,7 +1093,7 @@ mod tests {
         let files = create_files_manager();
         let file_key = FileKey::data("table1");
         let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
-        let cache = Cache::new(1, files.clone());
+        let cache = Cache::new(1, files.clone(), None);
         let id = FilePageRef {
             page_id: pid,
             file_key: file_key.clone(),
@@ -1110,7 +1127,7 @@ mod tests {
         let files = create_files_manager();
         let file_key = FileKey::data("table1");
 
-        let cache = Cache::new(1, files.clone());
+        let cache = Cache::new(1, files.clone(), None);
 
         // Allocate page via cache
         let (mut w, pid) = cache.allocate_page(&file_key).expect("allocate_page");
@@ -1145,7 +1162,7 @@ mod tests {
             page_id: pid,
             file_key: fk.clone(),
         };
-        let cache = Cache::new(1, files.clone());
+        let cache = Cache::new(1, files.clone(), None);
 
         let writers = 4;
         let start = Arc::new(Barrier::new(writers + 1));
@@ -1192,7 +1209,7 @@ mod tests {
         let files = create_files_manager();
         let file_key = FileKey::data("table_alloc");
 
-        let cache = Cache::new(1, files.clone());
+        let cache = Cache::new(1, files.clone(), None);
 
         let (mut pinned, _) = cache
             .allocate_page(&file_key)
@@ -1228,7 +1245,7 @@ mod tests {
             file_key: fk.clone(),
         };
 
-        let cache = Cache::new(1, files.clone());
+        let cache = Cache::new(1, files.clone(), None);
 
         {
             let h = spawn_check_page(cache.clone(), id.clone(), 0xAA);
@@ -1254,7 +1271,7 @@ mod tests {
         let pid2 = alloc_page_with_u64(&files, &file_key, 2);
         let pid3 = alloc_page_with_u64(&files, &file_key, 3);
 
-        let cache = Cache::new(2, files.clone());
+        let cache = Cache::new(2, files.clone(), None);
 
         let fp1 = FilePageRef {
             page_id: pid1,
@@ -1306,7 +1323,7 @@ mod tests {
 
         // start cache with a short cleanup interval
         let (cache, mut cleaner) =
-            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50));
+            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50), None);
 
         // create a frame and insert it directly into frames map WITHOUT adding to LRU
         let page: Page = [0u8; 4096];
@@ -1343,7 +1360,7 @@ mod tests {
         };
 
         let (cache, mut cleaner) =
-            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50));
+            Cache::with_background_cleaner(2, files.clone(), Duration::from_millis(50), None);
 
         let page: Page = [0u8; 4096];
         let frame = Arc::new(PageFrame::new(id.clone(), page));
@@ -1389,7 +1406,7 @@ mod tests {
         };
 
         let (cache, mut cleaner) =
-            Cache::with_background_cleaner(3, files.clone(), Duration::from_millis(50));
+            Cache::with_background_cleaner(3, files.clone(), Duration::from_millis(50), None);
 
         let page: Page = [0u8; 4096];
 
@@ -1437,7 +1454,7 @@ mod tests {
             file_key: file_key.clone(),
         };
 
-        let cache = Cache::new(1, files.clone());
+        let cache = Cache::new(1, files.clone(), None);
 
         {
             let mut w = cache.pin_write(&id).expect("pin_write failed");
@@ -1463,7 +1480,7 @@ mod tests {
         let pid2 = alloc_page_with_u64(&files, &file_key, 0x2222);
         let pid3 = alloc_page_with_u64(&files, &file_key, 0x3333);
 
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         let id1 = FilePageRef {
             page_id: pid1,
@@ -1518,7 +1535,7 @@ mod tests {
         let pid1 = alloc_page_with_u64(&files, &file_key1, 0x1111);
         let pid2 = alloc_page_with_u64(&files, &file_key2, 0x2222);
 
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         let id1 = FilePageRef {
             page_id: pid1,
@@ -1554,7 +1571,7 @@ mod tests {
         let file_key = FileKey::data("table_remove_dirty");
 
         let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         let id = FilePageRef {
             page_id: pid,
@@ -1594,7 +1611,7 @@ mod tests {
         let files = create_files_manager();
         let file_key = FileKey::data("table_empty");
 
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         // Try to remove pages from a file that has no cached pages
         cache
@@ -1610,7 +1627,7 @@ mod tests {
         let file_key = FileKey::data("table_remove_held");
 
         let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         let id = FilePageRef {
             page_id: pid,
@@ -1664,7 +1681,7 @@ mod tests {
         let pid1 = alloc_page_with_u64(&files, &file_key, 0x1111);
         let pid2 = alloc_page_with_u64(&files, &file_key, 0x2222);
 
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         let id1 = FilePageRef {
             page_id: pid1,
@@ -1715,7 +1732,7 @@ mod tests {
         let pid1 = alloc_page_with_u64(&files, &file_key1, 0x1111);
         let pid2 = alloc_page_with_u64(&files, &file_key2, 0x2222);
 
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         let id1 = FilePageRef {
             page_id: pid1,
@@ -1771,7 +1788,7 @@ mod tests {
         let file_key = FileKey::data("table_remove_held_flush");
 
         let pid = alloc_page_with_u64(&files, &file_key, 0x1111);
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         let id = FilePageRef {
             page_id: pid,
@@ -1820,7 +1837,7 @@ mod tests {
         let files = create_files_manager();
         let file_key = FileKey::data("table_empty_remove");
 
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         // Remove file that has no cached pages
         cache
@@ -1839,7 +1856,7 @@ mod tests {
         let pid1 = alloc_page_with_u64(&files, &file_key1, 0x1111);
         let pid2 = alloc_page_with_u64(&files, &file_key2, 0x2222);
 
-        let cache = Cache::new(5, files.clone());
+        let cache = Cache::new(5, files.clone(), None);
 
         let id1 = FilePageRef {
             page_id: pid1,

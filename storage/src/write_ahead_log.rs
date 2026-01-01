@@ -561,7 +561,7 @@ impl WalRecordData {
 
 /// Client handle for interacting with the WAL from other threads.
 /// This is the public API for WAL operations.
-pub(crate) struct WalClient {
+pub struct WalClient {
     sender: channel::Sender<WalRequest>,
     flushed_lsn: Arc<AtomicLsn>,
 }
@@ -846,7 +846,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
 
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).expect("spawn_wal should succeed");
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS)
+                .expect("spawn_wal should succeed");
 
         assert!(handle.redo_records.is_empty());
         drop(handle);
@@ -857,7 +859,8 @@ mod tests {
     fn write_single_returns_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let mut diff = PageDiff::default();
         diff.write_at(0, vec![1, 2, 3]);
@@ -875,7 +878,8 @@ mod tests {
     fn write_single_increments_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let lsn1 = handle
             .wal_client
@@ -899,7 +903,8 @@ mod tests {
     fn write_multi_returns_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let mut diff1 = PageDiff::default();
         diff1.write_at(0, vec![1]);
@@ -920,7 +925,8 @@ mod tests {
     fn flush_updates_flushed_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         assert_eq!(handle.wal_client.flushed_lsn(), 0);
 
@@ -943,7 +949,8 @@ mod tests {
     fn checkpoint_returns_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         handle
             .wal_client
@@ -964,7 +971,8 @@ mod tests {
     fn checkpoint_truncates_wal_file() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         // Write several records
         for _ in 0..10 {
@@ -994,7 +1002,8 @@ mod tests {
 
         // First session: write records and checkpoint
         {
-            let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            let (handle, mut bg_handle) =
+                spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
             handle
                 .wal_client
                 .write_single(make_test_file_page_ref(1), PageDiff::default());
@@ -1015,7 +1024,8 @@ mod tests {
 
         // Second session: recover
         {
-            let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            let (handle, mut bg_handle) =
+                spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
             // Should only have records after checkpoint (LSN 4 and 5)
             assert_eq!(handle.redo_records.len(), 2);
@@ -1034,7 +1044,8 @@ mod tests {
 
         // First session
         {
-            let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            let (handle, mut bg_handle) =
+                spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
             handle
                 .wal_client
                 .write_single(make_test_file_page_ref(1), PageDiff::default());
@@ -1051,7 +1062,8 @@ mod tests {
 
         // Second session
         {
-            let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            let (handle, mut bg_handle) =
+                spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
             // flushed_lsn should be set to last_lsn from recovery
             assert_eq!(handle.wal_client.flushed_lsn(), 3);
@@ -1080,7 +1092,8 @@ mod tests {
     fn multiple_writers_concurrent() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         // Simulate how Cache would share WalClient via Arc
         let shared = SharedWalClient::new(handle.wal_client);
@@ -1113,7 +1126,8 @@ mod tests {
     fn arc_shared_client_sees_same_flushed_lsn() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("wal.log");
-        let (handle, mut bg_handle) = spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+        let (handle, mut bg_handle) =
+            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         let shared = SharedWalClient::new(handle.wal_client);
         let client1 = shared.clone_arc();
