@@ -265,8 +265,28 @@ where
 
     pub fn batch_insert(&mut self, insert_values: Vec<Vec<u8>>) -> Result<(), BTreeNodeError> {
         for (index, value) in insert_values.iter().enumerate() {
-            self.slotted_page
-                .insert_at(value.as_slice(), index as SlotId)?;
+            let pos = index as SlotId;
+            let res = self.slotted_page.insert_at(value.as_slice(), pos)?;
+            match res {
+                InsertResult::Success(_) => {}
+                InsertResult::NeedsDefragmentation => {
+                    self.slotted_page.compact_records()?;
+                    let res2 = self.slotted_page.insert_at(value.as_slice(), pos)?;
+                    match res2 {
+                        InsertResult::Success(_) => {}
+                        InsertResult::NeedsDefragmentation | InsertResult::PageFull => {
+                            return Err(BTreeNodeError::CorruptNode {
+                                reason: "batch_insert failed after defragmentation".to_string(),
+                            });
+                        }
+                    }
+                }
+                InsertResult::PageFull => {
+                    return Err(BTreeNodeError::CorruptNode {
+                        reason: "batch_insert: page unexpectedly full".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -504,16 +524,28 @@ where
     ) -> Result<(), BTreeNodeError> {
         let child_ptr = self.get_child_ptr(slot_id)?;
 
-        self.slotted_page.delete(slot_id)?;
-
         let mut buffer = Vec::new();
         buffer.extend_from_slice(new_key);
         child_ptr.serialize(&mut buffer);
 
-        let result = self.slotted_page.insert_at(&buffer, slot_id)?;
-        self.handle_insert_result(result, &buffer, slot_id)?;
-
-        Ok(())
+        match self.slotted_page.update(slot_id, &buffer)? {
+            UpdateResult::Success => Ok(()),
+            UpdateResult::NeedsDefragmentation => {
+                self.slotted_page.compact_records()?;
+                match self.slotted_page.update(slot_id, &buffer)? {
+                    UpdateResult::Success => Ok(()),
+                    UpdateResult::NeedsDefragmentation | UpdateResult::PageFull => {
+                        Err(BTreeNodeError::CorruptNode {
+                            reason: "update_separator_at_slot failed after defragmentation"
+                                .to_string(),
+                        })
+                    }
+                }
+            }
+            UpdateResult::PageFull => Err(BTreeNodeError::CorruptNode {
+                reason: "update_separator_at_slot: page unexpectedly full".to_string(),
+            }),
+        }
     }
 
     pub fn split_keys(&mut self) -> Result<(Vec<Vec<u8>>, Vec<u8>), BTreeNodeError> {
@@ -861,12 +893,13 @@ where
         let serialized_record_ptr_size = size_of::<PageId>() + size_of::<SlotId>();
         let key_bytes_end = record.len() - serialized_record_ptr_size;
         let (key, _) = record.split_at(key_bytes_end);
+
         let position = match self.search(key)? {
             LeafNodeSearchResult::Found { .. } => return Ok(NodeInsertResult::KeyAlreadyExists),
             LeafNodeSearchResult::NotFoundLeaf { insert_slot_id } => insert_slot_id,
         };
-        self.slotted_page.insert_at(record, position)?;
-        Ok(NodeInsertResult::Success)
+        let insert_result = self.slotted_page.insert_at(record, position)?;
+        self.handle_insert_result(insert_result, record, position)
     }
 
     pub(crate) fn update_record_ptr(
