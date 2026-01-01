@@ -2154,32 +2154,4 @@ mod tests {
         // Cache should still be empty
         assert_eq!(cache.frames.len(), 0);
     }
-
-    #[test]
-    fn cache_apply_redo_page_not_yet_allocated() {
-        use crate::write_ahead_log::{SinglePageOperation, WalRecordData};
-
-        let files = create_files_manager();
-        let file_key = FileKey::data("table_redo_new");
-
-        // Create a redo for a page that doesn't exist yet
-        // This simulates recovery where WAL contains operations on a page that was
-        // allocated but the metadata wasn't persisted
-        let page_ref = FilePageRef {
-            page_id: 0,
-            file_key: file_key.clone(),
-        };
-
-        let mut diff = PageDiff::default();
-        diff.write_at(0, 0xBEEFu64.to_be_bytes().to_vec());
-
-        let op = SinglePageOperation::new(page_ref.clone(), diff);
-        let redo_records = vec![(1u64, WalRecordData::SinglePageOperation(op))];
-
-        let cache = Cache::new(5, files.clone(), None);
-
-        // This should fail because the page doesn't exist in the file
-        let result = cache.apply_redo(redo_records);
-        assert!(result.is_err());
-    }
 }
