@@ -3,7 +3,7 @@ use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_key::Key;
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeLeafNode, BTreeNode, BTreeNodeError, ChildPosition,
+    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition,
     LeafNodeSearchResult, NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
@@ -1016,6 +1016,10 @@ impl BTree {
         mut leaf_latch: LeafNodeLatch,
         metadata_page: Option<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
+        // We need to store all the latches to nodes we modify during merge/redistribute to
+        // write them atomically to WAL at the end.
+        let mut dropped_page_latches: Vec<PinnedWritePage> = Vec::new();
+
         // We need the parent for separator updates.
         let parent = match internal_nodes.pop() {
             Some(p) => p,
@@ -1054,6 +1058,13 @@ impl BTree {
 
                 self.update_structural_version(parent_id);
                 self.update_structural_version(right_sibling_id);
+
+                // Store modified pages for WAL write.
+                dropped_page_latches.push(leaf_latch.node.into_page());
+                dropped_page_latches.push(right_sibling.into_page());
+                dropped_page_latches.push(parent_node.into_page());
+                self.cache.drop_write_pages(dropped_page_latches);
+
                 return Ok(());
             }
 
@@ -1073,6 +1084,7 @@ impl BTree {
                         node: right_sibling,
                     },
                     ctx,
+                    dropped_page_latches,
                 );
             }
         }
@@ -1102,6 +1114,13 @@ impl BTree {
             leaf_latch
                 .node
                 .insert_record(redistributed_record.as_slice())?;
+
+            // Store modified pages for WAL write.
+            dropped_page_latches.push(leaf_latch.node.into_page());
+            dropped_page_latches.push(left_sibling.into_page());
+            dropped_page_latches.push(parent_node.into_page());
+            self.cache.drop_write_pages(dropped_page_latches);
+
             return Ok(());
         }
 
@@ -1121,6 +1140,7 @@ impl BTree {
                 node: left_sibling,
             },
             ctx,
+            dropped_page_latches,
         )
     }
 
@@ -1130,7 +1150,8 @@ impl BTree {
         &self,
         mut current_node_latch: LeafNodeLatch,
         right_sibling_latch: LeafNodeLatch,
-        mut ctx: MergeContext,
+        ctx: MergeContext,
+        mut dropped_page_latches: Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
         // Move all keys from right sibling to node.
         let keys_to_move = right_sibling_latch.node.get_all_records()?;
@@ -1152,15 +1173,41 @@ impl BTree {
             .slot_id()
             .expect("next_child_pos must be AfterSlot");
 
-        ctx.parent_node.delete_at(slot_id)?;
-        self.update_structural_version(ctx.parent_id);
+        // Destructure ctx to extract components
+        let MergeContext {
+            parent_id,
+            mut parent_node,
+            child_pos,
+            internal_nodes,
+            metadata_page,
+        } = ctx;
 
+        parent_node.delete_at(slot_id)?;
+        self.update_structural_version(parent_id);
+
+        // Free the right sibling page
         self.free_latch(right_sibling_latch)?;
 
-        if ctx.parent_node.is_underflow()? {
-            self.handle_internal_underflow(ctx)?;
+        // Check underflow BEFORE moving parent_node to vector
+        let parent_has_underflow = parent_node.is_underflow()?;
+
+        // Store modified current node page
+        dropped_page_latches.push(current_node_latch.node.into_page());
+
+        if parent_has_underflow {
+            let new_ctx = MergeContext {
+                parent_id,
+                parent_node,
+                child_pos,
+                internal_nodes,
+                metadata_page,
+            };
+            return self.handle_internal_underflow(new_ctx, dropped_page_latches);
         }
 
+        // No underflow, so we can write all pages atomically
+        dropped_page_latches.push(parent_node.into_page());
+        self.cache.drop_write_pages(dropped_page_latches);
         Ok(())
     }
 
@@ -1170,7 +1217,8 @@ impl BTree {
         &self,
         current_node_latch: LeafNodeLatch,
         mut left_sibling_latch: LeafNodeLatch,
-        mut ctx: MergeContext,
+        ctx: MergeContext,
+        mut dropped_page_latches: Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
         let keys_to_move = current_node_latch.node.get_all_records()?;
         for key in keys_to_move {
@@ -1186,18 +1234,42 @@ impl BTree {
             .child_pos
             .slot_id()
             .expect("child_pos must be AfterSlot for merge_with_left_sibling");
-        ctx.parent_node.delete_at(slot_id)?;
-        self.update_structural_version(ctx.parent_id);
+
+        let MergeContext {
+            parent_id,
+            mut parent_node,
+            child_pos,
+            internal_nodes,
+            metadata_page,
+        } = ctx;
+
+        parent_node.delete_at(slot_id)?;
+        self.update_structural_version(parent_id);
 
         self.free_latch(current_node_latch)?;
 
-        if ctx.parent_node.is_underflow()? {
-            self.handle_internal_underflow(ctx)?;
+        let parent_has_underflow = parent_node.is_underflow()?;
+
+        // Store modified left sibling page
+        dropped_page_latches.push(left_sibling_latch.node.into_page());
+
+        if parent_has_underflow {
+            let new_ctx = MergeContext {
+                parent_id,
+                parent_node,
+                child_pos,
+                internal_nodes,
+                metadata_page,
+            };
+            return self.handle_internal_underflow(new_ctx, dropped_page_latches);
         }
 
+        // No underflow, so we can write all pages atomically
+        dropped_page_latches.push(parent_node.into_page());
+        self.cache.drop_write_pages(dropped_page_latches);
         Ok(())
-    }
 
+    }
     /// Frees the latch's page at disk level and removes it from structural version numbers map.
     fn free_latch(&self, latch: impl Latch) -> Result<(), BTreeError> {
         self.structural_version_numbers.remove(&latch.page_id());
@@ -1207,7 +1279,11 @@ impl BTree {
 
     /// Takes care of restructuring an internal node if it has an underflow. Works similarly to
     /// [`redistribute_or_merge`] just for internal nodes.
-    fn handle_internal_underflow(&self, mut ctx: MergeContext) -> Result<(), BTreeError> {
+    fn handle_internal_underflow(
+        &self,
+        mut ctx: MergeContext,
+        dropped_page_latches: Vec<PinnedWritePage>,
+    ) -> Result<(), BTreeError> {
         // The node that has an underflow (it was the parent when handling the leaf).
         let underflow_id = ctx.parent_id;
         let underflow_node = ctx.parent_node;
@@ -1221,6 +1297,7 @@ impl BTree {
                         node: underflow_node,
                     },
                     ctx.metadata_page.unwrap(),
+                    dropped_page_latches,
                 );
             }
             Some(handle) => handle,
@@ -1257,6 +1334,7 @@ impl BTree {
                         node: parent_node,
                     },
                     separator_slot,
+                    dropped_page_latches,
                 );
             }
 
@@ -1284,6 +1362,7 @@ impl BTree {
                     },
                     separator_slot,
                     new_ctx,
+                    dropped_page_latches,
                 );
             }
         }
@@ -1313,6 +1392,7 @@ impl BTree {
                     node: parent_node,
                 },
                 separator_slot,
+                dropped_page_latches,
             );
         }
 
@@ -1334,6 +1414,7 @@ impl BTree {
                 node: left_sibling,
             },
             new_ctx,
+            dropped_page_latches,
         )
     }
 
@@ -1347,6 +1428,7 @@ impl BTree {
         mut right_sibling_latch: InternalNodeLatch,
         mut parent_latch: InternalNodeLatch,
         separator_slot: SlotId,
+        mut dropped_page_latches: Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
         // Get current separator from parent
         let separator_key = parent_latch.node.get_key(separator_slot)?.to_vec();
@@ -1370,6 +1452,12 @@ impl BTree {
         self.update_structural_version(right_sibling_latch.page_id);
         self.update_structural_version(parent_latch.page_id);
 
+        // Store modified pages for WAL write.
+        dropped_page_latches.push(underflow_node_latch.node.into_page());
+        dropped_page_latches.push(right_sibling_latch.node.into_page());
+        dropped_page_latches.push(parent_latch.node.into_page());
+        self.cache.drop_write_pages(dropped_page_latches);
+
         Ok(())
     }
 
@@ -1383,6 +1471,7 @@ impl BTree {
         mut left_sibling_latch: InternalNodeLatch,
         mut parent_latch: InternalNodeLatch,
         separator_slot: SlotId,
+        mut dropped_page_latches: Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
         // Get current separator from parent
         let separator_key = parent_latch.node.get_key(separator_slot)?.to_vec();
@@ -1404,6 +1493,12 @@ impl BTree {
         self.update_structural_version(left_sibling_latch.page_id);
         self.update_structural_version(parent_latch.page_id);
 
+        // Store modified pages for WAL write.
+        dropped_page_latches.push(underflow_node_latch.node.into_page());
+        dropped_page_latches.push(left_sibling_latch.node.into_page());
+        dropped_page_latches.push(parent_latch.node.into_page());
+        self.cache.drop_write_pages(dropped_page_latches);
+
         Ok(())
     }
 
@@ -1416,9 +1511,18 @@ impl BTree {
         mut underflow_node_latch: InternalNodeLatch,
         right_sibling_latch: InternalNodeLatch,
         separator_slot: SlotId,
-        mut ctx: MergeContext,
+        ctx: MergeContext,
+        mut dropped_page_latches: Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
-        let separator_key = ctx.parent_node.get_key(separator_slot)?.to_vec();
+        let MergeContext {
+            parent_id,
+            mut parent_node,
+            child_pos,
+            internal_nodes,
+            metadata_page,
+        } = ctx;
+
+        let separator_key = parent_node.get_key(separator_slot)?.to_vec();
 
         let right_leftmost = right_sibling_latch
             .node
@@ -1432,14 +1536,30 @@ impl BTree {
         let right_records = right_sibling_latch.node.get_all_records()?;
         self.insert_internal_records(&mut underflow_node_latch.node, right_records)?;
 
-        ctx.parent_node.delete_at(separator_slot)?;
-        self.update_structural_version(ctx.parent_id);
+        parent_node.delete_at(separator_slot)?;
+        self.update_structural_version(parent_id);
+
         self.free_latch(right_sibling_latch)?;
 
-        if ctx.parent_node.is_underflow()? {
-            return self.handle_internal_underflow(ctx);
+        let parent_has_underflow = parent_node.is_underflow()?;
+
+        // Store modified underflow node page
+        dropped_page_latches.push(underflow_node_latch.node.into_page());
+
+        if parent_has_underflow {
+            let new_ctx = MergeContext {
+                parent_id,
+                parent_node,
+                child_pos,
+                internal_nodes,
+                metadata_page,
+            };
+            return self.handle_internal_underflow(new_ctx, dropped_page_latches);
         }
 
+        // No underflow, so we can write all pages atomically
+        dropped_page_latches.push(parent_node.into_page());
+        self.cache.drop_write_pages(dropped_page_latches);
         Ok(())
     }
 
@@ -1451,14 +1571,23 @@ impl BTree {
         &self,
         underflow_node_latch: InternalNodeLatch,
         mut left_sibling_latch: InternalNodeLatch,
-        mut ctx: MergeContext,
+        ctx: MergeContext,
+        mut dropped_page_latches: Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
-        let separator_slot = ctx
+        let slot_id = ctx
             .child_pos
             .slot_id()
             .expect("child_pos must be AfterSlot for merge_with_left_sibling");
 
-        let separator_key = ctx.parent_node.get_key(separator_slot)?.to_vec();
+        let MergeContext {
+            parent_id,
+            mut parent_node,
+            child_pos,
+            internal_nodes,
+            metadata_page,
+        } = ctx;
+
+        let separator_key = parent_node.get_key(slot_id)?.to_vec();
 
         let underflow_leftmost = underflow_node_latch
             .node
@@ -1472,14 +1601,30 @@ impl BTree {
         let underflow_records = underflow_node_latch.node.get_all_records()?;
         self.insert_internal_records(&mut left_sibling_latch.node, underflow_records)?;
 
-        ctx.parent_node.delete_at(separator_slot)?;
-        self.update_structural_version(ctx.parent_id);
+        parent_node.delete_at(slot_id)?;
+        self.update_structural_version(parent_id);
+
         self.free_latch(underflow_node_latch)?;
 
-        if ctx.parent_node.is_underflow()? {
-            return self.handle_internal_underflow(ctx);
+        let parent_has_underflow = parent_node.is_underflow()?;
+
+        // Store modified left sibling page
+        dropped_page_latches.push(left_sibling_latch.node.into_page());
+
+        if parent_has_underflow {
+            let new_ctx = MergeContext {
+                parent_id,
+                parent_node,
+                child_pos,
+                internal_nodes,
+                metadata_page,
+            };
+            return self.handle_internal_underflow(new_ctx, dropped_page_latches);
         }
 
+        // No underflow, so we can write all pages atomically
+        dropped_page_latches.push(parent_node.into_page());
+        self.cache.drop_write_pages(dropped_page_latches);
         Ok(())
     }
 
@@ -1488,6 +1633,7 @@ impl BTree {
         &self,
         root_latch: InternalNodeLatch,
         mut metadata_page: PinnedWritePage,
+        mut dropped_page_latches: Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
         // If root has more than one child we can keep it with the underflow.
         if root_latch.node.num_children()? == 1 {
@@ -1498,7 +1644,17 @@ impl BTree {
             let metadata = BTreeMetadata::new(child_id);
             metadata.save_to_page(&mut metadata_page);
 
+            // Store modified metadata page
+            dropped_page_latches.push(metadata_page);
+
+            // Free the old root page
             self.free_latch(root_latch)?;
+
+            // Write all modified pages atomically to WAL
+            self.cache.drop_write_pages(dropped_page_latches);
+        } else {
+            // Root still has multiple children, just write the modified pages
+            self.cache.drop_write_pages(dropped_page_latches);
         }
 
         Ok(())
