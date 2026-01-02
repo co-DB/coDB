@@ -571,6 +571,34 @@ trait WritePageLockChain {
     fn record_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, RecordPageHeader>;
     /// Gets mutable current overflow page (undefined when only record page is held at the time).
     fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, OverflowPageHeader>;
+    /// Add pages directly to the collected pages vec
+    fn add_pages(&mut self, pages: Vec<PinnedWritePage>);
+}
+
+/// Trait for collecting pages during operations that may allocate new pages.
+trait PageCollector {
+    /// Adds a newly allocated or modified page to the collection
+    fn consume_heap_page<H: BaseHeapPageHeader>(&mut self, heap_page: HeapPage<PinnedWritePage, H>);
+}
+
+/// Simple wrapper around Vec<PinnedWritePage> that implements PageCollector
+struct VecPageCollector<'a> {
+    pages: &'a mut Vec<PinnedWritePage>,
+}
+
+impl<'a> VecPageCollector<'a> {
+    fn new(pages: &'a mut Vec<PinnedWritePage>) -> Self {
+        VecPageCollector { pages }
+    }
+}
+
+impl<'a> PageCollector for VecPageCollector<'a> {
+    fn consume_heap_page<H: BaseHeapPageHeader>(
+        &mut self,
+        heap_page: HeapPage<PinnedWritePage, H>,
+    ) {
+        self.pages.push(heap_page.page.into_page());
+    }
 }
 
 /// Trait encapsulating logic behind sending locked pages as single MultiPageOperation to WAL.
@@ -750,10 +778,63 @@ impl<'hf, const BUCKETS_COUNT: usize> WritePageLockChain
             ),
         }
     }
+
+    fn add_pages(&mut self, pages: Vec<PinnedWritePage>) {
+        self.pages.extend(pages);
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> PageCollector for ExclusivePageLockChain<'hf, BUCKETS_COUNT> {
+    fn consume_heap_page<H: BaseHeapPageHeader>(
+        &mut self,
+        heap_page: HeapPage<PinnedWritePage, H>,
+    ) {
+        self.pages.push(heap_page.page.into_page());
+    }
 }
 
 impl<'hf, const BUCKETS_COUNT: usize> MultiPageOperationChain
     for ExclusivePageLockChain<'hf, BUCKETS_COUNT>
+{
+    fn drop_pages(self) {
+        self.heap_file.cache.drop_write_pages(self.pages);
+    }
+}
+
+/// Helper struct used for collecting all pages during insert operations.
+///
+/// Unlike ExclusivePageLockChain, this struct is designed for insert operations where:
+/// - We don't need to advance through a chain of existing pages
+/// - We may allocate multiple new pages
+/// - All modified pages should be collected and dropped together at the end
+///
+/// This allows insert to properly participate in multi-page WAL operations.
+struct InsertPageLockChain<'hf, const BUCKETS_COUNT: usize> {
+    heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+    pages: Vec<PinnedWritePage>,
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> InsertPageLockChain<'hf, BUCKETS_COUNT> {
+    /// Creates a new empty InsertPageLockChain
+    fn new(heap_file: &'hf HeapFile<BUCKETS_COUNT>) -> Self {
+        InsertPageLockChain {
+            heap_file,
+            pages: Vec::new(),
+        }
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> PageCollector for InsertPageLockChain<'hf, BUCKETS_COUNT> {
+    fn consume_heap_page<H: BaseHeapPageHeader>(
+        &mut self,
+        heap_page: HeapPage<PinnedWritePage, H>,
+    ) {
+        self.pages.push(heap_page.page.into_page());
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> MultiPageOperationChain
+    for InsertPageLockChain<'hf, BUCKETS_COUNT>
 {
     fn drop_pages(self) {
         self.heap_file.cache.drop_write_pages(self.pages);
@@ -768,6 +849,8 @@ struct NoDroppingPageLockChain<'hf, const BUCKETS_COUNT: usize> {
     overflow_page: Option<(PageId, HeapPage<PinnedWritePage, OverflowPageHeader>)>,
     previous_record_pages: HashMap<PageId, HeapPage<PinnedWritePage, RecordPageHeader>>,
     previous_overflow_pages: HashMap<PageId, HeapPage<PinnedWritePage, OverflowPageHeader>>,
+    /// Additional pages collected during inserts (from [`HeapFile::insert_using_only_overflow_pages`])
+    additional_pages: Vec<PinnedWritePage>,
 }
 
 impl<'hf, const BUCKETS_COUNT: usize> NoDroppingPageLockChain<'hf, BUCKETS_COUNT> {
@@ -779,6 +862,7 @@ impl<'hf, const BUCKETS_COUNT: usize> NoDroppingPageLockChain<'hf, BUCKETS_COUNT
             overflow_page: None,
             previous_record_pages: HashMap::new(),
             previous_overflow_pages: HashMap::new(),
+            additional_pages: Vec::new(),
         })
     }
 
@@ -899,6 +983,10 @@ impl<'hf, const BUCKETS_COUNT: usize> WritePageLockChain
             ),
         }
     }
+
+    fn add_pages(&mut self, pages: Vec<PinnedWritePage>) {
+        self.additional_pages.extend(pages);
+    }
 }
 
 impl<'a, 'hf, const BUCKETS_COUNT: usize> WritePageLockChain
@@ -915,6 +1003,35 @@ impl<'a, 'hf, const BUCKETS_COUNT: usize> WritePageLockChain
     fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, OverflowPageHeader> {
         (**self).overflow_page_mut()
     }
+
+    fn add_pages(&mut self, pages: Vec<PinnedWritePage>) {
+        self.additional_pages.extend(pages);
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> PageCollector
+    for NoDroppingPageLockChain<'hf, BUCKETS_COUNT>
+{
+    fn consume_heap_page<H: BaseHeapPageHeader>(
+        &mut self,
+        heap_page: HeapPage<PinnedWritePage, H>,
+    ) {
+        // For NoDroppingPageLockChain, we store additional pages from inserts in a separate vector
+        // These are pages that were allocated during insert_using_only_overflow_pages
+        self.additional_pages.push(heap_page.page.into_page());
+    }
+}
+
+impl<'a, 'hf, const BUCKETS_COUNT: usize> PageCollector
+    for &'a mut NoDroppingPageLockChain<'hf, BUCKETS_COUNT>
+{
+    fn consume_heap_page<H: BaseHeapPageHeader>(
+        &mut self,
+        heap_page: HeapPage<PinnedWritePage, H>,
+    ) {
+        // Delegate to the actual implementation
+        (**self).consume_heap_page(heap_page)
+    }
 }
 
 impl<'hf, const BUCKETS_COUNT: usize> MultiPageOperationChain
@@ -922,7 +1039,9 @@ impl<'hf, const BUCKETS_COUNT: usize> MultiPageOperationChain
 {
     fn drop_pages(mut self) {
         let mut pages = Vec::with_capacity(
-            2 + self.previous_record_pages.len() + self.previous_overflow_pages.len(),
+            2 + self.previous_record_pages.len()
+                + self.previous_overflow_pages.len()
+                + self.additional_pages.len(),
         );
         if let Some((_, r)) = self.record_page.take() {
             pages.push(r.page.into_page());
@@ -936,6 +1055,7 @@ impl<'hf, const BUCKETS_COUNT: usize> MultiPageOperationChain
         for (_, page) in self.previous_overflow_pages {
             pages.push(page.page.into_page());
         }
+        pages.extend(self.additional_pages);
         self.heap_file.cache.drop_write_pages(pages);
     }
 }
@@ -1273,11 +1393,14 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Inserts `record` into heap file and returns its [`RecordPtr`].
     pub fn insert(&self, record: Record) -> Result<RecordPtr, HeapFileError> {
         let serialized = record.serialize();
-        self.insert_record_internal(
-            serialized,
-            |heap_file, data| heap_file.insert_to_record_page(data),
-            |heap_file, data| heap_file.insert_to_overflow_page(data),
-        )
+        let mut page_chain = InsertPageLockChain::new(self);
+        let result = self.insert_record_internal(serialized, &mut page_chain);
+
+        // Drop all pages together as a single multi-page operation
+        if result.is_ok() {
+            page_chain.drop_pages();
+        }
+        result
     }
 
     /// Applies all updates described in `updated_fields` to [`Record`] stored at `ptr`.
@@ -1578,7 +1701,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
             // Record cannot fit in this page. We store as much as before (`- RecordPtr` to be sure continuation will fit)
             // in the first page and save `rest` in other page(s).
-            self.split_and_extend_fragment(
+            let pages = self.split_and_extend_fragment(
                 first_page,
                 start.slot_id,
                 start.page_id,
@@ -1586,6 +1709,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 previous_len,
                 &self.record_pages_fsm,
             )?;
+            page_chain.add_pages(pages);
             return Ok(());
         }
 
@@ -1652,14 +1776,18 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                             return Ok(());
                         }
                         // Need to allocate new fragments for remaining changed bytes
-                        let rest_ptr = self.insert_using_only_overflow_pages(Vec::from(
-                            processor.remaining_bytes,
-                        ))?;
+                        let (rest_ptr, pages) = self.insert_using_only_overflow_pages(
+                            Vec::from(processor.remaining_bytes),
+                        )?;
                         // Update current fragment to point to new chain
                         let current_data = current_fragment.data;
                         let current_with_tag =
                             RecordTag::with_has_continuation(current_data, &rest_ptr);
                         current_page.update(current_ptr.slot_id, &current_with_tag)?;
+
+                        // Add all allocated pages to the chain
+                        page_chain.add_pages(pages);
+
                         return Ok(());
                     }
                 }
@@ -1691,7 +1819,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                 }
                 None => {
                     // This is the last fragment from original chain, so additional bytes can be added wherever we want
-                    self.split_and_extend_fragment(
+                    let pages = self.split_and_extend_fragment(
                         current_page,
                         current_ptr.slot_id,
                         current_ptr.page_id,
@@ -1699,6 +1827,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
                         current_frag_len,
                         &self.overflow_pages_fsm,
                     )?;
+                    page_chain.add_pages(pages);
                     return Ok(());
                 }
             }
@@ -1758,6 +1887,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Takes the maximum amount of data that can fit in the current fragment (accounting for
     /// the RecordPtr overhead), stores it with a continuation tag, and recursively stores
     /// the remaining data in overflow pages.
+    ///
+    /// Returns the Vec of newly allocated pages.
     fn split_and_extend_fragment<P, H>(
         &self,
         page: &mut HeapPage<P, H>,
@@ -1766,7 +1897,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         remaining_bytes: &[u8],
         previous_fragment_len: usize,
         fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
-    ) -> Result<(), HeapFileError>
+    ) -> Result<Vec<PinnedWritePage>, HeapFileError>
     where
         P: PageRead + PageWrite,
         H: BaseHeapPageHeader,
@@ -1776,31 +1907,66 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let space_for_data = previous_fragment_len.saturating_sub(size_of::<RecordPtr>());
 
         let (current_page_part, rest) = remaining_bytes.split_at(space_for_data);
-        let rest_ptr = self.insert_using_only_overflow_pages(Vec::from(rest))?;
+        let (rest_ptr, pages) = self.insert_using_only_overflow_pages(Vec::from(rest))?;
         let current_with_tag = RecordTag::with_has_continuation(current_page_part, &rest_ptr);
 
         self.update_page_with_fsm(page, slot, &current_with_tag, page_id, fsm)?;
-        Ok(())
+
+        Ok(pages)
     }
 
     /// Inserts `data` into heap file using only overflow pages and returns its [`RecordPtr`].
+    /// Returns both the RecordPtr and the Vec of allocated pages.
     /// It is intended to use during update operation.
     /// We use new allocation, because otherwise we end up with deadlock as we hold write-lock to page and fsm wants to get it as well.
     fn insert_using_only_overflow_pages(
         &self,
-        serialized: Vec<u8>,
-    ) -> Result<RecordPtr, HeapFileError> {
-        self.insert_record_internal(
-            serialized,
-            |heap_file, data| heap_file.insert_to_overflow_with_new_allocation(data),
-            |heap_file, data| heap_file.insert_to_overflow_with_new_allocation(data),
-        )
+        mut serialized: Vec<u8>,
+    ) -> Result<(RecordPtr, Vec<PinnedWritePage>), HeapFileError> {
+        let mut pages = Vec::new();
+        let mut collector = VecPageCollector::new(&mut pages);
+
+        let ptr = if serialized.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
+            // Record can be stored on single page
+            let data = RecordTag::with_final(&serialized);
+            self.insert_to_overflow_with_new_allocation(&data, &mut collector)?
+        } else {
+            // We need to split record into pieces, so that each piece can fit into one page.
+            let piece_size = Self::MAX_RECORD_SIZE_WHEN_MANY_FRAGMENTS;
+
+            let last_fragment = serialized.split_off(serialized.len() - 1 - piece_size);
+            let last_fragment_with_tag = RecordTag::with_final(&last_fragment);
+            let mut next_ptr = self
+                .insert_to_overflow_with_new_allocation(&last_fragment_with_tag, &mut collector)?;
+
+            // It means 2 pieces is enough
+            if serialized.len() <= piece_size {
+                let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
+                self.insert_to_overflow_with_new_allocation(&data, &mut collector)?
+            } else {
+                // We need to split it into more than 2 pieces
+                let middle_pieces = serialized.split_off(piece_size);
+
+                // We save middle pieces into overflow pages
+                for chunk in middle_pieces.rchunks(piece_size as _) {
+                    let chunk = RecordTag::with_has_continuation(chunk, &next_ptr);
+                    next_ptr =
+                        self.insert_to_overflow_with_new_allocation(&chunk, &mut collector)?;
+                }
+
+                let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
+                self.insert_to_overflow_with_new_allocation(&data, &mut collector)?
+            }
+        };
+
+        Ok((ptr, pages))
     }
 
     /// Same as [`Self::insert_to_overflow_page`], but it doesn't check fsm and always allocates page.
     fn insert_to_overflow_with_new_allocation(
         &self,
         data: &[u8],
+        page_collector: &mut impl PageCollector,
     ) -> Result<RecordPtr, HeapFileError> {
         let (page_id, mut page) = self.allocate_overflow_page()?;
 
@@ -1814,6 +1980,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         self.overflow_pages_fsm
             .update_page_bucket(page_id, page.page.free_space()? as _);
+
+        // Add the page to the collector before returning
+        page_collector.consume_heap_page(page);
 
         Ok(RecordPtr { page_id, slot_id })
     }
@@ -1956,6 +2125,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         data: &[u8],
         fsm: &FreeSpaceMap<BUCKETS_COUNT, H>,
         allocate_fn: impl FnOnce() -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>,
+        page_collector: &mut impl PageCollector,
     ) -> Result<RecordPtr, HeapFileError>
     where
         H: BaseHeapPageHeader,
@@ -1979,41 +2149,53 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         fsm.update_page_bucket(page_id, page.page.free_space()? as _);
 
+        // Add the page to the collector before returning
+        page_collector.consume_heap_page(page);
+
         Ok(RecordPtr { page_id, slot_id })
     }
 
     /// Inserts `data` into first found record page that has enough size.
-    fn insert_to_record_page(&self, data: &[u8]) -> Result<RecordPtr, HeapFileError> {
-        self.insert_to_page(data, &self.record_pages_fsm, || self.allocate_record_page())
+    fn insert_to_record_page(
+        &self,
+        data: &[u8],
+        page_collector: &mut impl PageCollector,
+    ) -> Result<RecordPtr, HeapFileError> {
+        self.insert_to_page(
+            data,
+            &self.record_pages_fsm,
+            || self.allocate_record_page(),
+            page_collector,
+        )
     }
 
     /// Inserts `data` into first found overflow page that has enough size.
-    fn insert_to_overflow_page(&self, data: &[u8]) -> Result<RecordPtr, HeapFileError> {
-        self.insert_to_page(data, &self.overflow_pages_fsm, || {
-            self.allocate_overflow_page()
-        })
+    fn insert_to_overflow_page(
+        &self,
+        data: &[u8],
+        page_collector: &mut impl PageCollector,
+    ) -> Result<RecordPtr, HeapFileError> {
+        self.insert_to_page(
+            data,
+            &self.overflow_pages_fsm,
+            || self.allocate_overflow_page(),
+            page_collector,
+        )
     }
 
     /// Generic helper for inserting serialized record data using first-fragment-insert strategy
     ///
-    /// In insert we don't need to use our lock strategy (get next then drop previous), because in insert we write record
-    /// starting from the end of it. It means that once we write the first fragment in record page, the rest is already there
-    /// and we can safely drop it. During inserts to overflow pages we don't need this locking strategy, as heap file is still not
-    /// aware of this record (because its first fragment hasn't been inserted yet).
-    fn insert_record_internal<F, G>(
+    /// In insert we now collect all pages in PageCollector so they can be dropped together
+    /// as a single multi-page operation for WAL.
+    fn insert_record_internal<PC: PageCollector>(
         &self,
         mut serialized: Vec<u8>,
-        insert_first_fragment: F,
-        insert_next_fragments: G,
-    ) -> Result<RecordPtr, HeapFileError>
-    where
-        F: FnOnce(&Self, &[u8]) -> Result<RecordPtr, HeapFileError>,
-        G: Fn(&Self, &[u8]) -> Result<RecordPtr, HeapFileError>,
-    {
+        page_collector: &mut PC,
+    ) -> Result<RecordPtr, HeapFileError> {
         if serialized.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
             // Record can be stored on single page
             let data = RecordTag::with_final(&serialized);
-            return insert_first_fragment(self, &data);
+            return self.insert_to_record_page(&data, page_collector);
         }
 
         // We need to split record into pieces, so that each piece can fit into one page.
@@ -2025,12 +2207,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
         let last_fragment = serialized.split_off(serialized.len() - 1 - piece_size);
         let last_fragment_with_tag = RecordTag::with_final(&last_fragment);
-        let mut next_ptr = insert_next_fragments(self, &last_fragment_with_tag)?;
+        let mut next_ptr = self.insert_to_overflow_page(&last_fragment_with_tag, page_collector)?;
 
         // It means 2 pieces is enough
         if serialized.len() <= piece_size {
             let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
-            return insert_first_fragment(self, &data);
+            return self.insert_to_record_page(&data, page_collector);
         }
 
         // We need to split it into more than 2 pieces
@@ -2039,11 +2221,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // We save middle pieces into overflow pages
         for chunk in middle_pieces.rchunks(piece_size as _) {
             let chunk = RecordTag::with_has_continuation(chunk, &next_ptr);
-            next_ptr = insert_next_fragments(self, &chunk)?;
+            next_ptr = self.insert_to_overflow_page(&chunk, page_collector)?;
         }
 
         let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
-        insert_first_fragment(self, &data)
+        self.insert_to_record_page(&data, page_collector)
     }
 
     /// Generic helper for updating a record and registering the page in FSM
