@@ -6,7 +6,7 @@ use crate::b_tree_node::{
     BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, LeafNodeSearchResult,
     NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
-use crate::heap_file::RecordPtr;
+use crate::heap_file::record::RecordPtr;
 use crate::slotted_page::SlotId;
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
