@@ -4,27 +4,19 @@ mod lock_chains;
 mod pages;
 pub mod record;
 
-use crate::heap_file::error::HeapFileError;
-use crate::heap_file::fsm::FreeSpaceMap;
-use crate::heap_file::lock_chains::ExclusivePageLockChain;
-use crate::heap_file::lock_chains::InsertPageLockChain;
-use crate::heap_file::lock_chains::MultiPageOperationChain;
-use crate::heap_file::lock_chains::NoDroppingPageLockChain;
-use crate::heap_file::lock_chains::PageCollector;
-use crate::heap_file::lock_chains::ReadPageLockChain;
-use crate::heap_file::lock_chains::SharedPageLockChain;
-use crate::heap_file::lock_chains::SharedPageLockChainWithRecordPage;
-use crate::heap_file::lock_chains::VecPageCollector;
-use crate::heap_file::lock_chains::WritePageLockChain;
-use crate::heap_file::pages::BaseHeapPageHeader;
-use crate::heap_file::pages::HeapPage;
-use crate::heap_file::pages::Metadata;
-use crate::heap_file::pages::MetadataRepr;
-use crate::heap_file::pages::OverflowPageHeader;
-use crate::heap_file::pages::RecordPageHeader;
-use crate::heap_file::record::RecordHandle;
-use crate::heap_file::record::RecordPtr;
-use crate::heap_file::record::RecordTag;
+use crate::heap_file::{
+    error::HeapFileError,
+    fsm::FreeSpaceMap,
+    lock_chains::{
+        ExclusivePageLockChain, InsertPageLockChain, MultiPageOperationChain,
+        NoDroppingPageLockChain, PageCollector, ReadPageLockChain, SharedPageLockChain,
+        SharedPageLockChainWithRecordPage, VecPageCollector, WritePageLockChain,
+    },
+    pages::{
+        BaseHeapPageHeader, HeapPage, Metadata, MetadataRepr, OverflowPageHeader, RecordPageHeader,
+    },
+    record::{RecordHandle, RecordPtr, RecordTag},
+};
 
 use std::{
     collections::VecDeque,
