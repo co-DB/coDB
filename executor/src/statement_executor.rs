@@ -2,7 +2,8 @@ use engine::b_tree::{Range, RangeBound};
 use engine::heap_file::FieldUpdateDescriptor;
 use engine::{
     b_tree_key::Key,
-    heap_file::{HeapFileError, RecordHandle},
+    heap_file::error::HeapFileError,
+    heap_file::record::RecordHandle,
     record::{Field, Record},
 };
 use itertools::Itertools;

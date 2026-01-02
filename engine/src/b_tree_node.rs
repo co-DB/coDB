@@ -1,4 +1,4 @@
-﻿use crate::heap_file::RecordPtr;
+﻿use crate::heap_file::record::RecordPtr;
 use crate::slotted_page::{
     InsertResult, PageType, ReprC, SlotId, SlottedPage, SlottedPageBaseHeader, SlottedPageError,
     SlottedPageHeader, UpdateResult, get_base_header,

@@ -1,7 +1,7 @@
 //! error_factory - provides helpers for creating errors across `executor` crate.
 
 use engine::b_tree::BTreeError;
-use engine::heap_file::HeapFileError;
+use engine::heap_file::error::HeapFileError;
 use storage::cache::CacheError;
 use thiserror::Error;
 use types::{data::Value, schema::Type};
