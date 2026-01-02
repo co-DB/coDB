@@ -544,109 +544,67 @@ impl<'a> FragmentProcessor<'a> {
     }
 }
 
-/// Trait encapsulating logic behind locking pages.
+/// Trait encapsulating logic behind locking pages with shared lock.
 ///
 /// When dealing with record that spans multiple pages (multi-fragment record) pages shouldn't be read by hand,
 /// but instead struct that implements this trait should be used.
-trait PageLockChain<P> {
+trait ReadPageLockChain {
     /// Locks the next page
     fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError>;
     /// Gets current record page (undefined when only overflow page is held at the time).
-    fn record_page(&self) -> &HeapPage<P, RecordPageHeader>;
-    /// Gets mutable current record page (undefined when only overflow page is held at the time).
-    fn record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader>;
+    fn record_page(&self) -> &HeapPage<PinnedReadPage, RecordPageHeader>;
     /// Gets current overflow page (undefined when only record page is held at the time).
-    fn overflow_page(&self) -> &HeapPage<P, OverflowPageHeader>;
-    /// Gets mutable current overflow page (undefined when only record page is held at the time).
-    fn overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader>;
+    fn overflow_page(&self) -> &HeapPage<PinnedReadPage, OverflowPageHeader>;
 }
 
-/// Helper struct used for locking pages when working with records.
+/// Trait encapsulating logic behind locking pages with exclusive lock.
+///
+/// When dealing with mutable record that spans multiple pages (multi-fragment record) pages shouldn't be read by hand,
+/// but instead struct that implements this trait should be used.
+trait WritePageLockChain {
+    /// Locks the next page
+    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError>;
+    /// Gets mutable current record page (undefined when only overflow page is held at the time).
+    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, RecordPageHeader>;
+    /// Gets mutable current overflow page (undefined when only record page is held at the time).
+    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, OverflowPageHeader>;
+    /// Drops all pages and send them to WAL as single MultiPageOperation.
+    fn drop_pages(self);
+}
+
+/// Helper struct used for locking pages when reading records.
 ///
 /// Locking pages with this struct works as follows:
 /// - read page
-/// - do an action on the page
+/// - read the record fragment
 /// - read next page
 /// - drop the previous page
-struct SinglePageLockChain<'hf, const BUCKETS_COUNT: usize, P> {
+struct SharedPageLockChain<'hf, const BUCKETS_COUNT: usize> {
     heap_file: &'hf HeapFile<BUCKETS_COUNT>,
-    record_page: Option<HeapPage<P, RecordPageHeader>>,
-    overflow_page: Option<HeapPage<P, OverflowPageHeader>>,
+    record_page: Option<HeapPage<PinnedReadPage, RecordPageHeader>>,
+    overflow_page: Option<HeapPage<PinnedReadPage, OverflowPageHeader>>,
 }
 
-impl<'hf, const BUCKETS_COUNT: usize, P> SinglePageLockChain<'hf, BUCKETS_COUNT, P> {
-    /// Gets current record page.
-    ///
-    /// Panics if we hold overflow page instead.
-    fn _record_page(&self) -> &HeapPage<P, RecordPageHeader> {
-        match &self.record_page {
-            Some(record_page) => record_page,
-            None => panic!(
-                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
-            ),
-        }
-    }
-
-    /// Gets mutable current record page.
-    ///
-    /// Panics if we hold overflow page instead.
-    fn _record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
-        match &mut self.record_page {
-            Some(record_page) => record_page,
-            None => panic!(
-                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
-            ),
-        }
-    }
-
-    /// Gets current overflow page.
-    ///
-    /// Panics if we hold record page instead.
-    fn _overflow_page(&self) -> &HeapPage<P, OverflowPageHeader> {
-        match &self.overflow_page {
-            Some(overflow_page) => overflow_page,
-            None => panic!(
-                "invalid usage of PageLockChain - tried to get overflow page when record page is stored instead"
-            ),
-        }
-    }
-
-    /// Gets mutable current overflow page.
-    ///
-    /// Panics if we hold record page instead.
-    fn _overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader> {
-        match &mut self.overflow_page {
-            Some(overflow_page) => overflow_page,
-            None => panic!(
-                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
-            ),
-        }
-    }
-}
-
-impl<'hf, const BUCKETS_COUNT: usize> SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedReadPage> {
-    /// Creates new [`SinglePageLockChain`] that starts with record page
-    fn with_record(
+impl<'hf, const BUCKETS_COUNT: usize> SharedPageLockChain<'hf, BUCKETS_COUNT> {
+    /// Creates new [`SharedPageLockChain`] that starts with record page with `page_id`
+    fn with_page_id(
         heap_file: &'hf HeapFile<BUCKETS_COUNT>,
         page_id: PageId,
     ) -> Result<Self, HeapFileError> {
         let record_page = heap_file.read_record_page(page_id)?;
-        Ok(SinglePageLockChain {
+        Ok(SharedPageLockChain {
             heap_file,
             record_page: Some(record_page),
             overflow_page: None,
         })
     }
-}
 
-impl<'hf, const BUCKETS_COUNT: usize> SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage> {
-    /// Creates new [`SinglePageLockChain`] that starts with record page
+    /// Creates new [`SharedPageLockChain`] that starts with provided record page
     fn with_record(
         heap_file: &'hf HeapFile<BUCKETS_COUNT>,
-        page_id: PageId,
+        record_page: HeapPage<PinnedReadPage, RecordPageHeader>,
     ) -> Result<Self, HeapFileError> {
-        let record_page = heap_file.write_record_page(page_id)?;
-        Ok(SinglePageLockChain {
+        Ok(SharedPageLockChain {
             heap_file,
             record_page: Some(record_page),
             overflow_page: None,
@@ -654,8 +612,8 @@ impl<'hf, const BUCKETS_COUNT: usize> SinglePageLockChain<'hf, BUCKETS_COUNT, Pi
     }
 }
 
-impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<PinnedReadPage>
-    for SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedReadPage>
+impl<'hf, const BUCKETS_COUNT: usize> ReadPageLockChain
+    for SharedPageLockChain<'hf, BUCKETS_COUNT>
 {
     /// Locks the next page and only then drops the previous one
     fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
@@ -669,113 +627,50 @@ impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<PinnedReadPage>
     }
 
     fn record_page(&self) -> &HeapPage<PinnedReadPage, RecordPageHeader> {
-        self._record_page()
-    }
-
-    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, RecordPageHeader> {
-        self._record_page_mut()
+        match &self.record_page {
+            Some(record_page) => record_page,
+            None => panic!(
+                "invalid usage of SharedPageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
     }
 
     fn overflow_page(&self) -> &HeapPage<PinnedReadPage, OverflowPageHeader> {
-        self._overflow_page()
-    }
-
-    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, OverflowPageHeader> {
-        self._overflow_page_mut()
-    }
-}
-
-impl<'hf, const BUCKETS_COUNT: usize> PageLockChain<PinnedWritePage>
-    for SinglePageLockChain<'hf, BUCKETS_COUNT, PinnedWritePage>
-{
-    /// Locks the next page and only then drops the previous one
-    fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
-        // Read next page
-        let new_page = self.heap_file.write_overflow_page(next_page_id)?;
-
-        // Drop previous page
-        self.record_page = None;
-        self.overflow_page = Some(new_page);
-        Ok(())
-    }
-
-    fn record_page(&self) -> &HeapPage<PinnedWritePage, RecordPageHeader> {
-        self._record_page()
-    }
-
-    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, RecordPageHeader> {
-        self._record_page_mut()
-    }
-
-    fn overflow_page(&self) -> &HeapPage<PinnedWritePage, OverflowPageHeader> {
-        self._overflow_page()
-    }
-
-    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, OverflowPageHeader> {
-        self._overflow_page_mut()
+        match &self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of SharedPageLockChain - tried to get overflow page when record page is stored instead"
+            ),
+        }
     }
 }
 
-struct PageLockChainWithLockedRecordPage<'hf, 'rp, const BUCKETS_COUNT: usize, P> {
+/// Works the same as [`SharedPageLockChain`], but must be constructed with already read record page.
+struct SharedPageLockChainWithRecordPage<'hf, 'rp, const BUCKETS_COUNT: usize> {
     heap_file: &'hf HeapFile<BUCKETS_COUNT>,
-    record_page: &'rp mut HeapPage<P, RecordPageHeader>,
-    overflow_page: Option<HeapPage<P, OverflowPageHeader>>,
+    record_page: &'rp HeapPage<PinnedReadPage, RecordPageHeader>,
+    overflow_page: Option<HeapPage<PinnedReadPage, OverflowPageHeader>>,
 }
 
-impl<'hf, 'rp, const BUCKETS_COUNT: usize, P>
-    PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, P>
+impl<'hf, 'rp, const BUCKETS_COUNT: usize>
+    SharedPageLockChainWithRecordPage<'hf, 'rp, BUCKETS_COUNT>
 {
-    /// Creates new [`PageLockChainWithLockedRecordPage`] that starts with record page
+    /// Creates new [`SharedPageLockChainWithRecordPage`] that starts with record page
     fn with_record(
         heap_file: &'hf HeapFile<BUCKETS_COUNT>,
-        record_page: &'rp mut HeapPage<P, RecordPageHeader>,
+        record_page: &'rp HeapPage<PinnedReadPage, RecordPageHeader>,
     ) -> Result<Self, HeapFileError> {
-        Ok(PageLockChainWithLockedRecordPage {
+        Ok(SharedPageLockChainWithRecordPage {
             heap_file,
             record_page,
             overflow_page: None,
         })
     }
-
-    /// Gets current record page.
-    fn _record_page(&self) -> &HeapPage<P, RecordPageHeader> {
-        self.record_page
-    }
-
-    /// Gets mutable current record page.
-    fn _record_page_mut(&mut self) -> &mut HeapPage<P, RecordPageHeader> {
-        self.record_page
-    }
-
-    /// Gets current overflow page.
-    ///
-    /// Panics if we hold record page instead.
-    fn _overflow_page(&self) -> &HeapPage<P, OverflowPageHeader> {
-        match &self.overflow_page {
-            Some(overflow_page) => overflow_page,
-            None => panic!(
-                "invalid usage of PageLockChain - tried to get overflow page when record page is stored instead"
-            ),
-        }
-    }
-
-    /// Gets mutable current overflow page.
-    ///
-    /// Panics if we hold record page instead.
-    fn _overflow_page_mut(&mut self) -> &mut HeapPage<P, OverflowPageHeader> {
-        match &mut self.overflow_page {
-            Some(overflow_page) => overflow_page,
-            None => panic!(
-                "invalid usage of PageLockChain - tried to get record page when overflow page is stored instead"
-            ),
-        }
-    }
 }
 
-impl<'hf, 'rp, const BUCKETS_COUNT: usize> PageLockChain<PinnedReadPage>
-    for PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, PinnedReadPage>
+impl<'hf, 'rp, const BUCKETS_COUNT: usize> ReadPageLockChain
+    for SharedPageLockChainWithRecordPage<'hf, 'rp, BUCKETS_COUNT>
 {
-    /// Locks the next page
     fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
         let new_page = self.heap_file.read_overflow_page(next_page_id)?;
         self.overflow_page = Some(new_page);
@@ -783,46 +678,100 @@ impl<'hf, 'rp, const BUCKETS_COUNT: usize> PageLockChain<PinnedReadPage>
     }
 
     fn record_page(&self) -> &HeapPage<PinnedReadPage, RecordPageHeader> {
-        self._record_page()
-    }
-
-    fn record_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, RecordPageHeader> {
-        self._record_page_mut()
+        &self.record_page
     }
 
     fn overflow_page(&self) -> &HeapPage<PinnedReadPage, OverflowPageHeader> {
-        self._overflow_page()
-    }
-
-    fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedReadPage, OverflowPageHeader> {
-        self._overflow_page_mut()
+        match &self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of SharedPageLockChainWithRecordPage - tried to get overflow page when record page is stored instead"
+            ),
+        }
     }
 }
 
-impl<'hf, 'rp, const BUCKETS_COUNT: usize> PageLockChain<PinnedWritePage>
-    for PageLockChainWithLockedRecordPage<'hf, 'rp, BUCKETS_COUNT, PinnedWritePage>
+/// Helper struct used for locking pages when modifying records.
+///
+/// Locking pages with this struct works as follows:
+/// - read page
+/// - modify record
+/// - read next page
+///
+/// It locks all pages until the operation is done.
+struct ExclusivePageLockChain<'hf, const BUCKETS_COUNT: usize> {
+    heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+    record_page: Option<HeapPage<PinnedWritePage, RecordPageHeader>>,
+    overflow_page: Option<HeapPage<PinnedWritePage, OverflowPageHeader>>,
+    pages: Vec<PinnedWritePage>,
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> ExclusivePageLockChain<'hf, BUCKETS_COUNT> {
+    /// Creates new [`ExclusivePageLockChain`] that starts with record page with `page_id`
+    fn with_page_id(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        page_id: PageId,
+    ) -> Result<Self, HeapFileError> {
+        let record_page = heap_file.write_record_page(page_id)?;
+        Ok(ExclusivePageLockChain {
+            heap_file,
+            record_page: Some(record_page),
+            overflow_page: None,
+            pages: vec![],
+        })
+    }
+
+    /// Creates new [`ExclusivePageLockChainWithRecordPage`] that starts with provided record page
+    fn with_record(
+        heap_file: &'hf HeapFile<BUCKETS_COUNT>,
+        record_page: HeapPage<PinnedWritePage, RecordPageHeader>,
+    ) -> Result<Self, HeapFileError> {
+        Ok(ExclusivePageLockChain {
+            heap_file,
+            record_page: Some(record_page),
+            overflow_page: None,
+            pages: vec![],
+        })
+    }
+}
+
+impl<'hf, const BUCKETS_COUNT: usize> WritePageLockChain
+    for ExclusivePageLockChain<'hf, BUCKETS_COUNT>
 {
-    /// Locks the next page
     fn advance(&mut self, next_page_id: PageId) -> Result<(), HeapFileError> {
         let new_page = self.heap_file.write_overflow_page(next_page_id)?;
+        if let Some(r) = self.record_page.take() {
+            let p = r.page.into_page();
+            self.pages.push(p);
+        };
+        if let Some(o) = self.overflow_page.take() {
+            let p = o.page.into_page();
+            self.pages.push(p);
+        };
         self.overflow_page = Some(new_page);
         Ok(())
     }
 
-    fn record_page(&self) -> &HeapPage<PinnedWritePage, RecordPageHeader> {
-        self._record_page()
-    }
-
     fn record_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, RecordPageHeader> {
-        self._record_page_mut()
-    }
-
-    fn overflow_page(&self) -> &HeapPage<PinnedWritePage, OverflowPageHeader> {
-        self._overflow_page()
+        match &mut self.record_page {
+            Some(record_page) => record_page,
+            None => panic!(
+                "invalid usage of ExclusivePageLockChain - tried to get record page when overflow page is stored instead"
+            ),
+        }
     }
 
     fn overflow_page_mut(&mut self) -> &mut HeapPage<PinnedWritePage, OverflowPageHeader> {
-        self._overflow_page_mut()
+        match &mut self.overflow_page {
+            Some(overflow_page) => overflow_page,
+            None => panic!(
+                "invalid usage of ExclusivePageLockChain - tried to get overflow page when record page is stored instead"
+            ),
+        }
+    }
+
+    fn drop_pages(self) {
+        self.heap_file.cache.drop_write_pages(self.pages);
     }
 }
 
@@ -1112,8 +1061,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
     /// Reads [`Record`] located at `ptr` and deserializes it.
     pub fn record(&self, ptr: &RecordPtr) -> Result<Record, HeapFileError> {
-        let page_chain =
-            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(self, ptr.page_id)?;
+        let page_chain = SharedPageLockChain::<BUCKETS_COUNT>::with_page_id(self, ptr.page_id)?;
         let record_bytes = self.record_bytes(ptr, page_chain)?;
         let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
         Ok(record)
@@ -1140,14 +1088,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         // Process each chunk of records from the same page together.
         for chunk in record_ptrs.chunk_by(|r1, r2| r1.page_id == r2.page_id) {
             let page_id = chunk[0].page_id;
-            let mut page = self.read_record_page(page_id)?;
+            let page = self.read_record_page(page_id)?;
 
             for record_ptr in chunk {
                 // Create PageLockChain that reuses the already locked record page.
                 let page_chain =
-                    PageLockChainWithLockedRecordPage::<BUCKETS_COUNT, PinnedReadPage>::with_record(
-                        self, &mut page,
-                    )?;
+                    SharedPageLockChainWithRecordPage::<BUCKETS_COUNT>::with_record(self, &page)?;
 
                 // Read record bytes and deserialize.
                 let record_bytes = self.record_bytes(record_ptr, page_chain)?;
@@ -1178,8 +1124,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         updated_fields: Vec<FieldUpdateDescriptor>,
     ) -> Result<(), HeapFileError> {
         // Read record bytes from disk
-        let page_chain =
-            SinglePageLockChain::<BUCKETS_COUNT, PinnedReadPage>::with_record(self, ptr.page_id)?;
+        let page_chain = SharedPageLockChain::<BUCKETS_COUNT>::with_page_id(self, ptr.page_id)?;
         let mut record_bytes = self.record_bytes(ptr, page_chain)?;
         let mut bytes_changed = vec![false; record_bytes.len()];
 
@@ -1194,8 +1139,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         }
 
         // Save back to disk at the same ptr
-        let page_chain =
-            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(self, ptr.page_id)?;
+        let page_chain = ExclusivePageLockChain::<BUCKETS_COUNT>::with_page_id(self, ptr.page_id)?;
         self.update_record_bytes(ptr, &record_bytes, &bytes_changed, page_chain)?;
 
         Ok(())
@@ -1204,7 +1148,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Removes [`Record`] located at `ptr`.
     pub fn delete(&self, ptr: &RecordPtr) -> Result<(), HeapFileError> {
         let mut page_chain =
-            SinglePageLockChain::<BUCKETS_COUNT, PinnedWritePage>::with_record(self, ptr.page_id)?;
+            ExclusivePageLockChain::<BUCKETS_COUNT>::with_page_id(self, ptr.page_id)?;
         let first_page = page_chain.record_page_mut();
         let record_first_fragment = first_page.record_fragment(ptr.slot_id)?;
 
@@ -1252,8 +1196,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     ) -> Result<(), HeapFileError> {
         let old_columns = mem::replace(&mut self.columns_metadata, new_column_metadata);
 
-        // Iterate through all record pages - we don't need to use PageLockChain
-        // as this whole function has exclusive access to the whole heap file struct.
+        // Iterate through all record pages
         let mut page_id = *self.metadata.first_record_page.lock();
         while page_id != RecordPageHeader::NO_NEXT_PAGE {
             let mut page = self.write_record_page(page_id)?;
@@ -1318,14 +1261,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Reads [`Record`] located at `ptr` and returns its bare bytes.
-    fn record_bytes<P>(
+    fn record_bytes(
         &self,
         ptr: &RecordPtr,
-        mut page_chain: impl PageLockChain<P>,
-    ) -> Result<Vec<u8>, HeapFileError>
-    where
-        P: PageRead,
-    {
+        mut page_chain: impl ReadPageLockChain,
+    ) -> Result<Vec<u8>, HeapFileError> {
         // Read first fragment
         let first_page = page_chain.record_page();
         let fragment = first_page.record_fragment(ptr.slot_id)?;
@@ -1349,7 +1289,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         &self,
         page_id: PageId,
     ) -> Result<(PageId, VecDeque<RecordHandle>), HeapFileError> {
-        let mut page = self.read_record_page(page_id)?;
+        let page = self.read_record_page(page_id)?;
         let next_page_id = page.next_page()?;
 
         let records_ptrs: Vec<_> = page
@@ -1360,11 +1300,8 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut records = VecDeque::with_capacity(records_ptrs.len());
 
         for ptr in records_ptrs {
-            // Create PageLockChain that reuses the already locked record page.
             let page_chain =
-                PageLockChainWithLockedRecordPage::<BUCKETS_COUNT, PinnedReadPage>::with_record(
-                    self, &mut page,
-                )?;
+                SharedPageLockChainWithRecordPage::<BUCKETS_COUNT>::with_record(self, &page)?;
             let record_bytes = self.record_bytes(&ptr, page_chain)?;
             let record = Record::deserialize(&self.columns_metadata, &record_bytes)?;
             records.push_back(RecordHandle::new(record, ptr));
@@ -1434,16 +1371,13 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// If length is different then the difference is applied at the end of pages chain.
     ///
     /// This function assumes that `bytes` and `bytes_changed` have the same length.
-    fn update_record_bytes<P>(
+    fn update_record_bytes(
         &self,
         start: &RecordPtr,
         bytes: &[u8],
         bytes_changed: &[bool],
-        mut page_chain: impl PageLockChain<P>,
-    ) -> Result<(), HeapFileError>
-    where
-        P: PageRead + PageWrite,
-    {
+        mut page_chain: impl WritePageLockChain,
+    ) -> Result<(), HeapFileError> {
         let mut processor = FragmentProcessor::new(bytes, bytes_changed);
 
         let first_page = page_chain.record_page_mut();
@@ -1714,14 +1648,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Deletes all record fragments from chain of overflow pages starting in `next_ptr`.
-    fn delete_record_fragments_from_overflow_pages_chain<P>(
+    fn delete_record_fragments_from_overflow_pages_chain(
         &self,
-        mut page_chain: impl PageLockChain<P>,
+        mut page_chain: impl WritePageLockChain,
         mut next_ptr: Option<RecordPtr>,
-    ) -> Result<(), HeapFileError>
-    where
-        P: PageRead + PageWrite,
-    {
+    ) -> Result<(), HeapFileError> {
         while let Some(next) = next_ptr {
             page_chain.advance(next.page_id)?;
             let page = page_chain.overflow_page_mut();
@@ -1987,7 +1918,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         old_columns: &[ColumnMetadata],
     ) -> Result<(), HeapFileError> {
         // Read the record with the old schema
-        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        let page_chain = DefaultSharedPageLockChain::with_page_id(self, ptr.page_id)?;
         let record_bytes = self.record_bytes(ptr, page_chain)?;
         let record = Record::deserialize(old_columns, &record_bytes)?;
 
@@ -2001,7 +1932,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut bytes_changed = vec![false; new_bytes.len()];
         bytes_changed[new_column_min_offset..].fill(true);
 
-        let page_chain = PageLockChainWithLockedRecordPage::with_record(self, page)?;
+        let page_chain = DefaultExclusivePageLockChain::with_record(self, page)?;
         self.update_record_bytes(ptr, &new_bytes, &bytes_changed, page_chain)?;
 
         Ok(())
