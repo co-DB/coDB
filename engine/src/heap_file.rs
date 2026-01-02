@@ -1926,38 +1926,28 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut pages = Vec::new();
         let mut collector = VecPageCollector::new(&mut pages);
 
-        let ptr = if serialized.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
+        if serialized.len() <= Self::MAX_RECORD_SIZE_WHEN_ONE_FRAGMENT {
             // Record can be stored on single page
             let data = RecordTag::with_final(&serialized);
-            self.insert_to_overflow_with_new_allocation(&data, &mut collector)?
-        } else {
-            // We need to split record into pieces, so that each piece can fit into one page.
-            let piece_size = Self::MAX_RECORD_SIZE_WHEN_MANY_FRAGMENTS;
+            let ptr = self.insert_to_overflow_with_new_allocation(&data, &mut collector)?;
+            return Ok((ptr, pages));
+        }
+        // We need to split record into pieces, so that each piece can fit into one page.
+        let piece_size = Self::MAX_RECORD_SIZE_WHEN_MANY_FRAGMENTS;
 
-            let last_fragment = serialized.split_off(serialized.len() - 1 - piece_size);
-            let last_fragment_with_tag = RecordTag::with_final(&last_fragment);
-            let mut next_ptr = self
-                .insert_to_overflow_with_new_allocation(&last_fragment_with_tag, &mut collector)?;
+        let last_fragment = serialized.split_off(serialized.len() - 1 - piece_size);
+        let last_fragment_with_tag = RecordTag::with_final(&last_fragment);
+        let mut next_ptr =
+            self.insert_to_overflow_with_new_allocation(&last_fragment_with_tag, &mut collector)?;
 
-            // It means 2 pieces is enough
-            if serialized.len() <= piece_size {
-                let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
-                self.insert_to_overflow_with_new_allocation(&data, &mut collector)?
-            } else {
-                // We need to split it into more than 2 pieces
-                let middle_pieces = serialized.split_off(piece_size);
+        // Insert all remaining pieces in reverse order (rchunks processes right-to-left)
+        // Since all fragments are overflow pages, we can treat them uniformly
+        for chunk in serialized.rchunks(piece_size as _) {
+            let chunk = RecordTag::with_has_continuation(chunk, &next_ptr);
+            next_ptr = self.insert_to_overflow_with_new_allocation(&chunk, &mut collector)?;
+        }
 
-                // We save middle pieces into overflow pages
-                for chunk in middle_pieces.rchunks(piece_size as _) {
-                    let chunk = RecordTag::with_has_continuation(chunk, &next_ptr);
-                    next_ptr =
-                        self.insert_to_overflow_with_new_allocation(&chunk, &mut collector)?;
-                }
-
-                let data = RecordTag::with_has_continuation(&serialized, &next_ptr);
-                self.insert_to_overflow_with_new_allocation(&data, &mut collector)?
-            }
-        };
+        let ptr = next_ptr;
 
         Ok((ptr, pages))
     }
