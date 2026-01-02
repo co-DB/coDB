@@ -1648,14 +1648,13 @@ impl BTree {
 
             // Free the old root page
             self.free_latch(root_latch)?;
-
-            // Write all modified pages atomically to WAL
-            self.cache.drop_write_pages(dropped_page_latches);
         } else {
-            // Root still has multiple children, just write the modified pages
-            self.cache.drop_write_pages(dropped_page_latches);
+            // Root still has multiple children; ensure the modified root page is also flushed.
+            dropped_page_latches.push(root_latch.node.into_page());
         }
 
+        // Write all modified pages atomically to WAL
+        self.cache.drop_write_pages(dropped_page_latches);
         Ok(())
     }
 
