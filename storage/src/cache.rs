@@ -478,7 +478,7 @@ impl Cache {
 
     /// Consumes `pages` and send all their diffs to wal as [`MultiPageOperation`].
     ///
-    /// /// This helper is intended for callers that want to explicitly flush a batch of
+    /// This helper is intended for callers that want to explicitly flush a batch of
     /// [`PinnedWritePage`]s at once, instead of relying on each page being dropped
     /// independently. This could be the case if you performed one logical operation that
     /// required changes in more than one page (e.g. merge in [`BTree`]).

@@ -3,8 +3,8 @@ use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_key::Key;
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, LeafNodeSearchResult,
-    NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
+    BTreeInternalNode, BTreeLeafNode, BTreeNode, BTreeNodeError, ChildPosition,
+    LeafNodeSearchResult, NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
 use crate::slotted_page::SlotId;
@@ -750,13 +750,32 @@ impl BTree {
         record_pointer: RecordPtr,
         metadata_page: Option<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
+        // We need to store all the latches to nodes we modify during split propagation to
+        // write them atomically to WAL at the end.
+        let mut dropped_page_latches: Vec<PinnedWritePage> = Vec::new();
+
         let (leaf_page_id, leaf_node) = (leaf_node.page_id, leaf_node.node);
         // Split the leaf and get separator + new leaf id
-        let (separator_key, new_leaf_id) =
-            self.split_leaf(leaf_page_id, leaf_node, key, record_pointer)?;
+        let (separator_key, new_leaf_id) = self.split_leaf(
+            leaf_page_id,
+            leaf_node,
+            key,
+            record_pointer,
+            &mut dropped_page_latches,
+        )?;
 
         // Propagate separator up the stack (or create new root if stack empty)
-        self.propagate_separator_up(internal_nodes, separator_key, new_leaf_id, metadata_page)
+        self.propagate_separator_up(
+            internal_nodes,
+            separator_key,
+            new_leaf_id,
+            metadata_page,
+            &mut dropped_page_latches,
+        )?;
+
+        self.cache.drop_write_pages(dropped_page_latches);
+
+        Ok(())
     }
 
     /// Splits the provided leaf node and creates a new one with the split keys. Returns a pair
@@ -767,6 +786,7 @@ impl BTree {
         mut leaf_node: BTreeLeafNode<PinnedWritePage>,
         key: &[u8],
         record_pointer: RecordPtr,
+        dropped_page_latches: &mut Vec<PinnedWritePage>,
     ) -> Result<(Vec<u8>, PageId), BTreeError> {
         // Split keys of the leaf.
         let (records_to_move, separator_key) = leaf_node.split_keys()?;
@@ -794,6 +814,9 @@ impl BTree {
         // Bump version.
         self.update_structural_version(leaf_page_id);
 
+        dropped_page_latches.push(leaf_node.into_page());
+        dropped_page_latches.push(new_leaf_node.into_page());
+
         Ok((separator_key, new_leaf_id))
     }
 
@@ -805,6 +828,7 @@ impl BTree {
         mut current_separator_key: Vec<u8>,
         mut child_page_id: PageId,
         metadata_page: Option<PinnedWritePage>,
+        dropped_page_latches: &mut Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
         // If there are no parents, create new root.
         if internal_nodes.is_empty() {
@@ -816,6 +840,7 @@ impl BTree {
                 current_separator_key,
                 child_page_id,
                 metadata,
+                dropped_page_latches,
             );
         }
 
@@ -862,6 +887,10 @@ impl BTree {
                     // Bump version for parent to indicate structural change.
                     self.update_structural_version(parent_page_id);
 
+                    // Store modified pages for WAL write later.
+                    dropped_page_latches.push(parent_node.into_page());
+                    dropped_page_latches.push(new_internal_node.into_page());
+
                     // The new separator and new child id will be propagated up
                     current_separator_key = new_separator;
                     child_page_id = new_internal_id;
@@ -876,6 +905,7 @@ impl BTree {
                             current_separator_key,
                             child_page_id,
                             metadata,
+                            dropped_page_latches,
                         );
                     }
                 }
@@ -892,6 +922,7 @@ impl BTree {
         separator_key: Vec<u8>,
         right_child_id: PageId,
         mut metadata_page: PinnedWritePage,
+        dropped_page_latches: &mut Vec<PinnedWritePage>,
     ) -> Result<(), BTreeError> {
         let (new_root_id, mut new_root) = self.allocate_and_init_internal(left_child_id)?;
 
@@ -901,6 +932,10 @@ impl BTree {
         // Update the metadata to point to the new root
         let metadata = BTreeMetadata::new(new_root_id);
         metadata.save_to_page(&mut metadata_page);
+
+        // Store modified pages for WAL write later.
+        dropped_page_latches.push(new_root.into_page());
+        dropped_page_latches.push(metadata_page);
 
         Ok(())
     }
