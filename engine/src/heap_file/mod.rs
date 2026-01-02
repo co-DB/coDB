@@ -253,8 +253,12 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         }
 
         // Save back to disk at the same ptr
-        let page_chain = ExclusivePageLockChain::<BUCKETS_COUNT>::with_page_id(self, ptr.page_id)?;
-        self.update_record_bytes(ptr, &record_bytes, &bytes_changed, page_chain)?;
+        let mut page_chain =
+            ExclusivePageLockChain::<BUCKETS_COUNT>::with_page_id(self, ptr.page_id)?;
+        self.update_record_bytes(ptr, &record_bytes, &bytes_changed, &mut page_chain)?;
+
+        // Drop all pages together as a single multi-page operation
+        page_chain.drop_pages();
 
         Ok(())
     }
@@ -272,7 +276,11 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         first_page.delete(ptr.slot_id)?;
 
         // Follow record chain and delete each fragment
-        self.delete_record_fragments_from_overflow_pages_chain(page_chain, next_ptr)?;
+        self.delete_record_fragments_from_overflow_pages_chain(&mut page_chain, next_ptr)?;
+
+        // Drop all pages together as a single multi-page operation
+        page_chain.drop_pages();
+
         Ok(())
     }
 
@@ -336,6 +344,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
             page_id = next_page_id;
         }
 
+        // Drop all pages together as a single multi-page operation
+        chain.drop_pages();
+
         Ok(())
     }
 
@@ -373,6 +384,9 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
             page_id = next_page_id;
         }
+
+        // Drop all pages together as a single multi-page operation
+        chain.drop_pages();
 
         Ok(())
     }
@@ -496,7 +510,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         start: &RecordPtr,
         bytes: &[u8],
         bytes_changed: &[bool],
-        mut page_chain: impl WritePageLockChain,
+        page_chain: &mut impl WritePageLockChain,
     ) -> Result<(), HeapFileError> {
         let mut processor = FragmentProcessor::new(bytes, bytes_changed);
 
@@ -806,7 +820,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Deletes all record fragments from chain of overflow pages starting in `next_ptr`.
     fn delete_record_fragments_from_overflow_pages_chain(
         &self,
-        mut page_chain: impl WritePageLockChain,
+        page_chain: &mut impl WritePageLockChain,
         mut next_ptr: Option<RecordPtr>,
     ) -> Result<(), HeapFileError> {
         while let Some(next) = next_ptr {
@@ -4303,11 +4317,14 @@ mod tests {
         bytes_changed[4..].fill(true);
 
         // Perform the update
-        let page_chain =
+        let mut page_chain =
             ExclusivePageLockChain::<4>::with_page_id(&heap_file, ptr.page_id).unwrap();
         heap_file
-            .update_record_bytes(&ptr, &new_bytes, &bytes_changed, page_chain)
+            .update_record_bytes(&ptr, &new_bytes, &bytes_changed, &mut page_chain)
             .unwrap();
+
+        // Drop pages to release locks and write to WAL
+        page_chain.drop_pages();
 
         // Now update the heap_file's column metadata to match the new schema
         let new_columns = vec![
