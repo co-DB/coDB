@@ -3,8 +3,8 @@ use storage::paged_file::{Page, PageId, PagedFileError};
 
 use crate::b_tree_key::Key;
 use crate::b_tree_node::{
-    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition,
-    LeafNodeSearchResult, NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
+    BTreeInternalNode, BTreeLeafNode, BTreeNodeError, ChildPosition, LeafNodeSearchResult,
+    NodeDeleteResult, NodeInsertResult, NodeType, get_node_type,
 };
 use crate::heap_file::RecordPtr;
 use crate::slotted_page::SlotId;
@@ -1268,7 +1268,6 @@ impl BTree {
         dropped_page_latches.push(parent_node.into_page());
         self.cache.drop_write_pages(dropped_page_latches);
         Ok(())
-
     }
     /// Frees the latch's page at disk level and removes it from structural version numbers map.
     fn free_latch(&self, latch: impl Latch) -> Result<(), BTreeError> {
