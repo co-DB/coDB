@@ -308,7 +308,7 @@ impl<'hf, const BUCKETS_COUNT: usize> MultiPageOperationChain
     }
 }
 
-/// Strut that should be used for special operations such as adding/removing column.
+/// Struct that should be used for special operations such as adding/removing column.
 /// It works by not dropping any page it acquired and allowing for reusing them as long as this struct lives.
 pub(super) struct NoDroppingPageLockChain<'hf, const BUCKETS_COUNT: usize> {
     heap_file: &'hf HeapFile<BUCKETS_COUNT>,
