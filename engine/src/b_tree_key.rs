@@ -1,5 +1,5 @@
 ﻿use thiserror::Error;
-use types::data::Value;
+use types::data::{DbDate, DbDateTime, Value};
 use types::lexicographic_serialization::{DecodeError, SortableSerialize};
 use types::schema::Type;
 
@@ -14,21 +14,23 @@ pub enum BTreeKeyError {
 #[derive(Clone, Debug)]
 pub struct Key {
     bytes: Vec<u8>,
+    ty: Type,
 }
 
 impl TryFrom<Value> for Key {
     type Error = BTreeKeyError;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let ty = value.ty();
         let bytes = match value {
             Value::Int32(i) => i.encode_key(),
             Value::Int64(i) => i.encode_key(),
             Value::DateTime(dt) => dt.encode_key(),
             Value::Date(d) => d.encode_key(),
             Value::String(s) => s.encode_key(),
-            _ => return Err(Self::Error::UnsupportedKeyType { ty: value.ty() }),
+            _ => return Err(Self::Error::UnsupportedKeyType { ty }),
         };
-        Ok(Key { bytes })
+        Ok(Key { bytes, ty })
     }
 }
 
@@ -42,6 +44,17 @@ impl Key {
     /// Returns the raw bytes of the key.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub fn decode_key(self) -> Result<Value, BTreeKeyError> {
+        match self.ty {
+            Type::String => Ok(Value::String(String::decode_key(&self.bytes)?)),
+            Type::I32 => Ok(Value::Int32(i32::decode_key(&self.bytes)?)),
+            Type::I64 => Ok(Value::Int64(i64::decode_key(&self.bytes)?)),
+            Type::Date => Ok(Value::Date(DbDate::decode_key(&self.bytes)?)),
+            Type::DateTime => Ok(Value::DateTime(DbDateTime::decode_key(&self.bytes)?)),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -73,6 +86,7 @@ mod test_helpers {
         fn from(value: i32) -> Self {
             Key {
                 bytes: value.encode_key(),
+                ty: Type::I32,
             }
         }
     }
@@ -81,6 +95,7 @@ mod test_helpers {
         fn from(value: &str) -> Self {
             Key {
                 bytes: value.to_string().encode_key(),
+                ty: Type::String,
             }
         }
     }
