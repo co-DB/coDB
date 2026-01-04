@@ -48,6 +48,8 @@ pub(crate) enum InternalExecutorError {
     CannotLoadColumnValueFromContext { column_name: String },
     #[error("cannot compare NaN values ('{lhs}' and '{rhs}')")]
     ComparingNaNValues { lhs: String, rhs: String },
+    #[error("key '{key:?}' already exists in table '{table}'")]
+    DuplicateKey { key: Value, table: String },
 }
 
 /// Helper to create [`StatementResult::RuntimeError`] with provided message.
@@ -109,5 +111,12 @@ pub(crate) fn comparing_nan_values(
     InternalExecutorError::ComparingNaNValues {
         lhs: lhs.into(),
         rhs: rhs.into(),
+    }
+}
+
+pub(crate) fn duplicate_key(key: Value, table: impl Into<String>) -> InternalExecutorError {
+    InternalExecutorError::DuplicateKey {
+        key,
+        table: table.into(),
     }
 }

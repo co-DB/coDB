@@ -1,4 +1,4 @@
-use engine::b_tree::{Range, RangeBound};
+use engine::b_tree::{BTreeError, Range, RangeBound};
 use engine::heap_file::FieldUpdateDescriptor;
 use engine::{
     b_tree_key::Key,
@@ -349,8 +349,22 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
 
         // Insert placeholder into B-Tree to check for duplicate primary key and prevent others from
         // inserting it concurrently.
-        self.executor
-            .with_b_tree(&insert.table_name, |btree| btree.insert_placeholder(&key))??;
+        let placeholder_insert_result = self
+            .executor
+            .with_b_tree(&insert.table_name, |btree| btree.insert_placeholder(&key))?;
+
+        if let Err(e) = placeholder_insert_result {
+            match e {
+                BTreeError::DuplicateKey => {
+                    let key = match key.decode_key() {
+                        Ok(k) => k,
+                        Err(_) => return Err(e.into()),
+                    };
+                    return Err(error_factory::duplicate_key(key, &insert.table_name));
+                }
+                _ => return Err(e.into()),
+            }
+        }
 
         let ptr = match self
             .executor

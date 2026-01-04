@@ -49,7 +49,7 @@ pub enum AnalyzerError {
     AmbiguousTableAlias { table_alias: String },
     #[error("no table with alias '{table_alias}' was found")]
     TableWithAliasNotFound { table_alias: String },
-    #[error("number of columns ('{columns}') and number of values ('{values}') are not equal")]
+    #[error("number of columns ({columns}) and number of values ({values}) are not equal")]
     InsertColumnsAndValuesLenNotEqual { columns: usize, values: usize },
     #[error("cannot use type '{value_type}' for column '{column_type}'")]
     ColumnAndValueTypeDontMatch {

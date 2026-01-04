@@ -1426,7 +1426,7 @@ mod tests {
         let insert_result = executor.execute_statement(&insert_plan, &insert_ast);
         match insert_result {
             StatementResult::RuntimeError { error } => {
-                assert!(error.contains("tried to insert a duplicate key"));
+                assert!(error.contains("key 'Int32(1)' already exists in table 'users'"));
             }
             other_result => panic!(
                 "Expected error due to duplicate primary key and instead got {:?}",
