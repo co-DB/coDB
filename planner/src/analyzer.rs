@@ -74,8 +74,10 @@ pub enum AnalyzerError {
     UnexpectedTableMetadataError(#[from] TableMetadataError),
     #[error("unexpected ast error: {0}")]
     UnexpectedAstError(#[from] AstError),
-    #[error("query cannot contain more than one statement when DDL statement type is used")]
-    MoreThanOneStatementWithDDL,
+    #[error(
+        "query cannot contain multiple statements when a DDL statement is present (DDL statements cannot be combined with other statements)"
+    )]
+    MixedStatementTypes,
     #[error("value '{got}' cannot be used in {context}")]
     ValueOutOfBounds { got: i64, context: String },
     #[error("cannot use type '{ty}' for '{addon}'")]
@@ -1346,13 +1348,13 @@ impl<'a> Analyzer<'a> {
         let first = StatementCategory::from(&statements[0]);
 
         if first == StatementCategory::DDL && statements.len() > 1 {
-            return Err(AnalyzerError::MoreThanOneStatementWithDDL);
+            return Err(AnalyzerError::MixedStatementTypes);
         }
 
         for statement in &statements[1..] {
             let category = StatementCategory::from(statement);
             if first != category {
-                return Err(AnalyzerError::MoreThanOneStatementWithDDL);
+                return Err(AnalyzerError::MixedStatementTypes);
             }
         }
         Ok(())
@@ -3944,8 +3946,8 @@ mod tests {
         assert_eq!(errs.len(), 1);
 
         match &errs[0] {
-            AnalyzerError::MoreThanOneStatementWithDDL => {}
-            other => panic!("expected MoreThanOneStatementWithDDL, got: {:?}", other),
+            AnalyzerError::MixedStatementTypes => {}
+            other => panic!("expected MixedStatementTypes, got: {:?}", other),
         }
     }
 
@@ -3993,7 +3995,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_more_than_one_ddl_statements_fail() {
+    fn analyze_more_than_one_ddl_statements_fails() {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
 
@@ -4025,8 +4027,8 @@ mod tests {
         assert_eq!(errs.len(), 1);
 
         match &errs[0] {
-            AnalyzerError::MoreThanOneStatementWithDDL => {}
-            other => panic!("expected MoreThanOneStatementWithDDL, got: {:?}", other),
+            AnalyzerError::MixedStatementTypes => {}
+            other => panic!("expected MixedStatementTypes, got: {:?}", other),
         }
     }
 
