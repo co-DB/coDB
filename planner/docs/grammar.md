@@ -128,7 +128,7 @@ Precedence (from lowest to highest)
 #### Start
 
 ```
- <query> :: (<dml_statement>;)* | (<ddl_statement>;)*
+ <query> :: (<dml_statement>;)* | ddl_statement;
  <dml_statement> :: <select_stmt> | <insert_stmt> | <update_stmt> | <delete_stmt>
  <ddl_statement> :: <create_stmt> | <alter_stmt> | <truncate_stmt> | <drop_stmt>
 ```
