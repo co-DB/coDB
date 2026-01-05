@@ -74,11 +74,8 @@ pub enum AnalyzerError {
     UnexpectedTableMetadataError(#[from] TableMetadataError),
     #[error("unexpected ast error: {0}")]
     UnexpectedAstError(#[from] AstError),
-    #[error("mixed statement types in query: found both {first_type} and {second_type}")]
-    MixedStatementTypes {
-        first_type: String,
-        second_type: String,
-    },
+    #[error("query cannot contain more than one statement when DDL statement type is used")]
+    MoreThanOneStatementWithDDL,
     #[error("value '{got}' cannot be used in {context}")]
     ValueOutOfBounds { got: i64, context: String },
     #[error("cannot use type '{ty}' for '{addon}'")]
@@ -1347,13 +1344,15 @@ impl<'a> Analyzer<'a> {
         }
 
         let first = StatementCategory::from(&statements[0]);
+
+        if first == StatementCategory::DDL && statements.len() > 1 {
+            return Err(AnalyzerError::MoreThanOneStatementWithDDL);
+        }
+
         for statement in &statements[1..] {
             let category = StatementCategory::from(statement);
             if first != category {
-                return Err(AnalyzerError::MixedStatementTypes {
-                    first_type: first.to_string(),
-                    second_type: category.to_string(),
-                });
+                return Err(AnalyzerError::MoreThanOneStatementWithDDL);
             }
         }
         Ok(())
@@ -3945,14 +3944,8 @@ mod tests {
         assert_eq!(errs.len(), 1);
 
         match &errs[0] {
-            AnalyzerError::MixedStatementTypes {
-                first_type,
-                second_type,
-            } => {
-                assert_eq!(first_type, "DML");
-                assert_eq!(second_type, "DDL");
-            }
-            other => panic!("expected MixedStatementTypes, got: {:?}", other),
+            AnalyzerError::MoreThanOneStatementWithDDL => {}
+            other => panic!("expected MoreThanOneStatementWithDDL, got: {:?}", other),
         }
     }
 
@@ -4000,7 +3993,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_all_ddl_statements_succeeds() {
+    fn analyze_more_than_one_ddl_statements_fail() {
         let catalog = catalog_with_users();
         let mut ast = Ast::default();
 
@@ -4027,9 +4020,14 @@ mod tests {
         ast.add_statement(Statement::Drop(drop));
 
         let analyzer = Analyzer::new(&ast, catalog);
-        let rt = analyzer.analyze().expect("all DDL should succeed");
+        let errs = analyzer.analyze().unwrap_err();
 
-        assert_eq!(rt.statements.len(), 2);
+        assert_eq!(errs.len(), 1);
+
+        match &errs[0] {
+            AnalyzerError::MoreThanOneStatementWithDDL => {}
+            other => panic!("expected MoreThanOneStatementWithDDL, got: {:?}", other),
+        }
     }
 
     #[test]
