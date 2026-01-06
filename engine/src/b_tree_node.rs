@@ -227,12 +227,32 @@ where
     fn find_new_mid(&self, mid: u16, left: u16, right: u16) -> Result<Option<u16>, BTreeNodeError> {
         // Find first non-deleted slot to the right
         let right_candidate = ((mid + 1)..=right)
-            .find(|&slot| !self.slotted_page.is_slot_deleted(slot).unwrap_or(true));
+            .find_map(|slot| match self.slotted_page.is_slot_deleted(slot) {
+                Ok(is_deleted) => {
+                    if !is_deleted {
+                        Some(Ok::<u16, SlottedPageError>(slot))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .transpose()?;
 
         // Find first non-deleted slot to the left
         let left_candidate = (left..mid)
             .rev()
-            .find(|&slot| !self.slotted_page.is_slot_deleted(slot).unwrap_or(true));
+            .find_map(|slot| match self.slotted_page.is_slot_deleted(slot) {
+                Ok(is_deleted) => {
+                    if !is_deleted {
+                        Some(Ok::<u16, SlottedPageError>(slot))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .transpose()?;
 
         // Choose the closer one
         match (left_candidate, right_candidate) {
