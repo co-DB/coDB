@@ -225,37 +225,24 @@ where
     /// slot on both the left and right sides, then choosing whichever is closer. This maintains
     /// optimal balance in binary search.
     fn find_new_mid(&self, mid: u16, left: u16, right: u16) -> Result<Option<u16>, BTreeNodeError> {
-        // Find first non-deleted slot to the right
-        let right_candidate = ((mid + 1)..=right)
-            .find_map(|slot| match self.slotted_page.is_slot_deleted(slot) {
-                Ok(is_deleted) => {
-                    if !is_deleted {
-                        Some(Ok::<u16, SlottedPageError>(slot))
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => Some(Err(e)),
-            })
-            .transpose()?;
+        let mut first_left = None;
+        for i in (left..mid).rev() {
+            if !self.slotted_page.is_slot_deleted(i)? {
+                first_left = Some(i);
+                break;
+            }
+        }
 
-        // Find first non-deleted slot to the left
-        let left_candidate = (left..mid)
-            .rev()
-            .find_map(|slot| match self.slotted_page.is_slot_deleted(slot) {
-                Ok(is_deleted) => {
-                    if !is_deleted {
-                        Some(Ok::<u16, SlottedPageError>(slot))
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => Some(Err(e)),
-            })
-            .transpose()?;
+        let mut first_right = None;
+        for i in (mid + 1)..=right {
+            if !self.slotted_page.is_slot_deleted(i)? {
+                first_right = Some(i);
+                break;
+            }
+        }
 
         // Choose the closer one
-        match (left_candidate, right_candidate) {
+        match (first_left, first_right) {
             (Some(l), Some(r)) => {
                 let left_distance = mid - l;
                 let right_distance = r - mid;
