@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error;
+use types::data::{DbDate, DbDateTime};
 use types::schema::Type;
 
 use crate::resolved_tree::Bound;
@@ -1068,6 +1069,17 @@ impl<'a> Analyzer<'a> {
         if ty == new_ty {
             return Ok(child);
         }
+
+        // String literal to Date/DateTime - parse and create literal
+        if matches!(new_ty, Type::Date | Type::DateTime)
+            && ty == Type::String
+            && let ResolvedExpression::Literal(ResolvedLiteral::String(s)) =
+                self.resolved_tree.node(child)
+        {
+            let s_clone = s.clone();
+            return self.parse_string_to_date_time(&s_clone, new_ty);
+        }
+
         let resolved = ResolvedCast { child, new_ty };
         Ok(self
             .resolved_tree
@@ -1140,6 +1152,9 @@ impl<'a> Analyzer<'a> {
 
     /// Tries to find a common type for `left` and `right`.
     /// If such type does not exist error is returned.
+    ///
+    /// If one side is Date/DateTime and the other is String,
+    /// returns the Date/DateTime type (casting will handle the string conversion).
     fn get_common_type(
         &self,
         left: ResolvedNodeId,
@@ -1147,6 +1162,15 @@ impl<'a> Analyzer<'a> {
     ) -> Result<Type, AnalyzerError> {
         let left_ty = self.assert_not_table_ref(left)?;
         let right_ty = self.assert_not_table_ref(right)?;
+
+        // Special handling for Date/DateTime with String
+        if matches!(left_ty, Type::Date | Type::DateTime) && right_ty == Type::String {
+            return Ok(left_ty);
+        }
+        if matches!(right_ty, Type::Date | Type::DateTime) && left_ty == Type::String {
+            return Ok(right_ty);
+        }
+
         Type::coercion(&left_ty, &right_ty).ok_or(AnalyzerError::CommonTypeNotFound {
             left: left_ty.to_string(),
             right: right_ty.to_string(),
@@ -1276,30 +1300,63 @@ impl<'a> Analyzer<'a> {
             return Ok(value);
         }
 
-        let common_type = Type::coercion(&column_type, &value_type).ok_or(
-            AnalyzerError::ColumnAndValueTypeDontMatch {
-                column_type: column_type.to_string(),
-                value_type: value_type.to_string(),
-            },
-        )?;
+        // Check if we can cast value_type to column_type
+        // For Date/DateTime + String, we allow the conversion
+        let can_cast =
+            if matches!(column_type, Type::Date | Type::DateTime) && value_type == Type::String {
+                true
+            } else {
+                Type::coercion(&column_type, &value_type)
+                    .map(|common| common == column_type)
+                    .unwrap_or(false)
+            };
 
-        // It means that column_type can be cast to value_type, but in this case
-        // we only allow value_type to be cast.
-        if column_type != common_type {
+        if !can_cast {
             return Err(AnalyzerError::ColumnAndValueTypeDontMatch {
                 column_type: column_type.to_string(),
                 value_type: value_type.to_string(),
             });
         }
 
-        // We need to cast value to new type
-        let resolved_cast = ResolvedCast {
-            child: value,
-            new_ty: common_type,
-        };
-        Ok(self
-            .resolved_tree
-            .add_node(ResolvedExpression::Cast(resolved_cast)))
+        self.resolve_cast(value, column_type)
+    }
+
+    /// Parses a string into a Date or DateTime literal.
+    fn parse_string_to_date_time(
+        &mut self,
+        s: &str,
+        target_type: Type,
+    ) -> Result<ResolvedNodeId, AnalyzerError> {
+        match target_type {
+            Type::Date => {
+                let db_date = DbDate::from_string(s).map_err(|_| {
+                    AnalyzerError::ColumnAndValueTypeDontMatch {
+                        column_type: target_type.to_string(),
+                        value_type: format!("String (invalid date format: '{}')", s),
+                    }
+                })?;
+                let date: time::Date = db_date.into();
+                Ok(self
+                    .resolved_tree
+                    .add_node(ResolvedExpression::Literal(ResolvedLiteral::Date(date))))
+            }
+            Type::DateTime => {
+                let db_datetime = DbDateTime::from_string(s).map_err(|_| {
+                    AnalyzerError::ColumnAndValueTypeDontMatch {
+                        column_type: target_type.to_string(),
+                        value_type: format!("String (invalid datetime format: '{}')", s),
+                    }
+                })?;
+                let datetime: time::PrimitiveDateTime = db_datetime.into();
+                Ok(self.resolved_tree.add_node(ResolvedExpression::Literal(
+                    ResolvedLiteral::DateTime(datetime),
+                )))
+            }
+            _ => Err(AnalyzerError::ColumnAndValueTypeDontMatch {
+                column_type: target_type.to_string(),
+                value_type: "String".to_string(),
+            }),
+        }
     }
 
     /// Helper for transforming create column addon from [`Ast`] version into [`ResolvedTree`] version.

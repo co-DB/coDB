@@ -1,4 +1,4 @@
-use time::{Date, Duration, PrimitiveDateTime, Time};
+use time::{Date, Duration, PrimitiveDateTime, Time, format_description::well_known::Iso8601};
 
 use crate::lexicographic_serialization::{DecodeError, SortableSerialize};
 use crate::{
@@ -39,6 +39,14 @@ impl DbDate {
 
     pub fn days_since_epoch(&self) -> i32 {
         self.days_since_epoch
+    }
+
+    /// Attempts to parse a string into a DbDate.
+    /// Accepts ISO 8601 date format (YYYY-MM-DD).
+    pub fn from_string(s: &str) -> Result<Self, DbSerializationError> {
+        Date::parse(s, &Iso8601::DEFAULT)
+            .map(DbDate::from)
+            .map_err(|_| DbSerializationError::InvalidDateFormat { format: s.into() })
     }
 }
 
@@ -113,6 +121,14 @@ impl DbDateTime {
 
     pub fn millisecond(&self) -> u16 {
         (self.milliseconds_since_midnight % 1000) as u16
+    }
+
+    /// Attempts to parse a string into a DbDateTime.
+    /// Accepts ISO 8601 datetime format (YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS).
+    pub fn from_string(s: &str) -> Result<Self, DbSerializationError> {
+        PrimitiveDateTime::parse(s, &Iso8601::DEFAULT)
+            .map(DbDateTime::from)
+            .map_err(|_| DbSerializationError::InvalidDateTimeFormat { format: s.into() })
     }
 }
 
