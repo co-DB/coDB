@@ -91,9 +91,7 @@ pub enum DbSerializationError {
     FailedToDeserialize,
     #[error("'{format}' is not a valid date format (should be YYYY-MM-DD")]
     InvalidDateFormat { format: String },
-    #[error(
-        "'{format}' is not a valid datetime format (should be YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS)"
-    )]
+    #[error("'{format}' is not a valid datetime format (should be YYYY-MM-DDTHH:MM:SS)")]
     InvalidDateTimeFormat { format: String },
 }
 

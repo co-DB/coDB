@@ -124,7 +124,7 @@ impl DbDateTime {
     }
 
     /// Attempts to parse a string into a DbDateTime.
-    /// Accepts ISO 8601 datetime format (YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS).
+    /// Accepts ISO 8601 datetime format (YYYY-MM-DDTHH:MM:SS).
     pub fn from_string(s: &str) -> Result<Self, DbSerializationError> {
         PrimitiveDateTime::parse(s, &Iso8601::DEFAULT)
             .map(DbDateTime::from)
@@ -419,5 +419,116 @@ mod tests {
         // conversion from time::PrimitiveDateTime works
         let converted_db_datetime = DbDateTime::from(known_datetime);
         assert_eq!(converted_db_datetime, datetime);
+    }
+
+    #[test]
+    fn test_db_date_from_string_valid() {
+        let date_str = "2024-01-15";
+        let db_date = DbDate::from_string(date_str).expect("should parse valid date");
+
+        assert_eq!(db_date.year(), 2024);
+        assert_eq!(db_date.month(), 1);
+        assert_eq!(db_date.day(), 15);
+    }
+
+    #[test]
+    fn test_db_date_from_string_valid_leap_year() {
+        let date_str = "2024-02-29";
+        let db_date = DbDate::from_string(date_str).expect("should parse leap year date");
+
+        assert_eq!(db_date.year(), 2024);
+        assert_eq!(db_date.month(), 2);
+        assert_eq!(db_date.day(), 29);
+    }
+
+    #[test]
+    fn test_db_date_from_string_invalid_format() {
+        assert!(DbDate::from_string("not-a-date").is_err());
+        assert!(DbDate::from_string("2024/01/15").is_err());
+        assert!(DbDate::from_string("15-01-2024").is_err());
+        // Single digit month/day
+        assert!(DbDate::from_string("2024-1-15").is_err());
+        assert!(DbDate::from_string("2024-01-1").is_err());
+        assert!(DbDate::from_string("").is_err());
+    }
+
+    #[test]
+    fn test_db_date_from_string_invalid_date() {
+        // Test invalid dates that have correct format
+        assert!(DbDate::from_string("2024-13-01").is_err());
+        assert!(DbDate::from_string("2024-02-30").is_err());
+        assert!(DbDate::from_string("2023-02-29").is_err());
+    }
+
+    #[test]
+    fn test_db_datetime_from_string_valid() {
+        let datetime_str = "2024-01-15T14:30:45";
+        let db_datetime =
+            DbDateTime::from_string(datetime_str).expect("should parse valid datetime");
+
+        assert_eq!(db_datetime.year(), 2024);
+        assert_eq!(db_datetime.month(), 1);
+        assert_eq!(db_datetime.day(), 15);
+        assert_eq!(db_datetime.hour(), 14);
+        assert_eq!(db_datetime.minute(), 30);
+        assert_eq!(db_datetime.second(), 45);
+    }
+
+    #[test]
+    fn test_db_datetime_from_string_with_milliseconds() {
+        // Test datetime with milliseconds
+        let datetime_str = "2024-01-15T14:30:45.123";
+        let db_datetime =
+            DbDateTime::from_string(datetime_str).expect("should parse datetime with millis");
+
+        assert_eq!(db_datetime.year(), 2024);
+        assert_eq!(db_datetime.month(), 1);
+        assert_eq!(db_datetime.day(), 15);
+        assert_eq!(db_datetime.hour(), 14);
+        assert_eq!(db_datetime.minute(), 30);
+        assert_eq!(db_datetime.second(), 45);
+        assert_eq!(db_datetime.millisecond(), 123);
+    }
+
+    #[test]
+    fn test_db_datetime_from_string_midnight() {
+        // Test midnight time
+        let datetime_str = "2024-06-15T00:00:00";
+        let db_datetime = DbDateTime::from_string(datetime_str).expect("should parse midnight");
+
+        assert_eq!(db_datetime.year(), 2024);
+        assert_eq!(db_datetime.month(), 6);
+        assert_eq!(db_datetime.day(), 15);
+        assert_eq!(db_datetime.hour(), 0);
+        assert_eq!(db_datetime.minute(), 0);
+        assert_eq!(db_datetime.second(), 0);
+    }
+
+    #[test]
+    fn test_db_datetime_from_string_invalid_format() {
+        // Test various invalid formats
+        assert!(DbDateTime::from_string("not-a-datetime").is_err());
+        assert!(DbDateTime::from_string("2024-01-15").is_err());
+        assert!(DbDateTime::from_string("2024-01-15 14:30:45").is_err());
+        assert!(DbDateTime::from_string("").is_err());
+    }
+
+    #[test]
+    fn test_db_datetime_from_string_invalid_time() {
+        // Test invalid time values
+        assert!(DbDateTime::from_string("2024-01-15T25:00:00").is_err());
+        assert!(DbDateTime::from_string("2024-01-15T14:60:00").is_err());
+        assert!(DbDateTime::from_string("2024-01-15T14:30:60").is_err());
+    }
+
+    #[test]
+    fn test_db_datetime_from_string_roundtrip() {
+        let datetime_str = "2024-12-31T23:59:59";
+        let db_datetime = DbDateTime::from_string(datetime_str).expect("should parse datetime");
+
+        let primitive_datetime: PrimitiveDateTime = db_datetime.into();
+        let db_datetime_again = DbDateTime::from(primitive_datetime);
+
+        assert_eq!(db_datetime, db_datetime_again);
     }
 }
