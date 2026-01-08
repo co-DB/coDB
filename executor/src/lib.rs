@@ -4249,4 +4249,447 @@ mod tests {
         let (_, rows) = expect_select_successful(result);
         assert_eq!(rows.len(), 3); // Products 3, 4, 5 have price > 20
     }
+
+    #[test]
+    fn test_insert_and_select_date_from_string() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table with Date column
+        execute_single(
+            &executor,
+            "CREATE TABLE events (id INT32 PRIMARY_KEY, event_date DATE, description STRING);",
+        );
+
+        // Insert with date string
+        let result = execute_single(
+            &executor,
+            "INSERT INTO events (id, event_date, description) VALUES (1, '2024-01-15', 'New Year Event');",
+        );
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        // Select and verify the date was stored correctly
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, event_date, description FROM events;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[1].ty, Type::Date);
+        assert_eq!(rows.len(), 1);
+
+        // Verify date value
+        match rows[0].fields[1].deref() {
+            Value::Date(db_date) => {
+                assert_eq!(db_date.year(), 2024);
+                assert_eq!(db_date.month(), 1);
+                assert_eq!(db_date.day(), 15);
+            }
+            other => panic!("Expected Date value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_insert_and_select_datetime_from_string() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table with DateTime column
+        execute_single(
+            &executor,
+            "CREATE TABLE logs (id INT32 PRIMARY_KEY, timestamp DATETIME, message STRING);",
+        );
+
+        // Insert with datetime string
+        let result = execute_single(
+            &executor,
+            "INSERT INTO logs (id, timestamp, message) VALUES (1, '2024-06-15T14:30:45', 'System started');",
+        );
+        assert_operation_successful(result, 1, StatementType::Insert);
+
+        // Select and verify the datetime was stored correctly
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, timestamp, message FROM logs;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (columns, rows) = expect_select_successful(result);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[1].ty, Type::DateTime);
+        assert_eq!(rows.len(), 1);
+
+        // Verify datetime value
+        match rows[0].fields[1].deref() {
+            Value::DateTime(db_datetime) => {
+                assert_eq!(db_datetime.year(), 2024);
+                assert_eq!(db_datetime.month(), 6);
+                assert_eq!(db_datetime.day(), 15);
+                assert_eq!(db_datetime.hour(), 14);
+                assert_eq!(db_datetime.minute(), 30);
+                assert_eq!(db_datetime.second(), 45);
+            }
+            other => panic!("Expected DateTime value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_insert_multiple_dates_and_filter() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE bookings (id INT32 PRIMARY_KEY, booking_date DATE, customer STRING);",
+        );
+
+        // Insert multiple records with different dates
+        execute_single(
+            &executor,
+            "INSERT INTO bookings (id, booking_date, customer) VALUES (1, '2024-01-10', 'Alice');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO bookings (id, booking_date, customer) VALUES (2, '2024-02-15', 'Bob');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO bookings (id, booking_date, customer) VALUES (3, '2024-03-20', 'Charlie');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO bookings (id, booking_date, customer) VALUES (4, '2024-04-25', 'David');",
+        );
+
+        // Filter by date: bookings after 2024-02-01
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, customer FROM bookings WHERE booking_date > '2024-02-01';",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 3); // Bob, Charlie, David
+
+        // Verify the correct customers
+        let customers: Vec<String> = rows
+            .iter()
+            .map(|r| match r.fields[1].deref() {
+                Value::String(s) => s.clone(),
+                _ => panic!("Expected string"),
+            })
+            .collect();
+        assert!(customers.contains(&"Bob".to_string()));
+        assert!(customers.contains(&"Charlie".to_string()));
+        assert!(customers.contains(&"David".to_string()));
+    }
+
+    #[test]
+    fn test_filter_with_date_equality() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE appointments (id INT32 PRIMARY_KEY, appointment_date DATE, patient STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO appointments (id, appointment_date, patient) VALUES (1, '2024-05-10', 'John');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO appointments (id, appointment_date, patient) VALUES (2, '2024-05-11', 'Jane');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO appointments (id, appointment_date, patient) VALUES (3, '2024-05-10', 'Jim');",
+        );
+
+        // Filter by exact date
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, patient FROM appointments WHERE appointment_date = '2024-05-10';",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2); // John and Jim
+    }
+
+    #[test]
+    fn test_filter_with_datetime_comparison() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE transactions (id INT32 PRIMARY_KEY, transaction_time DATETIME, amount INT32);",
+        );
+
+        // Insert records
+        execute_single(
+            &executor,
+            "INSERT INTO transactions (id, transaction_time, amount) VALUES (1, '2024-01-15T09:00:00', 100);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO transactions (id, transaction_time, amount) VALUES (2, '2024-01-15T14:30:00', 200);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO transactions (id, transaction_time, amount) VALUES (3, '2024-01-15T18:45:00', 150);",
+        );
+
+        // Filter by datetime: transactions after 2:00 PM
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, amount FROM transactions WHERE transaction_time > '2024-01-15T14:00:00';",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2); // transactions at 14:30 and 18:45
+    }
+
+    #[test]
+    fn test_update_date_column_with_string() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table with 2 records
+        execute_single(
+            &executor,
+            "CREATE TABLE schedules (id INT32 PRIMARY_KEY, scheduled_date DATE, task STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO schedules (id, scheduled_date, task) VALUES (1, '2024-01-01', 'Task 1');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO schedules (id, scheduled_date, task) VALUES (2, '2024-01-02', 'Task 2');",
+        );
+
+        // Update only the first record's date using string
+        let result = execute_single(
+            &executor,
+            "UPDATE schedules SET scheduled_date = '2024-12-31' WHERE id = 1;",
+        );
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify the first record was updated
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, scheduled_date FROM schedules WHERE id = 1;",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+
+        match rows[0].fields[1].deref() {
+            Value::Date(db_date) => {
+                assert_eq!(db_date.year(), 2024);
+                assert_eq!(db_date.month(), 12);
+                assert_eq!(db_date.day(), 31);
+            }
+            other => panic!("Expected Date value, got {:?}", other),
+        }
+
+        // Verify the second record was NOT changed
+        let (select_plan2, select_ast2) = create_single_statement(
+            "SELECT id, scheduled_date FROM schedules WHERE id = 2;",
+            &executor,
+        );
+        let result2 = executor.execute_statement(&select_plan2, &select_ast2);
+
+        let (_, rows2) = expect_select_successful(result2);
+        assert_eq!(rows2.len(), 1);
+
+        match rows2[0].fields[1].deref() {
+            Value::Date(db_date) => {
+                assert_eq!(db_date.year(), 2024);
+                assert_eq!(db_date.month(), 1);
+                assert_eq!(db_date.day(), 2);
+            }
+            other => panic!("Expected Date value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_datetime_column_with_string() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table with 2 records
+        execute_single(
+            &executor,
+            "CREATE TABLE events (id INT32 PRIMARY_KEY, event_time DATETIME, name STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO events (id, event_time, name) VALUES (1, '2024-01-01T10:00:00', 'Event 1');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO events (id, event_time, name) VALUES (2, '2024-02-15T14:30:00', 'Event 2');",
+        );
+
+        // Update only the first record's datetime using string
+        let result = execute_single(
+            &executor,
+            "UPDATE events SET event_time = '2024-06-15T16:30:45' WHERE id = 1;",
+        );
+        assert_operation_successful(result, 1, StatementType::Update);
+
+        // Verify the first record was updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, event_time FROM events WHERE id = 1;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+
+        match rows[0].fields[1].deref() {
+            Value::DateTime(db_datetime) => {
+                assert_eq!(db_datetime.year(), 2024);
+                assert_eq!(db_datetime.month(), 6);
+                assert_eq!(db_datetime.day(), 15);
+                assert_eq!(db_datetime.hour(), 16);
+                assert_eq!(db_datetime.minute(), 30);
+                assert_eq!(db_datetime.second(), 45);
+            }
+            other => panic!("Expected DateTime value, got {:?}", other),
+        }
+
+        // Verify the second record was NOT changed
+        let (select_plan2, select_ast2) =
+            create_single_statement("SELECT id, event_time FROM events WHERE id = 2;", &executor);
+        let result2 = executor.execute_statement(&select_plan2, &select_ast2);
+
+        let (_, rows2) = expect_select_successful(result2);
+        assert_eq!(rows2.len(), 1);
+
+        match rows2[0].fields[1].deref() {
+            Value::DateTime(db_datetime) => {
+                assert_eq!(db_datetime.year(), 2024);
+                assert_eq!(db_datetime.month(), 2);
+                assert_eq!(db_datetime.day(), 15);
+                assert_eq!(db_datetime.hour(), 14);
+                assert_eq!(db_datetime.minute(), 30);
+                assert_eq!(db_datetime.second(), 0);
+            }
+            other => panic!("Expected DateTime value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_delete_with_date_filter() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE orders (id INT32 PRIMARY_KEY, order_date DATE, status STRING);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO orders (id, order_date, status) VALUES (1, '2024-01-10', 'pending');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO orders (id, order_date, status) VALUES (2, '2024-02-15', 'completed');",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO orders (id, order_date, status) VALUES (3, '2024-03-20', 'pending');",
+        );
+
+        // Delete orders before 2024-02-01
+        let result = execute_single(
+            &executor,
+            "DELETE FROM orders WHERE order_date < '2024-02-01';",
+        );
+        assert_operation_successful(result, 1, StatementType::Delete);
+
+        // Verify only 2 records remain
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id FROM orders;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_date_range_filter() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE sales (id INT32 PRIMARY_KEY, sale_date DATE, amount INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO sales (id, sale_date, amount) VALUES (1, '2024-01-05', 100);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO sales (id, sale_date, amount) VALUES (2, '2024-01-15', 200);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO sales (id, sale_date, amount) VALUES (3, '2024-01-25', 150);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO sales (id, sale_date, amount) VALUES (4, '2024-02-05', 300);",
+        );
+
+        // Filter by date range: between Jan 10 and Jan 30
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, amount FROM sales WHERE sale_date >= '2024-01-10' AND sale_date <= '2024-01-30';",
+            &executor,
+        );
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2); // Jan 15 and Jan 25
+    }
+
+    #[test]
+    fn test_insert_invalid_date_string_error() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE events (id INT32 PRIMARY_KEY, event_date DATE);",
+        );
+
+        // Try to insert invalid date
+        let result = execute_single(
+            &executor,
+            "INSERT INTO events (id, event_date) VALUES (1, 'not-a-date');",
+        );
+
+        // Should get a parse error
+        assert_parse_error_contains(result, "Date");
+    }
+
+    #[test]
+    fn test_insert_invalid_datetime_string_error() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE logs (id INT32 PRIMARY_KEY, log_time DATETIME);",
+        );
+
+        // Try to insert invalid datetime
+        let result = execute_single(
+            &executor,
+            "INSERT INTO logs (id, log_time) VALUES (1, 'invalid-datetime');",
+        );
+
+        // Should get a parse error
+        assert_parse_error_contains(result, "DateTime");
+    }
 }
