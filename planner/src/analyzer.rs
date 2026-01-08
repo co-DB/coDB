@@ -1584,6 +1584,20 @@ mod tests {
         }
     }
 
+    fn expect_literal_date(rt: &ResolvedTree, id: ResolvedNodeId) -> time::Date {
+        match rt.node(id) {
+            ResolvedExpression::Literal(ResolvedLiteral::Date(d)) => *d,
+            other => panic!("expected Date literal, got: {:?}", other),
+        }
+    }
+
+    fn expect_literal_datetime(rt: &ResolvedTree, id: ResolvedNodeId) -> time::PrimitiveDateTime {
+        match rt.node(id) {
+            ResolvedExpression::Literal(ResolvedLiteral::DateTime(dt)) => *dt,
+            other => panic!("expected DateTime literal, got: {:?}", other),
+        }
+    }
+
     fn expect_binary(rt: &ResolvedTree, id: ResolvedNodeId) -> &ResolvedBinaryExpression {
         match rt.node(id) {
             ResolvedExpression::Binary(b) => b,
@@ -4623,5 +4637,510 @@ mod tests {
 
         let select_stmt = expect_select(&rt, 0);
         assert!(select_stmt.index_bounds.is_none());
+    }
+
+    // Helper to create a catalog with a table containing date and datetime columns
+    fn catalog_with_events() -> Arc<RwLock<Catalog>> {
+        let tmp_dir = TempDir::new().unwrap();
+        let db_dir = tmp_dir.path().join("db");
+        fs::create_dir(&db_dir).unwrap();
+        let db_path = db_dir.join(METADATA_FILE_NAME);
+
+        let json = r#"
+        {
+            "tables": [
+                {
+                    "name": "events",
+                    "columns": [
+                        { "name": "id", "ty": "I32", "pos": 0, "base_offset": 0, "base_offset_pos": 0 },
+                        { "name": "event_date", "ty": "Date", "pos": 1, "base_offset": 4, "base_offset_pos": 1 },
+                        { "name": "event_datetime", "ty": "DateTime", "pos": 2, "base_offset": 8, "base_offset_pos": 2 }
+                    ],
+                    "primary_key_column_name": "id"
+                }
+            ]
+        }
+        "#;
+
+        fs::write(&db_path, json).unwrap();
+
+        let catalog = Catalog::new(tmp_dir.path(), "db").unwrap();
+        Arc::new(RwLock::new(catalog))
+    }
+
+    #[test]
+    fn analyze_insert_with_date_string_cast() {
+        let catalog = catalog_with_events();
+        let mut ast = Ast::default();
+
+        // INSERT INTO events (id, event_date) VALUES (1, '2024-01-15')
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "events".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let id_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let date_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "event_date".into(),
+        }));
+        let date_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: date_ident,
+            table_alias: None,
+        }));
+
+        let val_1 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1),
+        }));
+        let val_date_str = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("2024-01-15".into()),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: Some(vec![id_name, date_name]),
+            values: vec![val_1, val_date_str],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let insert_stmt = expect_insert(&rt, 0);
+        assert_eq!(insert_stmt.values.len(), 2);
+
+        // First value should be i32
+        let val1 = expect_literal_i32(&rt, insert_stmt.values[0]);
+        assert_eq!(val1, 1);
+
+        // Second value should be a Date literal (parsed from string)
+        let val2 = expect_literal_date(&rt, insert_stmt.values[1]);
+        assert_eq!(val2.year(), 2024);
+        assert_eq!(val2.month() as u8, 1);
+        assert_eq!(val2.day(), 15);
+    }
+
+    #[test]
+    fn analyze_insert_with_datetime_string_cast() {
+        let catalog = catalog_with_events();
+        let mut ast = Ast::default();
+
+        // INSERT INTO events (id, event_datetime) VALUES (1, '2024-01-15T14:30:00')
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "events".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let id_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let datetime_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "event_datetime".into(),
+        }));
+        let datetime_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: datetime_ident,
+            table_alias: None,
+        }));
+
+        let val_1 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1),
+        }));
+        let val_datetime_str = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("2024-01-15T14:30:00".into()),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: Some(vec![id_name, datetime_name]),
+            values: vec![val_1, val_datetime_str],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let insert_stmt = expect_insert(&rt, 0);
+        assert_eq!(insert_stmt.values.len(), 2);
+
+        // Second value should be a DateTime literal (parsed from string)
+        let val2 = expect_literal_datetime(&rt, insert_stmt.values[1]);
+        assert_eq!(val2.year(), 2024);
+        assert_eq!(val2.month() as u8, 1);
+        assert_eq!(val2.day(), 15);
+        assert_eq!(val2.hour(), 14);
+        assert_eq!(val2.minute(), 30);
+        assert_eq!(val2.second(), 0);
+    }
+
+    #[test]
+    fn analyze_insert_with_invalid_date_string() {
+        let catalog = catalog_with_events();
+        let mut ast = Ast::default();
+
+        // INSERT INTO events (id, event_date) VALUES (1, 'not-a-date')
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "events".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let id_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        let date_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "event_date".into(),
+        }));
+        let date_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: date_ident,
+            table_alias: None,
+        }));
+
+        let val_1 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1),
+        }));
+        let val_invalid = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("not-a-date".into()),
+        }));
+
+        let insert = InsertStatement {
+            table_name,
+            columns: Some(vec![id_name, date_name]),
+            values: vec![val_1, val_invalid],
+        };
+        ast.add_statement(Statement::Insert(insert));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            AnalyzerError::ColumnAndValueTypeDontMatch { column_type, .. } => {
+                assert_eq!(column_type, "Date");
+            }
+            _ => panic!("Expected ColumnAndValueTypeDontMatch error"),
+        }
+    }
+
+    #[test]
+    fn analyze_update_with_date_string_cast() {
+        let catalog = catalog_with_events();
+        let mut ast = Ast::default();
+
+        // UPDATE events SET event_date = '2024-12-31' WHERE id = 1
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "events".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let date_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "event_date".into(),
+        }));
+        let date_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: date_ident,
+            table_alias: None,
+        }));
+
+        let val_date_str = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("2024-12-31".into()),
+        }));
+
+        let id_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let id_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_col_ident,
+            table_alias: None,
+        }));
+        let val_1 = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(1),
+        }));
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: id_col,
+            right_id: val_1,
+            op: BinaryOperator::Equal,
+        }));
+
+        let update = UpdateStatement {
+            table_name,
+            column_setters: vec![(date_col, val_date_str)],
+            where_clause: Some(where_clause),
+        };
+        ast.add_statement(Statement::Update(update));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let update_stmt = expect_update(&rt, 0);
+        assert_eq!(update_stmt.values.len(), 1);
+
+        // Value should be a Date literal (parsed from string)
+        let val = expect_literal_date(&rt, update_stmt.values[0]);
+        assert_eq!(val.year(), 2024);
+        assert_eq!(val.month() as u8, 12);
+        assert_eq!(val.day(), 31);
+    }
+
+    #[test]
+    fn analyze_select_where_date_string_comparison() {
+        let catalog = catalog_with_events();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM events WHERE event_date > '2024-01-01'
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "events".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let date_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "event_date".into(),
+        }));
+        let date_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: date_col_ident,
+            table_alias: None,
+        }));
+
+        let date_str = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("2024-01-01".into()),
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: date_col,
+            right_id: date_str,
+            op: BinaryOperator::Greater,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        let where_id = select_stmt.where_clause.expect("where clause exists");
+
+        // Where clause should be a binary expression
+        let where_expr = expect_binary(&rt, where_id);
+        assert_eq!(where_expr.ty, Type::Bool);
+        assert!(matches!(where_expr.op, BinaryOperator::Greater));
+
+        // Left side should be the column
+        let left = expect_column(&rt, where_expr.left);
+        assert_eq!(left.name, "event_date");
+        assert_eq!(left.ty, Type::Date);
+
+        // Right side should be a Date literal (parsed from string)
+        let right_date = expect_literal_date(&rt, where_expr.right);
+        assert_eq!(right_date.year(), 2024);
+        assert_eq!(right_date.month() as u8, 1);
+        assert_eq!(right_date.day(), 1);
+    }
+
+    #[test]
+    fn analyze_select_where_datetime_string_comparison_reverse() {
+        let catalog = catalog_with_events();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM events WHERE '2024-01-01T00:00:00' < event_datetime
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "events".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let datetime_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "event_datetime".into(),
+        }));
+        let datetime_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: datetime_col_ident,
+            table_alias: None,
+        }));
+
+        let datetime_str = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("2024-01-01T00:00:00".into()),
+        }));
+
+        // String on the left, column on the right
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: datetime_str,
+            right_id: datetime_col,
+            op: BinaryOperator::Less,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        let where_id = select_stmt.where_clause.expect("where clause exists");
+
+        // Where clause should be a binary expression
+        let where_expr = expect_binary(&rt, where_id);
+        assert_eq!(where_expr.ty, Type::Bool);
+
+        // Left side should be a DateTime literal (parsed from string)
+        let _left_datetime = expect_literal_datetime(&rt, where_expr.left);
+
+        // Right side should be the column
+        let right = expect_column(&rt, where_expr.right);
+        assert_eq!(right.name, "event_datetime");
+        assert_eq!(right.ty, Type::DateTime);
+    }
+
+    #[test]
+    fn analyze_select_where_date_string_comparison_invalid() {
+        let catalog = catalog_with_events();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM events WHERE event_date > 'invalid-date'
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "events".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let date_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "event_date".into(),
+        }));
+        let date_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: date_col_ident,
+            table_alias: None,
+        }));
+
+        let invalid_date_str = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("invalid-date".into()),
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: date_col,
+            right_id: invalid_date_str,
+            op: BinaryOperator::Greater,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            AnalyzerError::ColumnAndValueTypeDontMatch { column_type, .. } => {
+                assert_eq!(column_type, "Date");
+            }
+            _ => panic!("Expected ColumnAndValueTypeDontMatch error"),
+        }
+    }
+
+    #[test]
+    fn analyze_select_where_date_equality() {
+        let catalog = catalog_with_events();
+        let mut ast = Ast::default();
+
+        // SELECT * FROM events WHERE event_date = '2024-06-15'
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "events".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        let date_col_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "event_date".into(),
+        }));
+        let date_col = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: date_col_ident,
+            table_alias: None,
+        }));
+
+        let date_str = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("2024-06-15".into()),
+        }));
+
+        let where_clause = ast.add_node(Expression::Binary(BinaryExpressionNode {
+            left_id: date_col,
+            right_id: date_str,
+            op: BinaryOperator::Equal,
+        }));
+
+        let select = SelectStatement {
+            table_name,
+            columns: None,
+            where_clause: Some(where_clause),
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+        ast.add_statement(Statement::Select(select));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let rt = analyzer.analyze().expect("analysis should succeed");
+
+        let select_stmt = expect_select(&rt, 0);
+        let where_id = select_stmt.where_clause.expect("where clause exists");
+
+        let where_expr = expect_binary(&rt, where_id);
+        assert!(matches!(where_expr.op, BinaryOperator::Equal));
+
+        // Right side should be a Date literal
+        let right_date = expect_literal_date(&rt, where_expr.right);
+        assert_eq!(right_date.year(), 2024);
+        assert_eq!(right_date.month() as u8, 6);
+        assert_eq!(right_date.day(), 15);
     }
 }
