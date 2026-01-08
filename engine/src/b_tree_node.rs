@@ -219,21 +219,43 @@ where
     }
 
     /// Finds a new mid for binary search in the case where the slot in the base mid (left + right / 2)
-    /// is deleted. Can return None if every node is deleted.
+    /// is deleted. Can return None if every slot is deleted.
+    ///
+    /// Searches for the closest non-deleted slot to `mid` by finding the first available
+    /// slot on both the left and right sides, then choosing whichever is closer. This maintains
+    /// optimal balance in binary search.
     fn find_new_mid(&self, mid: u16, left: u16, right: u16) -> Result<Option<u16>, BTreeNodeError> {
+        let mut first_left = None;
         for i in (left..mid).rev() {
             if !self.slotted_page.is_slot_deleted(i)? {
-                return Ok(Some(i));
+                first_left = Some(i);
+                break;
             }
         }
 
+        let mut first_right = None;
         for i in (mid + 1)..=right {
             if !self.slotted_page.is_slot_deleted(i)? {
-                return Ok(Some(i));
+                first_right = Some(i);
+                break;
             }
         }
 
-        Ok(None)
+        // Choose the closer one
+        match (first_left, first_right) {
+            (Some(l), Some(r)) => {
+                let left_distance = mid - l;
+                let right_distance = r - mid;
+                Ok(Some(if left_distance <= right_distance {
+                    l
+                } else {
+                    r
+                }))
+            }
+            (Some(l), None) => Ok(Some(l)),
+            (None, Some(r)) => Ok(Some(r)),
+            (None, None) => Ok(None),
+        }
     }
 
     pub(crate) fn get_all_records(&self) -> Result<Vec<&[u8]>, BTreeNodeError> {
