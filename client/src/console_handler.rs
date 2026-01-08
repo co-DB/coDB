@@ -1,11 +1,18 @@
 use std::io::{self, BufRead, Write};
 
 use log::error;
-use protocol::{ErrorType, Request, Response};
+use protocol::{ErrorType, Field, Request, Response};
+use time::{Date, Duration, PrimitiveDateTime, Time};
 
 use crate::{
     ClientError,
     db_client::{DbClient, ProtocolHandler, ReadResult},
+};
+
+// 1970-01-01 - the epoch for date conversions
+const EPOCH_DATE: Date = match Date::from_ordinal_date(1970, 1) {
+    Ok(date) => date,
+    Err(_) => panic!("Failed to create epoch date"),
 };
 
 pub struct ConsoleHandler<P>
@@ -207,14 +214,16 @@ pub fn display_response(response: &Response) {
             records,
             count: _count,
         } => {
-            print!("Row: ");
-            for (i, v) in records.iter().enumerate() {
-                if i > 0 {
-                    print!(", ");
+            for record in records.iter() {
+                print!("Row: ");
+                for (j, field) in record.fields.iter().enumerate() {
+                    if j > 0 {
+                        print!(", ");
+                    }
+                    print!("{}", format_field(field));
                 }
-                print!("{:?}", v);
+                println!();
             }
-            println!();
         }
 
         Response::StatementCompleted {
@@ -255,6 +264,33 @@ pub fn display_response(response: &Response) {
                     println!("  - {}", name);
                 }
             }
+        }
+    }
+}
+
+fn format_field(field: &Field) -> String {
+    match field {
+        Field::Int32(v) => v.to_string(),
+        Field::Int64(v) => v.to_string(),
+        Field::Float32(v) => v.to_string(),
+        Field::Float64(v) => v.to_string(),
+        Field::String(v) => format!("'{}'", v),
+        Field::Bool(v) => v.to_string(),
+        Field::Date(d) => {
+            let date = EPOCH_DATE + Duration::days(d.days_since_epoch as i64);
+            date.to_string()
+        }
+        Field::DateTime(dt) => {
+            let date = EPOCH_DATE + Duration::days(dt.days_since_epoch as i64);
+            let time = Time::from_hms_milli(
+                (dt.milliseconds_since_midnight / (1000 * 60 * 60)) as u8,
+                ((dt.milliseconds_since_midnight / (1000 * 60)) % 60) as u8,
+                ((dt.milliseconds_since_midnight / 1000) % 60) as u8,
+                (dt.milliseconds_since_midnight % 1000) as u16,
+            )
+            .unwrap_or(Time::MIDNIGHT);
+
+            PrimitiveDateTime::new(date, time).to_string()
         }
     }
 }
