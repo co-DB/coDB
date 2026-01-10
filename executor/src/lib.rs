@@ -3798,6 +3798,105 @@ mod tests {
     }
 
     #[test]
+    fn test_select_index_scan_1000_records_with_wal() {
+        let (catalog, temp_dir) = create_catalog();
+        let db_path = temp_dir.path().join("test_db");
+        let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+            .expect("with_background_workers should succeed");
+
+        // Create table
+        execute_single(
+            &executor,
+            "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING, price INT32);",
+        );
+
+        // Insert 1000 records to force B-tree splits
+        for i in 0..1000 {
+            execute_single(
+                &executor,
+                &format!(
+                    "INSERT INTO products (id, name, price) VALUES ({}, 'Product {}', {});",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
+        }
+
+        // Give WAL time to flush all pending writes
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // SELECT with range scan across all records
+        let (select_plan, select_ast) = create_single_statement(
+            "SELECT id, name, price FROM products WHERE id >= 0 AND id <= 999;",
+            &executor,
+        );
+
+        // Verify IndexScan is used in the plan
+        assert_uses_index_scan(&select_plan);
+
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1000, "Should have exactly 1000 records");
+
+        // Verify each record has correct values
+        for (i, row) in rows.iter().enumerate() {
+            let id = row.fields[0].as_i32().unwrap();
+            let name = row.fields[1].as_string().unwrap();
+            let price = row.fields[2].as_i32().unwrap();
+
+            assert_eq!(
+                id, i as i32,
+                "Record {} should have id={}, but got id={}",
+                i, i, id
+            );
+            assert_eq!(
+                name,
+                format!("Product {}", i),
+                "Record {} should have name='Product {}', but got name='{}'",
+                i,
+                i,
+                name
+            );
+            assert_eq!(
+                price,
+                (i as i32) * 10,
+                "Record {} should have price={}, but got price={}",
+                i,
+                i * 10,
+                price
+            );
+        }
+
+        // Also test a subset range scan in the middle
+        let (select_plan2, select_ast2) = create_single_statement(
+            "SELECT id FROM products WHERE id >= 400 AND id < 600;",
+            &executor,
+        );
+
+        let result2 = executor.execute_statement(&select_plan2, &select_ast2);
+        let (_, rows2) = expect_select_successful(result2);
+        assert_eq!(rows2.len(), 200, "Should have exactly 200 records in range");
+
+        // Verify the range is correct
+        for (i, row) in rows2.iter().enumerate() {
+            let id = row.fields[0].as_i32().unwrap();
+            let expected_id = 400 + i as i32;
+            assert_eq!(
+                id, expected_id,
+                "Record at position {} should have id={}, but got id={}",
+                i, expected_id, id
+            );
+        }
+
+        for mut handle in workers.drain(..) {
+            handle.shutdown().expect("shutdown should succeed");
+            handle.join().expect("join should succeed");
+        }
+    }
+
+    #[test]
     fn test_delete_index_scan_equal_primary_key() {
         let (executor, _temp_dir) = create_test_executor();
 

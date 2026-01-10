@@ -19,7 +19,9 @@ use crate::{
     background_worker::{BackgroundWorker, BackgroundWorkerHandle},
     files_manager::{FileKey, FilesManager, FilesManagerError},
     page_diff::PageDiff,
-    paged_file::{Lsn, Page, PageId, PagedFile, PagedFileError, get_page_lsn, set_page_lsn},
+    paged_file::{
+        Lsn, Page, PageId, PagedFile, PagedFileError, USABLE_PAGE_SIZE, get_page_lsn, set_page_lsn,
+    },
 };
 use crate::{
     paged_file::PAGE_SIZE,
@@ -242,13 +244,13 @@ pub trait PageWrite {
 
 impl PageRead for PinnedReadPage {
     fn data(&self) -> &[u8] {
-        self.page()
+        &self.page()[..USABLE_PAGE_SIZE]
     }
 }
 
 impl PageRead for PinnedWritePage {
     fn data(&self) -> &[u8] {
-        self.page()
+        &self.page()[..USABLE_PAGE_SIZE]
     }
 }
 impl<T: PageRead> PageRead for &T {
@@ -273,7 +275,7 @@ impl<T: PageWrite> PageWrite for &mut T {
 
 impl PageWrite for PinnedWritePage {
     fn data_mut(&mut self) -> &mut [u8] {
-        self.page_mut()
+        &mut self.page_mut()[..USABLE_PAGE_SIZE]
     }
 
     fn mark_diff(&mut self, from: u16, to: u16) {
@@ -460,8 +462,8 @@ impl Cache {
             page_id,
         };
 
-        // Initialize frame and add it to frames
-        let page = lock.read_page(page_id)?;
+        // Initialize frame with zeroed page (this way we don't need to read from disk - it's a new page anyway)
+        let page = [0u8; PAGE_SIZE];
         let new_frame = Arc::new(PageFrame::new(id.clone(), page));
         self.frames.insert(id.clone(), new_frame.clone());
         self.push_to_lru(&id);

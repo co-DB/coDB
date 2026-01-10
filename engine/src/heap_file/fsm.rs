@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use storage::{
     cache::{Cache, FilePageRef, PinnedWritePage},
     files_manager::FileKey,
-    paged_file::{PAGE_SIZE, PageId},
+    paged_file::{PageId, USABLE_PAGE_SIZE},
 };
 
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
 /// from a bucket the page header must be read to verify actual free space (so entries
 /// can be stale).
 ///
-/// Buckets split the page free-space range [0, PAGE_SIZE] into BUCKETS_COUNT equal
+/// Buckets split the page free-space range [0, USABLE_PAGE_SIZE] into BUCKETS_COUNT equal
 /// intervals. For BUCKETS_COUNT = 4 the mapping is:
 ///
 ///   ```text
@@ -234,11 +234,11 @@ impl<const BUCKETS_COUNT: usize, H: BaseHeapPageHeader> FreeSpaceMap<BUCKETS_COU
 
     /// Computes the bucket index for a given amount of free space (in bytes).
     ///
-    /// The page free-space range `[0, PAGE_SIZE]` is divided into `BUCKETS_COUNT` equal
+    /// The page free-space range `[0, USABLE_PAGE_SIZE]` is divided into `BUCKETS_COUNT` equal
     /// intervals. This returns the index of the interval that contains `space`.
     /// The result is clamped to `[0, BUCKETS_COUNT - 1]`.
     pub fn bucket_for_space(&self, space: usize) -> usize {
-        (space * BUCKETS_COUNT / PAGE_SIZE).clamp(0, BUCKETS_COUNT - 1)
+        (space * BUCKETS_COUNT / USABLE_PAGE_SIZE).clamp(0, BUCKETS_COUNT - 1)
     }
 
     /// Creates a `FilePageRef` for `page_id` using this map's file key.
