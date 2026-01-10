@@ -249,8 +249,8 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::ops::Deref;
+    use std::{fs, thread, time};
 
     use engine::record::Record;
     use tempfile::TempDir;
@@ -4691,5 +4691,308 @@ mod tests {
 
         // Should get a parse error
         assert_parse_error_contains(result, "DateTime");
+    }
+
+    #[test]
+    fn test_wal_redo_with_deleted_page() {
+        // Test scenario: Insert many records to span multiple B-tree pages, then delete all but one.
+        // On restart, WAL redo should gracefully handle pages that were deallocated.
+
+        let (catalog, temp_dir) = create_catalog();
+        let db_path = temp_dir.path().join("test_db");
+
+        {
+            // Create table, insert many records, then delete most of them
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("with_background_workers should succeed");
+
+            // Create table with data
+            execute_single(
+                &executor,
+                "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING);",
+            );
+
+            // Insert enough records to ensure multiple B-tree pages
+            // PAGE_SIZE = 4096, INT32 = 4 bytes, plus overhead for B-tree structure
+            // We insert PAGE_SIZE / 4 + 10 records to be safe
+            const NUM_RECORDS: i32 = 4096 / 4 + 10;
+            for i in 1..=NUM_RECORDS {
+                execute_single(
+                    &executor,
+                    &format!("INSERT INTO users (id, name) VALUES ({}, 'User{}');", i, i),
+                );
+            }
+
+            // Force WAL flush to ensure records are written
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Delete all records
+            execute_single(&executor, "DELETE FROM users;");
+
+            // Force another WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Shutdown cleanly
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+
+        {
+            // Restart and attempt redo
+            // This should NOT panic - it should gracefully handle missing pages
+            let catalog = Catalog::new(temp_dir.path(), "test_db").unwrap();
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("Recovery with redo should handle deleted pages gracefully");
+
+            let result = execute_single(&executor, "SELECT * FROM users;");
+            // We call it just to trigger wal redo
+            let _ = expect_select_successful(result);
+
+            // Cleanup
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_wal_redo_with_dropped_and_recreated_table() {
+        // Test scenario: Create table, insert data, drop table.
+        // On restart (phase 2), recreate table with same name.
+        // WAL redo should not try to apply old records to deleted pages.
+
+        let (catalog, temp_dir) = create_catalog();
+        let db_path = temp_dir.path().join("test_db");
+
+        {
+            // Create table, insert data, then drop it
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("with_background_workers should succeed");
+
+            // Create and populate table
+            execute_single(
+                &executor,
+                "CREATE TABLE products (id INT32 PRIMARY_KEY, price INT32);",
+            );
+            execute_single(
+                &executor,
+                "INSERT INTO products (id, price) VALUES (1, 100);",
+            );
+            execute_single(
+                &executor,
+                "INSERT INTO products (id, price) VALUES (2, 200);",
+            );
+            execute_single(
+                &executor,
+                "INSERT INTO products (id, price) VALUES (3, 300);",
+            );
+
+            // Force WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Drop the table - this deallocates all its pages
+            execute_single(&executor, "DROP TABLE products;");
+
+            // Force WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Shutdown cleanly
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+
+        {
+            // Restart, attempt redo, then create new table with same name
+            // This should NOT panic when trying to redo records for deleted pages
+            let catalog = Catalog::new(temp_dir.path(), "test_db").unwrap();
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("Recovery should handle dropped tables gracefully");
+
+            // Create new table with same name but different schema
+            execute_single(
+                &executor,
+                "CREATE TABLE products (id INT32 PRIMARY_KEY, name STRING);",
+            );
+            execute_single(
+                &executor,
+                "INSERT INTO products (id, name) VALUES (1, 'Widget');",
+            );
+
+            // Verify the new table has correct data
+            let result = execute_single(&executor, "SELECT * FROM products;");
+            let (_, rows) = expect_select_successful(result);
+
+            // Should only have the new table's data
+            assert_eq!(rows.len(), 1);
+
+            // Cleanup
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_wal_redo_with_truncated_table() {
+        // Test scenario: Create table, insert data, truncate it.
+        // On restart insert new records.
+        // WAL redo should handle pages that were deallocated during truncate.
+
+        let (catalog, temp_dir) = create_catalog();
+        let db_path = temp_dir.path().join("test_db");
+
+        {
+            // Create table, insert data, then truncate
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("with_background_workers should succeed");
+
+            // Create and populate table
+            execute_single(
+                &executor,
+                "CREATE TABLE logs (id INT32 PRIMARY_KEY, message STRING);",
+            );
+
+            // Insert multiple records to ensure multiple pages
+            for i in 1..=100 {
+                execute_single(
+                    &executor,
+                    &format!(
+                        "INSERT INTO logs (id, message) VALUES ({}, 'Log entry {}');",
+                        i, i
+                    ),
+                );
+            }
+
+            // Force WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Truncate the table - this deallocates all its pages
+            execute_single(&executor, "TRUNCATE TABLE logs;");
+
+            // Force WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Shutdown cleanly
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+
+        {
+            // Restart, attempt redo, then insert new data
+            // This should NOT panic when trying to redo records for deallocated pages
+            let catalog = Catalog::new(temp_dir.path(), "test_db").unwrap();
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("Recovery should handle truncated tables gracefully");
+
+            // Insert new data into the truncated table
+            execute_single(
+                &executor,
+                "INSERT INTO logs (id, message) VALUES (1, 'New log entry');",
+            );
+            execute_single(
+                &executor,
+                "INSERT INTO logs (id, message) VALUES (2, 'Another new entry');",
+            );
+
+            // Verify table has only new data
+            let result = execute_single(&executor, "SELECT * FROM logs;");
+            let (_, rows) = expect_select_successful(result);
+            assert_eq!(rows.len(), 2);
+
+            // Cleanup
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_wal_redo_with_multiple_table_operations() {
+        // Test scenario: Complex sequence of table operations to stress test WAL redo
+        // with multiple deletions, drops, and recreations.
+
+        let (catalog, temp_dir) = create_catalog();
+        let db_path = temp_dir.path().join("test_db");
+
+        {
+            // Complex sequence of operations
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("with_background_workers should succeed");
+
+            // Create first table
+            execute_single(
+                &executor,
+                "CREATE TABLE temp1 (id INT32 PRIMARY_KEY, value INT32);",
+            );
+            execute_single(&executor, "INSERT INTO temp1 (id, value) VALUES (1, 10);");
+            execute_single(&executor, "INSERT INTO temp1 (id, value) VALUES (2, 20);");
+
+            // Force WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Create second table
+            execute_single(
+                &executor,
+                "CREATE TABLE temp2 (id INT32 PRIMARY_KEY, data STRING);",
+            );
+            execute_single(&executor, "INSERT INTO temp2 (id, data) VALUES (1, 'foo');");
+
+            // Drop first table
+            execute_single(&executor, "DROP TABLE temp1;");
+
+            // Force WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Truncate second table
+            execute_single(&executor, "TRUNCATE TABLE temp2;");
+
+            // Recreate first table with different schema
+            execute_single(
+                &executor,
+                "CREATE TABLE temp1 (id INT32 PRIMARY_KEY, name STRING);",
+            );
+            execute_single(&executor, "INSERT INTO temp1 (id, name) VALUES (1, 'new');");
+
+            // Force final WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Shutdown cleanly
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+
+        {
+            // Restart and attempt redo
+            // This should NOT panic despite complex history of deletions
+            let catalog = Catalog::new(temp_dir.path(), "test_db").unwrap();
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("Recovery should handle complex table operations gracefully");
+
+            // Verify final state
+            let result = execute_single(&executor, "SELECT * FROM temp1;");
+            let (_, rows) = expect_select_successful(result);
+            assert_eq!(rows.len(), 1);
+
+            let result = execute_single(&executor, "SELECT * FROM temp2;");
+            let (_, rows) = expect_select_successful(result);
+            assert_eq!(rows.len(), 0);
+
+            // Cleanup
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
     }
 }
