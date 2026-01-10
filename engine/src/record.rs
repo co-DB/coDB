@@ -34,6 +34,14 @@ impl RecordError {
             DbSerializationError::FailedToDeserialize => Self::FailedToDeserialize {
                 field_name: field_name.into(),
             },
+            DbSerializationError::InvalidDateFormat { format: _ } => Self::FailedToDeserialize {
+                field_name: field_name.into(),
+            },
+            DbSerializationError::InvalidDateTimeFormat { format: _ } => {
+                Self::FailedToDeserialize {
+                    field_name: field_name.into(),
+                }
+            }
         }
     }
 }
