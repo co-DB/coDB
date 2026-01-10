@@ -4995,4 +4995,99 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_wal_redo_with_page_reallocation() {
+        // Test scenario: Insert records, truncate table (deallocates pages),
+        // then insert new record that reuses a previously allocated page ID.
+        // On restart, WAL redo should only apply the new record, not old ones.
+
+        let (catalog, temp_dir) = create_catalog();
+        let db_path = temp_dir.path().join("test_db");
+
+        {
+            // Create table, insert records, truncate, then insert one new record
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("with_background_workers should succeed");
+
+            // Create table
+            execute_single(
+                &executor,
+                "CREATE TABLE items (id INT32 PRIMARY_KEY, name STRING);",
+            );
+
+            // Insert initial records
+            execute_single(
+                &executor,
+                "INSERT INTO items (id, name) VALUES (1, 'Item One');",
+            );
+            execute_single(
+                &executor,
+                "INSERT INTO items (id, name) VALUES (2, 'Item Two');",
+            );
+            execute_single(
+                &executor,
+                "INSERT INTO items (id, name) VALUES (3, 'Item Three');",
+            );
+            execute_single(
+                &executor,
+                "INSERT INTO items (id, name) VALUES (4, 'Item Four');",
+            );
+
+            // Force WAL flush to ensure records are logged
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Truncate table - deallocates all pages
+            execute_single(&executor, "TRUNCATE TABLE items;");
+
+            // Force WAL flush
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Insert ONE new record - this might reuse a previously allocated page ID
+            execute_single(
+                &executor,
+                "INSERT INTO items (id, name) VALUES (1, 'Item One');",
+            );
+
+            // Force WAL flush to log the new insert
+            thread::sleep(time::Duration::from_millis(150));
+
+            // Shutdown cleanly
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+
+        {
+            // Restart and verify WAL redo only applies the new record
+            // NOT the old 4 records that existed before truncate
+            let catalog = Catalog::new(temp_dir.path(), "test_db").unwrap();
+            let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
+                .expect("Recovery should handle page reallocation correctly");
+
+            // Verify table has exactly 1 record (the one inserted after truncate)
+            let result = execute_single(&executor, "SELECT * FROM items;");
+            let (_, rows) = expect_select_successful(result);
+            assert_eq!(
+                rows.len(),
+                1,
+                "Expected 1 record after recovery, not the old 4 records"
+            );
+
+            // Verify it's the correct record
+            let record = &rows[0];
+            let id_value = &record.fields[0];
+            let name_value = &record.fields[1];
+
+            assert_eq!(id_value.as_i32().unwrap(), 1);
+            assert_eq!(name_value.as_string().unwrap(), "Item One");
+
+            // Cleanup
+            for mut handle in workers.drain(..) {
+                handle.shutdown().expect("shutdown should succeed");
+                handle.join().expect("join should succeed");
+            }
+        }
+    }
 }
