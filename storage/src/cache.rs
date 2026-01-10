@@ -475,7 +475,7 @@ impl Cache {
         // Manually mark whole page as diff - this way if during redo we have a case:
         // - make changes to page
         // - remove page
-        // - allocates page
+        // - allocate page
         // the newly allocated page will discard previous changes applied from wal.
         let mut pinned_write_page = self.pin_write(&id)?;
         pinned_write_page.mark_diff(0, PAGE_SIZE as _);

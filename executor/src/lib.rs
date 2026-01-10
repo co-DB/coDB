@@ -4695,14 +4695,14 @@ mod tests {
 
     #[test]
     fn test_wal_redo_with_deleted_page() {
-        // Test scenario: Insert many records to span multiple B-tree pages, then delete all but one.
+        // Test scenario: Insert many records to span multiple B-tree pages, then delete all records.
         // On restart, WAL redo should gracefully handle pages that were deallocated.
 
         let (catalog, temp_dir) = create_catalog();
         let db_path = temp_dir.path().join("test_db");
 
         {
-            // Create table, insert many records, then delete most of them
+            // Create table, insert many records, then delete all of them
             let (executor, mut workers) = Executor::with_background_workers(&db_path, catalog)
                 .expect("with_background_workers should succeed");
 
