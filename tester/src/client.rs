@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use protocol::{Request, Response};
-use rkyv::rancor::Error as RkyvError;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{
@@ -34,7 +33,7 @@ impl BinaryClient {
     }
 
     pub async fn send_request(&mut self, request: &Request) -> Result<(), TesterError> {
-        let bytes = rkyv::to_bytes::<RkyvError>(request)?;
+        let bytes = rmp_serde::to_vec(request)?;
         self.writer.write_u32(bytes.len() as u32).await?;
         self.writer.write_all(&bytes).await?;
         self.writer.flush().await?;
@@ -59,10 +58,7 @@ impl BinaryClient {
             Err(e) => return Err(TesterError::Io(e)),
         }
 
-        let archived = rkyv::access::<protocol::ArchivedResponse, RkyvError>(&buffer[..])
-            .map_err(TesterError::BinaryDeserialization)?;
-        let response = rkyv::deserialize::<Response, RkyvError>(archived)
-            .map_err(TesterError::BinaryDeserialization)?;
+        let response = rmp_serde::from_slice(&buffer)?;
 
         Ok(ReadResult::Response(response))
     }

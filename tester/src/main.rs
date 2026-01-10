@@ -2,7 +2,6 @@ use std::io;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use rkyv::rancor::Error as RkyvError;
 use thiserror::Error;
 
 use crate::performance::concurrent_inserts::{self, ConcurrentInserts};
@@ -121,10 +120,10 @@ enum TesterError {
     Io(#[from] io::Error),
 
     #[error("failed to serialize binary message: {0}")]
-    BinarySerialization(#[from] RkyvError),
+    BinarySerialization(#[from] rmp_serde::encode::Error),
 
     #[error("failed to deserialize binary message: {0}")]
-    BinaryDeserialization(RkyvError),
+    BinaryDeserialization(#[from] rmp_serde::decode::Error),
 
     #[error("server disconnected unexpectedly")]
     Disconnected,

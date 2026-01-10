@@ -1263,7 +1263,7 @@ mod tests {
     use crate::slotted_page::SlottedPageHeader;
     use bytemuck::Pod;
     use bytemuck::Zeroable;
-    use storage::paged_file::PAGE_SIZE;
+    use storage::paged_file::{PAGE_SIZE, USABLE_PAGE_SIZE};
 
     use std::{
         collections::HashSet,
@@ -1540,7 +1540,7 @@ mod tests {
         let fsm = create_test_fsm::<4>(cache, file_key, TestPageHeader::NO_NEXT_PAGE);
 
         // Empty page (100% free) should go to last bucket
-        let bucket = fsm.bucket_for_space(PAGE_SIZE);
+        let bucket = fsm.bucket_for_space(USABLE_PAGE_SIZE);
         assert_eq!(bucket, 3);
     }
 
@@ -1561,19 +1561,19 @@ mod tests {
 
         // [0%, 25%) -> bucket 0
         assert_eq!(fsm.bucket_for_space(0), 0);
-        assert_eq!(fsm.bucket_for_space(PAGE_SIZE / 4 - 1), 0);
+        assert_eq!(fsm.bucket_for_space(USABLE_PAGE_SIZE / 4 - 1), 0);
 
         // [25%, 50%) -> bucket 1
-        assert_eq!(fsm.bucket_for_space(PAGE_SIZE / 4), 1);
-        assert_eq!(fsm.bucket_for_space(PAGE_SIZE / 2 - 1), 1);
+        assert_eq!(fsm.bucket_for_space(USABLE_PAGE_SIZE / 4), 1);
+        assert_eq!(fsm.bucket_for_space(USABLE_PAGE_SIZE / 2 - 1), 1);
 
         // [50%, 75%) -> bucket 2
-        assert_eq!(fsm.bucket_for_space(PAGE_SIZE / 2), 2);
-        assert_eq!(fsm.bucket_for_space(PAGE_SIZE * 3 / 4 - 1), 2);
+        assert_eq!(fsm.bucket_for_space(USABLE_PAGE_SIZE / 2), 2);
+        assert_eq!(fsm.bucket_for_space(USABLE_PAGE_SIZE * 3 / 4 - 1), 2);
 
         // [75%, 100%] -> bucket 3
-        assert_eq!(fsm.bucket_for_space(PAGE_SIZE * 3 / 4), 3);
-        assert_eq!(fsm.bucket_for_space(PAGE_SIZE), 3);
+        assert_eq!(fsm.bucket_for_space(USABLE_PAGE_SIZE * 3 / 4), 3);
+        assert_eq!(fsm.bucket_for_space(USABLE_PAGE_SIZE), 3);
     }
 
     #[test]
@@ -1588,7 +1588,7 @@ mod tests {
         let (_, page_id) = cache.allocate_page(&file_key).unwrap();
 
         // Add page with 30% free space (should go to bucket 1)
-        let free_space = PAGE_SIZE * 30 / 100;
+        let free_space = USABLE_PAGE_SIZE * 30 / 100;
         fsm.update_page_bucket(page_id, free_space);
 
         let bucket_idx = fsm.bucket_for_space(free_space);
@@ -1607,10 +1607,10 @@ mod tests {
 
         // Create pages with different free space amounts
         let pages_and_spaces = vec![
-            (PAGE_SIZE * 10 / 100, 0), // 10% -> bucket 0
-            (PAGE_SIZE * 35 / 100, 1), // 35% -> bucket 1
-            (PAGE_SIZE * 60 / 100, 2), // 60% -> bucket 2
-            (PAGE_SIZE * 90 / 100, 3), // 90% -> bucket 3
+            (USABLE_PAGE_SIZE * 10 / 100, 0), // 10% -> bucket 0
+            (USABLE_PAGE_SIZE * 35 / 100, 1), // 35% -> bucket 1
+            (USABLE_PAGE_SIZE * 60 / 100, 2), // 60% -> bucket 2
+            (USABLE_PAGE_SIZE * 90 / 100, 3), // 90% -> bucket 3
         ];
 
         for (free_space, expected_bucket) in pages_and_spaces {
@@ -1691,12 +1691,12 @@ mod tests {
         );
 
         // Add page to bucket 3 (high free space)
-        let free_space = PAGE_SIZE * 90 / 100;
+        let free_space = USABLE_PAGE_SIZE * 90 / 100;
         let page_id = create_page_with_free_space(&cache, &file_key, free_space);
         fsm.update_page_bucket(page_id, free_space);
 
         // Request space that maps to bucket 1, should search up to bucket 3
-        let needed = PAGE_SIZE * 30 / 100;
+        let needed = USABLE_PAGE_SIZE * 30 / 100;
         let result = fsm.page_with_free_space(needed).unwrap();
         assert!(result.is_some());
     }
@@ -1771,7 +1771,7 @@ mod tests {
                     SlottedPage::<_, TestPageHeader>::initialize_default(pinned_page).unwrap();
                 drop(slotted);
 
-                let free_space = PAGE_SIZE * (50 + i) / 100;
+                let free_space = USABLE_PAGE_SIZE * (50 + i) / 100;
                 fsm_clone.update_page_bucket(page_id, free_space);
             });
 
@@ -1801,12 +1801,12 @@ mod tests {
         );
 
         // Create a page with 80% free space (bucket 3: [75%-100%])
-        let free_space_80_percent = PAGE_SIZE * 80 / 100;
+        let free_space_80_percent = USABLE_PAGE_SIZE * 80 / 100;
         let page_id = create_page_with_free_space(&cache, &file_key, free_space_80_percent);
         fsm.update_page_bucket(page_id, free_space_80_percent);
 
         // Request 90% free space - page should be popped but re-inserted since it's still in bucket 3
-        let needed_90_percent = PAGE_SIZE * 90 / 100;
+        let needed_90_percent = USABLE_PAGE_SIZE * 90 / 100;
         let result = fsm.page_with_free_space(needed_90_percent).unwrap();
         // Should not find suitable page
         assert!(result.is_none());
@@ -1826,7 +1826,7 @@ mod tests {
 
         // Manually insert a page into bucket 3 that actually belongs to bucket 2
         // (simulating a stale entry)
-        let free_space_60_percent = PAGE_SIZE * 60 / 100;
+        let free_space_60_percent = USABLE_PAGE_SIZE * 60 / 100;
         let page_id = create_page_with_free_space(&cache, &file_key, free_space_60_percent);
 
         // Add to tracked_pages and push to wrong bucket (bucket 3)
@@ -1834,7 +1834,7 @@ mod tests {
         fsm.buckets[3].push(page_id);
 
         // Request space that requires searching bucket 3
-        let needed_80_percent = PAGE_SIZE * 80 / 100;
+        let needed_80_percent = USABLE_PAGE_SIZE * 80 / 100;
         let result = fsm.page_with_free_space(needed_80_percent).unwrap();
         assert!(result.is_none());
 

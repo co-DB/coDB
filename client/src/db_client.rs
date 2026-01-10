@@ -1,8 +1,7 @@
 use std::io::ErrorKind;
 
 use log::info;
-use protocol::{ArchivedResponse, Request, Response};
-use rkyv::rancor::Error;
+use protocol::{Request, Response};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{
@@ -69,8 +68,7 @@ pub struct BinaryProtocolHandler {
 
 impl ProtocolHandler for BinaryProtocolHandler {
     async fn send_request(&mut self, request: Request) -> Result<(), ClientError> {
-        let bytes =
-            rkyv::to_bytes::<Error>(&request).map_err(ClientError::BinarySerializationError)?;
+        let bytes = rmp_serde::to_vec(&request)?;
         self.writer.write_u32(bytes.len() as u32).await?;
         self.writer.write_all(&bytes).await?;
         self.writer.flush().await?;
@@ -98,10 +96,7 @@ impl ProtocolHandler for BinaryProtocolHandler {
                 return Err(ClientError::IoError(e));
             }
         }
-        let archived_response = rkyv::access::<ArchivedResponse, Error>(&buffer[..])
-            .map_err(ClientError::BinaryDeserializationError)?;
-        let response = rkyv::deserialize::<Response, Error>(archived_response)
-            .map_err(ClientError::BinaryDeserializationError)?;
+        let response = rmp_serde::from_slice::<Response>(&buffer)?;
 
         Ok(ReadResult::Response(response))
     }

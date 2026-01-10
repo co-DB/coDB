@@ -20,7 +20,7 @@ parking_lot.workspace = true
 itertools.workspace = true
 log.workspace = true
 env_logger.workspace = true
-rkyv.workspace = true
+rmp-serde.workspace = true
 crossbeam.workspace = true
 
 tokio-util = "0.7"

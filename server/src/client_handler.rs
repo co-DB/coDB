@@ -10,7 +10,6 @@ use log::{error, info};
 use metadata::catalog_manager::{CatalogManager, CatalogManagerError};
 use parking_lot::RwLock;
 use protocol::{ErrorType, Record as ProtocolRecord, Request, Response, StatementType};
-use rkyv::rancor;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -49,10 +48,10 @@ pub(crate) enum ClientError {
     ExecutorError(#[from] ExecutorError),
 
     #[error("failed to serialize binary message: {0}")]
-    BinarySerializationError(rancor::Error),
+    BinarySerializationError(#[from] rmp_serde::encode::Error),
 
     #[error("failed to deserialize binary message: {0}")]
-    BinaryDeserializationError(rancor::Error),
+    BinaryDeserializationError(#[from] rmp_serde::decode::Error),
 }
 
 impl ClientError {
@@ -342,7 +341,6 @@ mod client_handler_tests {
     use metadata::catalog_manager::CatalogManager;
     use parking_lot::RwLock;
     use protocol::{Request, Response, StatementType};
-    use rkyv::rancor::Error;
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
     use tokio::net::{TcpListener, TcpStream};
@@ -425,7 +423,7 @@ mod client_handler_tests {
 
         async fn send_request(&mut self, request: &Request) -> Result<(), ClientError> {
             let bytes =
-                rkyv::to_bytes::<Error>(request).map_err(ClientError::BinarySerializationError)?;
+                rmp_serde::to_vec(request).map_err(ClientError::BinarySerializationError)?;
             self.writer.write_u32(bytes.len() as u32).await?;
             self.writer.write_all(&bytes).await?;
             self.writer.flush().await?;
@@ -437,9 +435,7 @@ mod client_handler_tests {
             let mut buffer = vec![0u8; length as usize];
             self.reader.read_exact(&mut buffer).await?;
 
-            let archived_response = rkyv::access::<protocol::ArchivedResponse, Error>(&buffer)
-                .map_err(ClientError::BinaryDeserializationError)?;
-            let response = rkyv::deserialize::<Response, Error>(archived_response)
+            let response = rmp_serde::from_slice::<Response>(&buffer)
                 .map_err(ClientError::BinaryDeserializationError)?;
             Ok(response)
         }

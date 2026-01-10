@@ -200,6 +200,7 @@ struct MergeContext {
     metadata_page: Option<PinnedWritePage>,
 }
 
+#[derive(Debug)]
 pub struct RangeBound {
     pub key: Key,
     pub inclusive: bool,
@@ -225,6 +226,7 @@ impl RangeBound {
     }
 }
 
+#[derive(Debug)]
 pub struct Range {
     start_key: Option<RangeBound>,
     end_key: Option<RangeBound>,
@@ -3121,6 +3123,17 @@ mod test {
             .collect();
 
         assert_eq!(results.len(), 10);
+
+        // Verify each inserted record is present with correct RecordPtr
+        for i in 0..10 {
+            let expected_ptr = record_ptr(i as u32, 0);
+            assert!(
+                results.contains(&expected_ptr),
+                "Record pointer {:?} for key {} should be in results",
+                expected_ptr,
+                i * 10
+            );
+        }
     }
 
     #[test]
@@ -3163,5 +3176,35 @@ mod test {
             .collect();
 
         assert_eq!(results.len(), 301);
+    }
+
+    #[test]
+    fn test_scan_1000_records_with_same_record_ptr() {
+        let (cache, file_key, _temp_dir) = setup_test_cache();
+        let btree = create_empty_btree(cache, file_key).unwrap();
+
+        // Insert 1000 records all pointing to the same RecordPtr (page_id: 5, slot_id: 5)
+        let expected_ptr = record_ptr(5, 5);
+        for i in 0..1000 {
+            btree.insert(&key_i32(i), expected_ptr).unwrap();
+        }
+
+        // Scan all records and verify each one has the correct RecordPtr
+        let range = make_range(0, true, 999, true);
+        let results: Vec<_> = btree
+            .ranged_scan(range)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(results.len(), 1000, "Should have exactly 1000 records");
+
+        for (i, record_ptr) in results.iter().enumerate() {
+            assert_eq!(
+                *record_ptr, expected_ptr,
+                "RecordPtr at position {} should be {:?}, but got {:?}",
+                i, expected_ptr, record_ptr
+            );
+        }
     }
 }
