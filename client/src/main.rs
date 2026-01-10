@@ -1,7 +1,6 @@
 use clap::{Parser, ValueEnum};
 use log::info;
 use protocol::{BINARY_PROTOCOL_PORT, Request, TEXT_PROTOCOL_PORT};
-use rkyv::rancor;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
@@ -154,9 +153,9 @@ enum ClientError {
     #[error("invalid command: {reason}")]
     InvalidCommand { reason: String },
     #[error("failed to serialize binary message: {0}")]
-    BinarySerializationError(rancor::Error),
+    BinarySerializationError(#[from] rmp_serde::encode::Error),
     #[error("failed to deserialize binary message: {0}")]
-    BinaryDeserializationError(rancor::Error),
+    BinaryDeserializationError(#[from] rmp_serde::decode::Error),
     #[error("missing parameter: {parameter}")]
     MissingParameter { parameter: String },
 }
