@@ -1,6 +1,6 @@
 use crossbeam::channel;
 use dashmap::{DashMap, Entry};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use lru::LruCache;
 use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{
@@ -385,7 +385,17 @@ impl Cache {
     /// Applies single page operation to the page if its LSN is lower than `lsn`.
     fn apply_operation(&self, lsn: Lsn, operation: SinglePageOperation) -> Result<(), CacheError> {
         let (page_ref, diff) = operation.into_parts();
-        let mut page = self.pin_write(&page_ref)?;
+        let mut page = match self.pin_write(&page_ref) {
+            Ok(p) => p,
+            Err(e) => {
+                if let CacheError::PagedFileError(PagedFileError::InvalidPageId(_)) = e {
+                    debug!("Skipping page '{page_ref:?}' in redo because it was deleted.");
+                    return Ok(());
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         if page.lsn() >= lsn {
             return Ok(());
         }
