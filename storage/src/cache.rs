@@ -1,6 +1,6 @@
 use crossbeam::channel;
 use dashmap::{DashMap, Entry};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use lru::LruCache;
 use parking_lot::{MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{
@@ -15,12 +15,15 @@ use std::{
 };
 use thiserror::Error;
 
-use crate::write_ahead_log::{SinglePageOperation, WalClient, WalHandle, WalRecordData};
 use crate::{
     background_worker::{BackgroundWorker, BackgroundWorkerHandle},
     files_manager::{FileKey, FilesManager, FilesManagerError},
     page_diff::PageDiff,
     paged_file::{Lsn, Page, PageId, PagedFile, PagedFileError, get_page_lsn, set_page_lsn},
+};
+use crate::{
+    paged_file::PAGE_SIZE,
+    write_ahead_log::{SinglePageOperation, WalClient, WalHandle, WalRecordData},
 };
 use types::serialization::DbSerializable;
 
@@ -385,7 +388,17 @@ impl Cache {
     /// Applies single page operation to the page if its LSN is lower than `lsn`.
     fn apply_operation(&self, lsn: Lsn, operation: SinglePageOperation) -> Result<(), CacheError> {
         let (page_ref, diff) = operation.into_parts();
-        let mut page = self.pin_write(&page_ref)?;
+        let mut page = match self.pin_write(&page_ref) {
+            Ok(p) => p,
+            Err(e) => {
+                if let CacheError::PagedFileError(PagedFileError::InvalidPageId(_)) = e {
+                    debug!("Skipping page '{page_ref:?}' in redo because it was deleted.");
+                    return Ok(());
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         if page.lsn() >= lsn {
             return Ok(());
         }
@@ -438,12 +451,36 @@ impl Cache {
     /// In case if lock is not needed the return value should not be assigned, so that lock lives as little as needed.
     pub fn allocate_page(&self, file: &FileKey) -> Result<(PinnedWritePage, PageId), CacheError> {
         let pf = self.files.get_or_open_new_file(file)?;
-        let page_id = pf.lock().allocate_page()?;
+        let mut lock = pf.lock();
+
+        // Allocate new page
+        let page_id = lock.allocate_page()?;
         let id = FilePageRef {
             file_key: file.clone(),
             page_id,
         };
-        Ok((self.pin_write(&id)?, page_id))
+
+        // Initialize frame and add it to frames
+        let page = lock.read_page(page_id)?;
+        let new_frame = Arc::new(PageFrame::new(id.clone(), page));
+        self.frames.insert(id.clone(), new_frame.clone());
+        self.push_to_lru(&id);
+        drop(lock);
+
+        // Cleanup cache if too many frames in memory
+        if self.frames.len() > self.capacity && !self.try_evict_frame()? {
+            warn!("Cache: cannot evict frame - every frame in cache is pinned or lru is empty.");
+        }
+
+        // Manually mark whole page as diff - this way if during redo we have a case:
+        // - make changes to page
+        // - remove page
+        // - allocates page
+        // the newly allocated page will discard previous changes applied from wal.
+        let mut pinned_write_page = self.pin_write(&id)?;
+        pinned_write_page.mark_diff(0, PAGE_SIZE as _);
+
+        Ok((pinned_write_page, page_id))
     }
 
     /// Remove page from file.
