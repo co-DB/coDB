@@ -509,30 +509,6 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             }
         };
 
-        // Check if column is primary key
-        let table_metadata = match self.executor.catalog.read().table(&update.table_name) {
-            Ok(tm) => tm,
-            Err(_) => {
-                return error_factory::runtime_error(format!(
-                    "Table '{}' does not exist",
-                    update.table_name
-                ));
-            }
-        };
-        let primary_key_name = table_metadata.primary_key_column_name();
-        for column in &update.columns {
-            let column_name = match self.ast.node(*column) {
-                ResolvedExpression::ColumnRef(cr) => &cr.name,
-                _ => unreachable!(),
-            };
-            if column_name == primary_key_name {
-                return error_factory::runtime_error(format!(
-                    "Cannot update primary key column '{}'",
-                    column_name
-                ));
-            }
-        }
-
         let rows_affected = records.len();
 
         for record_handle in records {
