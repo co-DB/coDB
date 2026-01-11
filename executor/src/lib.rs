@@ -2817,6 +2817,83 @@ mod tests {
     }
 
     #[test]
+    fn test_update_primary_key_column_fails() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 30);",
+        );
+
+        // Try to update primary key column
+        let result = execute_single(&executor, "UPDATE users SET id = 999 WHERE id = 1;");
+
+        assert_parse_error_contains(result, "primary key column 'id' cannot be updated");
+
+        // Verify no records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 2);
+
+        // Alice should still have id = 1
+        let alice = rows
+            .iter()
+            .find(|r| *r.fields[0].deref() == Value::Int32(1))
+            .unwrap();
+        assert_eq!(*alice.fields[1].deref(), Value::String("Alice".into()));
+        assert_eq!(*alice.fields[2].deref(), Value::Int32(25));
+    }
+
+    #[test]
+    fn test_update_multiple_columns_including_primary_key_fails() {
+        let (executor, _temp_dir) = create_test_executor();
+
+        // Create and populate table
+        execute_single(
+            &executor,
+            "CREATE TABLE users (id INT32 PRIMARY_KEY, name STRING, age INT32);",
+        );
+        execute_single(
+            &executor,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);",
+        );
+
+        // Try to update both primary key and other columns
+        let result = execute_single(
+            &executor,
+            "UPDATE users SET id = 999, name = 'Alicia', age = 26 WHERE id = 1;",
+        );
+
+        assert_parse_error_contains(result, "primary key column 'id' cannot be updated");
+
+        // Verify no records were updated
+        let (select_plan, select_ast) =
+            create_single_statement("SELECT id, name, age FROM users;", &executor);
+        let result = executor.execute_statement(&select_plan, &select_ast);
+
+        let (_, rows) = expect_select_successful(result);
+        assert_eq!(rows.len(), 1);
+
+        // Alice should remain unchanged
+        let alice = &rows[0];
+        assert_eq!(*alice.fields[0].deref(), Value::Int32(1));
+        assert_eq!(*alice.fields[1].deref(), Value::String("Alice".into()));
+        assert_eq!(*alice.fields[2].deref(), Value::Int32(25));
+    }
+
+    #[test]
     fn test_drop_table_empty_table() {
         let (executor, _temp_dir) = create_test_executor();
 

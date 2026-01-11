@@ -519,6 +519,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                         Ok(cm) => cm,
                         Err(e) => return StatementResult::from(&e),
                     };
+
                 let e = ExpressionExecutor::with_single_record(&record_handle.record, self.ast);
                 match e.execute_expression(*expression) {
                     Ok(value) => {
