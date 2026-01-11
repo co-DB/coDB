@@ -65,6 +65,8 @@ pub enum AnalyzerError {
     ColumnAlreadyExists { column: String },
     #[error("column '{column}' cannot be dropped")]
     ColumnCannotBeDropped { column: String },
+    #[error("primary key column '{column}' cannot be updated")]
+    PrimaryKeyCannotBeUpdated { column: String },
     #[error("primary key missing in create table statement")]
     PrimaryKeyMissing,
     #[error("unexpected type: expected {expected}, got {got}")]
@@ -366,6 +368,17 @@ impl<'a> Analyzer<'a> {
             .collect::<Result<Vec<_>, AnalyzerError>>()?;
         let (resolved_columns, resolved_values): (Vec<_>, Vec<_>) =
             resolved_column_setters.into_iter().unzip();
+
+        // Check if any column being updated is the primary key
+        for &column in &resolved_columns {
+            let column_name = self.get_column_name(column)?;
+            if column_name == primary_key {
+                return Err(AnalyzerError::PrimaryKeyCannotBeUpdated {
+                    column: column_name,
+                });
+            }
+        }
+
         let resolved_where_clause = update
             .where_clause
             .map(|node_id| self.resolve_expression(node_id))
@@ -3160,6 +3173,112 @@ mod tests {
                 assert_eq!(value_type, "Float64");
             }
             other => panic!("expected ColumnAndValueTypeDontMatch, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_update_primary_key_errors() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // column (id - primary key)
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        // value
+        let val_new = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(999),
+        }));
+
+        let update = UpdateStatement {
+            table_name,
+            column_setters: vec![(col_id, val_new)],
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Update(update));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
+        match err {
+            AnalyzerError::PrimaryKeyCannotBeUpdated { column } => {
+                assert_eq!(column, "id");
+            }
+            other => panic!("expected PrimaryKeyCannotBeUpdated, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn analyze_update_multiple_columns_including_primary_key_errors() {
+        let catalog = catalog_with_users();
+        let mut ast = Ast::default();
+
+        // table identifier
+        let table_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "users".into(),
+        }));
+        let table_name = ast.add_node(Expression::TableIdentifier(TableIdentifierNode {
+            identifier: table_ident,
+            alias: None,
+        }));
+
+        // column name (non-primary key)
+        let name_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "name".into(),
+        }));
+        let col_name = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: name_ident,
+            table_alias: None,
+        }));
+
+        // column id (primary key)
+        let id_ident = ast.add_node(Expression::Identifier(IdentifierNode {
+            value: "id".into(),
+        }));
+        let col_id = ast.add_node(Expression::ColumnIdentifier(ColumnIdentifierNode {
+            identifier: id_ident,
+            table_alias: None,
+        }));
+
+        // values
+        let val_name = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::String("John".into()),
+        }));
+        let val_id = ast.add_node(Expression::Literal(LiteralNode {
+            value: Literal::Int(999),
+        }));
+
+        let update = UpdateStatement {
+            table_name,
+            column_setters: vec![(col_name, val_name), (col_id, val_id)],
+            where_clause: None,
+        };
+        ast.add_statement(Statement::Update(update));
+
+        let analyzer = Analyzer::new(&ast, catalog);
+        let errs = analyzer.analyze().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let err = &errs[0];
+        match err {
+            AnalyzerError::PrimaryKeyCannotBeUpdated { column } => {
+                assert_eq!(column, "id");
+            }
+            other => panic!("expected PrimaryKeyCannotBeUpdated, got: {:?}", other),
         }
     }
 
