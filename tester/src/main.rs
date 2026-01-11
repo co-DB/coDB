@@ -117,14 +117,13 @@ enum Command {
     },
 
     /// E2E test for SELECT statements with comprehensive validation
-    E2eSelect {
-        /// Number of records to insert for testing
-        #[arg(long, default_value_t = 5000)]
-        records: usize,
-    },
+    E2eSelect,
 
     /// E2E test for INSERT statements with comprehensive validation
     E2eInsert,
+
+    /// Run all E2E tests (SELECT and INSERT)
+    E2eAll,
 }
 
 #[derive(Debug, Error)]
@@ -311,18 +310,20 @@ async fn concurrent_reads_non_index(
     Ok(test_results)
 }
 
-async fn e2e_select(num_records: usize) -> Result<(), TesterError> {
+async fn e2e_select() -> Result<(), TesterError> {
     let db_name = "E2E_SELECT_TEST".to_string();
     let table_name = "TEST_TABLE".to_string();
+
+    const NUM_RECORDS: usize = 15000;
 
     let setup = select::Setup {
         database_name: db_name.clone(),
         table_name: table_name.clone(),
-        num_records,
+        num_records: NUM_RECORDS,
     };
 
     // Generate test data
-    let test_data = select::TestRecord::generate(num_records);
+    let test_data = select::TestRecord::generate(NUM_RECORDS);
 
     let test = select::Test {
         database_name: db_name.clone(),
@@ -364,6 +365,42 @@ async fn e2e_insert() -> Result<(), TesterError> {
 
     println!("E2E INSERT test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
+
+    Ok(())
+}
+
+async fn e2e_all() -> Result<(), TesterError> {
+    println!("\n========================================");
+    println!("Running ALL E2E Tests");
+    println!("========================================\n");
+
+    // Run INSERT tests
+    println!("[1/2] Running INSERT E2E tests...");
+    match e2e_insert().await {
+        Ok(()) => {
+            println!("✓ INSERT E2E tests passed\n");
+        }
+        Err(e) => {
+            println!("✗ INSERT E2E tests failed: {:?}\n", e);
+            return Err(e);
+        }
+    }
+
+    // Run SELECT tests
+    println!("[2/2] Running SELECT E2E tests...");
+    match e2e_select().await {
+        Ok(()) => {
+            println!("✓ SELECT E2E tests passed\n");
+        }
+        Err(e) => {
+            println!("✗ SELECT E2E tests failed: {:?}\n", e);
+            return Err(e);
+        }
+    }
+
+    println!("========================================");
+    println!("All E2E Tests Completed Successfully!");
+    println!("========================================");
 
     Ok(())
 }
@@ -425,12 +462,16 @@ async fn main() -> Result<(), TesterError> {
             report_stats("concurrent-reads-and-inserts", &test_results);
             Ok(())
         }
-        Command::E2eSelect { records } => {
-            e2e_select(records).await?;
+        Command::E2eSelect => {
+            e2e_select().await?;
             Ok(())
         }
         Command::E2eInsert => {
             e2e_insert().await?;
+            Ok(())
+        }
+        Command::E2eAll => {
+            e2e_all().await?;
             Ok(())
         }
     }
