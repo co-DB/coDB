@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
+use crate::e2e::insert::{self, InsertE2ETest};
 use crate::e2e::select::{self, SelectE2ETest};
 use crate::performance::concurrent_inserts::{self, ConcurrentInserts};
 use crate::performance::concurrent_reads::{self, ReadMany};
@@ -121,6 +122,9 @@ enum Command {
         #[arg(long, default_value_t = 5000)]
         records: usize,
     },
+
+    /// E2E test for INSERT statements with comprehensive validation
+    E2eInsert,
 }
 
 #[derive(Debug, Error)]
@@ -338,6 +342,32 @@ async fn e2e_select(num_records: usize) -> Result<(), TesterError> {
     Ok(())
 }
 
+async fn e2e_insert() -> Result<(), TesterError> {
+    let db_name = "E2E_INSERT_TEST".to_string();
+    let table_name = "INSERT_TEST_TABLE".to_string();
+
+    let setup = insert::Setup {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+    };
+
+    let test = insert::Test {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+    };
+
+    let cleanup = insert::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let result = InsertE2ETest::run_suite(&setup, &test, &cleanup).await?;
+
+    println!("E2E INSERT test completed successfully!");
+    println!("Tests passed: {}", result.tests_passed);
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), TesterError> {
     env_logger::init();
@@ -397,6 +427,10 @@ async fn main() -> Result<(), TesterError> {
         }
         Command::E2eSelect { records } => {
             e2e_select(records).await?;
+            Ok(())
+        }
+        Command::E2eInsert => {
+            e2e_insert().await?;
             Ok(())
         }
     }
