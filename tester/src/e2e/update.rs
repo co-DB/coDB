@@ -236,15 +236,14 @@ impl Suite<E2ETestResult> for UpdateE2ETest {
     async fn run(args: &Self::TestArgs) -> Result<E2ETestResult, TesterError> {
         let mut tests_passed = 0;
 
-        // TODO: uncomment once its done
         // Test 1: Try to update primary key (should fail)
-        // info!("\n=== Test 1: Update primary key (should fail) ===");
-        // if let Err(e) = test_update_primary_key_fails(args).await {
-        //     error!("Test 1 failed: {:?}", e);
-        //     return Err(e);
-        // }
-        // info!("✓ Test 1: Update primary key correctly rejected");
-        // tests_passed += 1;
+        info!("\n=== Test 1: Update primary key (should fail) ===");
+        if let Err(e) = test_update_primary_key_fails(args).await {
+            error!("Test 1 failed: {:?}", e);
+            return Err(e);
+        }
+        info!("✓ Test 1: Update primary key correctly rejected");
+        tests_passed += 1;
 
         // Test 2: Update INT64 column (big_id)
         info!("\n=== Test 2: Update INT64 column ===");
