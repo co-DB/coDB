@@ -509,7 +509,7 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             }
         };
 
-        // Get primary key column name
+        // Check if column is primary key
         let table_metadata = match self.executor.catalog.read().table(&update.table_name) {
             Ok(tm) => tm,
             Err(_) => {
@@ -520,6 +520,18 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
             }
         };
         let primary_key_name = table_metadata.primary_key_column_name();
+        for column in &update.columns {
+            let column_name = match self.ast.node(*column) {
+                ResolvedExpression::ColumnRef(cr) => &cr.name,
+                _ => unreachable!(),
+            };
+            if column_name == primary_key_name {
+                return error_factory::runtime_error(format!(
+                    "Cannot update primary key column '{}'",
+                    column_name
+                ));
+            }
+        }
 
         let rows_affected = records.len();
 
@@ -531,13 +543,6 @@ impl<'e, 'q> StatementExecutor<'e, 'q> {
                         Ok(cm) => cm,
                         Err(e) => return StatementResult::from(&e),
                     };
-
-                if column_metadata.name() == primary_key_name {
-                    return error_factory::runtime_error(format!(
-                        "Cannot update primary key column '{}'",
-                        primary_key_name
-                    ));
-                }
 
                 let e = ExpressionExecutor::with_single_record(&record_handle.record, self.ast);
                 match e.execute_expression(*expression) {
