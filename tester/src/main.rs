@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
+use crate::e2e::delete::{self, DeleteE2ETest};
 use crate::e2e::insert::{self, InsertE2ETest};
 use crate::e2e::select::{self, SelectE2ETest};
 use crate::e2e::update::{self, UpdateE2ETest};
@@ -126,7 +127,10 @@ enum Command {
     /// E2E test for UPDATE statements with comprehensive validation
     E2eUpdate,
 
-    /// Run all E2E tests (SELECT, INSERT, and UPDATE)
+    /// E2E test for DELETE statements with comprehensive validation
+    E2eDelete,
+
+    /// Run all E2E tests (SELECT, INSERT, UPDATE, and DELETE)
     E2eAll,
 }
 
@@ -405,13 +409,44 @@ async fn e2e_update() -> Result<(), TesterError> {
     Ok(())
 }
 
+async fn e2e_delete() -> Result<(), TesterError> {
+    let db_name = "DELETE_E2E_DB".to_string();
+    let table_name = "DELETE_E2E_TABLE".to_string();
+    const NUM_RECORDS: usize = 5000;
+
+    let test_data = delete::DeleteTestRecord::generate(NUM_RECORDS);
+
+    let setup = delete::Setup {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        num_records: NUM_RECORDS,
+    };
+
+    let test = delete::Test {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        test_data,
+    };
+
+    let cleanup = delete::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let result = DeleteE2ETest::run_suite(&setup, &test, &cleanup).await?;
+
+    println!("E2E DELETE test completed successfully!");
+    println!("Tests passed: {}", result.tests_passed);
+
+    Ok(())
+}
+
 async fn e2e_all() -> Result<(), TesterError> {
     println!("\n========================================");
     println!("Running ALL E2E Tests");
     println!("========================================\n");
 
     // Run INSERT tests
-    println!("[1/3] Running INSERT E2E tests...");
+    println!("[1/4] Running INSERT E2E tests...");
     match e2e_insert().await {
         Ok(()) => {
             println!("✓ INSERT E2E tests passed\n");
@@ -423,7 +458,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run SELECT tests
-    println!("[2/3] Running SELECT E2E tests...");
+    println!("[2/4] Running SELECT E2E tests...");
     match e2e_select().await {
         Ok(()) => {
             println!("✓ SELECT E2E tests passed\n");
@@ -435,13 +470,25 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run UPDATE tests
-    println!("[3/3] Running UPDATE E2E tests...");
+    println!("[3/4] Running UPDATE E2E tests...");
     match e2e_update().await {
         Ok(()) => {
             println!("✓ UPDATE E2E tests passed\n");
         }
         Err(e) => {
             println!("✗ UPDATE E2E tests failed: {:?}\n", e);
+            return Err(e);
+        }
+    }
+
+    // Run DELETE tests
+    println!("[4/4] Running DELETE E2E tests...");
+    match e2e_delete().await {
+        Ok(()) => {
+            println!("✓ DELETE E2E tests passed\n");
+        }
+        Err(e) => {
+            println!("✗ DELETE E2E tests failed: {:?}\n", e);
             return Err(e);
         }
     }
@@ -520,6 +567,10 @@ async fn main() -> Result<(), TesterError> {
         }
         Command::E2eUpdate => {
             e2e_update().await?;
+            Ok(())
+        }
+        Command::E2eDelete => {
+            e2e_delete().await?;
             Ok(())
         }
         Command::E2eAll => {
