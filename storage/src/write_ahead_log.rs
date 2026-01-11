@@ -4,7 +4,7 @@ use crate::page_diff::PageDiff;
 use crate::paged_file::{AtomicLsn, Lsn};
 use crossbeam::channel;
 use crossbeam::select;
-use log::error;
+use log::{error, info};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -148,8 +148,7 @@ impl WalManager {
                             }
                         }
                         Err(_) => {
-                            // Channel closed, shutdown gracefully
-                            self.shutdown_gracefully();
+                            info!("Requests channel closed. Waiting for shutdown signal...");
                             break;
                         }
                     }
@@ -166,6 +165,9 @@ impl WalManager {
                 }
             }
         }
+
+        let _ = self.shutdown.recv();
+        self.shutdown_gracefully();
     }
 
     fn shutdown_gracefully(&mut self) {

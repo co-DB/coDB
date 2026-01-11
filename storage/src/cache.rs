@@ -734,6 +734,22 @@ impl Cache {
         }
 
         let page = frame.read();
+
+        if let Some(wal_client) = &self.wal_client {
+            let flushed_lsn = wal_client.flushed_lsn();
+
+            let page_lsn = get_page_lsn(&page);
+
+            // WAL record of this page wasn't yet flushed to disk - we need to do it before flushing page.
+            if page_lsn > flushed_lsn && !wal_client.flush() {
+                warn!(
+                    "Cache: failed to flush WAL before flushing page '{:?}' to disk.",
+                    frame.file_page_ref
+                );
+                return Ok(());
+            }
+        }
+
         file_lock.write_page(frame.file_page_ref.page_id, *page)?;
         frame.dirty.store(false, Ordering::Release);
 
