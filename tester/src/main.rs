@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
+use crate::e2e::select::{self, SelectE2ETest};
 use crate::performance::concurrent_inserts::{self, ConcurrentInserts};
 use crate::performance::concurrent_reads::{self, ReadMany};
 use crate::performance::concurrent_reads_and_inserts::{self, ConcurrentReadsAndInserts};
@@ -12,6 +13,7 @@ use crate::performance::concurrent_reads_with_index::{self, ReadByIndex};
 use crate::suite::{PerformanceTestResult, Suite};
 
 mod client;
+mod e2e;
 mod performance;
 mod suite;
 
@@ -111,6 +113,13 @@ enum Command {
         /// Records per writer
         #[arg(long, default_value_t = 1000)]
         records_per_writer: usize,
+    },
+
+    /// E2E test for SELECT statements with comprehensive validation
+    E2eSelect {
+        /// Number of records to insert for testing
+        #[arg(long, default_value_t = 5000)]
+        records: usize,
     },
 }
 
@@ -298,6 +307,37 @@ async fn concurrent_reads_non_index(
     Ok(test_results)
 }
 
+async fn e2e_select(num_records: usize) -> Result<(), TesterError> {
+    let db_name = "E2E_SELECT_TEST".to_string();
+    let table_name = "TEST_TABLE".to_string();
+
+    let setup = select::Setup {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        num_records,
+    };
+
+    // Generate test data
+    let test_data = select::TestRecord::generate(num_records);
+
+    let test = select::Test {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        test_data,
+    };
+
+    let cleanup = select::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let result = SelectE2ETest::run_suite(&setup, &test, &cleanup).await?;
+
+    println!("E2E SELECT test completed successfully!");
+    println!("Tests passed: {}", result.tests_passed);
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), TesterError> {
     env_logger::init();
@@ -353,6 +393,10 @@ async fn main() -> Result<(), TesterError> {
             let test_results =
                 concurrent_reads_and_inserts(runs, readers, writers, records_per_writer).await?;
             report_stats("concurrent-reads-and-inserts", &test_results);
+            Ok(())
+        }
+        Command::E2eSelect { records } => {
+            e2e_select(records).await?;
             Ok(())
         }
     }
