@@ -746,6 +746,10 @@ impl Cache {
                     "Cache: failed to flush WAL before flushing page '{:?}' to disk.",
                     frame.file_page_ref
                 );
+
+                // We need to re-insert the frame back to cache as we failed to flush it.
+                drop(page);
+                self.frames.insert(frame.file_page_ref.clone(), frame);
                 return Ok(());
             }
         }
