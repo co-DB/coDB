@@ -3,7 +3,7 @@ use protocol::{ColumnType, Request, StatementType};
 
 use crate::{
     TesterError,
-    suite::{Suite, default_client},
+    suite::{E2ETestResult, Suite, default_client},
 };
 
 use super::response_helpers::{validate_non_select_statement, validate_select_query};
@@ -146,10 +146,6 @@ pub struct Test {
 
 pub struct Cleanup {
     pub database_name: String,
-}
-
-pub struct E2ETestResult {
-    pub tests_passed: usize,
 }
 
 impl Suite<E2ETestResult> for DeleteE2ETest {

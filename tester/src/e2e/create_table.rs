@@ -4,7 +4,7 @@ use protocol::{ColumnType, Request, Response, StatementType};
 use crate::{
     TesterError,
     client::ReadResult,
-    suite::{Suite, default_client},
+    suite::{E2ETestResult, Suite, default_client},
 };
 
 use super::response_helpers::{
@@ -23,10 +23,6 @@ pub struct Test {
 
 pub struct Cleanup {
     pub database_name: String,
-}
-
-pub struct E2ETestResult {
-    pub tests_passed: usize,
 }
 
 impl Suite<E2ETestResult> for CreateTableE2ETest {
