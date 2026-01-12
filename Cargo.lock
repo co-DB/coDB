@@ -879,6 +879,7 @@ dependencies = [
  "rmp-serde",
  "serde_json",
  "storage",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

@@ -448,13 +448,9 @@ mod client_handler_tests {
     ) {
         let executors = Arc::new(DashMap::new());
 
-        let temp_dir = std::env::temp_dir().join(format!(
-            "codb_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let temp_dir = tempfile::TempDir::new()
+            .expect("Failed to create temp dir")
+            .keep();
 
         let catalog_manager = Arc::new(RwLock::new(
             CatalogManager::with_path(temp_dir).expect("Failed to create catalog manager"),
