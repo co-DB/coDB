@@ -7,20 +7,12 @@ pub(crate) struct WorkersContainer {
 }
 
 impl WorkersContainer {
-    pub fn new() -> Self {
-        WorkersContainer {
-            workers: SegQueue::new(),
-        }
-    }
-
-    pub fn add(&self, handle: BackgroundWorkerHandle) {
-        self.workers.push(handle);
-    }
-
-    pub fn add_many(&self, handles: impl Iterator<Item = BackgroundWorkerHandle>) {
+    pub fn new(handles: impl Iterator<Item = BackgroundWorkerHandle>) -> Self {
+        let workers = SegQueue::new();
         for handle in handles {
-            self.add(handle);
+            workers.push(handle);
         }
+        WorkersContainer { workers }
     }
 
     pub fn shutdown(&self) {
