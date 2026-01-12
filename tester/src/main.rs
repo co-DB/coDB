@@ -6,8 +6,10 @@ use thiserror::Error;
 
 use crate::e2e::create_table::{self, CreateTableE2ETest};
 use crate::e2e::delete::{self, DeleteE2ETest};
+use crate::e2e::drop_table::{self, DropTableE2ETest};
 use crate::e2e::insert::{self, InsertE2ETest};
 use crate::e2e::select::{self, SelectE2ETest};
+use crate::e2e::truncate_table::{self, TruncateTableE2ETest};
 use crate::e2e::update::{self, UpdateE2ETest};
 use crate::performance::concurrent_inserts::{self, ConcurrentInserts};
 use crate::performance::concurrent_reads::{self, ReadMany};
@@ -134,7 +136,13 @@ enum Command {
     /// E2E test for CREATE TABLE statements with comprehensive validation
     E2eCreateTable,
 
-    /// Run all E2E tests (SELECT, INSERT, UPDATE, DELETE, and CREATE TABLE)
+    /// E2E test for TRUNCATE TABLE statements with comprehensive validation
+    E2eTruncateTable,
+
+    /// E2E test for DROP TABLE statements with comprehensive validation
+    E2eDropTable,
+
+    /// Run all E2E tests (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, TRUNCATE TABLE, and DROP TABLE)
     E2eAll,
 }
 
@@ -467,13 +475,59 @@ async fn e2e_create_table() -> Result<(), TesterError> {
     Ok(())
 }
 
+async fn e2e_truncate_table() -> Result<(), TesterError> {
+    let db_name = "TRUNCATE_TABLE_E2E_DB".to_string();
+
+    let setup = truncate_table::Setup {
+        database_name: db_name.clone(),
+    };
+
+    let test = truncate_table::Test {
+        database_name: db_name.clone(),
+    };
+
+    let cleanup = truncate_table::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let result = TruncateTableE2ETest::run_suite(&setup, &test, &cleanup).await?;
+
+    println!("E2E TRUNCATE TABLE test completed successfully!");
+    println!("Tests passed: {}", result.tests_passed);
+
+    Ok(())
+}
+
+async fn e2e_drop_table() -> Result<(), TesterError> {
+    let db_name = "DROP_TABLE_E2E_DB".to_string();
+
+    let setup = drop_table::Setup {
+        database_name: db_name.clone(),
+    };
+
+    let test = drop_table::Test {
+        database_name: db_name.clone(),
+    };
+
+    let cleanup = drop_table::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let result = DropTableE2ETest::run_suite(&setup, &test, &cleanup).await?;
+
+    println!("E2E DROP TABLE test completed successfully!");
+    println!("Tests passed: {}", result.tests_passed);
+
+    Ok(())
+}
+
 async fn e2e_all() -> Result<(), TesterError> {
     println!("\n========================================");
     println!("Running ALL E2E Tests");
     println!("========================================\n");
 
     // Run CREATE TABLE tests
-    println!("[1/5] Running CREATE TABLE E2E tests...");
+    println!("[1/7] Running CREATE TABLE E2E tests...");
     match e2e_create_table().await {
         Ok(()) => {
             println!("✓ CREATE TABLE E2E tests passed\n");
@@ -485,7 +539,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run INSERT tests
-    println!("[2/5] Running INSERT E2E tests...");
+    println!("[2/7] Running INSERT E2E tests...");
     match e2e_insert().await {
         Ok(()) => {
             println!("✓ INSERT E2E tests passed\n");
@@ -497,7 +551,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run SELECT tests
-    println!("[3/5] Running SELECT E2E tests...");
+    println!("[3/7] Running SELECT E2E tests...");
     match e2e_select().await {
         Ok(()) => {
             println!("✓ SELECT E2E tests passed\n");
@@ -509,7 +563,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run UPDATE tests
-    println!("[4/5] Running UPDATE E2E tests...");
+    println!("[4/7] Running UPDATE E2E tests...");
     match e2e_update().await {
         Ok(()) => {
             println!("✓ UPDATE E2E tests passed\n");
@@ -521,13 +575,37 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run DELETE tests
-    println!("[5/5] Running DELETE E2E tests...");
+    println!("[5/7] Running DELETE E2E tests...");
     match e2e_delete().await {
         Ok(()) => {
             println!("✓ DELETE E2E tests passed\n");
         }
         Err(e) => {
             println!("✗ DELETE E2E tests failed: {:?}\n", e);
+            return Err(e);
+        }
+    }
+
+    // Run TRUNCATE TABLE tests
+    println!("[6/7] Running TRUNCATE TABLE E2E tests...");
+    match e2e_truncate_table().await {
+        Ok(()) => {
+            println!("✓ TRUNCATE TABLE E2E tests passed\n");
+        }
+        Err(e) => {
+            println!("✗ TRUNCATE TABLE E2E tests failed: {:?}\n", e);
+            return Err(e);
+        }
+    }
+
+    // Run DROP TABLE tests
+    println!("[7/7] Running DROP TABLE E2E tests...");
+    match e2e_drop_table().await {
+        Ok(()) => {
+            println!("✓ DROP TABLE E2E tests passed\n");
+        }
+        Err(e) => {
+            println!("✗ DROP TABLE E2E tests failed: {:?}\n", e);
             return Err(e);
         }
     }
@@ -614,6 +692,14 @@ async fn main() -> Result<(), TesterError> {
         }
         Command::E2eCreateTable => {
             e2e_create_table().await?;
+            Ok(())
+        }
+        Command::E2eTruncateTable => {
+            e2e_truncate_table().await?;
+            Ok(())
+        }
+        Command::E2eDropTable => {
+            e2e_drop_table().await?;
             Ok(())
         }
         Command::E2eAll => {
