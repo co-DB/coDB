@@ -1,7 +1,4 @@
-use std::sync::atomic::AtomicBool;
-
 use bytemuck::{Pod, Zeroable};
-use parking_lot::Mutex;
 use storage::{
     cache::{PageRead, PageWrite},
     paged_file::PageId,
@@ -17,17 +14,15 @@ use crate::{
 
 /// Metadata of [`HeapFile`]. It's stored using bare [`PagedFile`].
 pub(super) struct Metadata {
-    pub first_record_page: Mutex<PageId>,
-    pub first_overflow_page: Mutex<PageId>,
-    pub dirty: AtomicBool,
+    pub first_record_page: PageId,
+    pub first_overflow_page: PageId,
 }
 
 impl From<&MetadataRepr> for Metadata {
     fn from(value: &MetadataRepr) -> Self {
         Metadata {
-            first_record_page: Mutex::new(value.first_record_page),
-            first_overflow_page: Mutex::new(value.first_overflow_page),
-            dirty: AtomicBool::new(false),
+            first_record_page: value.first_record_page,
+            first_overflow_page: value.first_overflow_page,
         }
     }
 }
@@ -60,11 +55,9 @@ impl MetadataRepr {
 
 impl From<&Metadata> for MetadataRepr {
     fn from(value: &Metadata) -> Self {
-        let first_record_page = *value.first_record_page.lock();
-        let first_overflow_page = *value.first_overflow_page.lock();
         MetadataRepr {
-            first_record_page,
-            first_overflow_page,
+            first_record_page: value.first_record_page,
+            first_overflow_page: value.first_overflow_page,
         }
     }
 }
