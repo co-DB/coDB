@@ -18,11 +18,7 @@ use crate::heap_file::{
     record::{RecordHandle, RecordPtr, RecordTag},
 };
 
-use std::{
-    collections::VecDeque,
-    mem,
-    sync::{Arc, atomic::Ordering},
-};
+use std::{collections::VecDeque, mem, sync::Arc};
 
 use metadata::catalog::ColumnMetadata;
 use parking_lot::Mutex;
@@ -39,6 +35,12 @@ use storage::{
     files_manager::FileKey,
     paged_file::{PageId, PagedFileError},
 };
+
+/// Helper enum to specify which metadata field to update
+enum PageTypeForMetadata {
+    Record,
+    Overflow,
+}
 
 /// Struct used for describing update of single field.
 pub struct FieldUpdateDescriptor {
@@ -152,7 +154,7 @@ impl<'hf, const BUCKETS_COUNT: usize> Iterator for AllRecordsIterator<'hf, BUCKE
 /// For concurrent access by multiple threads, wrap the instance in `Arc<HeapFile>`.
 pub struct HeapFile<const BUCKETS_COUNT: usize> {
     file_key: FileKey,
-    metadata: Metadata,
+    metadata: Mutex<Metadata>,
     record_pages_fsm: FreeSpaceMap<BUCKETS_COUNT, RecordPageHeader>,
     overflow_pages_fsm: FreeSpaceMap<BUCKETS_COUNT, OverflowPageHeader>,
     cache: Arc<Cache>,
@@ -180,7 +182,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
 
     /// Reads all [`Record`]s stored in heap file.
     pub fn all_records(&'_ self) -> AllRecordsIterator<'_, BUCKETS_COUNT> {
-        let first_page_id = *self.metadata.first_record_page.lock();
+        let first_page_id = self.metadata.lock().first_record_page;
         AllRecordsIterator::new(self, first_page_id)
     }
 
@@ -285,27 +287,14 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 
     /// Flushes [`HeapFile::metadata`] content to disk.
-    ///
-    /// If metadata is not dirty then this is no-op.
-    pub fn flush_metadata(&mut self) -> Result<(), HeapFileError> {
-        match self
-            .metadata
-            .dirty
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => {
-                // Changed dirty from true to false, so metadata must be flushed
-                let key = self.file_page_ref(Self::METADATA_PAGE_ID);
-                let mut page = self.cache.pin_write(&key)?;
-                let repr = MetadataRepr::from(&self.metadata);
-                repr.write_to_page(&mut page);
-                Ok(())
-            }
-            Err(_) => {
-                // Metadata was already clean
-                Ok(())
-            }
-        }
+    pub fn flush_metadata(&self) -> Result<(), HeapFileError> {
+        let metadata = self.metadata.lock();
+        let repr = MetadataRepr::from(&*metadata);
+
+        let key = self.file_page_ref(Self::METADATA_PAGE_ID);
+        let mut page = self.cache.pin_write(&key)?;
+        repr.write_to_page(&mut page);
+        Ok(())
     }
 
     /// Migrates all records to add a new column at the specified position with a default value.
@@ -321,7 +310,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut chain = NoDroppingPageLockChain::empty(self)?;
 
         // Iterate through all record pages
-        let mut page_id = *self.metadata.first_record_page.lock();
+        let mut page_id = self.metadata.lock().first_record_page;
         while page_id != RecordPageHeader::NO_NEXT_PAGE {
             chain.start_from_record_page(page_id)?;
             let record_page = chain.record_page();
@@ -363,7 +352,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let mut chain = NoDroppingPageLockChain::empty(self)?;
 
         // Iterate through all record pages
-        let mut page_id = *self.metadata.first_record_page.lock();
+        let mut page_id = self.metadata.lock().first_record_page;
         while page_id != RecordPageHeader::NO_NEXT_PAGE {
             chain.start_from_record_page(page_id)?;
             let record_page = chain.record_page();
@@ -909,7 +898,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     /// Generic helper for allocating a page and updating metadata
     fn allocate_page_with_metadata<H, F>(
         &self,
-        metadata_lock: &Mutex<PageId>,
+        page_type: PageTypeForMetadata,
         header_fn: F,
     ) -> Result<(PageId, HeapPage<PinnedWritePage, H>), HeapFileError>
     where
@@ -919,10 +908,22 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let (page, page_id) = self.cache.allocate_page(&self.file_key)?;
 
         let old_first_page = {
-            let mut metadata_page_lock = metadata_lock.lock();
-            let old = *metadata_page_lock;
-            *metadata_page_lock = page_id;
-            self.metadata.dirty.store(true, Ordering::Release);
+            let mut metadata = self.metadata.lock();
+            let old = match page_type {
+                PageTypeForMetadata::Record => {
+                    let old = metadata.first_record_page;
+                    metadata.first_record_page = page_id;
+                    old
+                }
+                PageTypeForMetadata::Overflow => {
+                    let old = metadata.first_overflow_page;
+                    metadata.first_overflow_page = page_id;
+                    old
+                }
+            };
+            drop(metadata);
+            // Flush metadata immediately
+            self.flush_metadata()?;
             old
         };
 
@@ -936,7 +937,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     fn allocate_record_page(
         &self,
     ) -> Result<(PageId, HeapPage<PinnedWritePage, RecordPageHeader>), HeapFileError> {
-        self.allocate_page_with_metadata(&self.metadata.first_record_page, |next_page| {
+        self.allocate_page_with_metadata(PageTypeForMetadata::Record, |next_page| {
             RecordPageHeader::new(next_page)
         })
     }
@@ -944,7 +945,7 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     fn allocate_overflow_page(
         &self,
     ) -> Result<(PageId, HeapPage<PinnedWritePage, OverflowPageHeader>), HeapFileError> {
-        self.allocate_page_with_metadata(&self.metadata.first_overflow_page, |next_page| {
+        self.allocate_page_with_metadata(PageTypeForMetadata::Overflow, |next_page| {
             OverflowPageHeader::new(next_page)
         })
     }
@@ -1153,14 +1154,6 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
     }
 }
 
-impl<const BUCKETS_COUNT: usize> Drop for HeapFile<BUCKETS_COUNT> {
-    fn drop(&mut self) {
-        if let Err(e) = self.flush_metadata() {
-            log::error!("failed to flush metadata while dropping HeapFile: {e}");
-        }
-    }
-}
-
 /// Factory responsible for creating and loading existing [`HeapFile`].
 pub struct HeapFileFactory<const BUCKETS_COUNT: usize> {
     file_key: FileKey,
@@ -1201,7 +1194,7 @@ impl<const BUCKETS_COUNT: usize> HeapFileFactory<BUCKETS_COUNT> {
             cache: self.cache,
             columns_metadata: self.columns_metadata,
             file_key: self.file_key,
-            metadata,
+            metadata: Mutex::new(metadata),
             record_pages_fsm,
             overflow_pages_fsm,
         };
@@ -1269,7 +1262,7 @@ mod tests {
         collections::HashSet,
         fs,
         ops::Deref,
-        sync::atomic::AtomicUsize,
+        sync::atomic::{AtomicUsize, Ordering},
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -2083,8 +2076,9 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Verify metadata was loaded
-        assert_ne!(*heap_file.metadata.first_record_page.lock(), 0);
-        assert_ne!(*heap_file.metadata.first_overflow_page.lock(), 0);
+        let metadata = heap_file.metadata.lock();
+        assert_ne!(metadata.first_record_page, 0);
+        assert_ne!(metadata.first_overflow_page, 0);
     }
 
     #[test]
@@ -2106,7 +2100,7 @@ mod tests {
         // The actual error will occur when trying to read from invalid page IDs
         if let Ok(heap_file) = result {
             let invalid_ptr = RecordPtr {
-                page_id: *heap_file.metadata.first_record_page.lock(),
+                page_id: heap_file.metadata.lock().first_record_page,
                 slot_id: 0,
             };
             let read_result = heap_file.record(&invalid_ptr);
@@ -2122,8 +2116,9 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Verify metadata was created with correct initial values
-        let first_record_page = *heap_file.metadata.first_record_page.lock();
-        let first_overflow_page = *heap_file.metadata.first_overflow_page.lock();
+        let metadata = heap_file.metadata.lock();
+        let first_record_page = metadata.first_record_page;
+        let first_overflow_page = metadata.first_overflow_page;
         assert_eq!(first_record_page, 2);
         assert_eq!(first_overflow_page, 3);
 
@@ -3364,9 +3359,7 @@ mod tests {
         assert_string(&large_string, &retrieved_record.fields[1]);
 
         // Assert metadata change and allocations were successful
-        assert!(heap_file.metadata.dirty.load(Ordering::Acquire));
-
-        let new_first_overflow_page = *heap_file.metadata.first_overflow_page.lock();
+        let new_first_overflow_page = heap_file.metadata.lock().first_overflow_page;
         assert_ne!(new_first_overflow_page, first_overflow_page_id);
 
         let mut overflow_pages_count = 0;
@@ -3395,9 +3388,8 @@ mod tests {
         let heap_file = factory.create_heap_file().unwrap();
 
         // Store initial metadata state
-        let initial_first_record_page = *heap_file.metadata.first_record_page.lock();
+        let initial_first_record_page = heap_file.metadata.lock().first_record_page;
         assert_eq!(initial_first_record_page, first_record_page_id);
-        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
 
         // Insert a large record that fills the first page
         let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
@@ -3429,10 +3421,8 @@ mod tests {
         assert_ne!(second_record_ptr.page_id, first_record_page_id);
         assert_eq!(second_record_ptr.slot_id, 0);
 
-        // Verify metadata was changed and is dirty
-        assert!(heap_file.metadata.dirty.load(Ordering::Acquire));
-
-        let new_first_record_page = *heap_file.metadata.first_record_page.lock();
+        // Verify metadata was changed
+        let new_first_record_page = heap_file.metadata.lock().first_record_page;
         assert_ne!(new_first_record_page, initial_first_record_page);
         assert_eq!(second_record_ptr.page_id, new_first_record_page);
 
@@ -3512,16 +3502,17 @@ mod tests {
     // Metadata
 
     #[test]
-    fn heap_file_flush_metadata() {
+    fn heap_file_metadata_persisted_immediately_after_allocation() {
         let (cache, _, file_key) = setup_test_cache();
-        setup_heap_file_structure(&cache, &file_key);
+        let (first_record_page_id, _) = setup_heap_file_structure(&cache, &file_key);
 
         // Create heap file
         let factory = create_test_heap_file_factory(cache.clone(), file_key.clone());
-        let mut heap_file = factory.create_heap_file().unwrap();
+        let heap_file = factory.create_heap_file().unwrap();
 
-        // Initially metadata should not be dirty
-        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
+        // Capture initial metadata values
+        let initial_first_record_page = heap_file.metadata.lock().first_record_page;
+        assert_eq!(initial_first_record_page, first_record_page_id);
 
         // Trigger a metadata change by allocating a new record page
         let max_single_page_size = SlottedPage::<(), RecordPageHeader>::MAX_FREE_SPACE as usize
@@ -3546,31 +3537,22 @@ mod tests {
         ]);
         heap_file.insert(small_record).unwrap();
 
-        // Verify metadata is now dirty
-        assert!(heap_file.metadata.dirty.load(Ordering::Acquire));
-
         // Capture current metadata values
-        let first_record_page = *heap_file.metadata.first_record_page.lock();
-        let first_overflow_page = *heap_file.metadata.first_overflow_page.lock();
+        let metadata = heap_file.metadata.lock();
+        let first_record_page = metadata.first_record_page;
+        let first_overflow_page = metadata.first_overflow_page;
+        drop(metadata);
 
-        // Flush metadata
-        heap_file.flush_metadata().unwrap();
+        // Verify metadata was changed
+        assert_ne!(first_record_page, initial_first_record_page);
 
-        // Verify metadata is no longer dirty
-        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
-
-        // Read metadata directly from disk to verify it was written
+        // Verify metadata is already persisted to disk (immediately after the insert)
         let metadata_page_ref = heap_file.file_page_ref(HeapFile::<4>::METADATA_PAGE_ID);
         let metadata_page = cache.pin_read(&metadata_page_ref).unwrap();
         let disk_metadata = MetadataRepr::load_from_page(&metadata_page).unwrap();
 
         assert_eq!(disk_metadata.first_record_page, first_record_page);
         assert_eq!(disk_metadata.first_overflow_page, first_overflow_page);
-
-        // Try flushing again (should be no-op since metadata is clean)
-        heap_file.flush_metadata().unwrap();
-
-        assert!(!heap_file.metadata.dirty.load(Ordering::Acquire));
     }
 
     // HeapFile updating record
