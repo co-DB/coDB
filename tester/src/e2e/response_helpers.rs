@@ -447,3 +447,46 @@ pub fn extract_f64(record: &Record, index: usize) -> Result<f64, TesterError> {
         }
     }
 }
+
+/// Helper to expect an error response from the server
+/// This properly handles the query flow: Acknowledge -> Error -> QueryCompleted
+pub async fn expect_error(client: &mut BinaryClient) -> Result<String, TesterError> {
+    // First, expect acknowledge
+    expect_acknowledge(client).await?;
+
+    // Then expect an error
+    let error_message = match client.read_response().await? {
+        ReadResult::Disconnected => {
+            error!("Expected Error but got disconnected");
+            return Err(TesterError::Disconnected);
+        }
+        ReadResult::Response(Response::Error { message, .. }) => {
+            info!("✓ Received expected error: {}", message);
+            message
+        }
+        ReadResult::Response(other) => {
+            error!("Expected Error but got: {:?}", other);
+            return Err(TesterError::ServerError {
+                message: format!("Expected Error but got: {:?}", other),
+            });
+        }
+    };
+
+    // Finally, expect QueryCompleted even after error
+    match client.read_response().await? {
+        ReadResult::Disconnected => {
+            error!("Expected QueryCompleted but got disconnected");
+            Err(TesterError::Disconnected)
+        }
+        ReadResult::Response(Response::QueryCompleted) => {
+            info!("✓ Received QueryCompleted after error");
+            Ok(error_message)
+        }
+        ReadResult::Response(other) => {
+            error!("Expected QueryCompleted but got: {:?}", other);
+            Err(TesterError::ServerError {
+                message: format!("Expected QueryCompleted after error but got: {:?}", other),
+            })
+        }
+    }
+}

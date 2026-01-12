@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
+use crate::e2e::alter_table::{self, AlterTableE2ETest};
 use crate::e2e::create_table::{self, CreateTableE2ETest};
 use crate::e2e::delete::{self, DeleteE2ETest};
 use crate::e2e::drop_table::{self, DropTableE2ETest};
@@ -142,7 +143,10 @@ enum Command {
     /// E2E test for DROP TABLE statements with comprehensive validation
     E2eDropTable,
 
-    /// Run all E2E tests (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, TRUNCATE TABLE, and DROP TABLE)
+    /// E2E test for ALTER TABLE statements with comprehensive validation
+    E2eAlterTable,
+
+    /// Run all E2E tests (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, TRUNCATE TABLE, DROP TABLE, and ALTER TABLE)
     E2eAll,
 }
 
@@ -521,13 +525,36 @@ async fn e2e_drop_table() -> Result<(), TesterError> {
     Ok(())
 }
 
+async fn e2e_alter_table() -> Result<(), TesterError> {
+    let db_name = "ALTER_TABLE_E2E_DB".to_string();
+
+    let setup = alter_table::Setup {
+        database_name: db_name.clone(),
+    };
+
+    let test = alter_table::Test {
+        database_name: db_name.clone(),
+    };
+
+    let cleanup = alter_table::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let result = AlterTableE2ETest::run_suite(&setup, &test, &cleanup).await?;
+
+    println!("E2E ALTER TABLE test completed successfully!");
+    println!("Tests passed: {}", result.tests_passed);
+
+    Ok(())
+}
+
 async fn e2e_all() -> Result<(), TesterError> {
     println!("\n========================================");
     println!("Running ALL E2E Tests");
     println!("========================================\n");
 
     // Run CREATE TABLE tests
-    println!("[1/7] Running CREATE TABLE E2E tests...");
+    println!("[1/8] Running CREATE TABLE E2E tests...");
     match e2e_create_table().await {
         Ok(()) => {
             println!("✓ CREATE TABLE E2E tests passed\n");
@@ -539,7 +566,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run INSERT tests
-    println!("[2/7] Running INSERT E2E tests...");
+    println!("[2/8] Running INSERT E2E tests...");
     match e2e_insert().await {
         Ok(()) => {
             println!("✓ INSERT E2E tests passed\n");
@@ -551,7 +578,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run SELECT tests
-    println!("[3/7] Running SELECT E2E tests...");
+    println!("[3/8] Running SELECT E2E tests...");
     match e2e_select().await {
         Ok(()) => {
             println!("✓ SELECT E2E tests passed\n");
@@ -563,7 +590,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run UPDATE tests
-    println!("[4/7] Running UPDATE E2E tests...");
+    println!("[4/8] Running UPDATE E2E tests...");
     match e2e_update().await {
         Ok(()) => {
             println!("✓ UPDATE E2E tests passed\n");
@@ -575,7 +602,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run DELETE tests
-    println!("[5/7] Running DELETE E2E tests...");
+    println!("[5/8] Running DELETE E2E tests...");
     match e2e_delete().await {
         Ok(()) => {
             println!("✓ DELETE E2E tests passed\n");
@@ -587,7 +614,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run TRUNCATE TABLE tests
-    println!("[6/7] Running TRUNCATE TABLE E2E tests...");
+    println!("[6/8] Running TRUNCATE TABLE E2E tests...");
     match e2e_truncate_table().await {
         Ok(()) => {
             println!("✓ TRUNCATE TABLE E2E tests passed\n");
@@ -599,7 +626,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
 
     // Run DROP TABLE tests
-    println!("[7/7] Running DROP TABLE E2E tests...");
+    println!("[7/8] Running DROP TABLE E2E tests...");
     match e2e_drop_table().await {
         Ok(()) => {
             println!("✓ DROP TABLE E2E tests passed\n");
@@ -609,7 +636,17 @@ async fn e2e_all() -> Result<(), TesterError> {
             return Err(e);
         }
     }
-
+    // Run ALTER TABLE tests
+    println!("[8/8] Running ALTER TABLE E2E tests...");
+    match e2e_alter_table().await {
+        Ok(()) => {
+            println!("✓ ALTER TABLE E2E tests passed\n");
+        }
+        Err(e) => {
+            println!("✗ ALTER TABLE E2E tests failed: {:?}\n", e);
+            return Err(e);
+        }
+    }
     println!("========================================");
     println!("All E2E Tests Completed Successfully!");
     println!("========================================");
@@ -700,6 +737,10 @@ async fn main() -> Result<(), TesterError> {
         }
         Command::E2eDropTable => {
             e2e_drop_table().await?;
+            Ok(())
+        }
+        Command::E2eAlterTable => {
+            e2e_alter_table().await?;
             Ok(())
         }
         Command::E2eAll => {

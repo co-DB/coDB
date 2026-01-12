@@ -1,15 +1,12 @@
 use log::{error, info};
-use protocol::{ColumnType, Request, Response, StatementType};
+use protocol::{ColumnType, Request, StatementType};
 
 use crate::{
     TesterError,
-    client::ReadResult,
     suite::{E2ETestResult, Suite, default_client},
 };
 
-use super::response_helpers::{
-    expect_acknowledge, validate_non_select_statement, validate_select_query,
-};
+use super::response_helpers::{expect_error, validate_non_select_statement, validate_select_query};
 
 pub struct DropTableE2ETest;
 
@@ -139,21 +136,9 @@ async fn test_drop_empty_table(args: &Test) -> Result<(), TesterError> {
         .await?;
 
     // Expect error since table doesn't exist
-    match expect_acknowledge(&mut client).await {
-        Ok(_) => match client.read_response().await? {
-            ReadResult::Response(Response::Error { .. }) => {
-                info!("✓ Table correctly dropped and not found");
-                Ok(())
-            }
-            _ => Err(TesterError::ServerError {
-                message: "Expected error when selecting from dropped table".to_string(),
-            }),
-        },
-        Err(_) => {
-            info!("✓ Table correctly dropped and not found");
-            Ok(())
-        }
-    }
+    expect_error(&mut client).await?;
+    info!("✓ Table correctly dropped and not found");
+    Ok(())
 }
 
 /// Test 2: Drop table with data
@@ -237,35 +222,12 @@ async fn test_drop_nonexistent_table(args: &Test) -> Result<(), TesterError> {
         .await?;
 
     // We expect an error here
-    match expect_acknowledge(&mut client).await {
-        Ok(_) => match client.read_response().await? {
-            ReadResult::Response(Response::Error { message, .. }) => {
-                info!(
-                    "✓ Got expected error when dropping non-existent table: {}",
-                    message
-                );
-                Ok(())
-            }
-            ReadResult::Response(Response::StatementCompleted { .. }) => {
-                error!("Dropping non-existent table should have failed but succeeded!");
-                Err(TesterError::ServerError {
-                    message: "Dropping non-existent table should have failed but succeeded"
-                        .to_string(),
-                })
-            }
-            _ => {
-                error!("Unexpected response type when dropping non-existent table");
-                Err(TesterError::ServerError {
-                    message: "Unexpected response type when dropping non-existent table"
-                        .to_string(),
-                })
-            }
-        },
-        Err(_) => {
-            info!("✓ Drop non-existent table correctly rejected");
-            Ok(())
-        }
-    }
+    let message = expect_error(&mut client).await?;
+    info!(
+        "✓ Got expected error when dropping non-existent table: {}",
+        message
+    );
+    Ok(())
 }
 
 /// Test 4: Drop multiple tables
