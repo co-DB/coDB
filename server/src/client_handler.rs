@@ -1,5 +1,6 @@
 ﻿use crate::protocol_handler::{ProtocolHandler, ReadResult};
 use crate::protocol_mappings::IntoProtocol;
+use crate::server::ExecutorWithWorkers;
 use crate::workers_container::WorkersContainer;
 use dashmap::{DashMap, Entry};
 use engine::record::Record as EngineRecord;
@@ -20,10 +21,9 @@ where
     P: ProtocolHandler,
 {
     current_database: Option<String>,
-    executors: Arc<DashMap<String, Arc<Executor>>>,
+    executors: Arc<DashMap<String, Arc<ExecutorWithWorkers>>>,
     catalog_manager: Arc<RwLock<CatalogManager>>,
     protocol_handler: P,
-    workers: Arc<WorkersContainer>,
     shutdown: CancellationToken,
 }
 
@@ -78,10 +78,9 @@ where
     const ROWS_CHUNK_SIZE: usize = 10000;
 
     pub(crate) fn new(
-        executors: Arc<DashMap<String, Arc<Executor>>>,
+        executors: Arc<DashMap<String, Arc<ExecutorWithWorkers>>>,
         catalog_manager: Arc<RwLock<CatalogManager>>,
         protocol_handler: P,
-        workers: Arc<WorkersContainer>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
@@ -89,7 +88,6 @@ where
             current_database: None,
             executors,
             catalog_manager,
-            workers,
             shutdown,
         }
     }
@@ -146,7 +144,9 @@ where
                 self.catalog_manager
                     .write()
                     .delete_database(&database_name)?;
-                self.executors.remove(&database_name);
+                if let Some((_, executor_with_workers)) = self.executors.remove(&database_name) {
+                    drop(executor_with_workers);
+                }
                 if self.current_database.as_deref() == Some(&database_name) {
                     self.current_database = None;
                 }
@@ -201,7 +201,7 @@ where
             mpsc::channel::<StatementResult>(Self::CHANNEL_BUFFER_CAPACITY);
 
         let handle = tokio::task::spawn_blocking(move || {
-            for result in executor.execute(&sql) {
+            for result in executor.executor().execute(&sql) {
                 if sender.blocking_send(result).is_err() {
                     break;
                 }
@@ -222,7 +222,7 @@ where
     fn get_or_create_executor(
         &self,
         database: impl AsRef<str> + Into<String> + Clone,
-    ) -> Result<Arc<Executor>, ClientError> {
+    ) -> Result<Arc<ExecutorWithWorkers>, ClientError> {
         let database_key = database.clone().into();
 
         match self.executors.entry(database_key) {
@@ -236,14 +236,15 @@ where
                 };
 
                 let db_directory_path = main_path.join(database.as_ref());
-                let (executor, background_workers) =
+                let (executor, background_workers, wal_worker) =
                     Executor::with_background_workers(db_directory_path, catalog)
                         .map_err(ClientError::ExecutorError)?;
 
+                let worker_container = WorkersContainer::new(background_workers.into_iter());
+                let executor =
+                    ExecutorWithWorkers::new(executor, worker_container, Some(wal_worker));
                 let executor = Arc::new(executor);
                 vacant_entry.insert(executor.clone());
-
-                self.workers.add_many(background_workers.into_iter());
 
                 Ok(executor)
             }
@@ -335,6 +336,7 @@ where
 mod client_handler_tests {
     use crate::client_handler::{ClientError, ClientHandler};
     use crate::protocol_handler::{BinaryProtocolHandler, TextProtocolHandler};
+    use crate::server::ExecutorWithWorkers;
     use crate::workers_container::WorkersContainer;
     use dashmap::DashMap;
     use executor::Executor;
@@ -443,7 +445,7 @@ mod client_handler_tests {
 
     /// Helper function to create test server components
     async fn setup_test_server() -> (
-        Arc<DashMap<String, Arc<Executor>>>,
+        Arc<DashMap<String, Arc<ExecutorWithWorkers>>>,
         Arc<RwLock<CatalogManager>>,
     ) {
         let executors = Arc::new(DashMap::new());
@@ -479,7 +481,6 @@ mod client_handler_tests {
                         executors.clone(),
                         catalog_manager.clone(),
                         text_handler,
-                        Arc::new(WorkersContainer::new()),
                         CancellationToken::new(),
                     );
                     tokio::spawn(async move {
@@ -509,7 +510,6 @@ mod client_handler_tests {
                         executors.clone(),
                         catalog_manager.clone(),
                         binary_handler,
-                        Arc::new(WorkersContainer::new()),
                         CancellationToken::new(),
                     );
                     tokio::spawn(async move {
