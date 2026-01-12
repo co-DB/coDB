@@ -448,12 +448,11 @@ mod client_handler_tests {
     ) {
         let executors = Arc::new(DashMap::new());
 
-        let temp_dir = tempfile::TempDir::new()
-            .expect("Failed to create temp dir")
-            .keep();
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
         let catalog_manager = Arc::new(RwLock::new(
-            CatalogManager::with_path(temp_dir).expect("Failed to create catalog manager"),
+            CatalogManager::with_path(temp_dir.path().to_path_buf())
+                .expect("Failed to create catalog manager"),
         ));
         (executors, catalog_manager)
     }

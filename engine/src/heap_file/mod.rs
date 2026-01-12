@@ -908,24 +908,27 @@ impl<const BUCKETS_COUNT: usize> HeapFile<BUCKETS_COUNT> {
         let (page, page_id) = self.cache.allocate_page(&self.file_key)?;
 
         let old_first_page = {
-            let mut metadata = self.metadata.lock();
+            let metadata = self.metadata.lock();
             match page_type {
-                PageTypeForMetadata::Record => {
-                    let old = metadata.first_record_page;
-                    metadata.first_record_page = page_id;
-                    old
-                }
-                PageTypeForMetadata::Overflow => {
-                    let old = metadata.first_overflow_page;
-                    metadata.first_overflow_page = page_id;
-                    old
-                }
+                PageTypeForMetadata::Record => metadata.first_record_page,
+                PageTypeForMetadata::Overflow => metadata.first_overflow_page,
             }
         };
 
         let header = header_fn(old_first_page);
         let slotted_page = SlottedPage::initialize_with_header(page, header)?;
         let heap_page = HeapPage::new(slotted_page);
+
+        let mut metadata = self.metadata.lock();
+        match page_type {
+            PageTypeForMetadata::Record => {
+                metadata.first_record_page = page_id;
+            }
+            PageTypeForMetadata::Overflow => {
+                metadata.first_overflow_page = page_id;
+            }
+        }
+        drop(metadata);
 
         self.flush_metadata()?;
 
