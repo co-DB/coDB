@@ -117,7 +117,7 @@ where
             });
         }
 
-        match command_segments[0] {
+        match command_segments[0].to_ascii_lowercase().as_str() {
             "create" => Self::parse_create_database(command_segments),
             "delete" => Self::parse_delete_database(command_segments),
             "list" => Self::parse_list_databases(command_segments),
