@@ -676,11 +676,7 @@ async fn e2e_wal_recovery(server_path: &str) -> Result<(), TesterError> {
         server,
     };
 
-    let cleanup = wal_recovery::Cleanup {
-        database_name: db_name.clone(),
-    };
-
-    let result = WalRecoveryE2ETest::run_suite(&setup, &RefCell::new(test), &cleanup).await?;
+    let result = WalRecoveryE2ETest::run_suite(&setup, &RefCell::new(test), &()).await?;
 
     println!("E2E WAL RECOVERY test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);

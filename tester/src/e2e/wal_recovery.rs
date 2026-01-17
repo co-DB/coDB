@@ -108,10 +108,6 @@ pub struct Test {
     pub server: ServerProcess,
 }
 
-pub struct Cleanup {
-    pub database_name: String,
-}
-
 impl Suite<E2ETestResult> for WalRecoveryE2ETest {
     type SetupArgs = Setup;
 
@@ -210,25 +206,27 @@ impl Suite<E2ETestResult> for WalRecoveryE2ETest {
         );
         tests_passed += 1;
 
-        server.stop()?;
+        // We need to do cleanup here because we can't pass it to cleanup function
 
-        Ok(E2ETestResult { tests_passed })
-    }
-
-    type CleanupArgs = Cleanup;
-
-    async fn cleanup(args: &Self::CleanupArgs) -> Result<(), TesterError> {
-        info!("Deleting database '{}'...", args.database_name);
+        info!("Deleting database '{}'...", &database_name);
         let mut client = default_client().await?;
 
         client
             .execute_and_wait(Request::DeleteDatabase {
-                database_name: args.database_name.clone(),
+                database_name: database_name.clone(),
             })
             .await?;
 
         info!("✓ Database deleted");
 
+        server.stop()?;
+
+        Ok(E2ETestResult { tests_passed })
+    }
+
+    type CleanupArgs = ();
+
+    async fn cleanup(_: &Self::CleanupArgs) -> Result<(), TesterError> {
         Ok(())
     }
 }
