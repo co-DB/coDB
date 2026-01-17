@@ -391,6 +391,8 @@ pub(crate) struct SinglePageOperation {
 }
 
 impl SinglePageOperation {
+    // Used in tests
+    #[allow(dead_code)]
     pub(crate) fn new(file_page_ref: FilePageRef, diff: PageDiff) -> Self {
         Self {
             file_page_ref,
@@ -930,7 +932,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         assert_eq!(handle.wal_client.flushed_lsn(), 0);
 
@@ -954,7 +956,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         handle
             .wal_client
@@ -1008,7 +1010,7 @@ mod tests {
         // First session: write records and checkpoint
         {
             let (handle, mut bg_handle) =
-                spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+                spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
             handle
                 .wal_client
                 .write_single(make_test_file_page_ref(1), PageDiff::default());
@@ -1030,7 +1032,7 @@ mod tests {
         // Second session: recover
         {
             let (handle, mut bg_handle) =
-                spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+                spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
             // Should only have records after checkpoint (LSN 4 and 5)
             assert_eq!(handle.redo_records.len(), 2);
@@ -1050,7 +1052,7 @@ mod tests {
         // First session
         {
             let (handle, mut bg_handle) =
-                spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+                spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
             handle
                 .wal_client
                 .write_single(make_test_file_page_ref(1), PageDiff::default());
@@ -1068,7 +1070,7 @@ mod tests {
         // Second session
         {
             let (handle, mut bg_handle) =
-                spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+                spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
             // flushed_lsn should be set to last_lsn from recovery
             assert_eq!(handle.wal_client.flushed_lsn(), 3);
@@ -1098,7 +1100,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let log_path = dir.path();
         let (handle, mut bg_handle) =
-            spawn_wal(&log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
+            spawn_wal(log_path, FLUSH_INTERVAL_MS, MAX_UNFLUSHED_RECORDS).unwrap();
 
         // Simulate how Cache would share WalClient via Arc
         let shared = SharedWalClient::new(handle.wal_client);
