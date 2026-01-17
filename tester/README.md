@@ -4,7 +4,8 @@ This crate is a test client used for running end-to-end and performance tests ag
 
 ## Overview
 
-The tester automatically manages the database server lifecycle - it starts the server before tests and stops it after tests complete.
+- **E2E Tests**: Automatically manage the database server lifecycle - start the server before tests and stop it after tests complete.
+- **Performance Tests**: Require a manually started server for more accurate benchmarking.
 
 ## Prerequisites
 
@@ -15,17 +16,28 @@ The tester automatically manages the database server lifecycle - it starts the s
 
 ## Quick Run
 
-All commands require the `--server-path` argument pointing to the server executable:
+### E2E Tests
+
+E2E tests require the `--server-path` argument - the server is started/stopped automatically:
 
 ```bash
-# Performance test example
-cargo run -p tester -- --server-path ./target/release/server concurrent-reads-index --runs 1 --threads 8 --records 1000 --bound-size 10
-
-# E2E test example
-cargo run -p tester -- --server-path ./target/release/server e2e-select
+# Run a specific E2E test
+cargo run -p tester -- e2e-select --server-path ./target/release/server
 
 # Run all E2E tests
-cargo run -p tester -- --server-path ./target/release/server e2e-all
+cargo run -p tester -- e2e-all --server-path ./target/release/server
+```
+
+### Performance Tests
+
+Performance tests require a **manually started server**:
+
+```bash
+# Terminal 1: Start the server
+./target/release/server
+
+# Terminal 2: Run performance tests (no --server-path needed)
+cargo run -p tester -- concurrent-reads-index --runs 1 --threads 8 --records 1000 --bound-size 10
 ```
 
 ## Test Types

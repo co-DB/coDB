@@ -32,10 +32,6 @@ mod suite;
 #[command(name = "tester")]
 #[command(about = "coDB tester client for e2e & performance tests", long_about = None)]
 struct Cli {
-    /// Path to the server executable
-    #[arg(long)]
-    server_path: String,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -131,34 +127,74 @@ enum Command {
     },
 
     /// E2E test for SELECT statements with comprehensive validation
-    E2eSelect,
+    E2eSelect {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// E2E test for INSERT statements with comprehensive validation
-    E2eInsert,
+    E2eInsert {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// E2E test for UPDATE statements with comprehensive validation
-    E2eUpdate,
+    E2eUpdate {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// E2E test for DELETE statements with comprehensive validation
-    E2eDelete,
+    E2eDelete {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// E2E test for CREATE TABLE statements with comprehensive validation
-    E2eCreateTable,
+    E2eCreateTable {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// E2E test for TRUNCATE TABLE statements with comprehensive validation
-    E2eTruncateTable,
+    E2eTruncateTable {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// E2E test for DROP TABLE statements with comprehensive validation
-    E2eDropTable,
+    E2eDropTable {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// E2E test for ALTER TABLE statements with comprehensive validation
-    E2eAlterTable,
+    E2eAlterTable {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// E2E test for WAL recovery after SIGKILL
-    E2eWalRecovery,
+    E2eWalRecovery {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 
     /// Run all E2E tests (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, TRUNCATE TABLE, DROP TABLE, ALTER TABLE, and WAL RECOVERY)
-    E2eAll,
+    E2eAll {
+        /// Path to the server executable
+        #[arg(long)]
+        server_path: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -226,7 +262,6 @@ impl Drop for ServerProcess {
 }
 
 async fn concurrent_inserts(
-    server_path: &str,
     runs: u32,
     threads: usize,
     records_per_thread: usize,
@@ -252,16 +287,13 @@ async fn concurrent_inserts(
     };
 
     for _ in 0..runs {
-        let mut server = ServerProcess::start(server_path)?;
         let result = ConcurrentInserts::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
-        server.stop()?;
     }
     Ok(test_results)
 }
 
 async fn concurrent_reads(
-    server_path: &str,
     runs: u32,
     threads: usize,
     records_to_insert: usize,
@@ -287,16 +319,13 @@ async fn concurrent_reads(
     };
 
     for _ in 0..runs {
-        let mut server = ServerProcess::start(server_path)?;
         let result = ReadMany::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
-        server.stop()?;
     }
     Ok(test_results)
 }
 
 async fn concurrent_reads_and_inserts(
-    server_path: &str,
     runs: u32,
     readers: usize,
     writers: usize,
@@ -324,16 +353,13 @@ async fn concurrent_reads_and_inserts(
     };
 
     for _ in 0..runs {
-        let mut server = ServerProcess::start(server_path)?;
         let result = ConcurrentReadsAndInserts::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
-        server.stop()?;
     }
     Ok(test_results)
 }
 
 async fn concurrent_reads_index(
-    server_path: &str,
     runs: u32,
     threads: usize,
     records_to_insert: usize,
@@ -361,16 +387,13 @@ async fn concurrent_reads_index(
     };
 
     for _ in 0..runs {
-        let mut server = ServerProcess::start(server_path)?;
         let result = ReadByIndex::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
-        server.stop()?;
     }
     Ok(test_results)
 }
 
 async fn concurrent_reads_non_index(
-    server_path: &str,
     runs: u32,
     threads: usize,
     records_to_insert: usize,
@@ -398,10 +421,8 @@ async fn concurrent_reads_non_index(
     };
 
     for _ in 0..runs {
-        let mut server = ServerProcess::start(server_path)?;
         let result = ReadByNonIndex::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
-        server.stop()?;
     }
     Ok(test_results)
 }
@@ -817,7 +838,7 @@ async fn main() -> Result<(), TesterError> {
             threads,
             records,
         } => {
-            let test_results = concurrent_inserts(&cli.server_path, runs, threads, records).await?;
+            let test_results = concurrent_inserts(runs, threads, records).await?;
             report_stats("concurrent-inserts", &test_results);
             Ok(())
         }
@@ -826,7 +847,7 @@ async fn main() -> Result<(), TesterError> {
             threads,
             records,
         } => {
-            let test_results = concurrent_reads(&cli.server_path, runs, threads, records).await?;
+            let test_results = concurrent_reads(runs, threads, records).await?;
             report_stats("concurrent-reads", &test_results);
             Ok(())
         }
@@ -836,9 +857,7 @@ async fn main() -> Result<(), TesterError> {
             records,
             bound_size,
         } => {
-            let test_results =
-                concurrent_reads_index(&cli.server_path, runs, threads, records, bound_size)
-                    .await?;
+            let test_results = concurrent_reads_index(runs, threads, records, bound_size).await?;
             report_stats("concurrent-reads-index", &test_results);
             Ok(())
         }
@@ -849,8 +868,7 @@ async fn main() -> Result<(), TesterError> {
             bound_size,
         } => {
             let test_results =
-                concurrent_reads_non_index(&cli.server_path, runs, threads, records, bound_size)
-                    .await?;
+                concurrent_reads_non_index(runs, threads, records, bound_size).await?;
             report_stats("concurrent-reads-non-index", &test_results);
             Ok(())
         }
@@ -860,55 +878,49 @@ async fn main() -> Result<(), TesterError> {
             writers,
             records_per_writer,
         } => {
-            let test_results = concurrent_reads_and_inserts(
-                &cli.server_path,
-                runs,
-                readers,
-                writers,
-                records_per_writer,
-            )
-            .await?;
+            let test_results =
+                concurrent_reads_and_inserts(runs, readers, writers, records_per_writer).await?;
             report_stats("concurrent-reads-and-inserts", &test_results);
             Ok(())
         }
-        Command::E2eSelect => {
-            e2e_select(&cli.server_path).await?;
+        Command::E2eSelect { server_path } => {
+            e2e_select(&server_path).await?;
             Ok(())
         }
-        Command::E2eInsert => {
-            e2e_insert(&cli.server_path).await?;
+        Command::E2eInsert { server_path } => {
+            e2e_insert(&server_path).await?;
             Ok(())
         }
-        Command::E2eUpdate => {
-            e2e_update(&cli.server_path).await?;
+        Command::E2eUpdate { server_path } => {
+            e2e_update(&server_path).await?;
             Ok(())
         }
-        Command::E2eDelete => {
-            e2e_delete(&cli.server_path).await?;
+        Command::E2eDelete { server_path } => {
+            e2e_delete(&server_path).await?;
             Ok(())
         }
-        Command::E2eCreateTable => {
-            e2e_create_table(&cli.server_path).await?;
+        Command::E2eCreateTable { server_path } => {
+            e2e_create_table(&server_path).await?;
             Ok(())
         }
-        Command::E2eTruncateTable => {
-            e2e_truncate_table(&cli.server_path).await?;
+        Command::E2eTruncateTable { server_path } => {
+            e2e_truncate_table(&server_path).await?;
             Ok(())
         }
-        Command::E2eDropTable => {
-            e2e_drop_table(&cli.server_path).await?;
+        Command::E2eDropTable { server_path } => {
+            e2e_drop_table(&server_path).await?;
             Ok(())
         }
-        Command::E2eAlterTable => {
-            e2e_alter_table(&cli.server_path).await?;
+        Command::E2eAlterTable { server_path } => {
+            e2e_alter_table(&server_path).await?;
             Ok(())
         }
-        Command::E2eWalRecovery => {
-            e2e_wal_recovery(&cli.server_path).await?;
+        Command::E2eWalRecovery { server_path } => {
+            e2e_wal_recovery(&server_path).await?;
             Ok(())
         }
-        Command::E2eAll => {
-            e2e_all(&cli.server_path).await?;
+        Command::E2eAll { server_path } => {
+            e2e_all(&server_path).await?;
             Ok(())
         }
     }
