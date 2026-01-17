@@ -1,4 +1,6 @@
 use std::io;
+use std::process::{Child, Command as StdCommand, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -28,6 +30,10 @@ mod suite;
 #[command(name = "tester")]
 #[command(about = "coDB tester client for e2e & performance tests", long_about = None)]
 struct Cli {
+    /// Path to the server executable
+    #[arg(long)]
+    server_path: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -168,7 +174,54 @@ enum TesterError {
     ServerError { message: String },
 }
 
+/// Helper struct to manage the database server process
+struct ServerProcess {
+    child: Child,
+}
+
+impl ServerProcess {
+    /// Start the database server as a child process
+    fn start(server_path: &str) -> Result<Self, TesterError> {
+        println!("Starting database server...");
+
+        // Start the server process
+        let child = StdCommand::new(server_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        // Give the server some time to start up
+        thread::sleep(Duration::from_secs(1));
+
+        println!("Database server started (PID: {})", child.id());
+
+        Ok(ServerProcess { child })
+    }
+
+    /// Stop the database server gracefully
+    fn stop(mut self) -> Result<(), TesterError> {
+        println!("Stopping database server (PID: {})...", self.child.id());
+
+        // Wait for the process to finish
+        self.child.kill()?;
+        self.child.wait()?;
+
+        println!("Database server stopped");
+
+        Ok(())
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        // Ensure the process is killed even if stop() wasn't called
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 async fn concurrent_inserts(
+    server_path: &str,
     runs: u32,
     threads: usize,
     records_per_thread: usize,
@@ -194,13 +247,16 @@ async fn concurrent_inserts(
     };
 
     for _ in 0..runs {
+        let server = ServerProcess::start(server_path)?;
         let result = ConcurrentInserts::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
+        server.stop()?;
     }
     Ok(test_results)
 }
 
 async fn concurrent_reads(
+    server_path: &str,
     runs: u32,
     threads: usize,
     records_to_insert: usize,
@@ -226,13 +282,16 @@ async fn concurrent_reads(
     };
 
     for _ in 0..runs {
+        let server = ServerProcess::start(server_path)?;
         let result = ReadMany::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
+        server.stop()?;
     }
     Ok(test_results)
 }
 
 async fn concurrent_reads_and_inserts(
+    server_path: &str,
     runs: u32,
     readers: usize,
     writers: usize,
@@ -260,13 +319,16 @@ async fn concurrent_reads_and_inserts(
     };
 
     for _ in 0..runs {
+        let server = ServerProcess::start(server_path)?;
         let result = ConcurrentReadsAndInserts::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
+        server.stop()?;
     }
     Ok(test_results)
 }
 
 async fn concurrent_reads_index(
+    server_path: &str,
     runs: u32,
     threads: usize,
     records_to_insert: usize,
@@ -294,13 +356,16 @@ async fn concurrent_reads_index(
     };
 
     for _ in 0..runs {
+        let server = ServerProcess::start(server_path)?;
         let result = ReadByIndex::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
+        server.stop()?;
     }
     Ok(test_results)
 }
 
 async fn concurrent_reads_non_index(
+    server_path: &str,
     runs: u32,
     threads: usize,
     records_to_insert: usize,
@@ -328,13 +393,17 @@ async fn concurrent_reads_non_index(
     };
 
     for _ in 0..runs {
+        let server = ServerProcess::start(server_path)?;
         let result = ReadByNonIndex::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
+        server.stop()?;
     }
     Ok(test_results)
 }
 
-async fn e2e_select() -> Result<(), TesterError> {
+async fn e2e_select(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
     let db_name = "E2E_SELECT_TEST".to_string();
     let table_name = "TEST_TABLE".to_string();
 
@@ -364,10 +433,14 @@ async fn e2e_select() -> Result<(), TesterError> {
     println!("E2E SELECT test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
 
+    server.stop()?;
+
     Ok(())
 }
 
-async fn e2e_insert() -> Result<(), TesterError> {
+async fn e2e_insert(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
     let db_name = "E2E_INSERT_TEST".to_string();
     let table_name = "INSERT_TEST_TABLE".to_string();
 
@@ -390,10 +463,14 @@ async fn e2e_insert() -> Result<(), TesterError> {
     println!("E2E INSERT test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
 
+    server.stop()?;
+
     Ok(())
 }
 
-async fn e2e_update() -> Result<(), TesterError> {
+async fn e2e_update(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
     let db_name = "UPDATE_E2E_DB".to_string();
     let table_name = "UPDATE_E2E_TABLE".to_string();
 
@@ -422,10 +499,14 @@ async fn e2e_update() -> Result<(), TesterError> {
     println!("E2E UPDATE test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
 
+    server.stop()?;
+
     Ok(())
 }
 
-async fn e2e_delete() -> Result<(), TesterError> {
+async fn e2e_delete(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
     let db_name = "DELETE_E2E_DB".to_string();
     let table_name = "DELETE_E2E_TABLE".to_string();
     const NUM_RECORDS: usize = 5000;
@@ -453,10 +534,14 @@ async fn e2e_delete() -> Result<(), TesterError> {
     println!("E2E DELETE test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
 
+    server.stop()?;
+
     Ok(())
 }
 
-async fn e2e_create_table() -> Result<(), TesterError> {
+async fn e2e_create_table(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
     let db_name = "CREATE_TABLE_E2E_DB".to_string();
 
     let setup = create_table::Setup {
@@ -476,10 +561,14 @@ async fn e2e_create_table() -> Result<(), TesterError> {
     println!("E2E CREATE TABLE test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
 
+    server.stop()?;
+
     Ok(())
 }
 
-async fn e2e_truncate_table() -> Result<(), TesterError> {
+async fn e2e_truncate_table(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
     let db_name = "TRUNCATE_TABLE_E2E_DB".to_string();
 
     let setup = truncate_table::Setup {
@@ -499,10 +588,14 @@ async fn e2e_truncate_table() -> Result<(), TesterError> {
     println!("E2E TRUNCATE TABLE test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
 
+    server.stop()?;
+
     Ok(())
 }
 
-async fn e2e_drop_table() -> Result<(), TesterError> {
+async fn e2e_drop_table(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
     let db_name = "DROP_TABLE_E2E_DB".to_string();
 
     let setup = drop_table::Setup {
@@ -522,10 +615,14 @@ async fn e2e_drop_table() -> Result<(), TesterError> {
     println!("E2E DROP TABLE test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
 
+    server.stop()?;
+
     Ok(())
 }
 
-async fn e2e_alter_table() -> Result<(), TesterError> {
+async fn e2e_alter_table(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
     let db_name = "ALTER_TABLE_E2E_DB".to_string();
 
     let setup = alter_table::Setup {
@@ -545,17 +642,19 @@ async fn e2e_alter_table() -> Result<(), TesterError> {
     println!("E2E ALTER TABLE test completed successfully!");
     println!("Tests passed: {}", result.tests_passed);
 
+    server.stop()?;
+
     Ok(())
 }
 
-async fn e2e_all() -> Result<(), TesterError> {
+async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
     println!("\n========================================");
     println!("Running ALL E2E Tests");
     println!("========================================\n");
 
     // Run CREATE TABLE tests
     println!("[1/8] Running CREATE TABLE E2E tests...");
-    match e2e_create_table().await {
+    match e2e_create_table(server_path).await {
         Ok(()) => {
             println!("✓ CREATE TABLE E2E tests passed\n");
         }
@@ -567,7 +666,7 @@ async fn e2e_all() -> Result<(), TesterError> {
 
     // Run INSERT tests
     println!("[2/8] Running INSERT E2E tests...");
-    match e2e_insert().await {
+    match e2e_insert(server_path).await {
         Ok(()) => {
             println!("✓ INSERT E2E tests passed\n");
         }
@@ -579,7 +678,7 @@ async fn e2e_all() -> Result<(), TesterError> {
 
     // Run SELECT tests
     println!("[3/8] Running SELECT E2E tests...");
-    match e2e_select().await {
+    match e2e_select(server_path).await {
         Ok(()) => {
             println!("✓ SELECT E2E tests passed\n");
         }
@@ -591,7 +690,7 @@ async fn e2e_all() -> Result<(), TesterError> {
 
     // Run UPDATE tests
     println!("[4/8] Running UPDATE E2E tests...");
-    match e2e_update().await {
+    match e2e_update(server_path).await {
         Ok(()) => {
             println!("✓ UPDATE E2E tests passed\n");
         }
@@ -603,7 +702,7 @@ async fn e2e_all() -> Result<(), TesterError> {
 
     // Run DELETE tests
     println!("[5/8] Running DELETE E2E tests...");
-    match e2e_delete().await {
+    match e2e_delete(server_path).await {
         Ok(()) => {
             println!("✓ DELETE E2E tests passed\n");
         }
@@ -615,7 +714,7 @@ async fn e2e_all() -> Result<(), TesterError> {
 
     // Run TRUNCATE TABLE tests
     println!("[6/8] Running TRUNCATE TABLE E2E tests...");
-    match e2e_truncate_table().await {
+    match e2e_truncate_table(server_path).await {
         Ok(()) => {
             println!("✓ TRUNCATE TABLE E2E tests passed\n");
         }
@@ -627,7 +726,7 @@ async fn e2e_all() -> Result<(), TesterError> {
 
     // Run DROP TABLE tests
     println!("[7/8] Running DROP TABLE E2E tests...");
-    match e2e_drop_table().await {
+    match e2e_drop_table(server_path).await {
         Ok(()) => {
             println!("✓ DROP TABLE E2E tests passed\n");
         }
@@ -638,7 +737,7 @@ async fn e2e_all() -> Result<(), TesterError> {
     }
     // Run ALTER TABLE tests
     println!("[8/8] Running ALTER TABLE E2E tests...");
-    match e2e_alter_table().await {
+    match e2e_alter_table(server_path).await {
         Ok(()) => {
             println!("✓ ALTER TABLE E2E tests passed\n");
         }
@@ -666,7 +765,7 @@ async fn main() -> Result<(), TesterError> {
             threads,
             records,
         } => {
-            let test_results = concurrent_inserts(runs, threads, records).await?;
+            let test_results = concurrent_inserts(&cli.server_path, runs, threads, records).await?;
             report_stats("concurrent-inserts", &test_results);
             Ok(())
         }
@@ -675,7 +774,7 @@ async fn main() -> Result<(), TesterError> {
             threads,
             records,
         } => {
-            let test_results = concurrent_reads(runs, threads, records).await?;
+            let test_results = concurrent_reads(&cli.server_path, runs, threads, records).await?;
             report_stats("concurrent-reads", &test_results);
             Ok(())
         }
@@ -685,7 +784,9 @@ async fn main() -> Result<(), TesterError> {
             records,
             bound_size,
         } => {
-            let test_results = concurrent_reads_index(runs, threads, records, bound_size).await?;
+            let test_results =
+                concurrent_reads_index(&cli.server_path, runs, threads, records, bound_size)
+                    .await?;
             report_stats("concurrent-reads-index", &test_results);
             Ok(())
         }
@@ -696,7 +797,8 @@ async fn main() -> Result<(), TesterError> {
             bound_size,
         } => {
             let test_results =
-                concurrent_reads_non_index(runs, threads, records, bound_size).await?;
+                concurrent_reads_non_index(&cli.server_path, runs, threads, records, bound_size)
+                    .await?;
             report_stats("concurrent-reads-non-index", &test_results);
             Ok(())
         }
@@ -706,45 +808,51 @@ async fn main() -> Result<(), TesterError> {
             writers,
             records_per_writer,
         } => {
-            let test_results =
-                concurrent_reads_and_inserts(runs, readers, writers, records_per_writer).await?;
+            let test_results = concurrent_reads_and_inserts(
+                &cli.server_path,
+                runs,
+                readers,
+                writers,
+                records_per_writer,
+            )
+            .await?;
             report_stats("concurrent-reads-and-inserts", &test_results);
             Ok(())
         }
         Command::E2eSelect => {
-            e2e_select().await?;
+            e2e_select(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eInsert => {
-            e2e_insert().await?;
+            e2e_insert(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eUpdate => {
-            e2e_update().await?;
+            e2e_update(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eDelete => {
-            e2e_delete().await?;
+            e2e_delete(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eCreateTable => {
-            e2e_create_table().await?;
+            e2e_create_table(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eTruncateTable => {
-            e2e_truncate_table().await?;
+            e2e_truncate_table(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eDropTable => {
-            e2e_drop_table().await?;
+            e2e_drop_table(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eAlterTable => {
-            e2e_alter_table().await?;
+            e2e_alter_table(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eAll => {
-            e2e_all().await?;
+            e2e_all(&cli.server_path).await?;
             Ok(())
         }
     }
