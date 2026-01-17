@@ -7,3 +7,4 @@ pub mod response_helpers;
 pub mod select;
 pub mod truncate_table;
 pub mod update;
+pub mod wal_recovery;

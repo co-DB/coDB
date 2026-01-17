@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io;
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::thread;
@@ -14,6 +15,7 @@ use crate::e2e::insert::{self, InsertE2ETest};
 use crate::e2e::select::{self, SelectE2ETest};
 use crate::e2e::truncate_table::{self, TruncateTableE2ETest};
 use crate::e2e::update::{self, UpdateE2ETest};
+use crate::e2e::wal_recovery::{self, WalRecoveryE2ETest};
 use crate::performance::concurrent_inserts::{self, ConcurrentInserts};
 use crate::performance::concurrent_reads::{self, ReadMany};
 use crate::performance::concurrent_reads_and_inserts::{self, ConcurrentReadsAndInserts};
@@ -152,7 +154,10 @@ enum Command {
     /// E2E test for ALTER TABLE statements with comprehensive validation
     E2eAlterTable,
 
-    /// Run all E2E tests (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, TRUNCATE TABLE, DROP TABLE, and ALTER TABLE)
+    /// E2E test for WAL recovery after SIGKILL
+    E2eWalRecovery,
+
+    /// Run all E2E tests (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, TRUNCATE TABLE, DROP TABLE, ALTER TABLE, and WAL RECOVERY)
     E2eAll,
 }
 
@@ -199,7 +204,7 @@ impl ServerProcess {
     }
 
     /// Stop the database server gracefully
-    fn stop(mut self) -> Result<(), TesterError> {
+    fn stop(&mut self) -> Result<(), TesterError> {
         println!("Stopping database server (PID: {})...", self.child.id());
 
         // Wait for the process to finish
@@ -247,7 +252,7 @@ async fn concurrent_inserts(
     };
 
     for _ in 0..runs {
-        let server = ServerProcess::start(server_path)?;
+        let mut server = ServerProcess::start(server_path)?;
         let result = ConcurrentInserts::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
         server.stop()?;
@@ -282,7 +287,7 @@ async fn concurrent_reads(
     };
 
     for _ in 0..runs {
-        let server = ServerProcess::start(server_path)?;
+        let mut server = ServerProcess::start(server_path)?;
         let result = ReadMany::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
         server.stop()?;
@@ -319,7 +324,7 @@ async fn concurrent_reads_and_inserts(
     };
 
     for _ in 0..runs {
-        let server = ServerProcess::start(server_path)?;
+        let mut server = ServerProcess::start(server_path)?;
         let result = ConcurrentReadsAndInserts::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
         server.stop()?;
@@ -356,7 +361,7 @@ async fn concurrent_reads_index(
     };
 
     for _ in 0..runs {
-        let server = ServerProcess::start(server_path)?;
+        let mut server = ServerProcess::start(server_path)?;
         let result = ReadByIndex::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
         server.stop()?;
@@ -393,7 +398,7 @@ async fn concurrent_reads_non_index(
     };
 
     for _ in 0..runs {
-        let server = ServerProcess::start(server_path)?;
+        let mut server = ServerProcess::start(server_path)?;
         let result = ReadByNonIndex::run_suite(&setup, &test, &cleanup).await?;
         test_results.push(result);
         server.stop()?;
@@ -402,7 +407,7 @@ async fn concurrent_reads_non_index(
 }
 
 async fn e2e_select(server_path: &str) -> Result<(), TesterError> {
-    let server = ServerProcess::start(server_path)?;
+    let mut server = ServerProcess::start(server_path)?;
 
     let db_name = "E2E_SELECT_TEST".to_string();
     let table_name = "TEST_TABLE".to_string();
@@ -439,7 +444,7 @@ async fn e2e_select(server_path: &str) -> Result<(), TesterError> {
 }
 
 async fn e2e_insert(server_path: &str) -> Result<(), TesterError> {
-    let server = ServerProcess::start(server_path)?;
+    let mut server = ServerProcess::start(server_path)?;
 
     let db_name = "E2E_INSERT_TEST".to_string();
     let table_name = "INSERT_TEST_TABLE".to_string();
@@ -469,7 +474,7 @@ async fn e2e_insert(server_path: &str) -> Result<(), TesterError> {
 }
 
 async fn e2e_update(server_path: &str) -> Result<(), TesterError> {
-    let server = ServerProcess::start(server_path)?;
+    let mut server = ServerProcess::start(server_path)?;
 
     let db_name = "UPDATE_E2E_DB".to_string();
     let table_name = "UPDATE_E2E_TABLE".to_string();
@@ -505,7 +510,7 @@ async fn e2e_update(server_path: &str) -> Result<(), TesterError> {
 }
 
 async fn e2e_delete(server_path: &str) -> Result<(), TesterError> {
-    let server = ServerProcess::start(server_path)?;
+    let mut server = ServerProcess::start(server_path)?;
 
     let db_name = "DELETE_E2E_DB".to_string();
     let table_name = "DELETE_E2E_TABLE".to_string();
@@ -540,7 +545,7 @@ async fn e2e_delete(server_path: &str) -> Result<(), TesterError> {
 }
 
 async fn e2e_create_table(server_path: &str) -> Result<(), TesterError> {
-    let server = ServerProcess::start(server_path)?;
+    let mut server = ServerProcess::start(server_path)?;
 
     let db_name = "CREATE_TABLE_E2E_DB".to_string();
 
@@ -567,7 +572,7 @@ async fn e2e_create_table(server_path: &str) -> Result<(), TesterError> {
 }
 
 async fn e2e_truncate_table(server_path: &str) -> Result<(), TesterError> {
-    let server = ServerProcess::start(server_path)?;
+    let mut server = ServerProcess::start(server_path)?;
 
     let db_name = "TRUNCATE_TABLE_E2E_DB".to_string();
 
@@ -594,7 +599,7 @@ async fn e2e_truncate_table(server_path: &str) -> Result<(), TesterError> {
 }
 
 async fn e2e_drop_table(server_path: &str) -> Result<(), TesterError> {
-    let server = ServerProcess::start(server_path)?;
+    let mut server = ServerProcess::start(server_path)?;
 
     let db_name = "DROP_TABLE_E2E_DB".to_string();
 
@@ -621,7 +626,7 @@ async fn e2e_drop_table(server_path: &str) -> Result<(), TesterError> {
 }
 
 async fn e2e_alter_table(server_path: &str) -> Result<(), TesterError> {
-    let server = ServerProcess::start(server_path)?;
+    let mut server = ServerProcess::start(server_path)?;
 
     let db_name = "ALTER_TABLE_E2E_DB".to_string();
 
@@ -647,13 +652,51 @@ async fn e2e_alter_table(server_path: &str) -> Result<(), TesterError> {
     Ok(())
 }
 
+async fn e2e_wal_recovery(server_path: &str) -> Result<(), TesterError> {
+    let server = ServerProcess::start(server_path)?;
+
+    let db_name = "WAL_RECOVERY_E2E_DB".to_string();
+    let table_name = "WAL_TEST_TABLE".to_string();
+
+    const NUM_RECORDS: usize = 10000;
+
+    let setup = wal_recovery::Setup {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+    };
+
+    // Generate test data
+    let test_data = wal_recovery::WalTestRecord::generate(NUM_RECORDS);
+
+    let test = wal_recovery::Test {
+        database_name: db_name.clone(),
+        table_name: table_name.clone(),
+        test_data: test_data.clone(),
+        server_path: server_path.to_string(),
+        server,
+    };
+
+    let cleanup = wal_recovery::Cleanup {
+        database_name: db_name.clone(),
+    };
+
+    let result = WalRecoveryE2ETest::run_suite(&setup, &RefCell::new(test), &cleanup).await?;
+
+    println!("E2E WAL RECOVERY test completed successfully!");
+    println!("Tests passed: {}", result.tests_passed);
+
+    // Server is stopped inside wal recovery test, no need to stop it here.
+
+    Ok(())
+}
+
 async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
     println!("\n========================================");
     println!("Running ALL E2E Tests");
     println!("========================================\n");
 
     // Run CREATE TABLE tests
-    println!("[1/8] Running CREATE TABLE E2E tests...");
+    println!("[1/9] Running CREATE TABLE E2E tests...");
     match e2e_create_table(server_path).await {
         Ok(()) => {
             println!("✓ CREATE TABLE E2E tests passed\n");
@@ -665,7 +708,7 @@ async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
     }
 
     // Run INSERT tests
-    println!("[2/8] Running INSERT E2E tests...");
+    println!("[2/9] Running INSERT E2E tests...");
     match e2e_insert(server_path).await {
         Ok(()) => {
             println!("✓ INSERT E2E tests passed\n");
@@ -677,7 +720,7 @@ async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
     }
 
     // Run SELECT tests
-    println!("[3/8] Running SELECT E2E tests...");
+    println!("[3/9] Running SELECT E2E tests...");
     match e2e_select(server_path).await {
         Ok(()) => {
             println!("✓ SELECT E2E tests passed\n");
@@ -689,7 +732,7 @@ async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
     }
 
     // Run UPDATE tests
-    println!("[4/8] Running UPDATE E2E tests...");
+    println!("[4/9] Running UPDATE E2E tests...");
     match e2e_update(server_path).await {
         Ok(()) => {
             println!("✓ UPDATE E2E tests passed\n");
@@ -701,7 +744,7 @@ async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
     }
 
     // Run DELETE tests
-    println!("[5/8] Running DELETE E2E tests...");
+    println!("[5/9] Running DELETE E2E tests...");
     match e2e_delete(server_path).await {
         Ok(()) => {
             println!("✓ DELETE E2E tests passed\n");
@@ -713,7 +756,7 @@ async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
     }
 
     // Run TRUNCATE TABLE tests
-    println!("[6/8] Running TRUNCATE TABLE E2E tests...");
+    println!("[6/9] Running TRUNCATE TABLE E2E tests...");
     match e2e_truncate_table(server_path).await {
         Ok(()) => {
             println!("✓ TRUNCATE TABLE E2E tests passed\n");
@@ -725,7 +768,7 @@ async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
     }
 
     // Run DROP TABLE tests
-    println!("[7/8] Running DROP TABLE E2E tests...");
+    println!("[7/9] Running DROP TABLE E2E tests...");
     match e2e_drop_table(server_path).await {
         Ok(()) => {
             println!("✓ DROP TABLE E2E tests passed\n");
@@ -736,7 +779,7 @@ async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
         }
     }
     // Run ALTER TABLE tests
-    println!("[8/8] Running ALTER TABLE E2E tests...");
+    println!("[8/9] Running ALTER TABLE E2E tests...");
     match e2e_alter_table(server_path).await {
         Ok(()) => {
             println!("✓ ALTER TABLE E2E tests passed\n");
@@ -746,6 +789,19 @@ async fn e2e_all(server_path: &str) -> Result<(), TesterError> {
             return Err(e);
         }
     }
+
+    // Run WAL RECOVERY tests
+    println!("[9/9] Running WAL RECOVERY E2E tests...");
+    match e2e_wal_recovery(server_path).await {
+        Ok(()) => {
+            println!("✓ WAL RECOVERY E2E tests passed\n");
+        }
+        Err(e) => {
+            println!("✗ WAL RECOVERY E2E tests failed: {:?}\n", e);
+            return Err(e);
+        }
+    }
+
     println!("========================================");
     println!("All E2E Tests Completed Successfully!");
     println!("========================================");
@@ -849,6 +905,10 @@ async fn main() -> Result<(), TesterError> {
         }
         Command::E2eAlterTable => {
             e2e_alter_table(&cli.server_path).await?;
+            Ok(())
+        }
+        Command::E2eWalRecovery => {
+            e2e_wal_recovery(&cli.server_path).await?;
             Ok(())
         }
         Command::E2eAll => {
