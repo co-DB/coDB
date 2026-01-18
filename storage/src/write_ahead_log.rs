@@ -391,8 +391,6 @@ pub(crate) struct SinglePageOperation {
 }
 
 impl SinglePageOperation {
-    // Used in tests
-    #[allow(dead_code)]
     pub(crate) fn new(file_page_ref: FilePageRef, diff: PageDiff) -> Self {
         Self {
             file_page_ref,
@@ -592,10 +590,7 @@ impl WalClient {
         let (send, recv) = channel::bounded(1);
         let ops = ops
             .into_iter()
-            .map(|(file_page_ref, diff)| SinglePageOperation {
-                file_page_ref,
-                diff,
-            })
+            .map(|(file_page_ref, diff)| SinglePageOperation::new(file_page_ref, diff))
             .collect();
         let record = WalRecord {
             data: WalRecordData::MultiPageOperation(ops),
