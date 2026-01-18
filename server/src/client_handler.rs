@@ -337,9 +337,7 @@ mod client_handler_tests {
     use crate::client_handler::{ClientError, ClientHandler};
     use crate::protocol_handler::{BinaryProtocolHandler, TextProtocolHandler};
     use crate::server::ExecutorWithWorkers;
-    use crate::workers_container::WorkersContainer;
     use dashmap::DashMap;
-    use executor::Executor;
     use metadata::catalog_manager::CatalogManager;
     use parking_lot::RwLock;
     use protocol::{Request, Response, StatementType};

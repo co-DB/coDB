@@ -480,7 +480,7 @@ impl Cache {
         // - allocate page
         // the newly allocated page will discard previous changes applied from wal.
         let mut pinned_write_page = self.pin_write(&id)?;
-        pinned_write_page.mark_diff(0, PAGE_SIZE as _);
+        pinned_write_page.mark_diff(0, USABLE_PAGE_SIZE as _);
 
         Ok((pinned_write_page, page_id))
     }
